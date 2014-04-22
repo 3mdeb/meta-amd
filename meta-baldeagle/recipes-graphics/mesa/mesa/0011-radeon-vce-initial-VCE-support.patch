@@ -1,0 +1,1305 @@
+From f2707bcf32c6f7a5026f8a6997f7c496e8779673 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 17 Oct 2013 06:21:40 -0600
+Subject: [PATCH 11/27] radeon/vce: initial VCE support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Leo Liu <leo.liu@amd.com>
+---
+ src/gallium/drivers/r600/r600_uvd.c          |   20 ++
+ src/gallium/drivers/radeon/Makefile.sources  |    5 +-
+ src/gallium/drivers/radeon/radeon_vce.c      |  342 ++++++++++++++++++++++++
+ src/gallium/drivers/radeon/radeon_vce.h      |  116 +++++++++
+ src/gallium/drivers/radeon/radeon_vce_v1_0.c |  319 +++++++++++++++++++++++
+ src/gallium/drivers/radeon/radeon_vce_v2_0.c |  357 ++++++++++++++++++++++++++
+ src/gallium/drivers/radeon/radeon_video.c    |    3 +-
+ src/gallium/drivers/radeonsi/si_uvd.c        |   20 ++
+ 8 files changed, 1180 insertions(+), 2 deletions(-)
+ create mode 100644 src/gallium/drivers/radeon/radeon_vce.c
+ create mode 100644 src/gallium/drivers/radeon/radeon_vce.h
+ create mode 100644 src/gallium/drivers/radeon/radeon_vce_v1_0.c
+ create mode 100644 src/gallium/drivers/radeon/radeon_vce_v2_0.c
+
+diff --git a/src/gallium/drivers/r600/r600_uvd.c b/src/gallium/drivers/r600/r600_uvd.c
+index c3da7f8..700a0b3 100644
+--- a/src/gallium/drivers/r600/r600_uvd.c
++++ b/src/gallium/drivers/r600/r600_uvd.c
+@@ -47,6 +47,7 @@
+ #include "r600_pipe.h"
+ #include "radeon/radeon_video.h"
+ #include "radeon/radeon_uvd.h"
++#include "radeon/radeon_vce.h"
+ #include "r600d.h"
+ 
+ /**
+@@ -164,9 +165,28 @@ static struct radeon_winsys_cs_handle* r600_uvd_set_dtb(struct ruvd_msg *msg, st
+ 	return luma->resource.cs_buf;
+ }
+ 
++/* get the radeon resources for VCE */
++static void r600_vce_get_buffer(struct pipe_resource *resource,
++				struct radeon_winsys_cs_handle **handle,
++				struct radeon_surface **surface)
++{
++	struct r600_texture *res = (struct r600_texture *)resource;
++
++	if (handle)
++		*handle = res->resource.cs_buf;
++
++	if (surface)
++		*surface = &res->surface;
++}
++
+ /* create decoder */
+ struct pipe_video_codec *r600_uvd_create_decoder(struct pipe_context *context,
+ 						   const struct pipe_video_codec *templat)
+ {
++	struct r600_context *ctx = (struct r600_context *)context;
++
++	if (templat->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE)
++		return rvce_create_encoder(context, templat, ctx->b.ws, r600_vce_get_buffer);
++
+ 	return ruvd_create_decoder(context, templat, r600_uvd_set_dtb);
+ }
+diff --git a/src/gallium/drivers/radeon/Makefile.sources b/src/gallium/drivers/radeon/Makefile.sources
+index 4653d7a..80ca6fb 100644
+--- a/src/gallium/drivers/radeon/Makefile.sources
++++ b/src/gallium/drivers/radeon/Makefile.sources
+@@ -4,7 +4,10 @@ C_SOURCES := \
+ 	r600_streamout.c \
+         r600_texture.c \
+ 	radeon_video.c \
+-	radeon_uvd.c
++	radeon_uvd.c \
++	radeon_vce.c \
++	radeon_vce_v1_0.c \
++	radeon_vce_v2_0.c
+ 
+ LLVM_C_FILES := \
+ 	radeon_setup_tgsi_llvm.c \
+diff --git a/src/gallium/drivers/radeon/radeon_vce.c b/src/gallium/drivers/radeon/radeon_vce.c
+new file mode 100644
+index 0000000..7da5b95
+--- /dev/null
++++ b/src/gallium/drivers/radeon/radeon_vce.c
+@@ -0,0 +1,342 @@
++/**************************************************************************
++ *
++ * Copyright 2013 Advanced Micro Devices, Inc.
++ * All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sub license, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial portions
++ * of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
++ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
++ * IN NO EVENT SHALL THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR
++ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ **************************************************************************/
++
++/*
++ * Authors:
++ *      Christian König <christian.koenig@amd.com>
++ *
++ */
++
++#include <stdio.h>
++
++#include "pipe/p_video_codec.h"
++
++#include "util/u_video.h"
++#include "util/u_memory.h"
++
++#include "vl/vl_video_buffer.h"
++
++#include "../../winsys/radeon/drm/radeon_winsys.h"
++#include "radeon_video.h"
++#include "radeon_vce.h"
++
++#define CPB_SIZE (40 * 1024 * 1024)
++
++static void flush(struct rvce_encoder *enc)
++{
++	enc->ws->cs_flush(enc->cs, 0, 0);
++
++	enc->ws->cs_add_reloc(enc->cs, enc->fb->cs_handle,
++			      RADEON_USAGE_WRITE, RADEON_DOMAIN_VRAM);
++}
++
++#if 0
++static void dump_feedback(struct rvce_encoder *enc, struct rvid_buffer *fb)
++{
++	uint32_t *ptr = enc->ws->buffer_map(fb->cs_handle, enc->cs, PIPE_TRANSFER_READ_WRITE);
++	unsigned i = 0;
++	fprintf(stderr, "\n");
++	fprintf(stderr, "encStatus:\t\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "encHasBitstream:\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "encHasAudioBitstream:\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "encBitstreamOffset:\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "encBitstreamSize:\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "encAudioBitstreamOffset:\t%08x\n", ptr[i++]);
++	fprintf(stderr, "encAudioBitstreamSize:\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "encExtrabytes:\t\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "encAudioExtrabytes:\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "videoTimeStamp:\t\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "audioTimeStamp:\t\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "videoOutputType:\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "attributeFlags:\t\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "seiPrivatePackageOffset:\t%08x\n", ptr[i++]);
++	fprintf(stderr, "seiPrivatePackageSize:\t\t%08x\n", ptr[i++]);
++	fprintf(stderr, "\n");
++	enc->ws->buffer_unmap(fb->cs_handle);
++}
++#endif
++
++static struct rvid_buffer *get_feedback_buffer(struct rvce_encoder *enc)
++{
++	struct rvid_buffer *fb;
++
++	pipe_mutex_lock(enc->fb_mutex);
++	if (enc->num_fb_buffers > 2) {
++		unsigned i;
++
++		fb = enc->fb_buffers[0];
++		for (i = 1; i < enc->num_fb_buffers; ++i)
++			enc->fb_buffers[i - 1] = enc->fb_buffers[i];
++		--enc->num_fb_buffers;
++		pipe_mutex_unlock(enc->fb_mutex);
++		return fb;
++	}
++	pipe_mutex_unlock(enc->fb_mutex);
++
++	fb = CALLOC_STRUCT(rvid_buffer);
++	if (!rvid_create_buffer(enc->ws, fb, 512)) {
++		RVID_ERR("Can't create feedback buffer.\n");
++		return NULL;
++	}
++	return fb;
++}
++
++static void put_feedback_buffer(struct rvce_encoder *enc, struct rvid_buffer *fb)
++{
++	unsigned i;
++
++	pipe_mutex_lock(enc->fb_mutex);
++	i = enc->num_fb_buffers++;
++	if (enc->num_fb_buffers > enc->size_fb_buffers) {
++		enc->fb_buffers = REALLOC(enc->fb_buffers,
++			enc->size_fb_buffers * sizeof(struct rvid_buffer *),
++			enc->num_fb_buffers * sizeof(struct rvid_buffer *)
++		);
++		enc->size_fb_buffers = enc->num_fb_buffers;
++	}
++	enc->fb_buffers[i] = fb;
++	pipe_mutex_unlock(enc->fb_mutex);
++}
++
++/**
++ * destroy this video encoder
++ */
++static void rvce_destroy(struct pipe_video_codec *encoder)
++{
++	struct rvce_encoder *enc = (struct rvce_encoder*)encoder;
++	unsigned i;
++
++	if (enc->stream_handle) {
++		enc->session(enc);
++		enc->fb = get_feedback_buffer(enc);
++		enc->feedback(enc);
++		enc->destroy(enc);
++		for (i = 0; i < enc->num_fb_buffers; ++i) {
++			enc->ws->cs_add_reloc(enc->cs, enc->fb_buffers[i]->cs_handle,
++					      RADEON_USAGE_WRITE, RADEON_DOMAIN_VRAM);
++		}
++		flush(enc);
++	}
++	rvid_destroy_buffer(&enc->cpb);
++
++	pipe_mutex_destroy(enc->fb_mutex);
++	for (i = 0; i < enc->num_fb_buffers; ++i) {
++		rvid_destroy_buffer(enc->fb_buffers[i]);
++		FREE(enc->fb_buffers[i]);
++	}
++	FREE(enc->fb_buffers);
++	FREE(enc);
++}
++
++static void rvce_begin_frame(struct pipe_video_codec *encoder,
++			     struct pipe_video_buffer *source,
++			     struct pipe_picture_desc *picture)
++{
++	struct rvce_encoder *enc = (struct rvce_encoder*)encoder;
++	struct vl_video_buffer *vid_buf = (struct vl_video_buffer *)source;
++	struct pipe_h264_enc_picture_desc *pic = (struct pipe_h264_enc_picture_desc *)picture;
++
++	bool need_rate_control =
++		enc->pic.rate_ctrl.rate_ctrl_method != pic->rate_ctrl.rate_ctrl_method ||
++		enc->pic.quant_i_frames != pic->quant_i_frames ||
++		enc->pic.quant_p_frames != pic->quant_p_frames ||
++		enc->pic.quant_b_frames != pic->quant_b_frames;
++
++	enc->pic = *pic;
++
++	enc->get_buffer(vid_buf->resources[0], &enc->handle, &enc->luma);
++	enc->get_buffer(vid_buf->resources[1], NULL, &enc->chroma);
++	
++	if (!enc->stream_handle) {
++		enc->stream_handle = rvid_alloc_stream_handle();
++		enc->session(enc);
++		enc->create(enc);
++		enc->rate_control(enc);
++		need_rate_control = false;
++		enc->config_extension(enc);
++		enc->motion_estimation(enc);
++		enc->rdo(enc);
++		enc->pic_control(enc);
++		enc->fb = get_feedback_buffer(enc);
++		enc->feedback(enc);
++		put_feedback_buffer(enc, enc->fb);
++		flush(enc);
++	}
++
++	enc->session(enc);
++
++	if (need_rate_control)
++		enc->rate_control(enc);
++}
++
++static void rvce_encode_bitstream(struct pipe_video_codec *encoder,
++				  struct pipe_video_buffer *source,
++				  struct pipe_resource *destination,
++				  void **fb)
++{
++	struct rvce_encoder *enc = (struct rvce_encoder*)encoder;
++	enc->get_buffer(destination, &enc->bs_handle, NULL);
++	enc->bs_size = destination->width0;
++
++	*fb = enc->fb = get_feedback_buffer(enc);
++
++	enc->encode(enc);
++	enc->feedback(enc);
++}
++
++static void rvce_end_frame(struct pipe_video_codec *encoder,
++			   struct pipe_video_buffer *source,
++			   struct pipe_picture_desc *picture)
++{
++	struct rvce_encoder *enc = (struct rvce_encoder*)encoder;
++	flush(enc);
++}
++
++static void rvce_get_feedback(struct pipe_video_codec *encoder,
++			      void *feedback, unsigned *size)
++{
++	struct rvce_encoder *enc = (struct rvce_encoder*)encoder;
++	struct rvid_buffer *fb = feedback;
++
++	if (size) {
++		uint32_t *ptr = enc->ws->buffer_map(fb->cs_handle, enc->cs, PIPE_TRANSFER_READ_WRITE);
++		*size = ptr[4] - ptr[7];
++		enc->ws->buffer_unmap(fb->cs_handle);
++	}
++	//dump_feedback(enc, fb);
++	put_feedback_buffer(enc, fb);
++}
++
++/**
++ * flush any outstanding command buffers to the hardware
++ */
++static void rvce_flush(struct pipe_video_codec *encoder)
++{
++}
++
++static void rvce_cs_flush(void *ctx, unsigned flags)
++{
++	// just ignored
++}
++
++struct pipe_video_codec *rvce_create_encoder(struct pipe_context *context,
++					     const struct pipe_video_codec *templ,
++					     struct radeon_winsys* ws,
++					     rvce_get_buffer get_buffer)
++{
++	struct rvce_encoder *enc;
++	struct radeon_info info;
++
++	ws->query_info(ws, &info);
++
++	enc = CALLOC_STRUCT(rvce_encoder);
++	if (!enc)
++		return NULL;
++
++	enc->base = *templ;
++	enc->base.context = context;
++
++	enc->base.destroy = rvce_destroy;
++	enc->base.begin_frame = rvce_begin_frame;
++	enc->base.encode_bitstream = rvce_encode_bitstream;
++	enc->base.end_frame = rvce_end_frame;
++	enc->base.flush = rvce_flush;
++	enc->base.get_feedback = rvce_get_feedback;
++	enc->get_buffer = get_buffer;
++
++	enc->ws = ws;
++	enc->cs = ws->cs_create(ws, RING_VCE, NULL);
++	if (!enc->cs) {
++		RVID_ERR("Can't get command submission context.\n");
++		goto error;
++	}
++
++	enc->ws->cs_set_flush_callback(enc->cs, rvce_cs_flush, enc);
++
++	if (!rvid_create_buffer(enc->ws, &enc->cpb, CPB_SIZE)) {
++		RVID_ERR("Can't create CPB buffer.\n");
++		goto error;
++	}
++
++	if (info.family < CHIP_HAINAN)
++		radeon_vce_v1_0_init(enc);
++	else
++		radeon_vce_v2_0_init(enc);
++
++	pipe_mutex_init(enc->fb_mutex);
++
++	return &enc->base;
++
++error:
++	if (enc->cs)
++		enc->ws->cs_destroy(enc->cs);
++
++	rvid_destroy_buffer(&enc->cpb);
++
++	FREE(enc);
++	return NULL;
++}
++
++int rvce_get_video_param(struct pipe_screen *screen,
++	                 enum pipe_video_profile profile,
++	                 enum pipe_video_entrypoint entrypoint,
++	                 enum pipe_video_cap param)
++{
++	switch (param) {
++	case PIPE_VIDEO_CAP_SUPPORTED:
++		switch (u_reduce_video_profile(profile)) {
++		case PIPE_VIDEO_FORMAT_MPEG4_AVC:
++			return true;
++		default:
++			return false;
++		}
++	case PIPE_VIDEO_CAP_NPOT_TEXTURES:
++		return 1;
++	case PIPE_VIDEO_CAP_MAX_WIDTH:
++		return 2048;
++	case PIPE_VIDEO_CAP_MAX_HEIGHT:
++		return 1152;
++	case PIPE_VIDEO_CAP_PREFERED_FORMAT:
++		return PIPE_FORMAT_NV12;
++	case PIPE_VIDEO_CAP_PREFERS_INTERLACED:
++		return false;
++	case PIPE_VIDEO_CAP_SUPPORTS_INTERLACED:
++		return false;
++	case PIPE_VIDEO_CAP_SUPPORTS_PROGRESSIVE:
++		return true;
++	default:
++		return 0;
++	}
++}
++
++boolean rvce_is_format_supported(struct pipe_screen *screen,
++				 enum pipe_format format,
++				 enum pipe_video_profile profile,
++				 enum pipe_video_entrypoint entrypoint)
++{
++	return format == PIPE_FORMAT_NV12;
++}
+diff --git a/src/gallium/drivers/radeon/radeon_vce.h b/src/gallium/drivers/radeon/radeon_vce.h
+new file mode 100644
+index 0000000..c153924
+--- /dev/null
++++ b/src/gallium/drivers/radeon/radeon_vce.h
+@@ -0,0 +1,116 @@
++/**************************************************************************
++ *
++ * Copyright 2013 Advanced Micro Devices, Inc.
++ * All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sub license, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial portions
++ * of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
++ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
++ * IN NO EVENT SHALL THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR
++ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ **************************************************************************/
++
++/*
++ * Authors:
++ *      Christian König <christian.koenig@amd.com>
++ *
++ */
++
++#ifndef RADEON_VCE_H
++#define RADEON_VCE_H
++
++#include "os/os_thread.h"
++
++#define RVCE_RELOC(buf, usage, domain) (enc->ws->cs_add_reloc(enc->cs, (buf), (usage), domain))
++
++#define RVCE_CS(value) (enc->cs->buf[enc->cs->cdw++] = (value))
++#define RVCE_BEGIN(cmd) { uint32_t *begin = &enc->cs->buf[enc->cs->cdw++]; RVCE_CS(cmd)
++#define RVCE_READ(buf, domain) RVCE_CS(RVCE_RELOC(buf, RADEON_USAGE_READ, domain) * 4)
++#define RVCE_WRITE(buf, domain) RVCE_CS(RVCE_RELOC(buf, RADEON_USAGE_WRITE, domain) * 4)
++#define RVCE_READWRITE(buf, domain) RVCE_CS(RVCE_RELOC(buf, RADEON_USAGE_READWRITE, domain) * 4)
++#define RVCE_END() *begin = (&enc->cs->buf[enc->cs->cdw] - begin) * 4; }
++
++/* driver dependent callback */
++typedef void (*rvce_get_buffer)(struct pipe_resource *resource,
++				struct radeon_winsys_cs_handle **handle,
++				struct radeon_surface **surface);
++
++/* VCE encoder representation */
++struct rvce_encoder {
++	struct pipe_video_codec		base;
++
++	/* version specific packets */
++	void (*session)(struct rvce_encoder *enc);
++	void (*create)(struct rvce_encoder *enc);
++	void (*feedback)(struct rvce_encoder *enc);
++	void (*rate_control)(struct rvce_encoder *enc);
++	void (*config_extension)(struct rvce_encoder *enc);
++	void (*pic_control)(struct rvce_encoder *enc);
++	void (*motion_estimation)(struct rvce_encoder *enc);
++	void (*rdo)(struct rvce_encoder *enc);
++	void (*encode)(struct rvce_encoder *enc);
++	void (*destroy)(struct rvce_encoder *enc);
++
++	unsigned			stream_handle;
++
++	struct radeon_winsys*		ws;
++	struct radeon_winsys_cs*	cs;
++
++	rvce_get_buffer			get_buffer;
++
++	struct radeon_winsys_cs_handle*	handle;
++	struct radeon_surface*		luma;
++	struct radeon_surface*		chroma;
++
++	struct radeon_winsys_cs_handle*	bs_handle;
++	unsigned			bs_size;
++
++	struct rvid_buffer		*fb;
++	struct rvid_buffer		cpb;
++	struct pipe_h264_enc_picture_desc pic;
++
++	pipe_mutex			fb_mutex;
++	struct rvid_buffer		**fb_buffers;
++	unsigned			size_fb_buffers;
++	unsigned			num_fb_buffers;
++};
++
++struct pipe_video_codec *rvce_create_encoder(struct pipe_context *context,
++					     const struct pipe_video_codec *templat,
++					     struct radeon_winsys* ws,
++					     rvce_get_buffer get_buffer);
++
++/* returns supported codecs and other parameters */
++int rvce_get_video_param(struct pipe_screen *screen,
++			 enum pipe_video_profile profile,
++			 enum pipe_video_entrypoint entrypoint,
++			 enum pipe_video_cap param);
++
++/* returns supported image formats */
++boolean rvce_is_format_supported(struct pipe_screen *screen,
++				 enum pipe_format format,
++				 enum pipe_video_profile profile,
++				 enum pipe_video_entrypoint entrypoint);
++
++/* init vce 1.0 specific callbacks */
++void radeon_vce_v1_0_init(struct rvce_encoder *enc);
++
++/* init vce 2.0 specific callbacks */
++void radeon_vce_v2_0_init(struct rvce_encoder *enc);
++
++#endif
+diff --git a/src/gallium/drivers/radeon/radeon_vce_v1_0.c b/src/gallium/drivers/radeon/radeon_vce_v1_0.c
+new file mode 100644
+index 0000000..581d713
+--- /dev/null
++++ b/src/gallium/drivers/radeon/radeon_vce_v1_0.c
+@@ -0,0 +1,319 @@
++/**************************************************************************
++ *
++ * Copyright 2013 Advanced Micro Devices, Inc.
++ * All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sub license, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial portions
++ * of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
++ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
++ * IN NO EVENT SHALL THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR
++ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ **************************************************************************/
++
++/*
++ * Authors:
++ *      Christian König <christian.koenig@amd.com>
++ *
++ */
++
++#include <stdio.h>
++
++#include "pipe/p_video_codec.h"
++
++#include "util/u_video.h"
++#include "util/u_memory.h"
++
++#include "vl/vl_video_buffer.h"
++
++#include "../../winsys/radeon/drm/radeon_winsys.h"
++#include "radeon_video.h"
++#include "radeon_vce.h"
++
++static void session(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x00000001); // session cmd
++	RVCE_CS(enc->stream_handle);
++	RVCE_END();
++}
++
++static void create(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x00000002); // create cmd
++	RVCE_CS(0x00000000); // encUseCircularBuffer
++	RVCE_CS(0x00000041); // encProfile
++	RVCE_CS(0x0000000a); // encLevel
++	RVCE_CS(0x00000001); // encNumberOfReferenceFrames
++	RVCE_CS(0x00000001); // encOutByteSwap
++	RVCE_CS(0x00000000); // encLowLatency
++	RVCE_CS(enc->base.width); // encImageWidth
++	RVCE_CS(enc->base.height); // encImageHeight
++	RVCE_CS(enc->luma->level[0].pitch_bytes); // encRefPicLumaPitch
++	RVCE_CS(enc->chroma->level[0].pitch_bytes); // encRefPicChromaPitch
++	RVCE_CS(align(enc->luma->npix_y, 16) / 8); // encRefYHeightInQw
++	RVCE_CS(0x00000000); // encRefPic(Addr|Array)Mode, encPicStructRestriction
++	RVCE_CS(0x00000000); // videoBitstreamRingAddressHi
++	RVCE_CS(0x00000000); // videoBitstreamRingAddressLo
++	RVCE_CS(0x00100000); // videoBitstreamRingBufferSize
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(enc->fb->buf->size); // feedbackRingSize
++	RVCE_CS(0x00000000); // encAvmuxEnable
++	RVCE_CS(0x00000000); // encDispCapEnable
++	RVCE_READWRITE(enc->cpb.cs_handle, RADEON_DOMAIN_VRAM); // autoContextAddressHi
++	RVCE_CS(0x00000000); // autoContextAddressLo
++	RVCE_CS(0x00000000); // autoInputFrameYPitch
++	RVCE_CS(0x00000000); // autoInputPicLumaPitch
++	RVCE_CS(0x00000000); // disableRDO
++	RVCE_CS(0x00000000); // maxNumTemporalEnhancementLayers
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_END();
++
++}
++
++static void feedback(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x0000001b); // feedback buffer
++	RVCE_WRITE(enc->fb->cs_handle, RADEON_DOMAIN_GTT); // feedbackRingAddressHi
++	RVCE_CS(0x00000000); // feedbackRingAddressLo
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_END();
++}
++
++static void rate_control(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x00000010); // rate control
++	RVCE_CS(enc->pic.rate_ctrl.rate_ctrl_method); // encRateControlMethod
++	RVCE_CS(enc->pic.rate_ctrl.target_bitrate); // encRateControlTargetBitRate
++	RVCE_CS(enc->pic.rate_ctrl.peak_bitrate); // encRateControlPeakBitRate
++	RVCE_CS(enc->pic.rate_ctrl.frame_rate_num); // encRateControlFrameRateNum
++	RVCE_CS(0x00000000); // encGOPSize
++	RVCE_CS(enc->pic.quant_i_frames); // encQP_I
++	RVCE_CS(enc->pic.quant_p_frames); // encQP_P
++	RVCE_CS(enc->pic.quant_b_frames); // encQP_B
++	RVCE_CS(enc->pic.rate_ctrl.vbv_buffer_size); // encVBVBufferSize
++	RVCE_CS(enc->pic.rate_ctrl.frame_rate_den); // encRateControlFrameRateDen
++	RVCE_CS(0x00000000); // encVBVBufferLevel
++	RVCE_CS(0x00000000); // encMaxAUSize
++	RVCE_CS(0x00000000); // encQPInitialMode
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(enc->pic.rate_ctrl.target_bits_picture); // encTargetBitsPerPicture
++	RVCE_CS(enc->pic.rate_ctrl.peak_bits_picture_integer); // encPeakBitsPerPictureInteger
++	RVCE_CS(enc->pic.rate_ctrl.peak_bits_picture_fraction); // encPeakBitsPerPictureFractional
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_END();
++}
++
++static void config_extension(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x00000013); // config extension
++	RVCE_CS(0x00000003); // encEnablePerfLogging
++	RVCE_CS(0x00000000); // encH264PacketMode
++	RVCE_CS(0x00000000); // encRefPicSelection
++	RVCE_CS(0x00000000); // encYUVFormat
++	RVCE_CS(0x00000000); // encBSliceModeTypes
++	RVCE_CS(0x00000000); // encWeightedPredictionModes
++	RVCE_CS(0x00000000); // encChromaQpOffset
++	RVCE_CS(0x00000000); // encScalingMatrix
++	RVCE_CS(0x00000000); // encNumberOfViews
++	RVCE_CS(0x00000000); // encMbaff
++	RVCE_CS(0x00000000); // encRtOptions
++	RVCE_CS(0x00000000); // reserved
++	RVCE_END();
++}
++
++static void pic_control(struct rvce_encoder *enc)
++{
++	unsigned encNumMBsPerSlice;
++
++	encNumMBsPerSlice = align(enc->base.width, 16) / 16;
++	encNumMBsPerSlice *= align(enc->base.height, 16) / 16;
++
++	RVCE_BEGIN(0x0000000f); // pic control
++	RVCE_CS(0x00000000); // encUseConstrainedIntraPred
++	RVCE_CS(0x00000000); // encCABACEnable
++	RVCE_CS(0x00000000); // encCABACIDC
++	RVCE_CS(0x00000000); // encLoopFilterDisable
++	RVCE_CS(0x00000000); // encLFBetaOffset
++	RVCE_CS(0x00000000); // encLFAlphaC0Offset
++	RVCE_CS(0x00000000); // encIDRPeriod
++	RVCE_CS(0x00000000); // encIPicPeriod
++	RVCE_CS(0x00000000); // encHeaderInsertionSpacing
++	RVCE_CS(0x00000000); // encCropLeftOffset
++	RVCE_CS(0x00000000); // encCropRightOffset
++	RVCE_CS(0x00000000); // encCropTopOffset
++	RVCE_CS(0x00000000); // encCropBottomOffset
++	RVCE_CS(encNumMBsPerSlice); // encNumMBsPerSlice
++	RVCE_CS(0x00000000); // encIntraRefreshNumMBsPerSlot
++	RVCE_CS(0x00000000); // encForceIntraRefresh
++	RVCE_CS(0x00000000); // encForceIMBPeriod
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // encSkippedPicPeriod
++	RVCE_CS(0x00000000); // encPicOrderCntType
++	RVCE_CS(0x00000000); // encSPSID
++	RVCE_CS(0x00000000); // encPPSID
++	RVCE_CS(0x00000000); // encNumOfTempEnhancementLayers
++	RVCE_CS(0x00000040); // encConstraintSetFlags
++	RVCE_CS(0x00000000); // encForcePrefixUnitsInBaseTempLayer
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_END();
++}
++
++static void motion_estimation(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x00000011); // motion estimation
++	RVCE_CS(0x00000001); // encIMEDecimationSearch
++	RVCE_CS(0x00000001); // motionEstHalfPixel
++	RVCE_CS(0x00000000); // motionEstQuarterPixel
++	RVCE_CS(0x00000000); // disableFavorPMVPoint
++	RVCE_CS(0x00000000); // forceZeroPointCenter
++	RVCE_CS(0x00000000); // LSMVert
++	RVCE_CS(0x00000010); // encSearchRangeX
++	RVCE_CS(0x00000010); // encSearchRangeY
++	RVCE_CS(0x00000010); // encSearch1RangeX
++	RVCE_CS(0x00000010); // encSearch1RangeY
++	RVCE_CS(0x00000000); // disable16x16Frame1
++	RVCE_CS(0x00000000); // disableSATD
++	RVCE_CS(0x00000000); // enableAMD
++	RVCE_CS(0x00000078); // encDisableSubMode
++	RVCE_CS(0x00000000); // encIMESkipX
++	RVCE_CS(0x00000000); // encIMESkipY
++	RVCE_CS(0x00000000); // encEnImeOverwDisSubm
++	RVCE_CS(0x00000000); // encImeOverwDisSubmNo
++	RVCE_CS(0x00000001); // encIME2SearchRangeX
++	RVCE_CS(0x00000001); // encIME2SearchRangeY
++	RVCE_END();
++}
++
++static void rdo(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x00000012); // rdo
++	RVCE_CS(0x00000000); // encDisableTbePredIFrame
++	RVCE_CS(0x00000000); // encDisableTbePredPFrame
++	RVCE_CS(0x00000000); // useFmeInterpolY
++	RVCE_CS(0x00000000); // useFmeInterpolUV
++	RVCE_CS(0x00000000); // enc16x16CostAdj
++	RVCE_CS(0x00000000); // encSkipCostAdj
++	RVCE_CS(0x00000000); // encForce16x16skip
++	RVCE_CS(0x00000000); // Reserved
++	RVCE_END();
++}
++
++static void encode(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x00000006); // encode
++	RVCE_CS(0x00000000); // insertHeaders
++	RVCE_CS(0x00000000); // pictureStructure
++	RVCE_CS(0x00000000); // encInterlacedMode
++	RVCE_CS(enc->pic.picture_type); // encForcePicType
++	RVCE_CS(enc->bs_size); // allowedMaxBitstreamSize
++	RVCE_CS(0x00000000); // forceRefreshMap
++	RVCE_CS(0x00000000); // insertAUD
++	RVCE_CS(0x00000000); // endOfSequence
++	RVCE_CS(0x00000000); // endOfStream
++	RVCE_READ(enc->handle, RADEON_DOMAIN_VRAM); // inputPictureLumaAddressHi
++	RVCE_CS(enc->luma->level[0].offset); // inputPictureLumaAddressLo
++	RVCE_READ(enc->handle, RADEON_DOMAIN_VRAM); // inputPictureChromaAddressHi
++	RVCE_CS(enc->chroma->level[0].offset); // inputPictureChromaAddressLo
++	RVCE_READWRITE(enc->cpb.cs_handle, RADEON_DOMAIN_VRAM); // encodeContextAddressHi
++	RVCE_CS(0x00000000); // encodeContextAddressLo
++	RVCE_CS(align(enc->luma->npix_y, 16)); // encInputFrameYPitch
++	RVCE_CS(enc->luma->level[0].pitch_bytes); // encInputPicLumaPitch
++	RVCE_CS(enc->chroma->level[0].pitch_bytes); // encInputPicChromaPitch
++	RVCE_CS(0x00000000); // encInputPic(Addr|Array)Mode
++	RVCE_CS(0x00000000); // encInputPicTileConfig
++	RVCE_WRITE(enc->bs_handle, RADEON_DOMAIN_GTT); // videoBitstreamRingAddressHi
++	RVCE_CS(0x00000000); // videoBitstreamRingAddressLo
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_CS(0x00000000); // reserved
++	RVCE_END();
++}
++
++static void destroy(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x00000005); // destroy
++	RVCE_END();
++}
++
++void radeon_vce_v1_0_init(struct rvce_encoder *enc)
++{
++	enc->session = session;
++	enc->create = create;
++	enc->feedback = feedback;
++	enc->rate_control = rate_control;
++	enc->config_extension = config_extension;
++	enc->pic_control = pic_control;
++	enc->motion_estimation = motion_estimation;
++	enc->rdo = rdo;
++	enc->encode = encode;
++	enc->destroy = destroy;
++}
+diff --git a/src/gallium/drivers/radeon/radeon_vce_v2_0.c b/src/gallium/drivers/radeon/radeon_vce_v2_0.c
+new file mode 100644
+index 0000000..149dd9e
+--- /dev/null
++++ b/src/gallium/drivers/radeon/radeon_vce_v2_0.c
+@@ -0,0 +1,357 @@
++/**************************************************************************
++ *
++ * Copyright 2013 Advanced Micro Devices, Inc.
++ * All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sub license, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial portions
++ * of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
++ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
++ * IN NO EVENT SHALL THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR
++ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ **************************************************************************/
++
++/*
++ * Authors:
++ *      Christian König <christian.koenig@amd.com>
++ *
++ */
++
++#include <stdio.h>
++
++#include "pipe/p_video_codec.h"
++
++#include "util/u_video.h"
++#include "util/u_memory.h"
++
++#include "vl/vl_video_buffer.h"
++
++#include "../../winsys/radeon/drm/radeon_winsys.h"
++#include "radeon_video.h"
++#include "radeon_vce.h"
++
++static void session(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x00000001); // session cmd
++	RVCE_CS(enc->stream_handle);
++	RVCE_END();
++}
++
++static void create(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x00000002); // task info
++	RVCE_CS(0xffffffff); // offsetOfNextTaskInfo
++	RVCE_CS(0x00000000); // taskOperation
++	RVCE_CS(0x00000000); // referencePictureDependency
++	RVCE_CS(0x00000000); // collocateFlagDependency
++	RVCE_CS(0x00000000); // feedbackIndex
++	RVCE_CS(0x00000000); // videoBitstreamRingIndex
++	RVCE_END();
++
++	RVCE_BEGIN(0x01000001); // create cmd
++	RVCE_CS(0x00000000); // encUseCircularBuffer
++	RVCE_CS(0x00000041); // encProfile
++	RVCE_CS(0x0000000a); // encLevel
++	RVCE_CS(0x00000000); // encPicStructRestriction
++	RVCE_CS(enc->base.width); // encImageWidth
++	RVCE_CS(enc->base.height); // encImageHeight
++	RVCE_CS(enc->luma->level[0].pitch_bytes); // encRefPicLumaPitch
++	RVCE_CS(enc->chroma->level[0].pitch_bytes); // encRefPicChromaPitch
++	RVCE_CS(align(enc->luma->npix_y, 16) / 8); // encRefYHeightInQw
++	RVCE_CS(0x00000000); // encRefPic(Addr|Array)Mode, encPicStructRestriction, disableRDO
++	RVCE_END();
++}
++
++static void feedback(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x05000005); // feedback buffer
++	RVCE_WRITE(enc->fb->cs_handle, RADEON_DOMAIN_GTT); // feedbackRingAddressHi
++	RVCE_CS(0x00000000); // feedbackRingAddressLo
++	RVCE_CS(0x00000001); // feedbackRingSize
++	RVCE_END();
++}
++
++static void rate_control(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x04000005); // rate control
++	RVCE_CS(enc->pic.rate_ctrl.rate_ctrl_method); // encRateControlMethod
++	RVCE_CS(enc->pic.rate_ctrl.target_bitrate); // encRateControlTargetBitRate
++	RVCE_CS(enc->pic.rate_ctrl.peak_bitrate); // encRateControlPeakBitRate
++	RVCE_CS(enc->pic.rate_ctrl.frame_rate_num); // encRateControlFrameRateNum
++	RVCE_CS(0x00000000); // encGOPSize
++	RVCE_CS(enc->pic.quant_i_frames); // encQP_I
++	RVCE_CS(enc->pic.quant_p_frames); // encQP_P
++	RVCE_CS(enc->pic.quant_b_frames); // encQP_B
++	RVCE_CS(enc->pic.rate_ctrl.vbv_buffer_size); // encVBVBufferSize
++	RVCE_CS(enc->pic.rate_ctrl.frame_rate_den); // encRateControlFrameRateDen
++	RVCE_CS(0x00000000); // encVBVBufferLevel
++	RVCE_CS(0x00000000); // encMaxAUSize
++	RVCE_CS(0x00000000); // encQPInitialMode
++	RVCE_CS(enc->pic.rate_ctrl.target_bits_picture); // encTargetBitsPerPicture
++	RVCE_CS(enc->pic.rate_ctrl.peak_bits_picture_integer); // encPeakBitsPerPictureInteger
++	RVCE_CS(enc->pic.rate_ctrl.peak_bits_picture_fraction); // encPeakBitsPerPictureFractional
++	RVCE_CS(0x00000000); // encMinQP
++	RVCE_CS(0x00000000); // encMaxQP
++	RVCE_CS(0x00000000); // encSkipFrameEnable
++	RVCE_CS(0x00000000); // encFillerDataEnable
++	RVCE_CS(0x00000000); // encEnforceHRD
++	RVCE_CS(0x00000000); // encBPicsDeltaQP
++	RVCE_CS(0x00000000); // encReferenceBPicsDeltaQP
++	RVCE_CS(0x00000000); // encRateControlReInitDisable
++	RVCE_END();
++}
++
++static void config_extension(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x04000001); // config extension
++	RVCE_CS(0x00000003); // encEnablePerfLogging
++	RVCE_END();
++}
++
++static void pic_control(struct rvce_encoder *enc)
++{
++	unsigned encNumMBsPerSlice;
++
++	encNumMBsPerSlice = align(enc->base.width, 16) / 16;
++	encNumMBsPerSlice *= align(enc->base.height, 16) / 16;
++
++	RVCE_BEGIN(0x04000002); // pic control
++	RVCE_CS(0x00000000); // encUseConstrainedIntraPred
++	RVCE_CS(0x00000000); // encCABACEnable
++	RVCE_CS(0x00000000); // encCABACIDC
++	RVCE_CS(0x00000000); // encLoopFilterDisable
++	RVCE_CS(0x00000000); // encLFBetaOffset
++	RVCE_CS(0x00000000); // encLFAlphaC0Offset
++	RVCE_CS(0x00000000); // encCropLeftOffset
++	RVCE_CS(0x00000000); // encCropRightOffset
++	RVCE_CS(0x00000000); // encCropTopOffset
++	RVCE_CS(0x00000000); // encCropBottomOffset
++	RVCE_CS(encNumMBsPerSlice); // encNumMBsPerSlice
++	RVCE_CS(0x00000000); // encIntraRefreshNumMBsPerSlot
++	RVCE_CS(0x00000000); // encForceIntraRefresh
++	RVCE_CS(0x00000000); // encForceIMBPeriod
++	RVCE_CS(0x00000000); // encPicOrderCntType
++	RVCE_CS(0x00000000); // log2_max_pic_order_cnt_lsb_minus4
++	RVCE_CS(0x00000000); // encSPSID
++	RVCE_CS(0x00000000); // encPPSID
++	RVCE_CS(0x00000040); // encConstraintSetFlags
++	RVCE_CS(0x00000000); // encBPicPattern
++	RVCE_CS(0x00000000); // weightPredModeBPicture
++	RVCE_CS(0x00000001); // encNumberOfReferenceFrames
++	RVCE_CS(0x00000001); // encMaxNumRefFrames
++	RVCE_CS(0x00000000); // encNumDefaultActiveRefL0
++	RVCE_CS(0x00000000); // encNumDefaultActiveRefL1
++	RVCE_CS(0x00000000); // encSliceMode
++	RVCE_CS(0x00000000); // encMaxSliceSize
++	RVCE_END();
++}
++
++static void motion_estimation(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x04000007); // motion estimation
++	RVCE_CS(0x00000001); // encIMEDecimationSearch
++	RVCE_CS(0x00000001); // motionEstHalfPixel
++	RVCE_CS(0x00000000); // motionEstQuarterPixel
++	RVCE_CS(0x00000000); // disableFavorPMVPoint
++	RVCE_CS(0x00000000); // forceZeroPointCenter
++	RVCE_CS(0x00000000); // LSMVert
++	RVCE_CS(0x00000010); // encSearchRangeX
++	RVCE_CS(0x00000010); // encSearchRangeY
++	RVCE_CS(0x00000010); // encSearch1RangeX
++	RVCE_CS(0x00000010); // encSearch1RangeY
++	RVCE_CS(0x00000000); // disable16x16Frame1
++	RVCE_CS(0x00000000); // disableSATD
++	RVCE_CS(0x00000000); // enableAMD
++	RVCE_CS(0x000000fe); // encDisableSubMode
++	RVCE_CS(0x00000000); // encIMESkipX
++	RVCE_CS(0x00000000); // encIMESkipY
++	RVCE_CS(0x00000000); // encEnImeOverwDisSubm
++	RVCE_CS(0x00000000); // encImeOverwDisSubmNo
++	RVCE_CS(0x00000001); // encIME2SearchRangeX
++	RVCE_CS(0x00000001); // encIME2SearchRangeY
++	RVCE_CS(0x00000000); // parallelModeSpeedupEnable
++	RVCE_CS(0x00000000); // fme0_encDisableSubMode
++	RVCE_CS(0x00000000); // fme1_encDisableSubMode
++	RVCE_CS(0x00000000); // imeSWSpeedupEnable
++	RVCE_END();
++}
++
++static void rdo(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x04000008); // rdo
++	RVCE_CS(0x00000000); // encDisableTbePredIFrame
++	RVCE_CS(0x00000000); // encDisableTbePredPFrame
++	RVCE_CS(0x00000000); // useFmeInterpolY
++	RVCE_CS(0x00000000); // useFmeInterpolUV
++	RVCE_CS(0x00000000); // useFmeIntrapolY
++	RVCE_CS(0x00000000); // useFmeIntrapolUV
++	RVCE_CS(0x00000000); // useFmeInterpolY_1
++	RVCE_CS(0x00000000); // useFmeInterpolUV_1
++	RVCE_CS(0x00000000); // useFmeIntrapolY_1
++	RVCE_CS(0x00000000); // useFmeIntrapolUV_1
++	RVCE_CS(0x00000000); // enc16x16CostAdj
++	RVCE_CS(0x00000000); // encSkipCostAdj
++	RVCE_CS(0x00000000); // encForce16x16skip
++	RVCE_CS(0x00000000); // encDisableThresholdCalcA
++	RVCE_CS(0x00000000); // encLumaCoeffCost
++	RVCE_CS(0x00000000); // encLumaMBCoeffCost
++	RVCE_CS(0x00000000); // encChromaCoeffCost
++	RVCE_END();
++}
++
++static void encode(struct rvce_encoder *enc)
++{
++	int i;
++	unsigned pitch = align(enc->luma->level[0].pitch_bytes, 128);
++	unsigned vpitch = align(enc->luma->npix_y, 16);
++	unsigned fsize = pitch * (vpitch + vpitch / 2);
++	unsigned chroma_offset = pitch * vpitch;
++	unsigned luma_offset;
++
++	RVCE_BEGIN(0x00000002); // task info
++	RVCE_CS(0xffffffff); // offsetOfNextTaskInfo
++	RVCE_CS(0x00000003); // taskOperation
++	RVCE_CS(0x00000000); // referencePictureDependency
++	RVCE_CS(0x00000000); // collocateFlagDependency
++	RVCE_CS(0x00000000); // feedbackIndex
++	RVCE_CS(0x00000000); // videoBitstreamRingIndex
++	RVCE_END();
++
++	RVCE_BEGIN(0x05000001); // context buffer
++	RVCE_READWRITE(enc->cpb.cs_handle, RADEON_DOMAIN_VRAM); // encodeContextAddressHi
++	RVCE_CS(0x00000000); // encodeContextAddressLo
++	RVCE_END();
++
++	RVCE_BEGIN(0x05000004); // video bitstream buffer
++	RVCE_WRITE(enc->bs_handle, RADEON_DOMAIN_GTT); // videoBitstreamRingAddressHi
++	RVCE_CS(0x00000000); // videoBitstreamRingAddressLo
++	RVCE_CS(enc->bs_size); // videoBitstreamRingSize
++	RVCE_END();
++
++	RVCE_BEGIN(0x03000001); // encode
++	RVCE_CS(0x00000000); // insertHeaders
++	RVCE_CS(0x00000000); // pictureStructure
++	RVCE_CS(enc->bs_size); // allowedMaxBitstreamSize
++	RVCE_CS(0x00000000); // forceRefreshMap
++	RVCE_CS(0x00000000); // insertAUD
++	RVCE_CS(0x00000000); // endOfSequence
++	RVCE_CS(0x00000000); // endOfStream
++	RVCE_READ(enc->handle, RADEON_DOMAIN_VRAM); // inputPictureLumaAddressHi
++	RVCE_CS(enc->luma->level[0].offset); // inputPictureLumaAddressLo
++	RVCE_READ(enc->handle, RADEON_DOMAIN_VRAM); // inputPictureChromaAddressHi
++	RVCE_CS(enc->chroma->level[0].offset); // inputPictureChromaAddressLo
++	RVCE_CS(align(enc->luma->npix_y, 16)); // encInputFrameYPitch
++	RVCE_CS(enc->luma->level[0].pitch_bytes); // encInputPicLumaPitch
++	RVCE_CS(enc->chroma->level[0].pitch_bytes); // encInputPicChromaPitch
++	RVCE_CS(0x00000000); // encInputPic(Addr|Array)Mode
++	RVCE_CS(0x00000000); // encInputPicTileConfig
++	RVCE_CS(enc->pic.picture_type); // encPicType
++	RVCE_CS(enc->pic.picture_type == 3); // encIdrFlag
++	RVCE_CS(0x00000000); // encIdrPicId
++	RVCE_CS(0x00000000); // encMGSKeyPic
++	RVCE_CS(0x00000001); // encReferenceFlag
++	RVCE_CS(0x00000000); // encTemporalLayerIndex
++	RVCE_CS(0x00000000); // num_ref_idx_active_override_flag
++	RVCE_CS(0x00000000); // num_ref_idx_l0_active_minus1
++	RVCE_CS(0x00000000); // num_ref_idx_l1_active_minus1
++	for (i = 0; i < 4; ++i) {
++		RVCE_CS(0x00000000); // encRefListModificationOp
++		RVCE_CS(0x00000000); // encRefListModificationNum
++	}
++	for (i = 0; i < 4; ++i) {
++		RVCE_CS(0x00000000); // encDecodedPictureMarkingOp
++		RVCE_CS(0x00000000); // encDecodedPictureMarkingNum
++		RVCE_CS(0x00000000); // encDecodedPictureMarkingIdx
++	}
++	for (i = 0; i < 4; ++i) {
++		RVCE_CS(0x00000000); // encDecodedRefBasePictureMarkingOp
++		RVCE_CS(0x00000000); // encDecodedRefBasePictureMarkingNum
++	}
++
++	RVCE_CS(0x00000000); // pictureStructure
++
++	luma_offset = (2 * ((enc->pic.frame_num - 1) % 2) * fsize + 2 * fsize); 
++	if (enc->pic.picture_type == PIPE_H264_ENC_PICTURE_TYPE_IDR) { 
++		RVCE_CS(0x00000000); // encPicType
++		RVCE_CS(0x00000000); // frameNumber
++		RVCE_CS(0x00000000); // pictureOrderCount
++		RVCE_CS(0xffffffff); // lumaOffset
++		RVCE_CS(0xffffffff); // chromaOffset
++	}
++	else if(enc->pic.picture_type == PIPE_H264_ENC_PICTURE_TYPE_P) {
++		RVCE_CS(0x00000000); // encPicType
++		RVCE_CS(enc->pic.frame_num - 1); // frameNumber
++		RVCE_CS(enc->pic.frame_num - 1); // pictureOrderCount
++		RVCE_CS(luma_offset); // lumaOffset
++		RVCE_CS(chroma_offset + luma_offset); // chromaOffset
++	}
++	for (i = 0; i < 2; ++i) {
++		RVCE_CS(0x00000000); // pictureStructure
++		RVCE_CS(0x00000000); // encPicType
++		RVCE_CS(0x00000000); // frameNumber
++		RVCE_CS(0x00000000); // pictureOrderCount
++		RVCE_CS(0xffffffff); // lumaOffset
++		RVCE_CS(0xffffffff); // chromaOffset
++	}
++	
++	luma_offset = (2 * (enc->pic.frame_num % 2) * fsize + 2 * fsize);
++	RVCE_CS(luma_offset); // encReconstructedLumaOffset
++	RVCE_CS(chroma_offset + luma_offset); // encReconstructedChromaOffset
++	RVCE_CS(0x00000000); // encColocBufferOffset
++	RVCE_CS(0x00000000); // encReconstructedRefBasePictureLumaOffset
++	RVCE_CS(0x00000000); // encReconstructedRefBasePictureChromaOffset
++	RVCE_CS(0x00000000); // encReferenceRefBasePictureLumaOffset
++	RVCE_CS(0x00000000); // encReferenceRefBasePictureChromaOffset
++	RVCE_CS(0x00000000); // pictureCount
++	RVCE_CS(0x00000000); // frameNumber
++	RVCE_CS(0x00000000); // pictureOrderCount
++	RVCE_CS(0x00000000); // numIPicRemainInRCGOP
++	RVCE_CS(0x00000000); // numPPicRemainInRCGOP
++	RVCE_CS(0x00000000); // numBPicRemainInRCGOP
++	RVCE_CS(0x00000000); // numIRPicRemainInRCGOP
++	RVCE_CS(0x00000000); // enableIntraRefresh
++	RVCE_END();
++}
++
++static void destroy(struct rvce_encoder *enc)
++{
++	RVCE_BEGIN(0x00000002); // task info
++	RVCE_CS(0xffffffff); // offsetOfNextTaskInfo
++	RVCE_CS(0x00000001); // taskOperation
++	RVCE_CS(0x00000000); // referencePictureDependency
++	RVCE_CS(0x00000000); // collocateFlagDependency
++	RVCE_CS(0x00000000); // feedbackIndex
++	RVCE_CS(0x00000000); // videoBitstreamRingIndex
++	RVCE_END();
++
++	RVCE_BEGIN(0x02000001); // destroy
++	RVCE_END();
++}
++
++void radeon_vce_v2_0_init(struct rvce_encoder *enc)
++{
++	enc->session = session;
++	enc->create = create;
++	enc->feedback = feedback;
++	enc->rate_control = rate_control;
++	enc->config_extension = config_extension;
++	enc->pic_control = pic_control;
++	enc->motion_estimation = motion_estimation;
++	enc->rdo = rdo;
++	enc->encode = encode;
++	enc->destroy = destroy;
++}
+diff --git a/src/gallium/drivers/radeon/radeon_video.c b/src/gallium/drivers/radeon/radeon_video.c
+index b0042ae..fdc7d21 100644
+--- a/src/gallium/drivers/radeon/radeon_video.c
++++ b/src/gallium/drivers/radeon/radeon_video.c
+@@ -229,12 +229,13 @@ int rvid_get_video_param(struct pipe_screen *screen,
+ 		switch (u_reduce_video_profile(profile)) {
+ 		case PIPE_VIDEO_FORMAT_MPEG12:
+ 		case PIPE_VIDEO_FORMAT_MPEG4:
+-		case PIPE_VIDEO_FORMAT_MPEG4_AVC:
+ 			return entrypoint != PIPE_VIDEO_ENTRYPOINT_ENCODE;
+ 		case PIPE_VIDEO_FORMAT_VC1:
+ 			/* FIXME: VC-1 simple/main profile is broken */
+ 			return profile == PIPE_VIDEO_PROFILE_VC1_ADVANCED &&
+ 			       entrypoint != PIPE_VIDEO_ENTRYPOINT_ENCODE;
++		case PIPE_VIDEO_FORMAT_MPEG4_AVC:
++			return true;
+ 		default:
+ 			return false;
+ 		}
+diff --git a/src/gallium/drivers/radeonsi/si_uvd.c b/src/gallium/drivers/radeonsi/si_uvd.c
+index 2f8e933..f5cb681 100644
+--- a/src/gallium/drivers/radeonsi/si_uvd.c
++++ b/src/gallium/drivers/radeonsi/si_uvd.c
+@@ -47,6 +47,7 @@
+ #include "si_pipe.h"
+ #include "radeon/radeon_video.h"
+ #include "radeon/radeon_uvd.h"
++#include "radeon/radeon_vce.h"
+ #include "sid.h"
+ 
+ /**
+@@ -144,11 +145,30 @@ static struct radeon_winsys_cs_handle* si_uvd_set_dtb(struct ruvd_msg *msg, stru
+ 	return luma->resource.cs_buf;
+ }
+ 
++/* get the radeon resources for VCE */
++static void si_vce_get_buffer(struct pipe_resource *resource,
++			      struct radeon_winsys_cs_handle **handle,
++			      struct radeon_surface **surface)
++{
++	struct r600_texture *res = (struct r600_texture *)resource;
++
++	if (handle)
++		*handle = res->resource.cs_buf;
++
++	if (surface)
++		*surface = &res->surface;
++}
++
+ /**
+  * creates an UVD compatible decoder
+  */
+ struct pipe_video_codec *si_uvd_create_decoder(struct pipe_context *context,
+ 					       const struct pipe_video_codec *templ)
+ {
++	struct si_context *ctx = (struct si_context *)context;
++
++        if (templ->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE)
++                return rvce_create_encoder(context, templ, ctx->b.ws, si_vce_get_buffer);
++
+ 	return ruvd_create_decoder(context, templ, si_uvd_set_dtb);
+ }
+-- 
+1.7.9.5
+

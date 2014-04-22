@@ -1,0 +1,149 @@
+From d3d2244bc229e0fdd59241b325aebfb3cb26daf9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 3 Feb 2014 02:28:58 -0700
+Subject: [PATCH 26/27] radeon/uvd: fix feedback buffer handling v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Without the correct feedback buffer size UVD runs
+into an error on each frame, reducing the maximum FPS.
+
+v2: fixing Michels comments
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Michel Dänzer <michel.daenzer@amd.com>
+Cc: "10.1" "10.0" "9.2" <mesa-stable@lists.freedesktop.org>
+---
+ src/gallium/drivers/radeon/radeon_uvd.c |   40 +++++++++++++++++++++----------
+ 1 file changed, 28 insertions(+), 12 deletions(-)
+
+diff --git a/src/gallium/drivers/radeon/radeon_uvd.c b/src/gallium/drivers/radeon/radeon_uvd.c
+index ba73e08..3075905 100644
+--- a/src/gallium/drivers/radeon/radeon_uvd.c
++++ b/src/gallium/drivers/radeon/radeon_uvd.c
+@@ -56,6 +56,9 @@
+ #define NUM_H264_REFS 17
+ #define NUM_VC1_REFS 5
+ 
++#define FB_BUFFER_OFFSET 0x1000
++#define FB_BUFFER_SIZE 2048
++
+ /* UVD decoder representation */
+ struct ruvd_decoder {
+ 	struct pipe_video_codec		base;
+@@ -72,6 +75,7 @@ struct ruvd_decoder {
+ 
+ 	struct rvid_buffer		msg_fb_buffers[NUM_BUFFERS];
+ 	struct ruvd_msg			*msg;
++	uint32_t			*fb;
+ 
+ 	struct rvid_buffer		bs_buffers[NUM_BUFFERS];
+ 	void*				bs_ptr;
+@@ -107,16 +111,21 @@ static void send_cmd(struct ruvd_decoder *dec, unsigned cmd,
+ 	set_reg(dec, RUVD_GPCOM_VCPU_CMD, cmd << 1);
+ }
+ 
+-/* map the next available message buffer */
+-static void map_msg_buf(struct ruvd_decoder *dec)
++/* map the next available message/feedback buffer */
++static void map_msg_fb_buf(struct ruvd_decoder *dec)
+ {
+ 	struct rvid_buffer* buf;
++	uint8_t *ptr;
+ 
+-	/* grap the current message buffer */
++	/* grab the current message/feedback buffer */
+ 	buf = &dec->msg_fb_buffers[dec->cur_buffer];
+ 
+-	/* copy the message into it */
+-	dec->msg = dec->ws->buffer_map(buf->cs_handle, dec->cs, PIPE_TRANSFER_WRITE);
++	/* and map it for CPU access */
++	ptr = dec->ws->buffer_map(buf->cs_handle, dec->cs, PIPE_TRANSFER_WRITE);
++
++	/* calc buffer offsets */
++	dec->msg = (struct ruvd_msg *)ptr;
++	dec->fb = (uint32_t *)(ptr + FB_BUFFER_OFFSET);
+ }
+ 
+ /* unmap and send a message command to the VCPU */
+@@ -124,8 +133,8 @@ static void send_msg_buf(struct ruvd_decoder *dec)
+ {
+ 	struct rvid_buffer* buf;
+ 
+-	/* ignore the request if message buffer isn't mapped */
+-	if (!dec->msg)
++	/* ignore the request if message/feedback buffer isn't mapped */
++	if (!dec->msg || !dec->fb)
+ 		return;
+ 
+ 	/* grap the current message buffer */
+@@ -133,6 +142,8 @@ static void send_msg_buf(struct ruvd_decoder *dec)
+ 
+ 	/* unmap the buffer */
+ 	dec->ws->buffer_unmap(buf->cs_handle);
++	dec->msg = NULL;
++	dec->fb = NULL;
+ 
+ 	/* and send it to the hardware */
+ 	send_cmd(dec, RUVD_CMD_MSG_BUFFER, buf->cs_handle, 0,
+@@ -544,7 +555,7 @@ static void ruvd_destroy(struct pipe_video_codec *decoder)
+ 
+ 	assert(decoder);
+ 
+-	map_msg_buf(dec);
++	map_msg_fb_buf(dec);
+ 	memset(dec->msg, 0, sizeof(*dec->msg));
+ 	dec->msg->size = sizeof(*dec->msg);
+ 	dec->msg->msg_type = RUVD_MSG_DESTROY;
+@@ -673,7 +684,7 @@ static void ruvd_end_frame(struct pipe_video_codec *decoder,
+ 	memset(dec->bs_ptr, 0, bs_size - dec->bs_size);
+ 	dec->ws->buffer_unmap(bs_buf->cs_handle);
+ 
+-	map_msg_buf(dec);
++	map_msg_fb_buf(dec);
+ 	dec->msg->size = sizeof(*dec->msg);
+ 	dec->msg->msg_type = RUVD_MSG_DECODE;
+ 	dec->msg->stream_handle = dec->stream_handle;
+@@ -713,6 +724,10 @@ static void ruvd_end_frame(struct pipe_video_codec *decoder,
+ 
+ 	dec->msg->body.decode.db_surf_tile_config = dec->msg->body.decode.dt_surf_tile_config;
+ 	dec->msg->body.decode.extension_support = 0x1;
++
++	/* set at least the feedback buffer size */
++	dec->fb[0] = FB_BUFFER_SIZE;
++
+ 	send_msg_buf(dec);
+ 
+ 	send_cmd(dec, RUVD_CMD_DPB_BUFFER, dec->dpb.cs_handle, 0,
+@@ -722,7 +737,7 @@ static void ruvd_end_frame(struct pipe_video_codec *decoder,
+ 	send_cmd(dec, RUVD_CMD_DECODING_TARGET_BUFFER, dt, 0,
+ 		 RADEON_USAGE_WRITE, RADEON_DOMAIN_VRAM);
+ 	send_cmd(dec, RUVD_CMD_FEEDBACK_BUFFER, msg_fb_buf->cs_handle,
+-		 0x1000, RADEON_USAGE_WRITE, RADEON_DOMAIN_GTT);
++		 FB_BUFFER_OFFSET, RADEON_USAGE_WRITE, RADEON_DOMAIN_GTT);
+ 	set_reg(dec, RUVD_ENGINE_CNTL, 1);
+ 
+ 	flush(dec);
+@@ -798,7 +813,8 @@ struct pipe_video_codec *ruvd_create_decoder(struct pipe_context *context,
+ 
+ 	bs_buf_size = width * height * 512 / (16 * 16);
+ 	for (i = 0; i < NUM_BUFFERS; ++i) {
+-		unsigned msg_fb_size = align(sizeof(struct ruvd_msg), 0x1000) + 0x1000;
++		unsigned msg_fb_size = FB_BUFFER_OFFSET + FB_BUFFER_SIZE;
++		STATIC_ASSERT(sizeof(struct ruvd_msg) <= FB_BUFFER_OFFSET);
+ 		if (!rvid_create_buffer(dec->ws, &dec->msg_fb_buffers[i], msg_fb_size, RADEON_DOMAIN_VRAM)) {
+ 			RVID_ERR("Can't allocated message buffers.\n");
+ 			goto error;
+@@ -820,7 +836,7 @@ struct pipe_video_codec *ruvd_create_decoder(struct pipe_context *context,
+ 
+ 	rvid_clear_buffer(dec->ws, dec->cs, &dec->dpb);
+ 
+-	map_msg_buf(dec);
++	map_msg_fb_buf(dec);
+ 	dec->msg->size = sizeof(*dec->msg);
+ 	dec->msg->msg_type = RUVD_MSG_CREATE;
+ 	dec->msg->stream_handle = dec->stream_handle;
+-- 
+1.7.9.5
+

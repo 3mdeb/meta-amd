@@ -1,0 +1,195 @@
+From 2bdd900f285439287da2670b735bf41ae8bc68b0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 15 Jan 2014 10:54:35 -0700
+Subject: [PATCH 16/27] radeon/vce: revert feedback buffer hack
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This reverts commit afe44ccfa559e6c8dd1615423b13d2066fd8d295.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+---
+ src/gallium/drivers/radeon/radeon_vce.c |   82 ++++++-------------------------
+ src/gallium/drivers/radeon/radeon_vce.h |    7 ---
+ 2 files changed, 16 insertions(+), 73 deletions(-)
+
+diff --git a/src/gallium/drivers/radeon/radeon_vce.c b/src/gallium/drivers/radeon/radeon_vce.c
+index 7da5b95..8fdb898 100644
+--- a/src/gallium/drivers/radeon/radeon_vce.c
++++ b/src/gallium/drivers/radeon/radeon_vce.c
+@@ -49,9 +49,6 @@
+ static void flush(struct rvce_encoder *enc)
+ {
+ 	enc->ws->cs_flush(enc->cs, 0, 0);
+-
+-	enc->ws->cs_add_reloc(enc->cs, enc->fb->cs_handle,
+-			      RADEON_USAGE_WRITE, RADEON_DOMAIN_VRAM);
+ }
+ 
+ #if 0
+@@ -80,75 +77,23 @@ static void dump_feedback(struct rvce_encoder *enc, struct rvid_buffer *fb)
+ }
+ #endif
+ 
+-static struct rvid_buffer *get_feedback_buffer(struct rvce_encoder *enc)
+-{
+-	struct rvid_buffer *fb;
+-
+-	pipe_mutex_lock(enc->fb_mutex);
+-	if (enc->num_fb_buffers > 2) {
+-		unsigned i;
+-
+-		fb = enc->fb_buffers[0];
+-		for (i = 1; i < enc->num_fb_buffers; ++i)
+-			enc->fb_buffers[i - 1] = enc->fb_buffers[i];
+-		--enc->num_fb_buffers;
+-		pipe_mutex_unlock(enc->fb_mutex);
+-		return fb;
+-	}
+-	pipe_mutex_unlock(enc->fb_mutex);
+-
+-	fb = CALLOC_STRUCT(rvid_buffer);
+-	if (!rvid_create_buffer(enc->ws, fb, 512)) {
+-		RVID_ERR("Can't create feedback buffer.\n");
+-		return NULL;
+-	}
+-	return fb;
+-}
+-
+-static void put_feedback_buffer(struct rvce_encoder *enc, struct rvid_buffer *fb)
+-{
+-	unsigned i;
+-
+-	pipe_mutex_lock(enc->fb_mutex);
+-	i = enc->num_fb_buffers++;
+-	if (enc->num_fb_buffers > enc->size_fb_buffers) {
+-		enc->fb_buffers = REALLOC(enc->fb_buffers,
+-			enc->size_fb_buffers * sizeof(struct rvid_buffer *),
+-			enc->num_fb_buffers * sizeof(struct rvid_buffer *)
+-		);
+-		enc->size_fb_buffers = enc->num_fb_buffers;
+-	}
+-	enc->fb_buffers[i] = fb;
+-	pipe_mutex_unlock(enc->fb_mutex);
+-}
+-
+ /**
+  * destroy this video encoder
+  */
+ static void rvce_destroy(struct pipe_video_codec *encoder)
+ {
+ 	struct rvce_encoder *enc = (struct rvce_encoder*)encoder;
+-	unsigned i;
+-
+ 	if (enc->stream_handle) {
++		struct rvid_buffer fb;
++		rvid_create_buffer(enc->ws, &fb, 512);
++		enc->fb = &fb;
+ 		enc->session(enc);
+-		enc->fb = get_feedback_buffer(enc);
+ 		enc->feedback(enc);
+ 		enc->destroy(enc);
+-		for (i = 0; i < enc->num_fb_buffers; ++i) {
+-			enc->ws->cs_add_reloc(enc->cs, enc->fb_buffers[i]->cs_handle,
+-					      RADEON_USAGE_WRITE, RADEON_DOMAIN_VRAM);
+-		}
+ 		flush(enc);
++		rvid_destroy_buffer(&fb);
+ 	}
+ 	rvid_destroy_buffer(&enc->cpb);
+-
+-	pipe_mutex_destroy(enc->fb_mutex);
+-	for (i = 0; i < enc->num_fb_buffers; ++i) {
+-		rvid_destroy_buffer(enc->fb_buffers[i]);
+-		FREE(enc->fb_buffers[i]);
+-	}
+-	FREE(enc->fb_buffers);
+ 	FREE(enc);
+ }
+ 
+@@ -172,7 +117,10 @@ static void rvce_begin_frame(struct pipe_video_codec *encoder,
+ 	enc->get_buffer(vid_buf->resources[1], NULL, &enc->chroma);
+ 	
+ 	if (!enc->stream_handle) {
++		struct rvid_buffer fb;
+ 		enc->stream_handle = rvid_alloc_stream_handle();
++		rvid_create_buffer(enc->ws, &fb, 512);
++		enc->fb = &fb;
+ 		enc->session(enc);
+ 		enc->create(enc);
+ 		enc->rate_control(enc);
+@@ -181,10 +129,10 @@ static void rvce_begin_frame(struct pipe_video_codec *encoder,
+ 		enc->motion_estimation(enc);
+ 		enc->rdo(enc);
+ 		enc->pic_control(enc);
+-		enc->fb = get_feedback_buffer(enc);
+ 		enc->feedback(enc);
+-		put_feedback_buffer(enc, enc->fb);
+ 		flush(enc);
++		//dump_feedback(enc, &fb);
++		rvid_destroy_buffer(&fb);
+ 	}
+ 
+ 	enc->session(enc);
+@@ -202,8 +150,11 @@ static void rvce_encode_bitstream(struct pipe_video_codec *encoder,
+ 	enc->get_buffer(destination, &enc->bs_handle, NULL);
+ 	enc->bs_size = destination->width0;
+ 
+-	*fb = enc->fb = get_feedback_buffer(enc);
+-
++	*fb = enc->fb = CALLOC_STRUCT(rvid_buffer);
++	if (!rvid_create_buffer(enc->ws, enc->fb, 512)) {
++		RVID_ERR("Can't create feedback buffer.\n");
++		return;
++	}
+ 	enc->encode(enc);
+ 	enc->feedback(enc);
+ }
+@@ -228,7 +179,8 @@ static void rvce_get_feedback(struct pipe_video_codec *encoder,
+ 		enc->ws->buffer_unmap(fb->cs_handle);
+ 	}
+ 	//dump_feedback(enc, fb);
+-	put_feedback_buffer(enc, fb);
++	rvid_destroy_buffer(fb);
++	FREE(fb);
+ }
+ 
+ /**
+@@ -287,8 +239,6 @@ struct pipe_video_codec *rvce_create_encoder(struct pipe_context *context,
+ 	else
+ 		radeon_vce_v2_0_init(enc);
+ 
+-	pipe_mutex_init(enc->fb_mutex);
+-
+ 	return &enc->base;
+ 
+ error:
+diff --git a/src/gallium/drivers/radeon/radeon_vce.h b/src/gallium/drivers/radeon/radeon_vce.h
+index c153924..a2319aa 100644
+--- a/src/gallium/drivers/radeon/radeon_vce.h
++++ b/src/gallium/drivers/radeon/radeon_vce.h
+@@ -34,8 +34,6 @@
+ #ifndef RADEON_VCE_H
+ #define RADEON_VCE_H
+ 
+-#include "os/os_thread.h"
+-
+ #define RVCE_RELOC(buf, usage, domain) (enc->ws->cs_add_reloc(enc->cs, (buf), (usage), domain))
+ 
+ #define RVCE_CS(value) (enc->cs->buf[enc->cs->cdw++] = (value))
+@@ -83,11 +81,6 @@ struct rvce_encoder {
+ 	struct rvid_buffer		*fb;
+ 	struct rvid_buffer		cpb;
+ 	struct pipe_h264_enc_picture_desc pic;
+-
+-	pipe_mutex			fb_mutex;
+-	struct rvid_buffer		**fb_buffers;
+-	unsigned			size_fb_buffers;
+-	unsigned			num_fb_buffers;
+ };
+ 
+ struct pipe_video_codec *rvce_create_encoder(struct pipe_context *context,
+-- 
+1.7.9.5
+
