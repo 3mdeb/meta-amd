@@ -5,6 +5,9 @@ PV = "10.0.4+git${SRCPV}"
 DEPENDS += "libvdpau"
 PACKAGECONFIG_append = " xvmc openvg gallium gallium-egl gallium-gbm r600"
 
+# Install the demos onto the target
+RRECOMMENDS_libgl-mesa += "mesa-demos"
+
 SRC_URI += " \
 	   file://0001-vl-vlc-add-remove-bits-function.patch \
 	   file://0002-vl-vlc-add-function-to-limit-the-vlc-size.patch \
