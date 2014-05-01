@@ -1,4 +1,3 @@
-PRINC := "${@int(PRINC) + 1}"
 EXTRA_OECONF += "--enable-optimized \
 		 --disable-assertions \
 		 --enable-shared \
