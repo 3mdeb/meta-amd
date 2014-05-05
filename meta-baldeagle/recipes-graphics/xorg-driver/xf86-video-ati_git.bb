@@ -23,4 +23,10 @@ SRC_URI = "git://anongit.freedesktop.org/git/xorg/driver/xf86-video-ati"
 
 S = "${WORKDIR}/git"
 
+RDEPENDS_${PN} += "libgbm-gallium \
+		   mesa-driver-radeon \
+		   mesa-driver-radeonsi \
+		   mesa-driver-swrast \
+		  "
+
 COMPATIBLE_HOST = '(i.86|x86_64).*-linux'

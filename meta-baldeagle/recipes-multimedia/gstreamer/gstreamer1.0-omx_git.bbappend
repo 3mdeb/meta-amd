@@ -21,3 +21,5 @@ SRC_URI += "file://0001-gstomxvideodec-fix-multithreads-negotiation-problem-.pat
 SRCREV = "c44cd849400b90f5f4b1f4f429278d9685b1daca"
 
 PV .= "+git${SRCPV}"
+
+EXTRA_OECONF += "--with-omx-target=bellagio"

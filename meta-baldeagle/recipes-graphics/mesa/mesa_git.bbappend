@@ -1,14 +1,17 @@
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 
 SRCREV = "ad04e396faaddce926ee1146f0da12b30aee7b87"
-PV = "10.0.4+git${SRCPV}"
+PV = "10.1.0+git${SRCPV}"
 DEPENDS += "libvdpau"
 PACKAGECONFIG_append = " xvmc openvg gallium gallium-egl gallium-gbm r600"
+PACKAGECONFIG_append += " gallium-llvm"
+MESA_LLVM_RELEASE = "3.4"
 
 # Install the demos onto the target
 RRECOMMENDS_libgl-mesa += "mesa-demos"
 
-SRC_URI += " \
+SRC_URI = " \
+	   git://anongit.freedesktop.org/git/mesa/mesa \
 	   file://0001-vl-vlc-add-remove-bits-function.patch \
 	   file://0002-vl-vlc-add-function-to-limit-the-vlc-size.patch \
 	   file://0003-vl-rbsp-add-H.264-RBSP-implementation.patch \
@@ -36,14 +39,19 @@ SRC_URI += " \
 	   file://0025-st-omx-enc-user-separate-pipe-object-for-scale-and-t.patch \
 	   file://0026-radeon-uvd-fix-feedback-buffer-handling-v2.patch \
 	   file://0027-st-omx-enc-always-flush-the-transfer-pipe-before-enc.patch \
-	   file://0029-glx-fix-the-default-values-for-GLXFBConfig-attributes.patch \
-	   file://0030-glx-fix-the-GLXFBConfig-attrib-sort-priorities.patch \
            "
 
+PATCHTOOL = "git"
+
+DEPENDS += "libomxil"
 EXTRA_OECONF += "--disable-dri3 \
 		 --enable-vdpau \
 		 --enable-osmesa \
-		 --enable-xa"
+		 --enable-xa \
+		 --enable-glx \
+		 --enable-omx \
+		 --with-omx-libdir=${libdir}/bellagio \
+		"
 
 PACKAGES += "libxvmcr600-${PN}-dev"
 FILES_libxvmcr600-${PN}-dev += "${libdir}/libXvMCr600.so \
@@ -68,3 +76,9 @@ FILES_libxatracker-${PN}-dev += "${includedir}/xa_tracker.h \
                                  ${libdir}/libxatracker.so \
                                  ${libdir}/libxatracker.la \
                                  "
+
+PACKAGES += "libomx-${PN} libomx-${PN}-dev libomx-${PN}-dbg"
+FILES_libomx-${PN} += "${libdir}/bellagio/libomx_*.so.*"
+FILES_libomx-${PN}-dev += "${libdir}/bellagio/libomx_*.so \
+			   ${libdir}/bellagio/libomx_*.la"
+FILES_libomx-${PN}-dbg += "${libdir}/bellagio/.debug"
