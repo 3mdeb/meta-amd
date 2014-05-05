@@ -12,7 +12,6 @@ inherit autotools pkgconfig
 EXTRA_OECONF += "--prefix=${prefix} \
 		 --sysconfdir=${sysconfdir} \
 		 --localstatedir=${localstatedir} \
-		 --enable-glamor-gles2 \
 		 --enable-glx-tls"
 
 FILES_${PN} += "${datadir}/X11/xorg.conf.d ${libdir}/xorg/modules/lib*.so"
