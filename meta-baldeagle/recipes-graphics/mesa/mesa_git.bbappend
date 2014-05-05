@@ -4,6 +4,8 @@ SRCREV = "ad04e396faaddce926ee1146f0da12b30aee7b87"
 PV = "10.0.4+git${SRCPV}"
 DEPENDS += "libvdpau"
 PACKAGECONFIG_append = " xvmc openvg gallium gallium-egl gallium-gbm r600"
+PACKAGECONFIG_append += " gallium-llvm"
+MESA_LLVM_RELEASE = "3.4"
 
 # Install the demos onto the target
 RRECOMMENDS_libgl-mesa += "mesa-demos"
