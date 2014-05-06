@@ -23,3 +23,10 @@ SRCREV = "c44cd849400b90f5f4b1f4f429278d9685b1daca"
 PV .= "+git${SRCPV}"
 
 EXTRA_OECONF += "--with-omx-target=bellagio"
+
+#
+# This package should not have commercial license flags.
+# There is discussion in the OE community about fixing this
+# but in the meantime we'll explicitly remove it here.
+#
+LICENSE_FLAGS := "${@oe_filter_out('commercial', '${LICENSE_FLAGS}', d)}"
