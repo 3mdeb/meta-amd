@@ -10,7 +10,7 @@ EXTRA_OECONF += "--enable-zlib"
 S = "${WORKDIR}/llvm-${PV}"
 
 SRC_URI_append_libc-uclibc = " file://arm_fenv_uclibc.patch "
-SRC_URI[md5sum] = "46ed668a1ce38985120dbf6344cf611"
+SRC_URI[md5sum] = "46ed668a1ce38985120dbf6344cf6116"
 SRC_URI[sha256sum] = "25a5612d692c48481b9b397e2b55f4870e447966d66c96d655241702d44a2628"
 
 PACKAGECONFIG ??= ""
