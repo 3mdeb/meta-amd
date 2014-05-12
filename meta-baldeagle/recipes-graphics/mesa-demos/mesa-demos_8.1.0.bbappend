@@ -5,6 +5,7 @@ DEPENDS_baldeagle += "mesa-glut glew"
 PACKAGECONFIG_append_baldeagle = " glut"
 
 SRC_URI += " \
+           file://add-missing-data-files.patch \
            file://use-demos-data-dir.patch \
 "
 
