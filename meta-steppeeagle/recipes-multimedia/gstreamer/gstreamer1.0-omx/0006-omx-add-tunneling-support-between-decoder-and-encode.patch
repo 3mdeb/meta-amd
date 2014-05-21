@@ -1,0 +1,328 @@
+From 17e9d641799a075a085a64d0543c5a51b11fd73d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 13 Sep 2013 03:33:19 -0600
+Subject: [PATCH 06/11] omx: add tunneling support between decoder and
+ encoders v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Forward the frames through both the OMX tunnel as well as the gst pad, this
+way we can map OMX buffers to their frame counterpart when they left the
+tunnel on the other side.
+
+v2: fix tunnel close and buffer dealloc order
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+---
+ omx/gstomx.c         |    6 +++-
+ omx/gstomx.h         |    2 ++
+ omx/gstomxvideodec.c |   90 ++++++++++++++++++++++++++++++++++++++++++++------
+ omx/gstomxvideoenc.c |   29 +++++++++++++---
+ 4 files changed, 110 insertions(+), 17 deletions(-)
+
+diff --git a/omx/gstomx.c b/omx/gstomx.c
+index c8a8927..df3a8ff 100644
+--- a/omx/gstomx.c
++++ b/omx/gstomx.c
+@@ -1204,7 +1204,6 @@ gst_omx_port_acquire_buffer (GstOMXPort * port, GstOMXBuffer ** buf)
+   GstOMXBuffer *_buf = NULL;
+ 
+   g_return_val_if_fail (port != NULL, GST_OMX_ACQUIRE_BUFFER_ERROR);
+-  g_return_val_if_fail (!port->tunneled, GST_OMX_ACQUIRE_BUFFER_ERROR);
+   g_return_val_if_fail (buf != NULL, GST_OMX_ACQUIRE_BUFFER_ERROR);
+ 
+   *buf = NULL;
+@@ -1298,6 +1297,11 @@ retry:
+     goto done;
+   }
+ 
++  if (port->tunneled) {
++    ret = GST_OMX_ACQUIRE_BUFFER_TUNNELED;
++    goto done;
++  }
++
+   /* 
+    * At this point we have no error or flushing/eos port
+    * and a properly configured port.
+diff --git a/omx/gstomx.h b/omx/gstomx.h
+index 3645b63..9b534bd 100644
+--- a/omx/gstomx.h
++++ b/omx/gstomx.h
+@@ -124,6 +124,8 @@ typedef enum {
+   GST_OMX_ACQUIRE_BUFFER_RECONFIGURE,
+   /* The port is EOS */
+   GST_OMX_ACQUIRE_BUFFER_EOS,
++  /* The port is tunneled */
++  GST_OMX_ACQUIRE_BUFFER_TUNNELED,
+   /* A fatal error happened */
+   GST_OMX_ACQUIRE_BUFFER_ERROR
+ } GstOMXAcquireBufferReturn;
+diff --git a/omx/gstomxvideodec.c b/omx/gstomxvideodec.c
+index 020b7d3..e8813fb 100644
+--- a/omx/gstomxvideodec.c
++++ b/omx/gstomxvideodec.c
+@@ -50,6 +50,7 @@
+ #include <string.h>
+ 
+ #include "gstomxvideodec.h"
++#include "gstomxvideoenc.h"
+ 
+ GST_DEBUG_CATEGORY_STATIC (gst_omx_video_dec_debug_category);
+ #define GST_CAT_DEFAULT gst_omx_video_dec_debug_category
+@@ -881,6 +882,11 @@ gst_omx_video_dec_shutdown (GstOMXVideoDec * self)
+       gst_omx_component_get_state (self->dec, 5 * GST_SECOND);
+   }
+ 
++  if (self->dec_out_port->tunneled) {
++    gst_omx_component_close_tunnel (self->dec, self->dec_out_port,
++        self->dec_out_port->tunneled->comp, self->dec_out_port->tunneled);
++  }
++
+   return TRUE;
+ }
+ 
+@@ -1527,7 +1533,7 @@ done:
+ static OMX_ERRORTYPE
+ gst_omx_video_dec_deallocate_output_buffers (GstOMXVideoDec * self)
+ {
+-  OMX_ERRORTYPE err;
++  OMX_ERRORTYPE err = OMX_ErrorNone;
+ 
+   if (self->out_port_pool) {
+     gst_buffer_pool_set_active (self->out_port_pool, FALSE);
+@@ -1543,7 +1549,10 @@ gst_omx_video_dec_deallocate_output_buffers (GstOMXVideoDec * self)
+       gst_omx_port_deallocate_buffers (self->
+       eglimage ? self->egl_out_port : self->dec_out_port);
+ #else
+-  err = gst_omx_port_deallocate_buffers (self->dec_out_port);
++  if (!self->dec_out_port->tunneled)
++    err = gst_omx_port_deallocate_buffers (self->dec_out_port);
++  else
++    err = gst_omx_port_set_enabled (self->dec_out_port, FALSE);
+ #endif
+ 
+   return err;
+@@ -1772,12 +1781,28 @@ gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
+ 
+   GST_VIDEO_DECODER_STREAM_UNLOCK (self);
+ 
++  {
++    GstPad *peer = gst_pad_get_peer (GST_VIDEO_DECODER_SRC_PAD (self));
++    GstElement *element = peer ? gst_pad_get_parent_element (peer) : NULL;
++
++    if (element && GST_IS_OMX_VIDEO_ENC (element)) {
++      GstOMXVideoEnc *enc = GST_OMX_VIDEO_ENC (element);
++
++      gst_omx_component_setup_tunnel (self->dec, self->dec_out_port,
++          enc->enc, enc->enc_in_port);
++
++    }
++  }
++
+ #if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_EGL)
+ enable_port:
+ #endif
+-  err = gst_omx_video_dec_allocate_output_buffers (self);
+-  if (err != OMX_ErrorNone)
+-    goto done;
++
++  if (!self->dec_out_port->tunneled) {
++    err = gst_omx_video_dec_allocate_output_buffers (self);
++    if (err != OMX_ErrorNone)
++      goto done;
++  }
+ 
+   err = gst_omx_port_populate (port);
+   if (err != OMX_ErrorNone)
+@@ -1816,6 +1841,9 @@ gst_omx_video_dec_loop (GstOMXVideoDec * self)
+     goto flushing;
+   } else if (acq_return == GST_OMX_ACQUIRE_BUFFER_EOS) {
+     goto eos;
++  } else if (acq_return == GST_OMX_ACQUIRE_BUFFER_TUNNELED) {
++    gst_pad_pause_task (GST_VIDEO_DECODER_SRC_PAD (self));
++    return;
+   }
+ 
+   if (!gst_pad_has_current_caps (GST_VIDEO_DECODER_SRC_PAD (self)) ||
+@@ -2657,6 +2685,7 @@ gst_omx_video_dec_set_format (GstVideoDecoder * decoder,
+   GST_DEBUG_OBJECT (self, "Starting task again");
+ 
+   self->downstream_flow_ret = GST_FLOW_OK;
++
+   gst_pad_start_task (GST_VIDEO_DECODER_SRC_PAD (self),
+       (GstTaskFunction) gst_omx_video_dec_loop, decoder, NULL);
+ 
+@@ -2703,6 +2732,7 @@ gst_omx_video_dec_reset (GstVideoDecoder * decoder, gboolean hard)
+   self->last_upstream_ts = 0;
+   self->eos = FALSE;
+   self->downstream_flow_ret = GST_FLOW_OK;
++
+   gst_pad_start_task (GST_VIDEO_DECODER_SRC_PAD (self),
+       (GstTaskFunction) gst_omx_video_dec_loop, decoder, NULL);
+ 
+@@ -2925,7 +2955,11 @@ gst_omx_video_dec_handle_frame (GstVideoDecoder * decoder,
+       goto release_error;
+   }
+ 
+-  gst_video_codec_frame_unref (frame);
++  if (self->dec_out_port->tunneled) {
++    frame->output_buffer = gst_buffer_new ();
++    gst_video_decoder_finish_frame (GST_VIDEO_DECODER (self), frame);
++  } else
++    gst_video_codec_frame_unref (frame);
+ 
+   GST_DEBUG_OBJECT (self, "Passed frame to component");
+ 
+@@ -3003,6 +3037,7 @@ gst_omx_video_dec_finish (GstVideoDecoder * decoder)
+ static GstFlowReturn
+ gst_omx_video_dec_drain (GstOMXVideoDec * self, gboolean is_eos)
+ {
++  GstOMXVideoEnc *enc = NULL;
+   GstOMXVideoDecClass *klass;
+   GstOMXBuffer *buf;
+   GstOMXAcquireBufferReturn acq_ret;
+@@ -3031,6 +3066,14 @@ gst_omx_video_dec_drain (GstOMXVideoDec * self, gboolean is_eos)
+     return GST_FLOW_OK;
+   }
+ 
++  if (self->dec_out_port->tunneled) {
++    GstPad *peer = gst_pad_get_peer (GST_VIDEO_DECODER_SRC_PAD (self));
++    GstElement *element = peer ? gst_pad_get_parent_element (peer) : NULL;
++
++    if (element && GST_IS_OMX_VIDEO_ENC (element))
++      enc = GST_OMX_VIDEO_ENC (element);
++  }
++
+   /* Make sure to release the base class stream lock, otherwise
+    * _loop() can't call _finish_frame() and we might block forever
+    * because no input buffers are released */
+@@ -3047,8 +3090,14 @@ gst_omx_video_dec_drain (GstOMXVideoDec * self, gboolean is_eos)
+     return GST_FLOW_ERROR;
+   }
+ 
+-  g_mutex_lock (&self->drain_lock);
+-  self->draining = TRUE;
++  if (enc) {
++    g_mutex_lock (&enc->drain_lock);
++    enc->draining = TRUE;
++  } else {
++    g_mutex_lock (&self->drain_lock);
++    self->draining = TRUE;
++  }
++
+   buf->omx_buf->nFilledLen = 0;
+   buf->omx_buf->nTimeStamp =
+       gst_util_uint64_scale (self->last_upstream_ts, OMX_TICKS_PER_SECOND,
+@@ -3059,6 +3108,10 @@ gst_omx_video_dec_drain (GstOMXVideoDec * self, gboolean is_eos)
+   if (err != OMX_ErrorNone) {
+     GST_ERROR_OBJECT (self, "Failed to drain component: %s (0x%08x)",
+         gst_omx_error_to_string (err), err);
++    if (enc)
++      g_mutex_unlock (&enc->drain_lock);
++    else
++      g_mutex_unlock (&self->drain_lock);
+     GST_VIDEO_DECODER_STREAM_LOCK (self);
+     return GST_FLOW_ERROR;
+   }
+@@ -3067,18 +3120,33 @@ gst_omx_video_dec_drain (GstOMXVideoDec * self, gboolean is_eos)
+ 
+   if (G_UNLIKELY (self->dec->hacks & GST_OMX_HACK_DRAIN_MAY_NOT_RETURN)) {
+     gint64 wait_until = g_get_monotonic_time () + G_TIME_SPAN_SECOND / 2;
++    gboolean result;
++
++    if (enc)
++      result =
++          g_cond_wait_until (&enc->drain_cond, &enc->drain_lock, wait_until);
++    else
++      result =
++          g_cond_wait_until (&self->drain_cond, &self->drain_lock, wait_until);
+ 
+-    if (!g_cond_wait_until (&self->drain_cond, &self->drain_lock, wait_until))
++    if (!result)
+       GST_WARNING_OBJECT (self, "Drain timed out");
+     else
+       GST_DEBUG_OBJECT (self, "Drained component");
+ 
+   } else {
+-    g_cond_wait (&self->drain_cond, &self->drain_lock);
++    if (enc)
++      g_cond_wait (&enc->drain_cond, &enc->drain_lock);
++    else
++      g_cond_wait (&self->drain_cond, &self->drain_lock);
+     GST_DEBUG_OBJECT (self, "Drained component");
+   }
+ 
+-  g_mutex_unlock (&self->drain_lock);
++  if (enc)
++    g_mutex_unlock (&enc->drain_lock);
++  else
++    g_mutex_unlock (&self->drain_lock);
++
+   GST_VIDEO_DECODER_STREAM_LOCK (self);
+ 
+   self->started = FALSE;
+diff --git a/omx/gstomxvideoenc.c b/omx/gstomxvideoenc.c
+index 3a139bb..8f6cab3 100644
+--- a/omx/gstomxvideoenc.c
++++ b/omx/gstomxvideoenc.c
+@@ -364,7 +364,10 @@ gst_omx_video_enc_shutdown (GstOMXVideoEnc * self)
+       gst_omx_component_get_state (self->enc, 5 * GST_SECOND);
+     }
+     gst_omx_component_set_state (self->enc, OMX_StateLoaded);
+-    gst_omx_port_deallocate_buffers (self->enc_in_port);
++    if (!self->enc_in_port->tunneled)
++      gst_omx_port_deallocate_buffers (self->enc_in_port);
++    else
++      gst_omx_port_set_enabled (self->enc_in_port, FALSE);
+     gst_omx_port_deallocate_buffers (self->enc_out_port);
+     if (state > OMX_StateLoaded)
+       gst_omx_component_get_state (self->enc, 5 * GST_SECOND);
+@@ -1086,8 +1089,9 @@ gst_omx_video_enc_set_format (GstVideoEncoder * encoder,
+     if (gst_omx_port_wait_buffers_released (self->enc_out_port,
+             1 * GST_SECOND) != OMX_ErrorNone)
+       return FALSE;
+-    if (gst_omx_port_deallocate_buffers (self->enc_in_port) != OMX_ErrorNone)
+-      return FALSE;
++    if (!self->enc_in_port->tunneled)
++      if (gst_omx_port_deallocate_buffers (self->enc_in_port) != OMX_ErrorNone)
++        return FALSE;
+     if (gst_omx_port_deallocate_buffers (self->enc_out_port) != OMX_ErrorNone)
+       return FALSE;
+     if (gst_omx_port_wait_enabled (self->enc_in_port,
+@@ -1225,8 +1229,18 @@ gst_omx_video_enc_set_format (GstVideoEncoder * encoder,
+       return FALSE;
+ 
+     /* Need to allocate buffers to reach Idle state */
+-    if (gst_omx_port_allocate_buffers (self->enc_in_port) != OMX_ErrorNone)
+-      return FALSE;
++    if (self->enc_in_port->tunneled) {
++      if (gst_omx_port_set_enabled (self->enc_in_port->tunneled,
++              TRUE) != OMX_ErrorNone)
++        return FALSE;
++
++      if (gst_omx_port_wait_enabled (self->enc_in_port->tunneled,
++              1 * GST_SECOND) != OMX_ErrorNone)
++        return FALSE;
++    } else {
++      if (gst_omx_port_allocate_buffers (self->enc_in_port) != OMX_ErrorNone)
++        return FALSE;
++    }
+ 
+     if (gst_omx_component_get_state (self->enc,
+             GST_CLOCK_TIME_NONE) != OMX_StateIdle)
+@@ -1492,6 +1506,11 @@ gst_omx_video_enc_handle_frame (GstVideoEncoder * encoder,
+ 
+   port = self->enc_in_port;
+ 
++  if (port->tunneled) {
++    gst_video_codec_frame_unref (frame);
++    return self->downstream_flow_ret;
++  }
++
+   while (acq_ret != GST_OMX_ACQUIRE_BUFFER_OK) {
+     GstClockTime timestamp, duration;
+ 
+-- 
+1.7.9.5
+
