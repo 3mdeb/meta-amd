@@ -9,7 +9,7 @@
 # to do this as an append to ensure proper sequencing.
 do_configure_append_x86-64() {
     # Fix paths in llvm-config
-    sed -ri "s#lib/${LLVM_DIR}#lib64/${LLVM_DIR}#g" ${S}/tools/llvm-config/llvm-config.cpp
+    sed -ri "s#lib/${LLVM_DIR}#${baselib}/${LLVM_DIR}#g" ${S}/tools/llvm-config/llvm-config.cpp
 }
 
 #
