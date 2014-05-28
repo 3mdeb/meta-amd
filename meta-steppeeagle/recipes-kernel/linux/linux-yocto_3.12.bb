@@ -67,5 +67,5 @@ SRC_URI = "http://git.yoctoproject.org/cgit/cgit.cgi/linux-yocto-dev/snapshot/li
 
 S = "${WORKDIR}/linux-yocto-dev-${PV}"
 
-SRC_URI[kernel.md5sum] = "3b58ba37133ace5e486cee3697a810be"
-SRC_URI[kernel.sha256sum] = "b4e914b4682d92f691da22ce8f2c89bfcd710515c416164ce57de0c7eca7ab3c"
+SRC_URI[kernel.md5sum] = "a9564529d2d310c1d93e1c0c5adc0360"
+SRC_URI[kernel.sha256sum] = "6e4c00016653ead0f57d7cd38364cf1194568301fbd37103b400a03145b369aa"
