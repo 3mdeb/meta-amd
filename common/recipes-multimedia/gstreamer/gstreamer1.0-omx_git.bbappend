@@ -3,9 +3,11 @@ FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 #
 # Remove the patch as it is not needed with the new SRCREV we are using
 #
-SRC_URI := "${@oe_filter_out('file://0001-omx-fixed-type-error-in-printf-call.patch', '${SRC_URI}', d)}"
+SRC_URI_baldeagle := "${@oe_filter_out('file://0001-omx-fixed-type-error-in-printf-call.patch', '${SRC_URI}', d)}"
+SRC_URI_steppeeagle := "${@oe_filter_out('file://0001-omx-fixed-type-error-in-printf-call.patch', '${SRC_URI}', d)}"
 
-SRC_URI += "file://0001-gstomxvideodec-fix-multithreads-negotiation-problem-.patch \
+SRC_URI_AMD_ADDITIONS = " \
+	   file://0001-gstomxvideodec-fix-multithreads-negotiation-problem-.patch \
 	   file://0002-gstomxvideodec-remove-dead-code.patch \
 	   file://0003-gstomxvideodec-simplify-_find_nearest_frame.patch \
 	   file://0004-gstomxvideoenc-simplify-_find_nearest_frame.patch \
@@ -17,8 +19,11 @@ SRC_URI += "file://0001-gstomxvideodec-fix-multithreads-negotiation-problem-.pat
 	   file://0010-omxvideoenc-fix-startup-race-condition.patch \
 	   file://0011-omx-fix-two-serious-message-handling-bugs.patch \
 	  "
+SRC_URI_append_baldeagle = " ${SRC_URI_AMD_ADDITIONS}"
+SRC_URI_append_steppeeagle = " ${SRC_URI_AMD_ADDITIONS}"
 
-SRCREV = "c44cd849400b90f5f4b1f4f429278d9685b1daca"
+SRCREV_baldeagle = "c44cd849400b90f5f4b1f4f429278d9685b1daca"
+SRCREV_steppeeagle = "c44cd849400b90f5f4b1f4f429278d9685b1daca"
 
 PV .= "+git${SRCPV}"
 

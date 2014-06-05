@@ -1,4 +1,5 @@
-RDEPENDS_${PN} += "libomx-mesa"
+RDEPENDS_${PN}_append_baldeagle = "libomx-mesa"
+RDEPENDS_${PN}_append_steppeeagle = "libomx-mesa"
 
 #
 # This package should not have commercial license flags.

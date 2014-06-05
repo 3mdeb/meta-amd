@@ -1,26 +1,27 @@
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 
-SRCREV = "d4e5ea65089af05b5891293d8947b0ee0e9dd429"
-LIC_FILES_CHKSUM = "file://docs/license.html;md5=6a23445982a7a972ac198e93cc1cb3de"
-PV = "10.2.0+git${SRCPV}"
-DEPENDS += "libvdpau"
-PACKAGECONFIG_append = " xvmc openvg gallium gallium-egl gallium-gbm r600"
-PACKAGECONFIG_append += " gallium-llvm"
-MESA_LLVM_RELEASE = "3.4"
+SRCREV_steppeeagle = "d4e5ea65089af05b5891293d8947b0ee0e9dd429"
+LIC_FILES_CHKSUM_steppeeagle = "file://docs/license.html;md5=6a23445982a7a972ac198e93cc1cb3de"
+PV_steppeeagle = "10.2.0+git${SRCPV}"
+DEPENDS_append_steppeeagle = " libvdpau"
+PACKAGECONFIG_append_steppeeagle = " xvmc openvg gallium gallium-egl gallium-gbm r600"
+PACKAGECONFIG_append_steppeeagle = " gallium-llvm"
+MESA_LLVM_RELEASE_steppeeagle = "3.4"
 
 # Install the demos onto the target
-RRECOMMENDS_libgl-mesa += "mesa-demos"
+RRECOMMENDS_libgl-mesa_append_steppeeagle = " mesa-demos"
 
-SRC_URI = " \
+SRC_URI_steppeeagle = " \
 	   git://people.freedesktop.org/~deathsimple/mesa;branch=vce-release \
 	   file://0001-radeonsi-add-support-for-Mullins-asics.patch \
 	   file://0002-radeonsi-add-Mullins-pci-ids.patch \
            "
 
-PATCHTOOL = "git"
+PATCHTOOL_steppeeagle = "git"
 
-DEPENDS += "libomxil"
-EXTRA_OECONF += "--disable-dri3 \
+DEPENDS_append_steppeeagle = " libomxil"
+EXTRA_OECONF_append_steppeeagle = " \
+		 --disable-dri3 \
 		 --enable-vdpau \
 		 --enable-osmesa \
 		 --enable-xa \
