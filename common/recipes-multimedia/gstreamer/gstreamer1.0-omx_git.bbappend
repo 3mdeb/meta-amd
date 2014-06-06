@@ -3,8 +3,8 @@ FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 #
 # Remove the patch as it is not needed with the new SRCREV we are using
 #
-SRC_URI_baldeagle := "${@oe_filter_out('file://0001-omx-fixed-type-error-in-printf-call.patch', '${SRC_URI}', d)}"
-SRC_URI_steppeeagle := "${@oe_filter_out('file://0001-omx-fixed-type-error-in-printf-call.patch', '${SRC_URI}', d)}"
+SRC_URI_remove_baldeagle = "file://0001-omx-fixed-type-error-in-printf-call.patch"
+SRC_URI_remove_steppeeagle = "file://0001-omx-fixed-type-error-in-printf-call.patch"
 
 SRC_URI_AMD_ADDITIONS = " \
 	   file://0001-gstomxvideodec-fix-multithreads-negotiation-problem-.patch \
@@ -32,4 +32,4 @@ PV .= "+git${SRCPV}"
 # There is discussion in the OE community about fixing this
 # but in the meantime we'll explicitly remove it here.
 #
-LICENSE_FLAGS := "${@oe_filter_out('commercial', '${LICENSE_FLAGS}', d)}"
+LICENSE_FLAGS_remove = "commercial"

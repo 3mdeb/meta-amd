@@ -6,4 +6,4 @@ RDEPENDS_${PN}_append_steppeeagle = "libomx-mesa"
 # There is discussion in the OE community about fixing this
 # but in the meantime we'll explicitly remove it here.
 #
-LICENSE_FLAGS := "${@oe_filter_out('commercial', '${LICENSE_FLAGS}', d)}"
+LICENSE_FLAGS_remove = "commercial"
