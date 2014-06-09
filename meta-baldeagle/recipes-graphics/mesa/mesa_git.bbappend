@@ -1,16 +1,16 @@
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 
-SRCREV = "ad04e396faaddce926ee1146f0da12b30aee7b87"
-PV = "10.1.0+git${SRCPV}"
-DEPENDS += "libvdpau"
-PACKAGECONFIG_append = " xvmc openvg gallium gallium-egl gallium-gbm r600"
-PACKAGECONFIG_append += " gallium-llvm"
-MESA_LLVM_RELEASE = "3.4"
+SRCREV_baldeagle = "ad04e396faaddce926ee1146f0da12b30aee7b87"
+PV_baldeagle = "10.1.0+git${SRCPV}"
+DEPENDS_append_baldeagle = " libvdpau"
+PACKAGECONFIG_append_baldeagle = " xvmc openvg gallium gallium-egl gallium-gbm r600"
+PACKAGECONFIG_append_baldeagle = " gallium-llvm"
+MESA_LLVM_RELEASE_baldeagle = "3.4"
 
 # Install the demos onto the target
-RRECOMMENDS_libgl-mesa += "mesa-demos"
+RRECOMMENDS_libgl-mesa_append_baldeagle = " mesa-demos"
 
-SRC_URI = " \
+SRC_URI_baldeagle = " \
 	   git://anongit.freedesktop.org/git/mesa/mesa \
 	   file://0001-vl-vlc-add-remove-bits-function.patch \
 	   file://0002-vl-vlc-add-function-to-limit-the-vlc-size.patch \
@@ -41,10 +41,11 @@ SRC_URI = " \
 	   file://0027-st-omx-enc-always-flush-the-transfer-pipe-before-enc.patch \
            "
 
-PATCHTOOL = "git"
+PATCHTOOL_baldeagle = "git"
 
-DEPENDS += "libomxil"
-EXTRA_OECONF += "--disable-dri3 \
+DEPENDS_append_baldeagle = " libomxil"
+EXTRA_OECONF_append_baldeagle = " \
+		 --disable-dri3 \
 		 --enable-vdpau \
 		 --enable-osmesa \
 		 --enable-xa \
