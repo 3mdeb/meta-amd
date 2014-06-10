@@ -43,6 +43,11 @@ SRC_URI_baldeagle = " \
 
 PATCHTOOL_baldeagle = "git"
 
+# Set DRIDRIVERS with anonymous python so we can effectively
+# override the _append_x86-64 assignement from mesa.inc.
+python __anonymous () {
+    d.setVar("DRIDRIVERS_baldeagle", "radeon")
+}
 DEPENDS_append_baldeagle = " libomxil"
 EXTRA_OECONF_append_baldeagle = " \
 		 --disable-dri3 \
