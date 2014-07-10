@@ -17,6 +17,7 @@ SRC_URI_steppeeagle = " \
 	   file://0002-radeonsi-add-Mullins-pci-ids.patch \
 	   file://0018-radeonsi-omx-Makefile.am-fix-lib-omx-radeonsi-loadin.patch \
 	   file://0019-st-omx-enc-fix-scaling-alignment-issue.patch \
+	   file://avoid-version.patch \
            "
 
 # Set DRIDRIVERS with anonymous python so we can effectively
@@ -61,8 +62,11 @@ FILES_libxatracker-${PN}-dev = "${includedir}/xa_tracker.h \
                                 ${libdir}/libxatracker.la \
                                 "
 
+#
+# libomx files are non-versioned so we put *.so directly in the
+# main package as opposed to the -dev package.
+#
 PACKAGES =+ "libomx-${PN} libomx-${PN}-dev"
-FILES_libomx-${PN} = "${libdir}/bellagio/libomx_*${SOLIBS}"
-FILES_libomx-${PN}-dev = "${libdir}/bellagio/libomx_*${SOLIBSDEV} \
-			  ${libdir}/bellagio/libomx_*.la"
+FILES_libomx-${PN} = "${libdir}/bellagio/libomx_*.so"
+FILES_libomx-${PN}-dev = "${libdir}/bellagio/libomx_*.la"
 FILES_${PN}-dbg += "${libdir}/bellagio/.debug"
