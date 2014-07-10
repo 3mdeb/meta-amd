@@ -36,31 +36,31 @@ EXTRA_OECONF_append_baldeagle = " \
 		"
 
 PACKAGES += "libxvmcr600-${PN}-dev"
-FILES_libxvmcr600-${PN}-dev += "${libdir}/libXvMCr600.so \
+FILES_libxvmcr600-${PN}-dev += "${libdir}/libXvMCr600${SOLIBSDEV} \
                                 ${libdir}/libXvMCr600.la"
 
 PACKAGES += "libxvmcnouveau-${PN}-dev"
-FILES_libxvmcnouveau-${PN}-dev += "${libdir}/libXvMCnouveau.so \
+FILES_libxvmcnouveau-${PN}-dev += "${libdir}/libXvMCnouveau${SOLIBSDEV} \
                                    ${libdir}/libXvMCnouveau.la"
 
 PACKAGES += "libvdpau-${PN} libvdpau-${PN}-dev"
-FILES_libvdpau-${PN}     += "${libdir}/vdpau/libvdpau*.so.*"
-FILES_libvdpau-${PN}-dev += "${libdir}/vdpau/libvdpau*.so \
+FILES_libvdpau-${PN}     += "${libdir}/vdpau/libvdpau*${SOLIBS}"
+FILES_libvdpau-${PN}-dev += "${libdir}/vdpau/libvdpau*${SOLIBSDEV} \
                              ${libdir}/vdpau/libvdpau*.la"
 FILES_${PN}-dbg           += "${libdir}/vdpau/.debug"
 
 PACKAGES += "libxatracker-${PN} libxatracker-${PN}-dev"
-FILES_libxatracker-${PN} += "${libdir}/libxatracker.so.*"
+FILES_libxatracker-${PN} += "${libdir}/libxatracker${SOLIBS}"
 FILES_libxatracker-${PN}-dev += "${includedir}/xa_tracker.h \
                                  ${includedir}/xa_composite.h \
                                  ${includedir}/xa_context.h \
                                  ${libdir}/pkgconfig/xatracker.pc \
-                                 ${libdir}/libxatracker.so \
+                                 ${libdir}/libxatracker${SOLIBSDEV} \
                                  ${libdir}/libxatracker.la \
                                  "
 
 PACKAGES += "libomx-${PN} libomx-${PN}-dev libomx-${PN}-dbg"
-FILES_libomx-${PN} += "${libdir}/bellagio/libomx_*.so.*"
-FILES_libomx-${PN}-dev += "${libdir}/bellagio/libomx_*.so \
+FILES_libomx-${PN} += "${libdir}/bellagio/libomx_*${SOLIBS}"
+FILES_libomx-${PN}-dev += "${libdir}/bellagio/libomx_*${SOLIBSDEV} \
 			   ${libdir}/bellagio/libomx_*.la"
 FILES_libomx-${PN}-dbg += "${libdir}/bellagio/.debug"

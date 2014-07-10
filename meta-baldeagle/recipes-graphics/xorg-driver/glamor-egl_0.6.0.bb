@@ -14,5 +14,5 @@ EXTRA_OECONF += "--prefix=${prefix} \
 		 --localstatedir=${localstatedir} \
 		 --enable-glx-tls"
 
-FILES_${PN} += "${datadir}/X11/xorg.conf.d ${libdir}/xorg/modules/lib*.so"
+FILES_${PN} += "${datadir}/X11/xorg.conf.d ${libdir}/xorg/modules/lib*${SOLIBSDEV}"
 FILES_${PN}-dbg += "${libdir}/xorg/modules/.debug"
