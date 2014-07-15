@@ -15,6 +15,8 @@ SRC_URI_steppeeagle = " \
 	   git://people.freedesktop.org/~deathsimple/mesa;branch=vce-release \
 	   file://0001-radeonsi-add-support-for-Mullins-asics.patch \
 	   file://0002-radeonsi-add-Mullins-pci-ids.patch \
+	   file://0018-radeonsi-omx-Makefile.am-fix-lib-omx-radeonsi-loadin.patch \
+	   file://0019-st-omx-enc-fix-scaling-alignment-issue.patch \
            "
 
 PATCHTOOL_steppeeagle = "git"
