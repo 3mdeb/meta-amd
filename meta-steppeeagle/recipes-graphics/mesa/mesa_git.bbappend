@@ -19,8 +19,6 @@ SRC_URI_steppeeagle = " \
 	   file://0019-st-omx-enc-fix-scaling-alignment-issue.patch \
            "
 
-PATCHTOOL_steppeeagle = "git"
-
 # Set DRIDRIVERS with anonymous python so we can effectively
 # override the _append_x86-64 assignement from mesa.inc.
 python __anonymous () {
