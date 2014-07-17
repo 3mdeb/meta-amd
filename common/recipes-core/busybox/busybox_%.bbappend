@@ -1,7 +1,4 @@
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
-SRC_URI_append_baldeagle = " \
-	    file://gpt_disklabel.cfg \
-           "
-SRC_URI_append_steppeeagle = " \
+SRC_URI_append_amd = " \
 	    file://gpt_disklabel.cfg \
            "
