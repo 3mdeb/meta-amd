@@ -19,3 +19,11 @@ RDEPENDS_${PN}_append_amd = "libomx-mesa"
 # but in the meantime we'll explicitly remove it here.
 #
 LICENSE_FLAGS_remove = "commercial"
+
+pkg_postinst_${PN}_amd () {
+    if test -n "$D"; then
+        exit 1
+    else
+        OMX_BELLAGIO_REGISTRY=${ROOT_HOME}/.omxregister ${bindir}/omxregister-bellagio -v
+    fi
+}
