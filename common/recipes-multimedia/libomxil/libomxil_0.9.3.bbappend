@@ -20,6 +20,24 @@ RDEPENDS_${PN}_append_amd = "libomx-mesa"
 #
 LICENSE_FLAGS_remove = "commercial"
 
+#
+# The upstream sources expect that "make check" is run
+# after "make install" and we have to jump through some
+# extra hoops since we are cross building to avoid RPATH
+# issues.
+#
+do_install_append_amd () {
+    ln -sf ${D}${libdir}/libomxil-bellagio.a test/components/audio_effects/
+    ln -sf ${D}${libdir}/libomxil-bellagio.a test/components/resource_manager/
+    oe_runmake includedir=${D}${includedir} LDFLAGS="${LDFLAGS} -L." check
+    install test/components/audio_effects/omxvolcontroltest ${D}${bindir}
+    install test/components/audio_effects/omxaudiomixertest ${D}${bindir}
+    install test/components/resource_manager/omxrmtest ${D}${bindir}
+}
+
+PACKAGES_prepend_amd = "${PN}-test "
+FILES_${PN}-test_amd = "${bindir}/omxvolcontroltest ${bindir}/omxaudiomixertest ${bindir}/omxrmtest"
+
 pkg_postinst_${PN}_amd () {
     if test -n "$D"; then
         exit 1
