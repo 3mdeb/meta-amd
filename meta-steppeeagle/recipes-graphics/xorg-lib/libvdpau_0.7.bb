@@ -18,19 +18,19 @@ inherit autotools pkgconfig
 
 S = "${WORKDIR}/libvdpau-${PV}"
 
-FILES_${PN} += "${libdir}/vdpau/libvdpau_nouveau.so.* \
-		${libdir}/vdpau/libvdpau_r600.so.* \
-		${libdir}/vdpau/libvdpau_radeonsi.so.* \
-		${libdir}/vdpau/libvdpau_trace.so.* \
+FILES_${PN} += "${libdir}/vdpau/libvdpau_nouveau${SOLIBS} \
+		${libdir}/vdpau/libvdpau_r600${SOLIBS} \
+		${libdir}/vdpau/libvdpau_radeonsi${SOLIBS} \
+		${libdir}/vdpau/libvdpau_trace${SOLIBS} \
 	       "
 
-FILES_${PN}-dev += "${libdir}/vdpau/libvdpau_nouveau.so \
+FILES_${PN}-dev += "${libdir}/vdpau/libvdpau_nouveau${SOLIBSDEV} \
 		    ${libdir}/vdpau/libvdpau_nouveau.la \
-		    ${libdir}/vdpau/libvdpau_r600.so \
+		    ${libdir}/vdpau/libvdpau_r600${SOLIBSDEV} \
 		    ${libdir}/vdpau/libvdpau_r600.la \
-		    ${libdir}/vdpau/libvdpau_radeonsi.so \
+		    ${libdir}/vdpau/libvdpau_radeonsi${SOLIBSDEV} \
 		    ${libdir}/vdpau/libvdpau_radeonsi.la \
-		    ${libdir}/vdpau/libvdpau_trace.so \
+		    ${libdir}/vdpau/libvdpau_trace${SOLIBSDEV} \
 		    ${libdir}/vdpau/libvdpau_trace.la \
 		   "
 

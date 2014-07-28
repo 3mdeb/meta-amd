@@ -17,6 +17,7 @@ SRC_URI_append_amd = " \
 	   file://0009-omxvideodec-fix-startup-race-condition.patch \
 	   file://0010-omxvideoenc-fix-startup-race-condition.patch \
 	   file://0011-omx-fix-two-serious-message-handling-bugs.patch \
+	   file://0001-Adjust-gstomx.conf-for-Radeon.patch \
 	  "
 
 SRCREV_amd = "c44cd849400b90f5f4b1f4f429278d9685b1daca"
@@ -29,3 +30,5 @@ PV .= "+git${SRCPV}"
 # but in the meantime we'll explicitly remove it here.
 #
 LICENSE_FLAGS_remove = "commercial"
+
+GSTREAMER_1_0_OMX_CORE_NAME_amd = "${libdir}/libomxil-bellagio.so.0"
