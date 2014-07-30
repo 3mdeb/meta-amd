@@ -8,4 +8,6 @@ SRC_URI += " \
      file://0009-init-install-efi.sh-Add-a-second-prompt-to-install.patch;striplevel=0;patchdir=${WORKDIR} \
      file://0010-init-install-efi.sh-Switch-to-using-UUIDs.patch;striplevel=0;patchdir=${WORKDIR} \
      file://0012-init-install-efi.sh-Verify-sys-based-files-exist-bef.patch;striplevel=0;patchdir=${WORKDIR} \
+     file://0014-init-install-efi.sh-Skip-CDROM-devices-during-probe.patch;striplevel=0;patchdir=${WORKDIR} \
+     file://0016-init-install-efi.sh-Strip-partition-number-from-live.patch;striplevel=0;patchdir=${WORKDIR} \
 "
