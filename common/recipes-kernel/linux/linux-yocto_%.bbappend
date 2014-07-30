@@ -4,6 +4,7 @@ SRC_URI_append_amd = " \
            file://console.cfg \
            file://logitech.cfg \
            file://efi-partition.cfg \
+           file://sound.cfg \
            ${@base_contains("DISTRO_FEATURES", "bluetooth", "file://bluetooth.cfg", "", d)} \
 "
 kernel_do_install_append() {

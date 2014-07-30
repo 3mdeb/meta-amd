@@ -1,6 +1,12 @@
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 
 #
+# Remove plugins-bad from DEPENDS as it is
+# not strictly needed.
+#
+DEPENDS_remove_amd = "gstreamer1.0-plugins-bad"
+
+#
 # Remove the patch as it is not needed with the new SRCREV we are using
 #
 SRC_URI_remove_amd = "file://0001-omx-fixed-type-error-in-printf-call.patch"
