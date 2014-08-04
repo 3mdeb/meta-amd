@@ -7,6 +7,13 @@ FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 DEPENDS_remove_amd = "gstreamer1.0-plugins-bad"
 
 #
+# Add some extra dependencies.  These are actually added
+# by the include file but accidentally overwritten in the
+# upstream bb file.
+#
+DEPENDS += "gstreamer1.0 gstreamer1.0-plugins-base"
+
+#
 # Remove the patch as it is not needed with the new SRCREV we are using
 #
 SRC_URI_remove_amd = "file://0001-omx-fixed-type-error-in-printf-call.patch"
