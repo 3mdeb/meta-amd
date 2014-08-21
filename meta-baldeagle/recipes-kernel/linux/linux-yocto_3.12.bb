@@ -53,7 +53,9 @@ SRC_URI = "http://git.yoctoproject.org/cgit/cgit.cgi/linux-yocto-dev/snapshot/li
            file://0042-yocto-poky-dora-10.0.0-amd-drm-radeon-cik-enable-disable-vce-cg-when-encoding.patch \
            file://0043-yocto-poky-dora-10.0.0-amd-drm-radeon-fix-CP-semaphores-on-CIK.patch \
            file://0044-yocto-poky-dora-10.0.0-amd-drm-radeon-disable-dynamic-powering-vce.patch \
-	   file://0045-yocto-poky-dora-10.0.0-amd-clear-exceptions-in-AMD-FXSAVE-workaround.patch"
+	   file://0045-yocto-poky-dora-10.0.0-amd-clear-exceptions-in-AMD-FXSAVE-workaround.patch \
+	   file://0046-yocto-poky-dora-10.0.0-amd-staging-add-support-to-enable-and-disable-IMC-to-fetch-BIOS-code.patch \
+	  "
 
 S = "${WORKDIR}/linux-yocto-dev-${PV}"
 
