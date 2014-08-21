@@ -31,39 +31,34 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <getopt.h>
 #include <fcntl.h>
 #include <string.h>
-#include <errno.h>
+#include <dirent.h>
+#include <signal.h>
+
+#include <sys/types.h>
 #include <sys/ioctl.h>
-#include <linux/types.h>
+#include <sys/stat.h>
+
+#include <readline/readline.h>
 
 #include "spirom.h"
 
-#define SPI_APP_VERSION		"0.1"
+#define SPI_APP_VERSION "1.0"
 
-#define WREN		0x06
-#define WRDI		0x04
-#define RDSR		0x05
-#define RDID		0x9F
-#define CHIP_ERASE	0x60
-#define SECTOR_ERASE	0x20
-#define BLOCK_ERASE	0xD8
-#define READ		0x03
-#define WRITE		0x02
+static int device_opened = 0;
+static char filename[20];
+static int fd = -1;
 
-static void pabort(const char *s)
+char *show_prompt(void)
 {
-	perror(s);
-	abort();
+	return "$ ";
 }
 
-static const char *device = "/dev/spirom0.0";
-static char command[20];
-static int inputfile_fd;
-static int outfile_fd;;
-static unsigned long address;
-static unsigned int num_bytes;
+void sighandler(int sig)
+{
+	/* Do nothing. That is the idea. */
+}
 
 void show_license(void)
 {
@@ -72,7 +67,7 @@ void show_license(void)
 	       "* Copyright (c) 2014, Advanced Micro Devices, Inc.\n"
 	       "* All rights reserved.\n"
 	       "*\n"
-	       "* Redistribution and use in source and binary forms, with or without\n" 
+	       "* Redistribution and use in source and binary forms, with or without\n"
 	       "* modification, are permitted provided that the following conditions are met:\n"
 	       "*     * Redistributions of source code must retain the above copyright\n"
 	       "*       notice, this list of conditions and the following disclaimer.\n"
@@ -98,188 +93,302 @@ void show_license(void)
 	       "***************************************************************************/\n");
 }
 
-void parse_command(int fd)
+void print_usage(void)
 {
-	uint8_t cmd_byte;
+	printf("\nCommands Supported ->\n");
+	printf(" enumerate				: List all SPI device nodes available\n");
+	printf(" setdevice <dev_id>			: Set the SPI device number to access\n");
+	printf(" wren					: Enable Write operation on SPI device\n");
+	printf(" wrdi					: Disable Write operation on SPI device\n");
+	printf(" chiperase				: Erase entire ROM chip\n");
+	printf(" rdsr					: Read status register of ROM device\n");
+	printf(" rdid					: Read device identification string\n");
+	printf(" sectorerase <addr> <num_sectors>	: Erase a fixed number of sectors starting at the address\n"
+	       "                                          specified\n");
+	printf(" blockerase <addr> <num_blocks>		: Erase a fixed number of blocks starting at the address\n"
+	       "                                          specified\n");
+	printf(" read <addr> <num_bytes> <filename>	: Read a fixed number of bytes starting at address\n"
+	       "                                          specified, and output the contents into file\n");
+	printf(" write <addr> <num_bytes> <filename>	: Read a fixed number of bytes from file and output\n"
+	       "                                          the contents to the device starting at the address\n"
+	       "                                          specified\n");
+	printf(" license				: Displays the terms of LICENSE for this application\n");
+	printf(" help					: Displays help text\n");
+	printf(" exit					: Exits the application\n\n");
+}
+
+void parse_cmd(const char *cmdline)
+{
 	struct spi_ioc_transfer tr;
 	unsigned int bytes_chunks;
 	unsigned int remaining_bytes;
+	int addr;
 	int ret;
 
-	/* Zero initialize spi_ioc_transfer */
-	memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-	if ((strncmp(command, "WREN", 4) == 0) ||
-	    (strncmp(command, "wren", 4) == 0)) {
-		/* Command without data */
-		tr.buf[0] = WREN;
+	if (strncmp(cmdline, "enumerate", 9) == 0) {
+		DIR *dir;
+		struct dirent *dir_entry;
+		int device_found = 0;
+
+		/* Get the directory handle */
+		if ((dir = opendir("/dev")) == NULL) {
+			printf("\n\nFailed to open directory /dev. Probably you "
+			       "do not have right privilege!\n\n");
+			exit(EXIT_FAILURE);
+		}
+
+		/* Iterate over all the directory entries */
+		while ((dir_entry = readdir(dir)) != NULL) {
+			/*
+			 * If the file is a character device, and its signature
+			 * matches spirom, then we print the corresponding file.
+			 */
+			if ((dir_entry->d_type == DT_CHR) &&
+			    (strncmp(dir_entry->d_name, "spirom", 6) == 0)) {
+				printf("/dev/%s\n", dir_entry->d_name);
+				device_found = 1;
+			}
+		}
+
+		printf("\n");
+
+		/*
+		 * In case we did not find even a single entry, we print a
+		 * message and exit.
+		 */
+		if (!device_found) {
+			printf("\n\nNo spirom device nodes found, load spirom "
+			       "kernel module and try again\n\n");
+			exit(EXIT_FAILURE);
+		}
+	} else if (strncmp(cmdline, "setdevice", 9) == 0) {
+		char input[2 + 1];
+		int file_desc;
+
+		cmdline += 10;
+		memset(input, 0, 3);
+		if (sscanf(cmdline, "%s", input) < 1) {
+			printf("\nInvalid inputs, please try again\n\n");
+			return;
+		}
+
+		memset(filename, 0, 20);
+		snprintf(filename, 19, "/dev/spirom%s", input);
+		file_desc = open(filename, O_RDWR);
+		if (file_desc < 0) {
+			printf("\nError opening file %s\n\n", filename);
+			return;
+		}
+
+		/* Once we have validated inputs, we store them into the global
+		 * variables used at other places in the program.
+		 */
+		fd = file_desc;
+		device_opened = 1;
+		printf("\nSPI device set to /dev/spirom%s\n\n", input);
+	} else if (strncmp(cmdline, "wren", 4) == 0) {
+		if (!device_opened) {
+			printf("\nSPI device needs to be set before you can "
+			       "perform this operation\n\n");
+			return;
+		}
+
+		/* command without data */
+		tr.buf[0] = ROM_WREN;
 		tr.direction = 0;
 		tr.len = 0;
 		tr.addr_present = 0;
 
 		ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
 		if (ret < 1)
-			pabort("can't send spi message");
-	} else if ((strncmp(command, "WRDI", 4) == 0) ||
-		   (strncmp(command, "wrdi", 4) == 0)) {
-		/* Command without data */
-		tr.buf[0] = WRDI;
+			printf("\nError executing WREN command\n\n");
+		else
+			printf("\n...WREN completed successfully\n\n");
+	} else if (strncmp(cmdline, "wrdi", 4) == 0) {
+		if (!device_opened) {
+			printf("\nSPI device needs to be set before you can "
+			       "perform this operation\n\n");
+			return;
+		}
+
+		/* command without data */
+		tr.buf[0] = ROM_WRDI;
 		tr.direction = 0;
 		tr.len = 0;
 		tr.addr_present = 0;
 
 		ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
 		if (ret < 1)
-			pabort("can't send spi message");
-	} else if ((strncmp(command, "CHIPERASE", 4) == 0) ||
-		   (strncmp(command, "chiperase", 4) == 0)) {
+			printf("\nError executing WRDI command\n\n");
+		else
+			printf("\n...WRDI completed successfully\n\n");
+	} else if (strncmp(cmdline, "chiperase", 9) == 0) {
+		if (!device_opened) {
+			printf("\nSPI device needs to be set before you can "
+			       "perform this operation\n\n");
+			return;
+		}
 
-		tr.buf[0] = RDSR;
+		tr.buf[0] = ROM_RDSR;
 		tr.direction = RECEIVE;
 		tr.addr_present = 0;
 		tr.len = 1;
 
 		ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-		if (ret < 1)
-			pabort("can't send spi message");
-		else if ((tr.buf[1] & 0x02) == 0x00) {
-			printf("cannot execute command, write is disabled\n");
-			exit(1);
+		if (ret < 1) {
+			printf("\nError executing RDSR command\n\n");;
+			return;
+		} else if ((tr.buf[1] & 0x02) == 0x00) {
+			printf("\nCannot execute RDSR command, write is disabled\n\n");
+			return;
 		}
 
 		/* Command without data */
-		tr.buf[0] = CHIP_ERASE;
+		tr.buf[0] = ROM_CHIP_ERASE;
 		tr.direction = 0;
 		tr.len = 0;
 		tr.addr_present = 0;
 		ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
 		if (ret < 1) {
-			if (errno == EPERM)
-				printf("\n\nIMC is enabled in your platform. "
-				       "Trying to perform CHIPERASE is not "
-				       "safe. If you really want to perform "
-				       "this operation, either disable IMC in "
-				       "BIOS, or set jumper JU105 to 2-3 "
-				       "position to disable IMC and then "
-				       "try again. Do not forget to remove "
-				       "power to the platform before changing "
-				       "jumper settings\n\n");
-
-			pabort("can't send spi message");
+			printf("\nError executing CHIPERASE command\n\n");
+			return;
 		}
+
+		printf("\n\nCHIPERASE operation in progress, please do not "
+		       " stop in between.\n\n");
 
 		/* Make sure WIP has been reset */
 		while (1) {
 			memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-			tr.buf[0] = RDSR;
+			tr.buf[0] = ROM_RDSR;
 			tr.direction = RECEIVE;
 			tr.addr_present = 0;
 			tr.len = 1;
 
 			ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-			if (ret < 1)
-				pabort("can't send spi message");
+			if (ret < 1) {
+				printf("\nError executing RDSR command\n\n");
+				return;
+			}
 
 			if ((tr.buf[1] & 0x01) == 0x00)
 				break;
 		}
-	} else if ((strncmp(command, "RDSR", 4) == 0) ||
-		   (strncmp(command, "rdsr", 4) == 0)) {
+
+		printf("\n\n...CHIPERASE completed successfully\n\n");
+		/* Restore signal handler to default */
+	} else if (strncmp(cmdline, "rdsr", 4) == 0) {
+		if (!device_opened) {
+			printf("\nSPI device needs to be set before you can "
+			       "perform this operation\n\n");
+			return;
+		}
+
 		/* Command with response */
-		tr.buf[0] = RDSR;
+		tr.buf[0] = ROM_RDSR;
 		tr.direction = RECEIVE;
 		tr.addr_present = 0;
 		tr.len = 1;
 
 		ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-		if (ret < 1)
-			pabort("can't send spi message");
+		if (ret < 1) {
+			printf("\nError executing RDSR command\n\n");
+			return;
+		}
 
 		/*
 		 * The 1-byte response will be stored in tr.buf,
 		 * so print it out
 		 */
-		printf("command: 0x%.2x response: 0x%.2x\n", tr.buf[0],
-			tr.buf[1]);
-	} else if ((strncmp(command, "RDID", 4) == 0) ||
-		   (strncmp(command, "rdid", 4) == 0)) {
+		printf("\nRDSR command returned: 0x%.2x\n\n", tr.buf[1]);
+	} else if (strncmp(cmdline, "rdid", 4) == 0) {
+		if (!device_opened) {
+			printf("\nSPI device needs to be set before you can "
+			       "perform this operation\n\n");
+			return;
+		}
+
 		/* Command with response */
-		tr.buf[0] = RDID;
+		tr.buf[0] = ROM_RDID;
 		tr.direction = RECEIVE;
 		tr.addr_present = 0;
 		tr.len = 3;
 
 		ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-		if (ret < 1)
-			pabort("can't send spi message");
+		if (ret < 1) {
+			printf("\nError executing RDID command\n\n");
+			return;
+		}
 
 		/*
 		 * The 3-bytes response will be stored in tr.buf,
 		 * so print it out
 		 */
-		printf("command: 0x%.2x response: 0x%.2x%.2x%.2x\n", tr.buf[0],
-			tr.buf[1], tr.buf[2], tr.buf[3]);
-	} else if ((strncmp(command, "SECTORERASE", 6) ==0) ||
-		   (strncmp(command, "sectorerase", 6) ==0)) {
+		printf("\nRDID command returned: 0x%.2x%.2x%.2x\n", tr.buf[1],
+			tr.buf[2], tr.buf[3]);
+	} else if (strncmp(cmdline, "sectorerase", 11) == 0) {
+		int nsectors;
 		int i;
 
-		tr.buf[0] = RDSR;
+		if (!device_opened) {
+			printf("\nSPI device needs to be set before you can "
+			       "perform this operation\n\n");
+			return;
+		}
+
+		cmdline += 12;
+		if (sscanf(cmdline, "0x%x 0x%x", &addr, &nsectors) < 2) {
+			printf("\nInvalid inputs, please try again\n\n");
+			return;
+		}
+
+		tr.buf[0] = ROM_RDSR;
 		tr.direction = RECEIVE;
 		tr.addr_present = 0;
 		tr.len = 1;
 
 		ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-		if (ret < 1)
-			pabort("can't send spi message");
-		else if ((tr.buf[1] & 0x02) == 0x00) {
-			printf("cannot execute command, write is disabled\n");
-			exit(1);
+		if (ret < 1) {
+			printf("\nError executing RDSR command\n\n");
+			return;
+		} else if ((tr.buf[1] & 0x02) == 0x00) {
+			printf("\nCannot execute SECTORERASE command, write is disabled\n\n");
+			return;
 		}
 
-		/*
-		 * num_bytes here is a little bit of misnomer, it indicates the
-		 * number of sectors to be erased, rather than the number of
-		 * bytes to be erased.
-		 */
-		for (i = 0; i < num_bytes; i++) {
+		printf("\n\nSECTORERASE operation in progress, please do not "
+		       " stop in between.\n\n");
+
+		for (i = 0; i < nsectors; i++) {
 			/* Write Enable before Sector Erase */
-			tr.buf[0] = WREN;
+			tr.buf[0] = ROM_WREN;
 			tr.direction = 0;
 			tr.len = 0;
 			tr.addr_present = 0;
 			ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-			if (ret < 1)
-				pabort("can't send spi message");
+			if (ret < 1) {
+				printf("\nError executing WREN command\n\n");
+				return;
+			}
 
 			/* Command with address but no data */
 			memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-			tr.buf[0] = SECTOR_ERASE;
-			tr.buf[3] = address & 0xff;
-			tr.buf[2] = (address >> 8) & 0xff;
-			tr.buf[1] = (address >> 16) & 0xff;
+			tr.buf[0] = ROM_SECTOR_ERASE;
+			tr.buf[3] = addr & 0xff;
+			tr.buf[2] = (addr >> 8) & 0xff;
+			tr.buf[1] = (addr >> 16) & 0xff;
 			tr.addr_present = 1;
 			tr.direction = 0;
 			tr.len = 0;
 
 			ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
 			if (ret < 1) {
-				if (errno == EPERM)
-					printf("\n\nIMC is enabled in your "
-					       "platform. Trying to perform "
-					       "SECTORERASE is not safe. If you "
-					       "really want to perform this "
-					       "operation, either disable IMC "
-					       "in BIOS, or set jumper JU105 "
-					       "to 2-3 position to disable IMC "
-					       "and then try again. Do not "
-					       "forget to remove power to the "
-					       "platform before changing jumper "
-					       "settings.\n\n");
-
-				pabort("can't send spi message");
+				printf("\nError executing SECTORERASE command\n\n");
+				return;
 			}
 
-			/* point to the next 4k block */
-			address += 4 * 1024;
+			/* point to the next 4k sector */
+			addr += 4 * 1024;
 
 			/*
 			 * Before the next loop, we need to make sure that WIP
@@ -287,80 +396,86 @@ void parse_command(int fd)
 			 */
 			while (1) {
 				memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-				tr.buf[0] = RDSR;
+				tr.buf[0] = ROM_RDSR;
 				tr.direction = RECEIVE;
 				tr.addr_present = 0;
 				tr.len = 1;
 
 				ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-				if (ret < 1)
-					pabort("can't send spi message");
+				if (ret < 1) {
+					printf("\nError executing RDSR command\n\n");
+					return;
+				}
 
 				if ((tr.buf[1] & 0x01) == 0x00)
 					break;
 			}
 		}
-	} else if ((strncmp(command, "BLOCKERASE", 5) == 0) ||
-		   (strncmp(command, "blockerase", 5) == 0)) {
+
+		printf("\n\n...SECTORERASE completed successfully\n\n");
+	} else if (strncmp(cmdline, "blockerase", 10) == 0) {
+		int nblocks;
 		int i;
 
-		tr.buf[0] = RDSR;
+		if (!device_opened) {
+			printf("\nSPI device needs to be set before you can "
+			       "perform this operation\n\n");
+			return;
+		}
+
+		cmdline += 11;
+		if (sscanf(cmdline, "0x%x 0x%x", &addr, &nblocks) < 2) {
+			printf("\nInvalid inputs, please try again\n\n");
+			return;
+		}
+
+		tr.buf[0] = ROM_RDSR;
 		tr.direction = RECEIVE;
 		tr.addr_present = 0;
 		tr.len = 1;
 
 		ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-		if (ret < 1)
-			pabort("can't send spi message");
-		else if ((tr.buf[1] & 0x02) == 0x00) {
-			printf("cannot execute command, write is disabled\n");
-			exit(1);
+		if (ret < 1) {
+			printf("\nError executing RDSR command\n\n");
+			return;
+		} else if ((tr.buf[1] & 0x02) == 0x00) {
+			printf("\nError executing BLOCKERASE command, write is disabled\n\n");
+			return;
 		}
 
-		/*
-		 * num_bytes indicates the number of blocks to be erased,
-		 * rather than the number of bytes to be erased.
-		 */
-		for (i = 0; i < num_bytes; i++) {
+		printf("\n\nBLOCKERASE operation in progress, please do not "
+		       " stop in between.\n\n");
+
+		for (i = 0; i < nblocks; i++) {
 			/* Write Enable before Block Erase */
-			tr.buf[0] = WREN;
+			tr.buf[0] = ROM_WREN;
 			tr.direction = 0;
 			tr.len = 0;
 			tr.addr_present = 0;
 			ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-			if (ret < 1)
-				pabort("can't send spi message");
+			if (ret < 1) {
+				printf("\nError executing WREN command\n\n");
+				return;
+			}
 
 			/* Command with address but no data */
 			memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-			tr.buf[0] = BLOCK_ERASE;
-			tr.buf[3] = address & 0xff;
-			tr.buf[2] = (address >> 8) & 0xff;
-			tr.buf[1] = (address >> 16) & 0xff;
+			tr.buf[0] = ROM_BLOCK_ERASE;
+			tr.buf[3] = addr & 0xff;
+			tr.buf[2] = (addr >> 8) & 0xff;
+			tr.buf[1] = (addr >> 16) & 0xff;
 			tr.addr_present = 1;
 			tr.direction = 0;
 			tr.len = 0;
 
 			ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
 			if (ret < 1) {
-				if (errno == EPERM)
-					printf("\n\nIMC is enabled in your "
-					       "platform. Trying to perform "
-					       "BLOCKERASE is not safe. If "
-					       "you really want to perform "
-					       "this operation, either disable "
-					       "IMC in BIOS, or set jumper "
-					       "JU105 to 2-3 position to "
-					       "disable IMC and then try "
-					       "again. Do not forget to remove "
-					       "power to the platform before "
-					       "changing jumper settings.\n\n");
-
-				pabort("can't send spi message");
+				printf("\nError executing BLOCKERASE command\n\n");
+				return;
 			}
 
 			/* point to the next 64k block */
-			address += 64 * 1024;
+			addr += 64 * 1024;
 
 			/*
 			 * Before the next loop, we need to make sure that WIP
@@ -368,22 +483,51 @@ void parse_command(int fd)
 			 */
 			while (1) {
 				memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-				tr.buf[0] = RDSR;
+				tr.buf[0] = ROM_RDSR;
 				tr.direction = RECEIVE;
 				tr.addr_present = 0;
 				tr.len = 1;
 
 				ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-				if (ret < 1)
-					pabort("can't send spi message");
+				if (ret < 1) {
+					printf("\nError executing RDSR command\n\n");
+					return;
+				}
 
 				if ((tr.buf[1] & 0x01) == 0x00)
 					break;
 			}
 		}
-	} else if ((strncmp(command, "READ", 4) == 0) ||
-		   (strncmp(command, "read", 4) ==0)) {
+
+		printf("\n\n...BLOCKERASE completed successfully\n\n");
+	} else if (strncmp(cmdline, "read", 4) == 0) {
+		int nbytes;
+		int outfile_fd;
 		int i;
+
+		if (!device_opened) {
+			printf("\nSPI device needs to be set before you can "
+			       "perform this operation\n\n");
+			return;
+		}
+
+		cmdline += 5;
+		memset(filename, 0, 20);
+		if (sscanf(cmdline, "0x%x 0x%x %s", &addr, &nbytes, filename) < 3) {
+			printf("\nInvalid inputs, please try again\n\n");
+			return;
+		}
+
+		/*
+		 * Open the output file for writing. Create a new file if not
+		 * there, and empty the file before writing if file already
+		 * exists.
+		 */
+		outfile_fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (outfile_fd < 0) {
+			printf("\nError opening file %s for writing\n\n", filename);
+			return;
+		}
 
 		/*
 		 * We will break down the bytes to be received in chunks of
@@ -391,58 +535,88 @@ void parse_command(int fd)
 		 * in that case, we will have some remaining bytes <4. We
 		 * handle that separately.
 		 */
-		bytes_chunks = num_bytes / 4;
-		remaining_bytes = num_bytes % 4;
+		bytes_chunks = nbytes / 4;
+		remaining_bytes = nbytes % 4;
+
+		printf("\n\nREAD operation in progress.\n\n");
 
 		for (i = 0; i < bytes_chunks; i++) {
 			/* Command with address and data */
 			memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-			tr.buf[0] = READ;
+			tr.buf[0] = ROM_READ;
 			tr.direction = RECEIVE;
 			/*
 			 * We will store the address into the buffer in little
 			 * endian order.
 			 */
-			tr.buf[3] = address & 0xff;
-			tr.buf[2] = (address >> 8) & 0xff;
-			tr.buf[1] = (address >> 16) & 0xff;
+			tr.buf[3] = addr & 0xff;
+			tr.buf[2] = (addr >> 8) & 0xff;
+			tr.buf[1] = (addr >> 16) & 0xff;
 			tr.len = 4;
 			tr.addr_present = 1;
 
 			ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-			if (ret < 1)
-				pabort("can't send spi message");
+			if (ret < 1) {
+				printf("\nError executing READ command\n\n");
+				return;
+			}
 
 			/* Write the data read to output file */
 			if (write(outfile_fd, &tr.buf[4], tr.len) < 0) {
-				perror("write error");
-				exit(1);
+				printf("\nError writing to file %s\n\n", filename);
+				return;
 			}
-			address += 4;
+			addr += 4;
 		}
 
 		if (remaining_bytes) {
 			memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-			tr.buf[0] = READ;
+			tr.buf[0] = ROM_READ;
 			tr.direction = RECEIVE;
-			tr.buf[3] = address & 0xff;
-			tr.buf[2] = (address >> 8) & 0xff;
-			tr.buf[1] = (address >> 16) & 0xff;
+			tr.buf[3] = addr & 0xff;
+			tr.buf[2] = (addr >> 8) & 0xff;
+			tr.buf[1] = (addr >> 16) & 0xff;
 			tr.len = remaining_bytes;
 			tr.addr_present = 1;
 
 			ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-			if (ret < 1)
-				pabort("can't send spi message");
+			if (ret < 1) {
+				printf("\nError executing READ command\n\n");
+				return;
+			}
 
 			if (write(outfile_fd, &tr.buf[4], tr.len) < 0) {
-				perror("write error");
-				exit(1);
+				printf("\nError writing to file %s\n\n", filename);
+				return;
 			}
 		}
-	} else if ((strncmp(command, "WRITE", 5) == 0) ||
-		   (strncmp(command, "write", 5) ==0)) {
+
+		printf("\n\n...READ completed successfully\n\n");
+		close(outfile_fd);
+	} else if (strncmp(cmdline, "write", 5) == 0) {
+		int nbytes;
+		int infile_fd;
 		int i;
+
+		if (!device_opened) {
+			printf("\nSPI device needs to be set before you can "
+			       "perform this operation\n\n");
+			return;
+		}
+
+		cmdline += 6;
+		memset(filename, 0, 20);
+		if (sscanf(cmdline, "0x%x 0x%x %s", &addr, &nbytes, filename) < 3) {
+			printf("\nInvalid inputs, please try again\n\n");
+			return;
+		}
+
+		/* Open the input file for reading*/
+		infile_fd = open(filename, O_RDONLY);
+		if (infile_fd < 0) {
+			printf("\nError opening file %s for reading\n\n", filename);
+			return;
+		}
 
 		/*
 		 * We will break down the bytes to be transmitted in chunks of
@@ -450,69 +624,64 @@ void parse_command(int fd)
 		 * even multiple of 4 bytes. So we will handle the remaining
 		 * bytes in the end.
 		 */
-		tr.buf[0] = RDSR;
+		tr.buf[0] = ROM_RDSR;
 		tr.direction = RECEIVE;
 		tr.addr_present = 0;
 		tr.len = 1;
 
 		ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-		if (ret < 1)
-			pabort("can't send spi message");
-		else if ((tr.buf[1] & 0x02) == 0x00) {
-			printf("cannot execute command, write is disabled\n");
-			exit(1);
+		if (ret < 1) {
+			printf("\nError executing RDSR command\n\n");
+			return;
+		} else if ((tr.buf[1] & 0x02) == 0x00) {
+			printf("\nCannot execute WRITE command, write is disabled\n\n");
+			return;
 		}
 
-		bytes_chunks = num_bytes / 4;
-		remaining_bytes = num_bytes % 4;
+		bytes_chunks = nbytes / 4;
+		remaining_bytes = nbytes % 4;
+
+		printf("\n\nWRITE operation in progress, please do not "
+		       " stop in between.\n\n");
 
 		for (i = 0; i < bytes_chunks; i++) {
-			tr.buf[0] = WREN;
+			tr.buf[0] = ROM_WREN;
 			tr.direction = 0;
 			tr.len = 0;
 			tr.addr_present = 0;
 			ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-			if (ret < 1)
-				pabort("can't send spi message");
+			if (ret < 1) {
+				printf("\nError executing WREN command\n\n");
+				return;
+			}
 
 			/* Command with data and address */
 			memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-			tr.buf[0] = WRITE;
+			tr.buf[0] = ROM_WRITE;
 			tr.direction = TRANSMIT;
 			/*
 			 * We will store the address into the buffer in little
 			 * endian order.
 			 */
-			tr.buf[3] = address & 0xff;
-			tr.buf[2] = (address >> 8) & 0xff;
-			tr.buf[1] = (address >> 16) & 0xff;
+			tr.buf[3] = addr & 0xff;
+			tr.buf[2] = (addr >> 8) & 0xff;
+			tr.buf[1] = (addr >> 16) & 0xff;
 			tr.len = 4;
 			tr.addr_present = 1;
 
-			/* Read 4 bytes from inputfile to buffer */
-			if (read(inputfile_fd, &tr.buf[4], tr.len) < 0) {
-				perror("read error");
-				exit(1);
+			/* Read 4 bytes from input file to buffer */
+			if (read(infile_fd, &tr.buf[4], tr.len) < 0) {
+				printf("\nError reading from file %s\n\n", filename);
+				return;
 			}
+
 			ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
 			if (ret < 1) {
-				if (errno == EPERM)
-					printf("\n\nIMC is enabled in your "
-					       "platform. Trying to perform "
-					       "WRITE is not safe. If you "
-					       "really want to perform this "
-					       "operation, either disable IMC "
-					       "in BIOS, or set jumper JU105 "
-					       "to 2-3 position to disable IMC "
-					       "and then try again. Do not "
-					       "forget to remove power to the "
-					       "platform before changing jumper "
-					       "settings.\n\n");
-
-				pabort("can't send spi message");
+				printf("\nError executing WRITE command\n\n");
+				return;
 			}
 
-			address += 4;
+			addr += 4;
 
 			/*
 			 * Before the next loop, we need to make sure that WIP
@@ -520,14 +689,16 @@ void parse_command(int fd)
 			 */
 			while (1) {
 				memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-				tr.buf[0] = RDSR;
+				tr.buf[0] = ROM_RDSR;
 				tr.direction = RECEIVE;
 				tr.addr_present = 0;
 				tr.len = 1;
 
 				ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-				if (ret < 1)
-					pabort("can't send spi message");
+				if (ret < 1) {
+					printf("\nError executing RDSR command\n\n");
+					return;
+				}
 
 				if ((tr.buf[1] & 0x01) == 0x00)
 					break;
@@ -535,161 +706,93 @@ void parse_command(int fd)
 		}
 
 		if (remaining_bytes) {
-			tr.buf[0] = WREN;
+			tr.buf[0] = ROM_WREN;
 			tr.direction = 0;
 			tr.len = 0;
 			tr.addr_present = 0;
 			ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-			if (ret < 1)
-				pabort("can't send spi message");
+			if (ret < 1) {
+				printf("\nError executing WREN command\n\n");
+				return;
+			}
 
 			memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-			tr.buf[0] = WRITE;
+			tr.buf[0] = ROM_WRITE;
 			tr.direction = TRANSMIT;
-			tr.buf[3] = address & 0xff;
-			tr.buf[2] = (address >> 8) & 0xff;
-			tr.buf[1] = (address >> 16) & 0xff;
+			tr.buf[3] = addr & 0xff;
+			tr.buf[2] = (addr >> 8) & 0xff;
+			tr.buf[1] = (addr >> 16) & 0xff;
 			tr.len = remaining_bytes;
 			tr.addr_present = 1;
 
-			if (read(inputfile_fd, &tr.buf[4], tr.len) < 0) {
-				perror("read error");
-				exit(1);
+			if (read(infile_fd, &tr.buf[4], tr.len) < 0) {
+				printf("\nError reading from file %s\n\n", filename);
+				return;
 			}
+
 			ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-			if (ret < 1)
-				pabort("can't send spi message");
+			if (ret < 1) {
+				printf("\nError executing WRITE command\n\n");
+				return;
+			}
 
 			while (1) {
 				memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-				tr.buf[0] = RDSR;
+				tr.buf[0] = ROM_RDSR;
 				tr.direction = RECEIVE;
 				tr.addr_present = 0;
 				tr.len = 1;
 
 				ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
-				if (ret < 1)
-					pabort("can't send spi message");
+				if (ret < 1) {
+					printf("\nError executing RDSR command\n\n");
+					return;
+				}
 
 				if ((tr.buf[1] & 0x01) == 0x00)
 					break;
 			}
 		}
-	} else
-		pabort("Unrecognized command, please try again.\n");
-}
 
-static void print_usage(const char *prog)
-{
-	printf("\nUsage: sudo %s [-DCAnio] [arguments]\n\n", prog);
-	puts("  -D --device        SPI ROM device to use\n"
-	     "                    (default /dev/spirom0.0)\n\n"
-	     "  -C --command       command to send to the device\n"
-	     "                    (WREN/WRDI/RDSR/RDID/CHIPERASE/SECTORERASE/\n"
-	     "                     BLOCKERASE/READ/WRITE)\n\n"
-	     "  -A --address       offset in decimal, into the device to read\n"
-	     "                     from or write to. For a ROM size of 8MB,\n"
-	     "                     address can go from 0 to 8388608. Negative\n"
-	     "                     offsets are not valid, but the program\n"
-	     "                     won't complain and convert it to its\n"
-	     "                     unsigned equivalent.\n\n"
-	     "  -n --num-bytes     number of bytes to be read from or written\n"
-	     "                     to. Depending on the address, this can\n"
-	     "                     take values from 0 to 8388608 for a ROM\n"
-	     "                     size of 8MB.\n\n"
-	     "                     In case of SECTORERASE and BLOCKERASE\n"
-	     "                     commands, num-bytes actually takes the\n"
-	     "                     number of sectors and blocks to be erased\n"
-	     "                     respectively, rather than the number of\n"
-	     "                     bytes.\n\n"
-	     "  -i --input-file    file to be used as input.\n\n"
-	     "  -o --output-file   file to be used for output. Remember that if\n"
-	     "                     an existing filename is given, its contents\n"
-	     "                     will be overwritten.\n"
-	     "  -l --license       displays the terms of LICENSE for this application\n\n");
-	exit(1);
-}
-
-static void parse_opts(int argc, char *argv[])
-{
-	if (argc == 1)
-		print_usage(argv[0]);
-
-	while (1) {
-		static const struct option lopts[] = {
-			{ "device",  1, 0, 'D' },
-			{ "command", 1, 0, 'C' },
-			{ "address", 1, 0, 'A' },
-			{ "num-bytes", 1, 0, 'n' },
-			{ "input-file", 1, 0, 'i' },
-			{ "output-file", 1, 0, 'o' },
-			{ "license", 0, 0, 'l' },
-			{ NULL, 0, 0, 0 },
-		};
-		int c;
-
-		c = getopt_long(argc, argv, "D:C:A:n:i:o:l", lopts, NULL);
-
-		if (c == -1)
-			break;
-
-		switch (c) {
-		case 'D':
-			device = optarg;
-			break;
-		case 'C':
-			memset(command, sizeof(command), 0);
-			strncpy(command, optarg, sizeof(command));
-			break;
-		case 'A':
-			address = atol(optarg);
-			break;
-		case 'n':
-			num_bytes = atoi(optarg);
-			break;
-		case 'i':
-			inputfile_fd = open(optarg, O_RDONLY);
-			if (inputfile_fd < 0) {
-				printf("Error opening %s\n", optarg);
-				exit(1);
-			}
-			break;
-		case 'o':
-			outfile_fd = open(optarg, O_WRONLY | O_CREAT |
-					O_TRUNC, 0644);
-			if(outfile_fd < 0) {
-				printf("Error opening %s\n", optarg);
-				exit(1);
-			}
-			break;
-		case 'l':
-			show_license();
-			exit(0);;
-		default:
-			print_usage(argv[0]);
-			break;
-		}
+		printf("\n\n...WRITE completed successfully\n\n");
+		close(infile_fd);
+	} else if (strncmp(cmdline, "license", 7) == 0) {
+		show_license();
+	} else if (strncmp(cmdline, "exit", 4) == 0) {
+		printf("\nExiting...\n");
+		close(fd);
+		exit(EXIT_SUCCESS);
+	} else if (strncmp(cmdline, "help", 4) == 0) {
+		print_usage();
+	} else {
+		printf("\nUnknown command\n");
+		print_usage();
 	}
 }
 
-int main(int argc, char *argv[])
+int main(void)
 {
-	int ret = 0;
-	int fd;
+	char *cmdline= NULL;
 
 	printf("SPI sample application version: %s\n", SPI_APP_VERSION);
 	printf("Copyright (c) 2014, Advanced Micro Devices, Inc.\n"
 	       "This sample application comes with ABSOLUTELY NO WARRANTY;\n"
 	       "This is free software, and you are welcome to redistribute it\n"
-	       "under certain conditions; type `license' for details.\n\n");
+	       "under certain conditions; type `license` for details.\n\n");
 
-	parse_opts(argc, argv);
+	/* Set the signal handler */
+	signal(SIGINT, sighandler);
 
-	fd = open(device, O_RDWR);
-	if (fd < 0)
-		pabort("can't open device");
+	while (1) {
+		cmdline = readline(show_prompt());
+		parse_cmd(cmdline);
+		/* Free the memory malloc'ed by readline */
+		free(cmdline);
+	}
 
-	parse_command(fd);
+	/* Restore the default signal handler */
+	signal(SIGINT, SIG_DFL);
 
-	return ret;
+	/* Should never reach here */
+	return 0;
 }

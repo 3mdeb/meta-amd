@@ -39,24 +39,6 @@ struct spi_ioc_transfer {
 		? ((N)*(sizeof (struct spi_ioc_transfer))) : 0)
 #define SPI_IOC_MESSAGE(N) _IOW(SPI_IOC_MAGIC, 0, char[SPI_MSGSIZE(N)])
 
-#ifdef __KERNEL__
-
-/* IO port address for indirect access using the ACPI PM registers */
-#define AMD_IO_PM_INDEX_REG		0xCD6
-#define AMD_IO_PM_DATA_REG		0xCD7
-
-#define AMD_PM_ACPI_MMIO_BASE0		0x24
-#define AMD_PM_ACPI_MMIO_BASE1		0x25
-#define AMD_PM_ACPI_MMIO_BASE2		0x26
-#define AMD_PM_ACPI_MMIO_BASE3		0x27
-
-#define AMD_ACPI_MMIO_ADDR_MASK		~0x1FFF
-
-/* Offset of IMC Strap Status register in the ACPI MMIO region */
-#define AMD_IMC_STRAP_STATUS_OFFSET	0xE80
- #define AMD_IMC_ENABLED		0x4
-#define AMD_IMC_STRAP_STATUS_SIZE	4
-
 /* SPI ROM command codes */
 #define ROM_WREN		0x06
 #define ROM_WRDI		0x04
@@ -67,7 +49,5 @@ struct spi_ioc_transfer {
 #define ROM_BLOCK_ERASE		0xD8
 #define ROM_READ		0x03
 #define ROM_WRITE		0x02
-
-#endif /* __KERNEL__ */
 
 #endif /* SPIROM_H */
