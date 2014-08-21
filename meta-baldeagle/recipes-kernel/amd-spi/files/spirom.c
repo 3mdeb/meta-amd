@@ -32,11 +32,13 @@
 #include <linux/spi/spi.h>
 #include <linux/pci.h>
 #include <linux/delay.h>
+#include <linux/amd_imc.h>
+
 #include <asm/uaccess.h>
 
 #include "spirom.h"
 
-#define SPIROM_VERSION	"0.1"
+#define SPIROM_VERSION	"0.2"
 
 /*
  * SPI has a character major number assigned.  We allocate minor numbers
@@ -52,7 +54,6 @@
 #define SPI_BUS_CS1	0
 
 static unsigned long	minors[N_SPI_MINORS / BITS_PER_LONG];
-static int imc_enabled;
 
 struct spirom_data {
 	dev_t			devt;
@@ -84,7 +85,6 @@ spirom_sync(struct spirom_data *spirom, struct spi_message *message)
 {
 	int status;
 
-	INIT_COMPLETION(spirom->done);
 	message->complete = spirom_complete;
 	message->context = &spirom->done;
 
@@ -128,18 +128,6 @@ static int spirom_message(struct spirom_data *spirom,
 		return -ENOMEM;
 
 	transfer->tx_buf = buffer;
-
-	/*
-	 * In case IMC is enabled, and an erase or write operation is requested
-	 * on the ROM, we simply print a message and return from here. Rather
-	 * than letting the user corrupt his system never to boot again, it is
-	 * better to play safe.
-	 */
-	if (imc_enabled && ((*buffer == ROM_CHIP_ERASE) ||
-	    (*buffer == ROM_SECTOR_ERASE) || (*buffer == ROM_BLOCK_ERASE) ||
-	    (*buffer == ROM_WRITE)))
-			return -EPERM;
-
 	transfer->len = 1;
 	buffer += transfer->len;
 	spi_message_add_tail(transfer, &msg);
@@ -318,6 +306,14 @@ static int spirom_open(struct inode *inode, struct file *filp)
 
 	mutex_unlock(&device_list_lock);
 
+	/*
+	 * In case IMC is enabled, we need to inform IMC to stop
+	 * fetching code from the BIOS ROM. We will inform IMC when
+	 * it is safe to start fetching from ROM again once we are
+	 * done with our SPI transactions.
+	 */
+	amd_imc_enter_scratch_ram();
+
 	return status;
 }
 
@@ -344,6 +340,14 @@ static int spirom_release(struct inode *inode, struct file *filp)
 			kfree(spirom);
 	}
 	mutex_unlock(&device_list_lock);
+
+	/*
+	 * In case IMC is enabled, we would have instructed IMC to stop
+	 * fetching from ROM BIOS earlier in the code path. Now that we
+	 * are done, we can safely inform IMC to start fetching from ROM
+	 * again.
+	 */
+	amd_imc_exit_scratch_ram();
 
 	return status;
 }
@@ -396,56 +400,11 @@ static int spirom_probe(struct spi_device *spi)
 	struct spirom_data	*spirom;
 	int			status;
 	unsigned long		minor;
-	u32 val;
-	u8 *byte;
-	u32 imc_strap_status_phys;
-	void __iomem *imcstrapstatus;
 
 	/* Allocate driver data */
 	spirom = kzalloc(sizeof(*spirom), GFP_KERNEL);
 	if (!spirom)
 		return -ENOMEM;
-
-	/* Locate ACPI MMIO Base Address */
-	byte = (u8 *)&val;
-
-	outb(AMD_PM_ACPI_MMIO_BASE0, AMD_IO_PM_INDEX_REG);
-	byte[0] = inb(AMD_IO_PM_DATA_REG);
-	outb(AMD_PM_ACPI_MMIO_BASE1, AMD_IO_PM_INDEX_REG);
-	byte[1] = inb(AMD_IO_PM_DATA_REG);
-	outb(AMD_PM_ACPI_MMIO_BASE2, AMD_IO_PM_INDEX_REG);
-	byte[2] = inb(AMD_IO_PM_DATA_REG);
-	outb(AMD_PM_ACPI_MMIO_BASE3, AMD_IO_PM_INDEX_REG);
-	byte[3] = inb(AMD_IO_PM_DATA_REG);
-
-	/* Bits 31:13 is the actual ACPI MMIO Base Address */
-	val &= AMD_ACPI_MMIO_ADDR_MASK;
-
-	/* IMCStrapStatus is located at ACPI MMIO Base Address + 0xE80 */
-	if (!request_mem_region_exclusive(val + AMD_IMC_STRAP_STATUS_OFFSET,
-	    AMD_IMC_STRAP_STATUS_SIZE, "IMC Strap Status"))
-		pr_err("spirom: MMIO address 0x%04x already in use\n", val +
-			AMD_IMC_STRAP_STATUS_OFFSET);
-
-	imc_strap_status_phys = val + AMD_IMC_STRAP_STATUS_OFFSET;
-
-	imcstrapstatus = ioremap(imc_strap_status_phys, AMD_IMC_STRAP_STATUS_SIZE);
-	if (!imcstrapstatus)
-		pr_err("spirom: failed to map IMC Strap Status address\n");
-
-	/* Check if IMC is enabled */
-	val = ioread32(imcstrapstatus);
-	if ((val & AMD_IMC_ENABLED) == AMD_IMC_ENABLED) {
-		pr_info("spirom: IMC is enabled\n");
-		imc_enabled = 1;
-	} else {
-		pr_info("spirom: IMC is disabled\n");
-		imc_enabled = 0;
-	}
-
-	/* Release the region occupied by IMC Strap Status register */
-	iounmap(imcstrapstatus);
-	release_mem_region(imc_strap_status_phys, AMD_IMC_STRAP_STATUS_SIZE);
 
 	/* Initialize the driver data */
 	spirom->spi = spi;

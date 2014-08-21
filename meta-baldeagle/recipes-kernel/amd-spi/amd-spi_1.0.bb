@@ -2,8 +2,8 @@ DESCRIPTION = "This kernel module provides support for AMD SPI controller driver
 LICENSE = "BSD | GPLv2"
 LIC_FILES_CHKSUM = "file://spi_amd.c;md5=bca93a3bd8cbdabafd4089daf5109768 \
                     file://spi_amd.h;md5=67ba12b2bcfda1402435aebf18cda6bd \
-                    file://spirom.c;md5=558c5e03489d2d7792c03dcf7e2539ab \
-                    file://spirom.h;md5=332ef940b1cb318fc8ecd9b1ba5940be \
+                    file://spirom.c;md5=f1cd805abcc598247c197aed08ec4a5d \
+                    file://spirom.h;md5=dad84d1bbdd9852dde1fdf1ea3a014d6 \
 		    file://Makefile;md5=8ea80a6d4ae15bcf922d090df6cfdd4c \
 		   "
 
