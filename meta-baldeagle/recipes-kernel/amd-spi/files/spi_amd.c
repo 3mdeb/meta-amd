@@ -45,9 +45,9 @@ struct amd_spi {
 	u32 rom_addr;
 	struct spi_master *master;
 	struct amd_platform_data controller_data;
-	spinlock_t lock;
 	struct task_struct *kthread_spi;
 	struct list_head msg_queue;
+	wait_queue_head_t wq;
 };
 
 static struct pci_device_id amd_spi_pci_device_id[] = {
@@ -155,7 +155,9 @@ static void amd_spi_execute_opcode(struct spi_master *master)
 	spi_busy = (ioread32((u8 *)amd_spi->io_remap_addr +
 		    AMD_SPI_CTRL0_REG) & AMD_SPI_BUSY) == AMD_SPI_BUSY;
 	while (spi_busy) {
+		set_current_state(TASK_INTERRUPTIBLE);
 		schedule();
+		set_current_state(TASK_RUNNING);
 		spi_busy = (ioread32((u8 *)amd_spi->io_remap_addr +
 			    AMD_SPI_CTRL0_REG) & AMD_SPI_BUSY) == AMD_SPI_BUSY;
 	}
@@ -199,29 +201,17 @@ static int amd_spi_master_setup(struct spi_device *spi)
 	return 0;
 }
 
-static int amd_spi_master_transfer(struct spi_device *spi,
+static int amd_spi_master_transfer(struct spi_master *master,
 				   struct spi_message *msg)
 {
-	struct spi_master *master = spi->master;
 	struct amd_spi *amd_spi = spi_master_get_devdata(master);
 
 	/*
-	 * We will just add this message to the message queue set up by
-	 * the controller, and let the kernel thread handle it later.
+	 * Add new message to the queue and let the kernel thread know
+	 * about it.
 	 */
-	msg->status = -EINPROGRESS;
-	msg->actual_length = 0;
-	msg->spi = spi;
-	/*
-	 * There could be a situation when we are running on this processor
-	 * and trying to add element to the end of the message queue, but
-	 * at the same time the kernel thread is running on another processor
-	 * and trying to find out if the list is empty or not. So protect
-	 * against such contention. Simple spin_lock() should do.
-	 */
-	spin_lock(&amd_spi->lock);
 	list_add_tail(&msg->queue, &amd_spi->msg_queue);
-	spin_unlock(&amd_spi->lock);
+	wake_up_interruptible(&amd_spi->wq);
 
 	return 0;
 }
@@ -249,22 +239,16 @@ static int amd_spi_thread(void *t)
 	 * 4-bytes of data and 3-bytes of address.
 	 */
 	while (1) {
-		/* break condition */
+		/*
+		 * Let us wait on a wait queue till the message queue is empty.
+		 */
+		wait_event_interruptible(amd_spi->wq,
+					 !list_empty(&amd_spi->msg_queue));
+
+		/* stop condition */
 		if (kthread_should_stop()) {
 			set_current_state(TASK_RUNNING);
 			break;
-		}
-
-		/*
-		 * If the message queue is empty, then there is no need to waste
-		 * CPU cycles. So we let other processes execute, and continue
-		 * from the beginning of the loop when we next get to run.
-		 */
-		spin_lock(&amd_spi->lock);
-		if (list_empty(&amd_spi->msg_queue)) {
-			spin_unlock(&amd_spi->lock);
-			schedule();
-			continue;
 		}
 
 		/*
@@ -276,7 +260,6 @@ static int amd_spi_thread(void *t)
 		message = list_entry(amd_spi->msg_queue.next,
 				     struct spi_message, queue);
 		list_del_init(&message->queue);
-		spin_unlock(&amd_spi->lock);
 
 		/* We store the CS# line to be used for this spi_message */
 		amd_spi->controller_data.chip_select =
@@ -396,7 +379,7 @@ static int amd_spi_thread(void *t)
 		message->actual_length = tx_len + rx_len + 1;
 		/* complete the transaction */
 		message->status = 0;
-		message->complete(message->context);
+		spi_finalize_current_message(master);
 	}
 
 	return 0;
@@ -441,8 +424,8 @@ static int amd_spi_pci_probe(struct pci_dev *pdev,
 
 	dev_dbg(dev, "io_base_addr: 0x%.8lx, io_remap_address: %p\n",
 		amd_spi->io_base_addr, amd_spi->io_remap_addr);
-	spin_lock_init(&amd_spi->lock);
 	INIT_LIST_HEAD(&amd_spi->msg_queue);
+	init_waitqueue_head(&amd_spi->wq);
 	amd_spi->kthread_spi = kthread_run(amd_spi_thread, amd_spi,
 					   "amd_spi_thread");
 
@@ -455,7 +438,7 @@ static int amd_spi_pci_probe(struct pci_dev *pdev,
 	master->mode_bits = 0;
 	master->flags = 0;
 	master->setup = amd_spi_master_setup;
-	master->transfer = amd_spi_master_transfer;
+	master->transfer_one_message = amd_spi_master_transfer;
 	/* Register the controller with SPI framework */
 	err = spi_register_master(master);
 	if (err) {

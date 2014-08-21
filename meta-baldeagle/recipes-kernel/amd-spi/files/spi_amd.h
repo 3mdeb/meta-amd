@@ -2,7 +2,7 @@
 #define SPI_AMD_H
 
 #define DRIVER_NAME	"spi_amd"
-#define SPI_VERSION	"0.1"
+#define SPI_VERSION	"1.0"
 
 #define PCI_DEVICE_ID_AMD_LPC_BRIDGE	0x780E
 
