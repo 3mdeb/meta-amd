@@ -20,7 +20,10 @@ do_compile() {
 
 do_install() {
 	install -v -m 444 -D ${S}/LICENSE.radeon ${D}/lib/firmware/radeon/LICENSE.radeon
+	install -v -d ${D}/lib/firmware/amd-ucode/
+	install -v -m 0644 ${S}/microcode_amd_fam15h.bin ${D}/lib/firmware/amd-ucode/
 	install -v -m 0644 ${S}/*.bin ${D}/lib/firmware/radeon/
+	rm -f ${D}/lib/firmware/radeon/microcode_amd_fam15h.bin
 }
 
 FILES_${PN} = "/lib/firmware/*"
