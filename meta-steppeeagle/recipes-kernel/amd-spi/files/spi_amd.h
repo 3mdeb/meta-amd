@@ -2,7 +2,7 @@
 #define SPI_AMD_H
 
 #define DRIVER_NAME	"spi_amd"
-#define SPI_VERSION	"0.1"
+#define SPI_VERSION	"1.0"
 
 #define AMD_SPI_CTRL0_REG		0x00
  #define AMD_SPI_EXEC_CMD		(0x1 << 16)

@@ -2,8 +2,8 @@ DESCRIPTION = "Sample application for AMD SPI driver"
 SECTION = "applications"
 LICENSE = "BSD"
 DEPENDS = "readline"
-LIC_FILES_CHKSUM = "file://spirom-test.c;md5=c6d80587d583668ffbfb5828abd58878 \
-                    file://spirom.h;md5=56f117ed31b82b02182c7a491364d112 \
+LIC_FILES_CHKSUM = "file://spirom-test.c;md5=3065341fac5fc1255711c219f00f7324 \
+                    file://spirom.h;md5=8de0c535224dbd8ecd2f40ef29c15d0a \
                    "
 
 PR = "r1"
