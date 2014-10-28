@@ -7,7 +7,6 @@ LIC_FILES_CHKSUM = "file://COPYING;md5=d7810fab7487fb0aad327b76f1be7cd7"
 inherit kernel cml1-config
 
 SRC_URI = "http://git.yoctoproject.org/cgit/cgit.cgi/linux-yocto-dev/snapshot/linux-yocto-dev-${PV}.tar.bz2;name=kernel \
-           file://defconfig \
            file://0000-yocto-amd-drm-radeon-backport-support-from-kernel-version-3.12.10.patch \
            file://0001-yocto-amd-drm-radeon-add-vm_set_page-tracepoint.patch \
            file://0002-yocto-amd-drm-radeon-cleanup-flushing-on-CIK-v3.patch \
@@ -53,19 +52,22 @@ SRC_URI = "http://git.yoctoproject.org/cgit/cgit.cgi/linux-yocto-dev/snapshot/li
            file://0042-yocto-amd-drm-radeon-cik-enable-disable-vce-cg-when-encoding.patch \
            file://0043-yocto-amd-drm-radeon-fix-CP-semaphores-on-CIK.patch \
            file://0044-yocto-amd-drm-radeon-disable-dynamic-powering-vce.patch \
-	   file://0045-yocto-amd-drm-radeon-add-Mullins-chip-family.patch \
-	   file://0046-yocto-amd-drm-radeon-update-cik-init-for-Mullins.patch \
-	   file://0047-yocto-amd-drm-radeon-add-Mullins-UVD-support.patch \
-	   file://0048-yocto-amd-drm-radeon-add-Mullins-dpm-support.patch \
-	   file://0049-yocto-amd-drm-radeon-modesetting-updates-for-Mullins.patch \
-	   file://0050-yocto-amd-drm-radeon-add-pci-ids-for-Mullins.patch \
-	   file://0051-yocto-amd-drm-radeon-add-Mulins-VCE-support.patch \
 	   file://0052-yocto-amd-clear-exceptions-in-AMD-FXSAVE-workaround.patch \
-	   file://0053-yocto-amd-i2c-piix4-add-support-for-AMD-ML-and-CZ-SMBus-changes.patch \
-	   file://0054-yocto-amd-i2c-piix4-use-different-message-for-AMD-auxiliary-SMBus-controller.patch \
-	   file://0055-yocto-amd-change-acpi-enforce-resources-to-lax.patch"
+ 	   file://logo.cfg \
+           file://console.cfg \
+           file://logitech.cfg \
+           file://efi-partition.cfg \
+           file://sound.cfg \
+           ${@base_contains("DISTRO_FEATURES", "bluetooth", "file://bluetooth.cfg", "", d)} \
+           file://0001-xhci-Enable-XHCI_TRUST_TX_LENGTH-quirk-for-AMD-devic.patch \
+           file://disable-debug-preempt.cfg \
+"
 
 S = "${WORKDIR}/linux-yocto-dev-${PV}"
 
 SRC_URI[kernel.md5sum] = "a9564529d2d310c1d93e1c0c5adc0360"
 SRC_URI[kernel.sha256sum] = "6e4c00016653ead0f57d7cd38364cf1194568301fbd37103b400a03145b369aa"
+
+kernel_do_install_append() {
+	ln -s ${KERNEL_IMAGETYPE}-${KERNEL_VERSION} ${D}/${KERNEL_IMAGEDEST}/${KERNEL_IMAGETYPE}
+}
