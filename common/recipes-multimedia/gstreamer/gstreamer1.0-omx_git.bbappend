@@ -7,13 +7,6 @@ FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 DEPENDS_remove_amd = "gstreamer1.0-plugins-bad"
 
 #
-# Add some extra dependencies.  These are actually added
-# by the include file but accidentally overwritten in the
-# upstream bb file.
-#
-DEPENDS += "gstreamer1.0 gstreamer1.0-plugins-base"
-
-#
 # Replace the git:// style URI with gitsm://
 # This forces the submodules to be fetched at build time and
 # packaged into installers for non-network-connected builds.
