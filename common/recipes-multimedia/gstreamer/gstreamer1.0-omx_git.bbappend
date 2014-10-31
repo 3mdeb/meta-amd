@@ -44,5 +44,3 @@ PV .= "+git${SRCPV}"
 # but in the meantime we'll explicitly remove it here.
 #
 LICENSE_FLAGS_remove = "commercial"
-
-GSTREAMER_1_0_OMX_CORE_NAME_amd = "${libdir}/libomxil-bellagio.so.0"
