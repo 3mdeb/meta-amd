@@ -4,7 +4,7 @@ LICENSE = "GPLv2"
 
 LIC_FILES_CHKSUM = "file://COPYING;md5=d7810fab7487fb0aad327b76f1be7cd7"
 
-inherit kernel
+inherit kernel cml1-config
 
 SRC_URI = "http://git.yoctoproject.org/cgit/cgit.cgi/linux-yocto-dev/snapshot/linux-yocto-dev-${PV}.tar.bz2;name=kernel \
            file://defconfig \
@@ -53,9 +53,11 @@ SRC_URI = "http://git.yoctoproject.org/cgit/cgit.cgi/linux-yocto-dev/snapshot/li
            file://0042-yocto-poky-dora-10.0.0-amd-drm-radeon-cik-enable-disable-vce-cg-when-encoding.patch \
            file://0043-yocto-poky-dora-10.0.0-amd-drm-radeon-fix-CP-semaphores-on-CIK.patch \
            file://0044-yocto-poky-dora-10.0.0-amd-drm-radeon-disable-dynamic-powering-vce.patch \
-	   file://0045-yocto-poky-dora-10.0.0-amd-clear-exceptions-in-AMD-FXSAVE-workaround.patch"
+	   file://0045-yocto-poky-dora-10.0.0-amd-clear-exceptions-in-AMD-FXSAVE-workaround.patch \
+	   file://0046-yocto-poky-dora-10.0.0-amd-staging-add-support-to-enable-and-disable-IMC-to-fetch-BIOS-code.patch \
+	   file://0047-yocto-poky-dora-10.0.0-amd-i2c-dev-add-calls-to-enable-and-disable-IMC-from-fetching-BIOS-code.patch"
 
 S = "${WORKDIR}/linux-yocto-dev-${PV}"
 
-SRC_URI[kernel.md5sum] = "3b58ba37133ace5e486cee3697a810be"
-SRC_URI[kernel.sha256sum] = "b4e914b4682d92f691da22ce8f2c89bfcd710515c416164ce57de0c7eca7ab3c"
+SRC_URI[kernel.md5sum] = "a9564529d2d310c1d93e1c0c5adc0360"
+SRC_URI[kernel.sha256sum] = "6e4c00016653ead0f57d7cd38364cf1194568301fbd37103b400a03145b369aa"
