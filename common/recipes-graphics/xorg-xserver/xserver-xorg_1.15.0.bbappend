@@ -1,5 +1,5 @@
 PR = "${INC_PR}.1"
-EXTRA_OECONF_append_steppeeagle = " \
+EXTRA_OECONF_append_amd = " \
 		 --enable-aiglx \
 		 --enable-xvmc \
 		 --enable-libdrm \
