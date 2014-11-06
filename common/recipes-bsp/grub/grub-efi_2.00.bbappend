@@ -6,3 +6,10 @@
 # in the meantime this will get us a bootable system.
 #
 TUNE_CCARGS_append_amd += "-march=core2"
+
+#
+# Make sure to use our modified cfg file
+# This fixes an issue where Grub would sometimes use
+# the wrong grub.cfg at boot time.
+#
+FILESPATH_prepend := "${THISDIR}/files:"
