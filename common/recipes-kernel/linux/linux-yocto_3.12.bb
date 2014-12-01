@@ -67,7 +67,3 @@ S = "${WORKDIR}/linux-yocto-dev-${PV}"
 
 SRC_URI[kernel.md5sum] = "a9564529d2d310c1d93e1c0c5adc0360"
 SRC_URI[kernel.sha256sum] = "6e4c00016653ead0f57d7cd38364cf1194568301fbd37103b400a03145b369aa"
-
-kernel_do_install_append() {
-	ln -s ${KERNEL_IMAGETYPE}-${KERNEL_VERSION} ${D}/${KERNEL_IMAGEDEST}/${KERNEL_IMAGETYPE}
-}
