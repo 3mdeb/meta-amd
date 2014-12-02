@@ -17,9 +17,6 @@ DEPENDS += "virtual/libx11 drm dri2proto glproto \
 PR = "${INC_PR}.1"
 EXTRA_OECONF += "--enable-udev --enable-glamor"
 
-SRCREV = "48d3dbc8a0d3bfde88f46e402e530438f9317715"
-PV = "7.3.99+git${SRCPV}"
-
 SRC_URI = " \
 	   git://anongit.freedesktop.org/git/xorg/driver/xf86-video-ati \
 "
