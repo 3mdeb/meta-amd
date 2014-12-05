@@ -8,6 +8,12 @@ PACKAGECONFIG_append_amd = " xvmc openvg gallium gallium-egl gallium-gbm r600"
 PACKAGECONFIG_append_amd = " gallium-llvm"
 MESA_LLVM_RELEASE_amd = "3.4"
 
+# Set DRIDRIVERS with anonymous python so we can effectively
+# override the _append_x86-64 assignement from mesa.inc.
+python __anonymous () {
+    d.setVar("DRIDRIVERS_amd", "radeon")
+}
+
 # Install the demos onto the target
 RRECOMMENDS_libgl-mesa_append_amd = " mesa-demos"
 
