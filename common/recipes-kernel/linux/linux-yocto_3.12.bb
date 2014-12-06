@@ -52,7 +52,19 @@ SRC_URI = "http://git.yoctoproject.org/cgit/cgit.cgi/linux-yocto-dev/snapshot/li
            file://0042-yocto-amd-drm-radeon-cik-enable-disable-vce-cg-when-encoding.patch \
            file://0043-yocto-amd-drm-radeon-fix-CP-semaphores-on-CIK.patch \
            file://0044-yocto-amd-drm-radeon-disable-dynamic-powering-vce.patch \
+	   file://0046-yocto-poky-dora-10.0.0-amd-staging-add-support-to-enable-and-disable-IMC-to-fetch-BIOS-code.patch \
+	   file://0047-yocto-poky-dora-10.0.0-amd-i2c-dev-add-calls-to-enable-and-disable-IMC-from-fetching-BIOS-code.patch \
+	   file://0045-yocto-amd-drm-radeon-add-Mullins-chip-family.patch \
+	   file://0046-yocto-amd-drm-radeon-update-cik-init-for-Mullins.patch \
+	   file://0047-yocto-amd-drm-radeon-add-Mullins-UVD-support.patch \
+	   file://0048-yocto-amd-drm-radeon-add-Mullins-dpm-support.patch \
+	   file://0049-yocto-amd-drm-radeon-modesetting-updates-for-Mullins.patch \
+	   file://0050-yocto-amd-drm-radeon-add-pci-ids-for-Mullins.patch \
+	   file://0051-yocto-amd-drm-radeon-add-Mulins-VCE-support.patch \
 	   file://0052-yocto-amd-clear-exceptions-in-AMD-FXSAVE-workaround.patch \
+	   file://0053-yocto-amd-i2c-piix4-add-support-for-AMD-ML-and-CZ-SMBus-changes.patch \
+	   file://0054-yocto-amd-i2c-piix4-use-different-message-for-AMD-auxiliary-SMBus-controller.patch \
+	   file://0055-yocto-amd-change-acpi-enforce-resources-to-lax.patch \
  	   file://logo.cfg \
            file://console.cfg \
            file://logitech.cfg \
