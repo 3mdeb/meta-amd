@@ -19,12 +19,6 @@ SRC_URI = "file://BONAIRE_ce.bin \
 	   file://HAINAN_me.bin \
 	   file://HAINAN_pfp.bin \
 	   file://HAINAN_rlc.bin \
-	   file://KAVERI_pfp.bin \
-	   file://KAVERI_rlc.bin \
-	   file://KAVERI_ce.bin \
-	   file://KAVERI_sdma.bin \
-	   file://KAVERI_me.bin \
-	   file://KAVERI_mec.bin \
 	   file://LICENSE.radeon \
 "
 
