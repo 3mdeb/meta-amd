@@ -1,6 +1,4 @@
-FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
-
-SRCREV_amd = "d4e5ea65089af05b5891293d8947b0ee0e9dd429"
+SRCREV_amd = "mesa-10.2.9"
 LIC_FILES_CHKSUM_amd = "file://docs/license.html;md5=6a23445982a7a972ac198e93cc1cb3de"
 PV_amd = "10.2.0+git${SRCPV}"
 DEPENDS_append_amd = " libvdpau"
@@ -17,14 +15,7 @@ python __anonymous () {
 # Install the demos onto the target
 RRECOMMENDS_libgl-mesa_append_amd = " mesa-demos"
 
-SRC_URI_amd = " \
-	   git://people.freedesktop.org/~deathsimple/mesa;branch=vce-release \
-	   file://0001-radeonsi-add-support-for-Mullins-asics.patch \
-	   file://0002-radeonsi-add-Mullins-pci-ids.patch \
-	   file://0018-radeonsi-omx-Makefile.am-fix-lib-omx-radeonsi-loadin.patch \
-	   file://0019-st-omx-enc-fix-scaling-alignment-issue.patch \
-	   file://avoid-version.patch \
-           "
+SRC_URI_amd = "git://anongit.freedesktop.org/git/mesa/mesa;branch=10.2"
 
 DEPENDS_append_amd = " libomxil"
 EXTRA_OECONF_append_amd = " \
