@@ -12,6 +12,7 @@ do_install_append_amd() {
 PNBLACKLIST[mplayer2] = ""
 
 #
-# Make sure we can find the configure script
+# mplayer has broken auto-tools scripts for
+# configuration which do not allow out-of-tree building
 #
-B = "${S}"
+inherit autotools-brokensep
