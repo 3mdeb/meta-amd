@@ -7,11 +7,19 @@ FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 DEPENDS_remove_amd = "gstreamer1.0-plugins-bad"
 
 #
+# Replace the git:// style URI with gitsm://
+# This forces the submodules to be fetched at build time and
+# packaged into installers for non-network-connected builds.
+#
+SRC_URI_remove_amd += " git://anongit.freedesktop.org/gstreamer/gst-omx;branch=master"
+SRC_URI_append_amd += " gitsm://anongit.freedesktop.org/gstreamer/gst-omx;branch=master"
+
+#
 # Remove the patch as it is not needed with the new SRCREV we are using
 #
-SRC_URI_remove_amd = "file://0001-omx-fixed-type-error-in-printf-call.patch"
+SRC_URI_remove_amd += " file://0001-omx-fixed-type-error-in-printf-call.patch"
 
-SRC_URI_append_amd = " \
+SRC_URI_append_amd += " \
 	   file://0001-gstomxvideodec-fix-multithreads-negotiation-problem-.patch \
 	   file://0002-gstomxvideodec-remove-dead-code.patch \
 	   file://0003-gstomxvideodec-simplify-_find_nearest_frame.patch \
@@ -36,3 +44,5 @@ PV .= "+git${SRCPV}"
 # but in the meantime we'll explicitly remove it here.
 #
 LICENSE_FLAGS_remove = "commercial"
+
+B = "${S}"
