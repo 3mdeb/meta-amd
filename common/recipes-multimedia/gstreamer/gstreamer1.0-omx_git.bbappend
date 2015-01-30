@@ -48,5 +48,3 @@ PV .= "+git${SRCPV}"
 # but in the meantime we'll explicitly remove it here.
 #
 LICENSE_FLAGS_remove = "commercial"
-
-B = "${S}"
