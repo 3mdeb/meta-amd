@@ -75,6 +75,7 @@ SRC_URI = "https://www.kernel.org/pub/linux/kernel/v3.x/linux-${PV}.tar.xz;name=
 "
 
 S = "${WORKDIR}/linux-${PV}"
+B = "${S}"
 
 SRC_URI[kernel.md5sum] = "0cadb5280ca8948fedd44734d3d6275f"
 SRC_URI[kernel.sha256sum] = "f067eb4447c36358c7b2ee392e0a2470a232818998287acd98ec6295f1b1ed0c"
