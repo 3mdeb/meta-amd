@@ -1,0 +1,1326 @@
+From cd81bdf67fc734e36691264595c837e47154fb03 Mon Sep 17 00:00:00 2001
+From: Arindam Nath <arindam.nath@amd.com>
+Date: Sun, 8 Feb 2015 03:30:18 +0530
+Subject: [PATCH 4/9] drm/ttm: move fpfn and lpfn into each placement
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Thiss allows us to more fine grained specify where to place the buffer object.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Arindam Nath <arindam.nath@amd.com>
+---
+ drivers/gpu/drm/ast/ast_drv.h                 |   2 +-
+ drivers/gpu/drm/ast/ast_ttm.c                 |  20 +++--
+ drivers/gpu/drm/cirrus/cirrus_drv.h           |   2 +-
+ drivers/gpu/drm/cirrus/cirrus_ttm.c           |  19 +++--
+ drivers/gpu/drm/mgag200/mgag200_drv.h         |   2 +-
+ drivers/gpu/drm/mgag200/mgag200_ttm.c         |  20 +++--
+ drivers/gpu/drm/nouveau/nouveau_bo.c          |  51 ++++++++----
+ drivers/gpu/drm/nouveau/nouveau_bo.h          |   4 +-
+ drivers/gpu/drm/nouveau/nouveau_ttm.c         |   6 +-
+ drivers/gpu/drm/qxl/qxl_drv.h                 |   2 +-
+ drivers/gpu/drm/qxl/qxl_object.c              |  17 ++--
+ drivers/gpu/drm/qxl/qxl_ttm.c                 |   8 +-
+ drivers/gpu/drm/radeon/radeon.h               |   2 +-
+ drivers/gpu/drm/radeon/radeon_object.c        |  62 ++++++++------
+ drivers/gpu/drm/radeon/radeon_ttm.c           |  25 +++---
+ drivers/gpu/drm/radeon/radeon_uvd.c           |   8 +-
+ drivers/gpu/drm/ttm/ttm_bo.c                  |  87 +++++++++-----------
+ drivers/gpu/drm/ttm/ttm_bo_manager.c          |   2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c        | 112 ++++++++++++++++----------
+ drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c        |  22 +++--
+ drivers/gpu/drm/vmwgfx/vmwgfx_fb.c            |  10 ++-
+ drivers/gpu/drm/vmwgfx/vmwgfx_gmrid_manager.c |   2 +-
+ include/drm/ttm/ttm_bo_api.h                  |  40 +++++----
+ include/drm/ttm/ttm_bo_driver.h               |   2 +-
+ 24 files changed, 308 insertions(+), 219 deletions(-)
+
+diff --git a/drivers/gpu/drm/ast/ast_drv.h b/drivers/gpu/drm/ast/ast_drv.h
+index 8492b68e..2c3416a 100644
+--- a/drivers/gpu/drm/ast/ast_drv.h
++++ b/drivers/gpu/drm/ast/ast_drv.h
+@@ -302,7 +302,7 @@ struct ast_bo {
+ 	struct ttm_placement placement;
+ 	struct ttm_bo_kmap_obj kmap;
+ 	struct drm_gem_object gem;
+-	u32 placements[3];
++	struct ttm_place placements[3];
+ 	int pin_count;
+ };
+ #define gem_to_ast_bo(gobj) container_of((gobj), struct ast_bo, gem)
+diff --git a/drivers/gpu/drm/ast/ast_ttm.c b/drivers/gpu/drm/ast/ast_ttm.c
+index 32aecb3..c78dd2f 100644
+--- a/drivers/gpu/drm/ast/ast_ttm.c
++++ b/drivers/gpu/drm/ast/ast_ttm.c
+@@ -291,18 +291,22 @@ void ast_mm_fini(struct ast_private *ast)
+ void ast_ttm_placement(struct ast_bo *bo, int domain)
+ {
+ 	u32 c = 0;
+-	bo->placement.fpfn = 0;
+-	bo->placement.lpfn = 0;
++	unsigned i;
++
+ 	bo->placement.placement = bo->placements;
+ 	bo->placement.busy_placement = bo->placements;
+ 	if (domain & TTM_PL_FLAG_VRAM)
+-		bo->placements[c++] = TTM_PL_FLAG_WC | TTM_PL_FLAG_UNCACHED | TTM_PL_FLAG_VRAM;
++		bo->placements[c++].flags = TTM_PL_FLAG_WC | TTM_PL_FLAG_UNCACHED | TTM_PL_FLAG_VRAM;
+ 	if (domain & TTM_PL_FLAG_SYSTEM)
+-		bo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++		bo->placements[c++].flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
+ 	if (!c)
+-		bo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++		bo->placements[c++].flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
+ 	bo->placement.num_placement = c;
+ 	bo->placement.num_busy_placement = c;
++	for (i = 0; i < c; ++i) {
++		bo->placements[i].fpfn = 0;
++		bo->placements[i].lpfn = 0;
++	}
+ }
+ 
+ int ast_bo_create(struct drm_device *dev, int size, int align,
+@@ -359,7 +363,7 @@ int ast_bo_pin(struct ast_bo *bo, u32 pl_flag, u64 *gpu_addr)
+ 
+ 	ast_ttm_placement(bo, pl_flag);
+ 	for (i = 0; i < bo->placement.num_placement; i++)
+-		bo->placements[i] |= TTM_PL_FLAG_NO_EVICT;
++		bo->placements[i].flags |= TTM_PL_FLAG_NO_EVICT;
+ 	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
+ 	if (ret)
+ 		return ret;
+@@ -382,7 +386,7 @@ int ast_bo_unpin(struct ast_bo *bo)
+ 		return 0;
+ 
+ 	for (i = 0; i < bo->placement.num_placement ; i++)
+-		bo->placements[i] &= ~TTM_PL_FLAG_NO_EVICT;
++		bo->placements[i].flags &= ~TTM_PL_FLAG_NO_EVICT;
+ 	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
+ 	if (ret)
+ 		return ret;
+@@ -406,7 +410,7 @@ int ast_bo_push_sysram(struct ast_bo *bo)
+ 
+ 	ast_ttm_placement(bo, TTM_PL_FLAG_SYSTEM);
+ 	for (i = 0; i < bo->placement.num_placement ; i++)
+-		bo->placements[i] |= TTM_PL_FLAG_NO_EVICT;
++		bo->placements[i].flags |= TTM_PL_FLAG_NO_EVICT;
+ 
+ 	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/cirrus/cirrus_drv.h b/drivers/gpu/drm/cirrus/cirrus_drv.h
+index 9b0bb91..c4b6925 100644
+--- a/drivers/gpu/drm/cirrus/cirrus_drv.h
++++ b/drivers/gpu/drm/cirrus/cirrus_drv.h
+@@ -163,7 +163,7 @@ struct cirrus_bo {
+ 	struct ttm_placement placement;
+ 	struct ttm_bo_kmap_obj kmap;
+ 	struct drm_gem_object gem;
+-	u32 placements[3];
++	struct ttm_place placements[3];
+ 	int pin_count;
+ };
+ #define gem_to_cirrus_bo(gobj) container_of((gobj), struct cirrus_bo, gem)
+diff --git a/drivers/gpu/drm/cirrus/cirrus_ttm.c b/drivers/gpu/drm/cirrus/cirrus_ttm.c
+index 75becde..7c332f0 100644
+--- a/drivers/gpu/drm/cirrus/cirrus_ttm.c
++++ b/drivers/gpu/drm/cirrus/cirrus_ttm.c
+@@ -296,18 +296,21 @@ void cirrus_mm_fini(struct cirrus_device *cirrus)
+ void cirrus_ttm_placement(struct cirrus_bo *bo, int domain)
+ {
+ 	u32 c = 0;
+-	bo->placement.fpfn = 0;
+-	bo->placement.lpfn = 0;
++	unsigned i;
+ 	bo->placement.placement = bo->placements;
+ 	bo->placement.busy_placement = bo->placements;
+ 	if (domain & TTM_PL_FLAG_VRAM)
+-		bo->placements[c++] = TTM_PL_FLAG_WC | TTM_PL_FLAG_UNCACHED | TTM_PL_FLAG_VRAM;
++		bo->placements[c++].flags = TTM_PL_FLAG_WC | TTM_PL_FLAG_UNCACHED | TTM_PL_FLAG_VRAM;
+ 	if (domain & TTM_PL_FLAG_SYSTEM)
+-		bo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++		bo->placements[c++].flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
+ 	if (!c)
+-		bo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++		bo->placements[c++].flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
+ 	bo->placement.num_placement = c;
+ 	bo->placement.num_busy_placement = c;
++	for (i = 0; i < c; ++i) {
++		bo->placements[i].fpfn = 0;
++		bo->placements[i].lpfn = 0;
++	}
+ }
+ 
+ int cirrus_bo_create(struct drm_device *dev, int size, int align,
+@@ -364,7 +367,7 @@ int cirrus_bo_pin(struct cirrus_bo *bo, u32 pl_flag, u64 *gpu_addr)
+ 
+ 	cirrus_ttm_placement(bo, pl_flag);
+ 	for (i = 0; i < bo->placement.num_placement; i++)
+-		bo->placements[i] |= TTM_PL_FLAG_NO_EVICT;
++		bo->placements[i].flags |= TTM_PL_FLAG_NO_EVICT;
+ 	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
+ 	if (ret)
+ 		return ret;
+@@ -387,7 +390,7 @@ int cirrus_bo_unpin(struct cirrus_bo *bo)
+ 		return 0;
+ 
+ 	for (i = 0; i < bo->placement.num_placement ; i++)
+-		bo->placements[i] &= ~TTM_PL_FLAG_NO_EVICT;
++		bo->placements[i].flags &= ~TTM_PL_FLAG_NO_EVICT;
+ 	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
+ 	if (ret)
+ 		return ret;
+@@ -411,7 +414,7 @@ int cirrus_bo_push_sysram(struct cirrus_bo *bo)
+ 
+ 	cirrus_ttm_placement(bo, TTM_PL_FLAG_SYSTEM);
+ 	for (i = 0; i < bo->placement.num_placement ; i++)
+-		bo->placements[i] |= TTM_PL_FLAG_NO_EVICT;
++		bo->placements[i].flags |= TTM_PL_FLAG_NO_EVICT;
+ 
+ 	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/mgag200/mgag200_drv.h b/drivers/gpu/drm/mgag200/mgag200_drv.h
+index baaae19..13b72dd 100644
+--- a/drivers/gpu/drm/mgag200/mgag200_drv.h
++++ b/drivers/gpu/drm/mgag200/mgag200_drv.h
+@@ -224,7 +224,7 @@ struct mgag200_bo {
+ 	struct ttm_placement placement;
+ 	struct ttm_bo_kmap_obj kmap;
+ 	struct drm_gem_object gem;
+-	u32 placements[3];
++	struct ttm_place placements[3];
+ 	int pin_count;
+ };
+ #define gem_to_mga_bo(gobj) container_of((gobj), struct mgag200_bo, gem)
+diff --git a/drivers/gpu/drm/mgag200/mgag200_ttm.c b/drivers/gpu/drm/mgag200/mgag200_ttm.c
+index 07b192f..1a25c52 100644
+--- a/drivers/gpu/drm/mgag200/mgag200_ttm.c
++++ b/drivers/gpu/drm/mgag200/mgag200_ttm.c
+@@ -291,18 +291,22 @@ void mgag200_mm_fini(struct mga_device *mdev)
+ void mgag200_ttm_placement(struct mgag200_bo *bo, int domain)
+ {
+ 	u32 c = 0;
+-	bo->placement.fpfn = 0;
+-	bo->placement.lpfn = 0;
++	unsigned i;
++
+ 	bo->placement.placement = bo->placements;
+ 	bo->placement.busy_placement = bo->placements;
+ 	if (domain & TTM_PL_FLAG_VRAM)
+-		bo->placements[c++] = TTM_PL_FLAG_WC | TTM_PL_FLAG_UNCACHED | TTM_PL_FLAG_VRAM;
++		bo->placements[c++].flags = TTM_PL_FLAG_WC | TTM_PL_FLAG_UNCACHED | TTM_PL_FLAG_VRAM;
+ 	if (domain & TTM_PL_FLAG_SYSTEM)
+-		bo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++		bo->placements[c++].flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
+ 	if (!c)
+-		bo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++		bo->placements[c++].flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
+ 	bo->placement.num_placement = c;
+ 	bo->placement.num_busy_placement = c;
++	for (i = 0; i < c; ++i) {
++		bo->placements[i].fpfn = 0;
++		bo->placements[i].lpfn = 0;
++	}
+ }
+ 
+ int mgag200_bo_create(struct drm_device *dev, int size, int align,
+@@ -360,7 +364,7 @@ int mgag200_bo_pin(struct mgag200_bo *bo, u32 pl_flag, u64 *gpu_addr)
+ 
+ 	mgag200_ttm_placement(bo, pl_flag);
+ 	for (i = 0; i < bo->placement.num_placement; i++)
+-		bo->placements[i] |= TTM_PL_FLAG_NO_EVICT;
++		bo->placements[i].flags |= TTM_PL_FLAG_NO_EVICT;
+ 	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
+ 	if (ret)
+ 		return ret;
+@@ -383,7 +387,7 @@ int mgag200_bo_unpin(struct mgag200_bo *bo)
+ 		return 0;
+ 
+ 	for (i = 0; i < bo->placement.num_placement ; i++)
+-		bo->placements[i] &= ~TTM_PL_FLAG_NO_EVICT;
++		bo->placements[i].flags &= ~TTM_PL_FLAG_NO_EVICT;
+ 	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
+ 	if (ret)
+ 		return ret;
+@@ -407,7 +411,7 @@ int mgag200_bo_push_sysram(struct mgag200_bo *bo)
+ 
+ 	mgag200_ttm_placement(bo, TTM_PL_FLAG_SYSTEM);
+ 	for (i = 0; i < bo->placement.num_placement ; i++)
+-		bo->placements[i] |= TTM_PL_FLAG_NO_EVICT;
++		bo->placements[i].flags |= TTM_PL_FLAG_NO_EVICT;
+ 
+ 	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index 60a97b6..456f89e 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -250,16 +250,16 @@ nouveau_bo_new(struct drm_device *dev, int size, int align,
+ }
+ 
+ static void
+-set_placement_list(uint32_t *pl, unsigned *n, uint32_t type, uint32_t flags)
++set_placement_list(struct ttm_place *pl, unsigned *n, uint32_t type, uint32_t flags)
+ {
+ 	*n = 0;
+ 
+ 	if (type & TTM_PL_FLAG_VRAM)
+-		pl[(*n)++] = TTM_PL_FLAG_VRAM | flags;
++		pl[(*n)++].flags = TTM_PL_FLAG_VRAM | flags;
+ 	if (type & TTM_PL_FLAG_TT)
+-		pl[(*n)++] = TTM_PL_FLAG_TT | flags;
++		pl[(*n)++].flags = TTM_PL_FLAG_TT | flags;
+ 	if (type & TTM_PL_FLAG_SYSTEM)
+-		pl[(*n)++] = TTM_PL_FLAG_SYSTEM | flags;
++		pl[(*n)++].flags = TTM_PL_FLAG_SYSTEM | flags;
+ }
+ 
+ static void
+@@ -268,6 +268,7 @@ set_placement_range(struct nouveau_bo *nvbo, uint32_t type)
+ 	struct nouveau_drm *drm = nouveau_bdev(nvbo->bo.bdev);
+ 	struct nouveau_fb *pfb = nouveau_fb(drm->device);
+ 	u32 vram_pages = pfb->ram->size >> PAGE_SHIFT;
++	unsigned i, fpfn, lpfn;
+ 
+ 	if (nv_device(drm->device)->card_type == NV_10 &&
+ 	    nvbo->tile_mode && (type & TTM_PL_FLAG_VRAM) &&
+@@ -279,11 +280,19 @@ set_placement_range(struct nouveau_bo *nvbo, uint32_t type)
+ 		 * at the same time.
+ 		 */
+ 		if (nvbo->tile_flags & NOUVEAU_GEM_TILE_ZETA) {
+-			nvbo->placement.fpfn = vram_pages / 2;
+-			nvbo->placement.lpfn = ~0;
++			fpfn = vram_pages / 2;
++			lpfn = ~0;
+ 		} else {
+-			nvbo->placement.fpfn = 0;
+-			nvbo->placement.lpfn = vram_pages / 2;
++			fpfn = 0;
++			lpfn = vram_pages / 2;
++		}
++		for (i = 0; i < nvbo->placement.num_placement; ++i) {
++			nvbo->placements[i].fpfn = fpfn;
++			nvbo->placements[i].lpfn = lpfn;
++		}
++		for (i = 0; i < nvbo->placement.num_busy_placement; ++i) {
++			nvbo->busy_placements[i].fpfn = fpfn;
++			nvbo->busy_placements[i].lpfn = lpfn;
+ 		}
+ 	}
+ }
+@@ -1062,12 +1071,15 @@ static int
+ nouveau_bo_move_flipd(struct ttm_buffer_object *bo, bool evict, bool intr,
+ 		      bool no_wait_gpu, struct ttm_mem_reg *new_mem)
+ {
+-	u32 placement_memtype = TTM_PL_FLAG_TT | TTM_PL_MASK_CACHING;
++	struct ttm_place placement_memtype = {
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = TTM_PL_FLAG_TT | TTM_PL_MASK_CACHING
++	};
+ 	struct ttm_placement placement;
+ 	struct ttm_mem_reg tmp_mem;
+ 	int ret;
+ 
+-	placement.fpfn = placement.lpfn = 0;
+ 	placement.num_placement = placement.num_busy_placement = 1;
+ 	placement.placement = placement.busy_placement = &placement_memtype;
+ 
+@@ -1095,12 +1107,15 @@ static int
+ nouveau_bo_move_flips(struct ttm_buffer_object *bo, bool evict, bool intr,
+ 		      bool no_wait_gpu, struct ttm_mem_reg *new_mem)
+ {
+-	u32 placement_memtype = TTM_PL_FLAG_TT | TTM_PL_MASK_CACHING;
++	struct ttm_place placement_memtype = {
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = TTM_PL_FLAG_TT | TTM_PL_MASK_CACHING
++	};
+ 	struct ttm_placement placement;
+ 	struct ttm_mem_reg tmp_mem;
+ 	int ret;
+ 
+-	placement.fpfn = placement.lpfn = 0;
+ 	placement.num_placement = placement.num_busy_placement = 1;
+ 	placement.placement = placement.busy_placement = &placement_memtype;
+ 
+@@ -1323,6 +1338,7 @@ nouveau_ttm_fault_reserve_notify(struct ttm_buffer_object *bo)
+ 	struct nouveau_bo *nvbo = nouveau_bo(bo);
+ 	struct nouveau_device *device = nv_device(drm->device);
+ 	u32 mappable = pci_resource_len(device->pdev, 1) >> PAGE_SHIFT;
++	unsigned i;
+ 
+ 	/* as long as the bo isn't in vram, and isn't tiled, we've got
+ 	 * nothing to do here.
+@@ -1337,9 +1353,16 @@ nouveau_ttm_fault_reserve_notify(struct ttm_buffer_object *bo)
+ 	if (bo->mem.start + bo->mem.num_pages < mappable)
+ 		return 0;
+ 
++	for (i = 0; i < nvbo->placement.num_placement; ++i) {
++		nvbo->placements[i].fpfn = 0;
++		nvbo->placements[i].lpfn = mappable;
++	}
++
++	for (i = 0; i < nvbo->placement.num_busy_placement; ++i) {
++		nvbo->busy_placements[i].fpfn = 0;
++		nvbo->busy_placements[i].lpfn = mappable;
++	}
+ 
+-	nvbo->placement.fpfn = 0;
+-	nvbo->placement.lpfn = mappable;
+ 	nouveau_bo_placement_set(nvbo, TTM_PL_FLAG_VRAM, 0);
+ 	return nouveau_bo_validate(nvbo, false, false);
+ }
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.h b/drivers/gpu/drm/nouveau/nouveau_bo.h
+index 653dbbb..dc14f76 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.h
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.h
+@@ -9,8 +9,8 @@ struct nouveau_bo {
+ 	struct ttm_buffer_object bo;
+ 	struct ttm_placement placement;
+ 	u32 valid_domains;
+-	u32 placements[3];
+-	u32 busy_placements[3];
++	struct ttm_place placements[3];
++	struct ttm_place busy_placements[3];
+ 	struct ttm_bo_kmap_obj kmap;
+ 	struct list_head head;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_ttm.c b/drivers/gpu/drm/nouveau/nouveau_ttm.c
+index 19e3757..cb4f13d 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_ttm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_ttm.c
+@@ -75,7 +75,7 @@ nouveau_vram_manager_del(struct ttm_mem_type_manager *man,
+ static int
+ nouveau_vram_manager_new(struct ttm_mem_type_manager *man,
+ 			 struct ttm_buffer_object *bo,
+-			 struct ttm_placement *placement,
++			 const struct ttm_place *place,
+ 			 struct ttm_mem_reg *mem)
+ {
+ 	struct nouveau_drm *drm = nouveau_bdev(man->bdev);
+@@ -161,7 +161,7 @@ nouveau_gart_manager_del(struct ttm_mem_type_manager *man,
+ static int
+ nouveau_gart_manager_new(struct ttm_mem_type_manager *man,
+ 			 struct ttm_buffer_object *bo,
+-			 struct ttm_placement *placement,
++			 const struct ttm_place *place,
+ 			 struct ttm_mem_reg *mem)
+ {
+ 	struct nouveau_drm *drm = nouveau_bdev(bo->bdev);
+@@ -240,7 +240,7 @@ nv04_gart_manager_del(struct ttm_mem_type_manager *man, struct ttm_mem_reg *mem)
+ static int
+ nv04_gart_manager_new(struct ttm_mem_type_manager *man,
+ 		      struct ttm_buffer_object *bo,
+-		      struct ttm_placement *placement,
++		      const struct ttm_place *place,
+ 		      struct ttm_mem_reg *mem)
+ {
+ 	struct nouveau_mem *node;
+diff --git a/drivers/gpu/drm/qxl/qxl_drv.h b/drivers/gpu/drm/qxl/qxl_drv.h
+index f7c9add..299a653 100644
+--- a/drivers/gpu/drm/qxl/qxl_drv.h
++++ b/drivers/gpu/drm/qxl/qxl_drv.h
+@@ -106,7 +106,7 @@ struct qxl_bo {
+ 	/* Protected by gem.mutex */
+ 	struct list_head		list;
+ 	/* Protected by tbo.reserved */
+-	u32				placements[3];
++	struct ttm_place		placements[3];
+ 	struct ttm_placement		placement;
+ 	struct ttm_buffer_object	tbo;
+ 	struct ttm_bo_kmap_obj		kmap;
+diff --git a/drivers/gpu/drm/qxl/qxl_object.c b/drivers/gpu/drm/qxl/qxl_object.c
+index 8691c76..355df40 100644
+--- a/drivers/gpu/drm/qxl/qxl_object.c
++++ b/drivers/gpu/drm/qxl/qxl_object.c
+@@ -55,21 +55,24 @@ void qxl_ttm_placement_from_domain(struct qxl_bo *qbo, u32 domain, bool pinned)
+ {
+ 	u32 c = 0;
+ 	u32 pflag = pinned ? TTM_PL_FLAG_NO_EVICT : 0;
++	unsigned i;
+ 
+-	qbo->placement.fpfn = 0;
+-	qbo->placement.lpfn = 0;
+ 	qbo->placement.placement = qbo->placements;
+ 	qbo->placement.busy_placement = qbo->placements;
+ 	if (domain == QXL_GEM_DOMAIN_VRAM)
+-		qbo->placements[c++] = TTM_PL_FLAG_CACHED | TTM_PL_FLAG_VRAM | pflag;
++		qbo->placements[c++].flags = TTM_PL_FLAG_CACHED | TTM_PL_FLAG_VRAM | pflag;
+ 	if (domain == QXL_GEM_DOMAIN_SURFACE)
+-		qbo->placements[c++] = TTM_PL_FLAG_CACHED | TTM_PL_FLAG_PRIV0 | pflag;
++		qbo->placements[c++].flags = TTM_PL_FLAG_CACHED | TTM_PL_FLAG_PRIV0 | pflag;
+ 	if (domain == QXL_GEM_DOMAIN_CPU)
+-		qbo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM | pflag;
++		qbo->placements[c++].flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM | pflag;
+ 	if (!c)
+-		qbo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++		qbo->placements[c++].flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
+ 	qbo->placement.num_placement = c;
+ 	qbo->placement.num_busy_placement = c;
++	for (i = 0; i < c; ++i) {
++		qbo->placements[i].fpfn = 0;
++		qbo->placements[i].lpfn = 0;
++	}
+ }
+ 
+ 
+@@ -261,7 +264,7 @@ int qxl_bo_unpin(struct qxl_bo *bo)
+ 	if (bo->pin_count)
+ 		return 0;
+ 	for (i = 0; i < bo->placement.num_placement; i++)
+-		bo->placements[i] &= ~TTM_PL_FLAG_NO_EVICT;
++		bo->placements[i].flags &= ~TTM_PL_FLAG_NO_EVICT;
+ 	r = ttm_bo_validate(&bo->tbo, &bo->placement, false, false);
+ 	if (unlikely(r != 0))
+ 		dev_err(qdev->dev, "%p validate failed for unpin\n", bo);
+diff --git a/drivers/gpu/drm/qxl/qxl_ttm.c b/drivers/gpu/drm/qxl/qxl_ttm.c
+index ed90fbe..850fca3 100644
+--- a/drivers/gpu/drm/qxl/qxl_ttm.c
++++ b/drivers/gpu/drm/qxl/qxl_ttm.c
+@@ -194,11 +194,13 @@ static void qxl_evict_flags(struct ttm_buffer_object *bo,
+ 				struct ttm_placement *placement)
+ {
+ 	struct qxl_bo *qbo;
+-	static u32 placements = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++	static struct ttm_place placements = {
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM
++	};
+ 
+ 	if (!qxl_ttm_bo_is_qxl_bo(bo)) {
+-		placement->fpfn = 0;
+-		placement->lpfn = 0;
+ 		placement->placement = &placements;
+ 		placement->busy_placement = &placements;
+ 		placement->num_placement = 1;
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index e98da4b..7958473 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -449,7 +449,7 @@ struct radeon_bo {
+ 	/* Protected by gem.mutex */
+ 	struct list_head		list;
+ 	/* Protected by tbo.reserved */
+-	u32				placements[3];
++	struct ttm_place		placements[3];
+ 	struct ttm_placement		placement;
+ 	struct ttm_buffer_object	tbo;
+ 	struct ttm_bo_kmap_obj		kmap;
+diff --git a/drivers/gpu/drm/radeon/radeon_object.c b/drivers/gpu/drm/radeon/radeon_object.c
+index 315b8e2..48e0a98 100644
+--- a/drivers/gpu/drm/radeon/radeon_object.c
++++ b/drivers/gpu/drm/radeon/radeon_object.c
+@@ -80,32 +80,45 @@ bool radeon_ttm_bo_is_radeon_bo(struct ttm_buffer_object *bo)
+ void radeon_ttm_placement_from_domain(struct radeon_bo *rbo, u32 domain)
+ {
+ 	u32 c = 0;
++	unsigned i;
+ 
+-	rbo->placement.fpfn = 0;
+-	rbo->placement.lpfn = 0;
+ 	rbo->placement.placement = rbo->placements;
+ 	rbo->placement.busy_placement = rbo->placements;
+ 	if (domain & RADEON_GEM_DOMAIN_VRAM)
+-		rbo->placements[c++] = TTM_PL_FLAG_WC | TTM_PL_FLAG_UNCACHED |
+-					TTM_PL_FLAG_VRAM;
++		rbo->placements[c++].flags = TTM_PL_FLAG_WC |
++					     TTM_PL_FLAG_UNCACHED |
++					     TTM_PL_FLAG_VRAM;
++
+ 	if (domain & RADEON_GEM_DOMAIN_GTT) {
+ 		if (rbo->rdev->flags & RADEON_IS_AGP) {
+-			rbo->placements[c++] = TTM_PL_FLAG_WC | TTM_PL_FLAG_TT;
++			rbo->placements[c++].flags = TTM_PL_FLAG_WC |
++						     TTM_PL_FLAG_TT;
+ 		} else {
+-			rbo->placements[c++] = TTM_PL_FLAG_CACHED | TTM_PL_FLAG_TT;
++			rbo->placements[c++].flags = TTM_PL_FLAG_CACHED |
++						     TTM_PL_FLAG_TT;
+ 		}
+ 	}
++
+ 	if (domain & RADEON_GEM_DOMAIN_CPU) {
+ 		if (rbo->rdev->flags & RADEON_IS_AGP) {
+-			rbo->placements[c++] = TTM_PL_FLAG_WC | TTM_PL_FLAG_SYSTEM;
++			rbo->placements[c++].flags = TTM_PL_FLAG_WC |
++						     TTM_PL_FLAG_SYSTEM;
+ 		} else {
+-			rbo->placements[c++] = TTM_PL_FLAG_CACHED | TTM_PL_FLAG_SYSTEM;
++			rbo->placements[c++].flags = TTM_PL_FLAG_CACHED |
++						     TTM_PL_FLAG_SYSTEM;
+ 		}
+ 	}
+ 	if (!c)
+-		rbo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++		rbo->placements[c++].flags = TTM_PL_MASK_CACHING |
++					     TTM_PL_FLAG_SYSTEM;
++
+ 	rbo->placement.num_placement = c;
+ 	rbo->placement.num_busy_placement = c;
++
++	for (i = 0; i < c; ++i) {
++		rbo->placements[i].fpfn = 0;
++		rbo->placements[i].lpfn = 0;
++	}
+ }
+ 
+ int radeon_bo_create(struct radeon_device *rdev,
+@@ -234,21 +247,22 @@ int radeon_bo_pin_restricted(struct radeon_bo *bo, u32 domain, u64 max_offset,
+ 		return 0;
+ 	}
+ 	radeon_ttm_placement_from_domain(bo, domain);
+-	if (domain == RADEON_GEM_DOMAIN_VRAM) {
++	for (i = 0; i < bo->placement.num_placement; i++) {
++		unsigned lpfn = 0;
++
+ 		/* force to pin into visible video ram */
+-		bo->placement.lpfn = bo->rdev->mc.visible_vram_size >> PAGE_SHIFT;
+-	}
+-	if (max_offset) {
+-		u64 lpfn = max_offset >> PAGE_SHIFT;
++		if (bo->placements[i].flags & TTM_PL_FLAG_VRAM)
++			lpfn = bo->rdev->mc.visible_vram_size >> PAGE_SHIFT;
++		else
++			lpfn = bo->rdev->mc.gtt_size >> PAGE_SHIFT; /* ??? */
+ 
+-		if (!bo->placement.lpfn)
+-			bo->placement.lpfn = bo->rdev->mc.gtt_size >> PAGE_SHIFT;
++		if (max_offset)
++			lpfn = min (lpfn, (unsigned)(max_offset >> PAGE_SHIFT));
+ 
+-		if (lpfn < bo->placement.lpfn)
+-			bo->placement.lpfn = lpfn;
++		bo->placements[i].lpfn = lpfn;
++		bo->placements[i].flags |= TTM_PL_FLAG_NO_EVICT;
+ 	}
+-	for (i = 0; i < bo->placement.num_placement; i++)
+-		bo->placements[i] |= TTM_PL_FLAG_NO_EVICT;
++
+ 	r = ttm_bo_validate(&bo->tbo, &bo->placement, false, false);
+ 	if (likely(r == 0)) {
+ 		bo->pin_count = 1;
+@@ -276,8 +290,10 @@ int radeon_bo_unpin(struct radeon_bo *bo)
+ 	bo->pin_count--;
+ 	if (bo->pin_count)
+ 		return 0;
+-	for (i = 0; i < bo->placement.num_placement; i++)
+-		bo->placements[i] &= ~TTM_PL_FLAG_NO_EVICT;
++	for (i = 0; i < bo->placement.num_placement; i++) {
++		bo->placements[i].lpfn = 0;
++		bo->placements[i].flags &= ~TTM_PL_FLAG_NO_EVICT;
++	}
+ 	r = ttm_bo_validate(&bo->tbo, &bo->placement, false, false);
+ 	if (unlikely(r != 0))
+ 		dev_err(bo->rdev->dev, "%p validate failed for unpin\n", bo);
+@@ -596,7 +612,7 @@ int radeon_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
+ 
+ 	/* hurrah the memory is not visible ! */
+ 	radeon_ttm_placement_from_domain(rbo, RADEON_GEM_DOMAIN_VRAM);
+-	rbo->placement.lpfn = rdev->mc.visible_vram_size >> PAGE_SHIFT;
++	rbo->placements[0].lpfn = rdev->mc.visible_vram_size >> PAGE_SHIFT;
+ 	r = ttm_bo_validate(bo, &rbo->placement, false, false);
+ 	if (unlikely(r == -ENOMEM)) {
+ 		radeon_ttm_placement_from_domain(rbo, RADEON_GEM_DOMAIN_GTT);
+diff --git a/drivers/gpu/drm/radeon/radeon_ttm.c b/drivers/gpu/drm/radeon/radeon_ttm.c
+index e632042..b72532e 100644
+--- a/drivers/gpu/drm/radeon/radeon_ttm.c
++++ b/drivers/gpu/drm/radeon/radeon_ttm.c
+@@ -176,12 +176,15 @@ static int radeon_init_mem_type(struct ttm_bo_device *bdev, uint32_t type,
+ static void radeon_evict_flags(struct ttm_buffer_object *bo,
+ 				struct ttm_placement *placement)
+ {
++	static struct ttm_place placements = {
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM
++	};
++
+ 	struct radeon_bo *rbo;
+-	static u32 placements = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
+ 
+ 	if (!radeon_ttm_bo_is_radeon_bo(bo)) {
+-		placement->fpfn = 0;
+-		placement->lpfn = 0;
+ 		placement->placement = &placements;
+ 		placement->busy_placement = &placements;
+ 		placement->num_placement = 1;
+@@ -284,20 +287,20 @@ static int radeon_move_vram_ram(struct ttm_buffer_object *bo,
+ 	struct radeon_device *rdev;
+ 	struct ttm_mem_reg *old_mem = &bo->mem;
+ 	struct ttm_mem_reg tmp_mem;
+-	u32 placements;
++	struct ttm_place placements;
+ 	struct ttm_placement placement;
+ 	int r;
+ 
+ 	rdev = radeon_get_rdev(bo->bdev);
+ 	tmp_mem = *new_mem;
+ 	tmp_mem.mm_node = NULL;
+-	placement.fpfn = 0;
+-	placement.lpfn = 0;
+ 	placement.num_placement = 1;
+ 	placement.placement = &placements;
+ 	placement.num_busy_placement = 1;
+ 	placement.busy_placement = &placements;
+-	placements = TTM_PL_MASK_CACHING | TTM_PL_FLAG_TT;
++	placements.fpfn = 0;
++	placements.lpfn = 0;
++	placements.flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_TT;
+ 	r = ttm_bo_mem_space(bo, &placement, &tmp_mem,
+ 			     interruptible, no_wait_gpu);
+ 	if (unlikely(r)) {
+@@ -332,19 +335,19 @@ static int radeon_move_ram_vram(struct ttm_buffer_object *bo,
+ 	struct ttm_mem_reg *old_mem = &bo->mem;
+ 	struct ttm_mem_reg tmp_mem;
+ 	struct ttm_placement placement;
+-	u32 placements;
++	struct ttm_place placements;
+ 	int r;
+ 
+ 	rdev = radeon_get_rdev(bo->bdev);
+ 	tmp_mem = *new_mem;
+ 	tmp_mem.mm_node = NULL;
+-	placement.fpfn = 0;
+-	placement.lpfn = 0;
+ 	placement.num_placement = 1;
+ 	placement.placement = &placements;
+ 	placement.num_busy_placement = 1;
+ 	placement.busy_placement = &placements;
+-	placements = TTM_PL_MASK_CACHING | TTM_PL_FLAG_TT;
++	placements.fpfn = 0;
++	placements.lpfn = 0;
++	placements.flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_TT;
+ 	r = ttm_bo_mem_space(bo, &placement, &tmp_mem,
+ 			     interruptible, no_wait_gpu);
+ 	if (unlikely(r)) {
+diff --git a/drivers/gpu/drm/radeon/radeon_uvd.c b/drivers/gpu/drm/radeon/radeon_uvd.c
+index 77976b6..57ba5ae 100644
+--- a/drivers/gpu/drm/radeon/radeon_uvd.c
++++ b/drivers/gpu/drm/radeon/radeon_uvd.c
+@@ -237,8 +237,12 @@ int radeon_uvd_resume(struct radeon_device *rdev)
+ 
+ void radeon_uvd_force_into_uvd_segment(struct radeon_bo *rbo)
+ {
+-	rbo->placement.fpfn = 0 >> PAGE_SHIFT;
+-	rbo->placement.lpfn = (256 * 1024 * 1024) >> PAGE_SHIFT;
++	int i;
++
++	for (i = 0; i < rbo->placement.num_placement; ++i) {
++		rbo->placements[i].fpfn = 0 >> PAGE_SHIFT;
++		rbo->placements[i].lpfn = (256 * 1024 * 1024) >> PAGE_SHIFT;
++	}
+ }
+ 
+ void radeon_uvd_free_handles(struct radeon_device *rdev, struct drm_file *filp)
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index acd0fe0..5b2c3cc 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -53,12 +53,13 @@ static struct attribute ttm_bo_count = {
+ 	.mode = S_IRUGO
+ };
+ 
+-static inline int ttm_mem_type_from_flags(uint32_t flags, uint32_t *mem_type)
++static inline int ttm_mem_type_from_place(const struct ttm_place *place,
++					  uint32_t *mem_type)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i <= TTM_PL_PRIV5; i++)
+-		if (flags & (1 << i)) {
++		if (place->flags & (1 << i)) {
+ 			*mem_type = i;
+ 			return 0;
+ 		}
+@@ -89,12 +90,12 @@ static void ttm_bo_mem_space_debug(struct ttm_buffer_object *bo,
+ 	       bo, bo->mem.num_pages, bo->mem.size >> 10,
+ 	       bo->mem.size >> 20);
+ 	for (i = 0; i < placement->num_placement; i++) {
+-		ret = ttm_mem_type_from_flags(placement->placement[i],
++		ret = ttm_mem_type_from_place(&placement->placement[i],
+ 						&mem_type);
+ 		if (ret)
+ 			return;
+ 		pr_err("  placement[%d]=0x%08X (%d)\n",
+-		       i, placement->placement[i], mem_type);
++		       i, placement->placement[i].flags, mem_type);
+ 		ttm_mem_type_debug(bo->bdev, mem_type);
+ 	}
+ }
+@@ -673,8 +674,6 @@ static int ttm_bo_evict(struct ttm_buffer_object *bo, bool interruptible,
+ 	evict_mem.bus.io_reserved_vm = false;
+ 	evict_mem.bus.io_reserved_count = 0;
+ 
+-	placement.fpfn = 0;
+-	placement.lpfn = 0;
+ 	placement.num_placement = 0;
+ 	placement.num_busy_placement = 0;
+ 	bdev->driver->evict_flags(bo, &placement);
+@@ -762,7 +761,7 @@ EXPORT_SYMBOL(ttm_bo_mem_put);
+  */
+ static int ttm_bo_mem_force_space(struct ttm_buffer_object *bo,
+ 					uint32_t mem_type,
+-					struct ttm_placement *placement,
++					const struct ttm_place *placement,
+ 					struct ttm_mem_reg *mem,
+ 					bool interruptible,
+ 					bool no_wait_gpu)
+@@ -815,18 +814,18 @@ static uint32_t ttm_bo_select_caching(struct ttm_mem_type_manager *man,
+ 
+ static bool ttm_bo_mt_compatible(struct ttm_mem_type_manager *man,
+ 				 uint32_t mem_type,
+-				 uint32_t proposed_placement,
++				 const struct ttm_place *place,
+ 				 uint32_t *masked_placement)
+ {
+ 	uint32_t cur_flags = ttm_bo_type_flags(mem_type);
+ 
+-	if ((cur_flags & proposed_placement & TTM_PL_MASK_MEM) == 0)
++	if ((cur_flags & place->flags & TTM_PL_MASK_MEM) == 0)
+ 		return false;
+ 
+-	if ((proposed_placement & man->available_caching) == 0)
++	if ((place->flags & man->available_caching) == 0)
+ 		return false;
+ 
+-	cur_flags |= (proposed_placement & man->available_caching);
++	cur_flags |= (place->flags & man->available_caching);
+ 
+ 	*masked_placement = cur_flags;
+ 	return true;
+@@ -857,15 +856,14 @@ int ttm_bo_mem_space(struct ttm_buffer_object *bo,
+ 
+ 	mem->mm_node = NULL;
+ 	for (i = 0; i < placement->num_placement; ++i) {
+-		ret = ttm_mem_type_from_flags(placement->placement[i],
++		ret = ttm_mem_type_from_place(&placement->placement[i],
+ 						&mem_type);
+ 		if (ret)
+ 			return ret;
+ 		man = &bdev->man[mem_type];
+ 
+-		type_ok = ttm_bo_mt_compatible(man,
+-						mem_type,
+-						placement->placement[i],
++		type_ok = ttm_bo_mt_compatible(man, mem_type,
++						&placement->placement[i],
+ 						&cur_flags);
+ 
+ 		if (!type_ok)
+@@ -877,7 +875,7 @@ int ttm_bo_mem_space(struct ttm_buffer_object *bo,
+ 		 * Use the access and other non-mapping-related flag bits from
+ 		 * the memory placement flags to the current flags
+ 		 */
+-		ttm_flag_masked(&cur_flags, placement->placement[i],
++		ttm_flag_masked(&cur_flags, placement->placement[i].flags,
+ 				~TTM_PL_MASK_MEMTYPE);
+ 
+ 		if (mem_type == TTM_PL_SYSTEM)
+@@ -885,7 +883,7 @@ int ttm_bo_mem_space(struct ttm_buffer_object *bo,
+ 
+ 		if (man->has_type && man->use_type) {
+ 			type_found = true;
+-			ret = (*man->func->get_node)(man, bo, placement, mem);
++			ret = (*man->func->get_node)(man, bo, &placement->placement[i], mem);
+ 			if (unlikely(ret))
+ 				return ret;
+ 		}
+@@ -903,17 +901,16 @@ int ttm_bo_mem_space(struct ttm_buffer_object *bo,
+ 		return -EINVAL;
+ 
+ 	for (i = 0; i < placement->num_busy_placement; ++i) {
+-		ret = ttm_mem_type_from_flags(placement->busy_placement[i],
++		ret = ttm_mem_type_from_place(&placement->busy_placement[i],
+ 						&mem_type);
+ 		if (ret)
+ 			return ret;
+ 		man = &bdev->man[mem_type];
+ 		if (!man->has_type)
+ 			continue;
+-		if (!ttm_bo_mt_compatible(man,
+-						mem_type,
+-						placement->busy_placement[i],
+-						&cur_flags))
++		if (!ttm_bo_mt_compatible(man, mem_type,
++					  &placement->busy_placement[i],
++					  &cur_flags))
+ 			continue;
+ 
+ 		cur_flags = ttm_bo_select_caching(man, bo->mem.placement,
+@@ -922,7 +919,7 @@ int ttm_bo_mem_space(struct ttm_buffer_object *bo,
+ 		 * Use the access and other non-mapping-related flag bits from
+ 		 * the memory placement flags to the current flags
+ 		 */
+-		ttm_flag_masked(&cur_flags, placement->busy_placement[i],
++		ttm_flag_masked(&cur_flags, placement->busy_placement[i].flags,
+ 				~TTM_PL_MASK_MEMTYPE);
+ 
+ 
+@@ -933,7 +930,7 @@ int ttm_bo_mem_space(struct ttm_buffer_object *bo,
+ 			return 0;
+ 		}
+ 
+-		ret = ttm_bo_mem_force_space(bo, mem_type, placement, mem,
++		ret = ttm_bo_mem_force_space(bo, mem_type, &placement->busy_placement[i], mem,
+ 						interruptible, no_wait_gpu);
+ 		if (ret == 0 && mem->mm_node) {
+ 			mem->placement = cur_flags;
+@@ -994,20 +991,27 @@ static bool ttm_bo_mem_compat(struct ttm_placement *placement,
+ {
+ 	int i;
+ 
+-	if (mem->mm_node && placement->lpfn != 0 &&
+-	    (mem->start < placement->fpfn ||
+-	     mem->start + mem->num_pages > placement->lpfn))
+-		return false;
+-
+ 	for (i = 0; i < placement->num_placement; i++) {
+-		*new_flags = placement->placement[i];
++		const struct ttm_place *heap = &placement->placement[i];
++		if (mem->mm_node && heap->lpfn != 0 &&
++		    (mem->start < heap->fpfn ||
++		     mem->start + mem->num_pages > heap->lpfn))
++			continue;
++
++		*new_flags = heap->flags;
+ 		if ((*new_flags & mem->placement & TTM_PL_MASK_CACHING) &&
+ 		    (*new_flags & mem->placement & TTM_PL_MASK_MEM))
+ 			return true;
+ 	}
+ 
+ 	for (i = 0; i < placement->num_busy_placement; i++) {
+-		*new_flags = placement->busy_placement[i];
++		const struct ttm_place *heap = &placement->busy_placement[i];
++		if (mem->mm_node && heap->lpfn != 0 &&
++		    (mem->start < heap->fpfn ||
++		     mem->start + mem->num_pages > heap->lpfn))
++			continue;
++
++		*new_flags = heap->flags;
+ 		if ((*new_flags & mem->placement & TTM_PL_MASK_CACHING) &&
+ 		    (*new_flags & mem->placement & TTM_PL_MASK_MEM))
+ 			return true;
+@@ -1025,11 +1029,6 @@ int ttm_bo_validate(struct ttm_buffer_object *bo,
+ 	uint32_t new_flags;
+ 
+ 	lockdep_assert_held(&bo->resv->lock.base);
+-	/* Check that range is valid */
+-	if (placement->lpfn || placement->fpfn)
+-		if (placement->fpfn > placement->lpfn ||
+-			(placement->lpfn - placement->fpfn) < bo->num_pages)
+-			return -EINVAL;
+ 	/*
+ 	 * Check whether we need to move buffer.
+ 	 */
+@@ -1058,15 +1057,6 @@ int ttm_bo_validate(struct ttm_buffer_object *bo,
+ }
+ EXPORT_SYMBOL(ttm_bo_validate);
+ 
+-int ttm_bo_check_placement(struct ttm_buffer_object *bo,
+-				struct ttm_placement *placement)
+-{
+-	BUG_ON((placement->fpfn || placement->lpfn) &&
+-	       (bo->mem.num_pages > (placement->lpfn - placement->fpfn)));
+-
+-	return 0;
+-}
+-
+ int ttm_bo_init(struct ttm_bo_device *bdev,
+ 		struct ttm_buffer_object *bo,
+ 		unsigned long size,
+@@ -1134,15 +1124,12 @@ int ttm_bo_init(struct ttm_bo_device *bdev,
+ 	atomic_inc(&bo->glob->bo_count);
+ 	drm_vma_node_reset(&bo->vma_node);
+ 
+-	ret = ttm_bo_check_placement(bo, placement);
+-
+ 	/*
+ 	 * For ttm_bo_type_device buffers, allocate
+ 	 * address space from the device.
+ 	 */
+-	if (likely(!ret) &&
+-	    (bo->type == ttm_bo_type_device ||
+-	     bo->type == ttm_bo_type_sg))
++	if (bo->type == ttm_bo_type_device ||
++	    bo->type == ttm_bo_type_sg)
+ 		ret = drm_vma_offset_add(&bdev->vma_manager, &bo->vma_node,
+ 					 bo->mem.num_pages);
+ 
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_manager.c b/drivers/gpu/drm/ttm/ttm_bo_manager.c
+index c58eba33..9abf92c 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_manager.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_manager.c
+@@ -49,7 +49,7 @@ struct ttm_range_manager {
+ 
+ static int ttm_bo_man_get_node(struct ttm_mem_type_manager *man,
+ 			       struct ttm_buffer_object *bo,
+-			       struct ttm_placement *placement,
++			       const struct ttm_place *placement,
+ 			       struct ttm_mem_reg *mem)
+ {
+ 	struct ttm_range_manager *rman = (struct ttm_range_manager *) man->priv;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c b/drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c
+index 96dc84d..c6c2f2c 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c
+@@ -30,59 +30,89 @@
+ #include <drm/ttm/ttm_placement.h>
+ #include <drm/ttm/ttm_page_alloc.h>
+ 
+-static uint32_t vram_placement_flags = TTM_PL_FLAG_VRAM |
+-	TTM_PL_FLAG_CACHED;
+-
+-static uint32_t vram_ne_placement_flags = TTM_PL_FLAG_VRAM |
+-	TTM_PL_FLAG_CACHED |
+-	TTM_PL_FLAG_NO_EVICT;
++static struct ttm_place vram_placement_flags = {
++	.fpfn = 0,
++	.lpfn = 0,
++	.flags = TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED
++};
+ 
+-static uint32_t sys_placement_flags = TTM_PL_FLAG_SYSTEM |
+-	TTM_PL_FLAG_CACHED;
++static struct ttm_place vram_ne_placement_flags = {
++	.fpfn = 0,
++	.lpfn = 0,
++	.flags = TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED | TTM_PL_FLAG_NO_EVICT
++};
+ 
+-static uint32_t gmr_placement_flags = VMW_PL_FLAG_GMR |
+-	TTM_PL_FLAG_CACHED;
++static struct ttm_place sys_placement_flags = {
++	.fpfn = 0,
++	.lpfn = 0,
++	.flags = TTM_PL_FLAG_SYSTEM | TTM_PL_FLAG_CACHED
++};
+ 
+-static uint32_t gmr_ne_placement_flags = VMW_PL_FLAG_GMR |
+-	TTM_PL_FLAG_CACHED |
+-	TTM_PL_FLAG_NO_EVICT;
++static struct ttm_place gmr_placement_flags = {
++	.fpfn = 0,
++	.lpfn = 0,
++	.flags = VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED
++};
+ 
+-struct ttm_placement vmw_vram_placement = {
++static struct ttm_place gmr_ne_placement_flags = {
+ 	.fpfn = 0,
+ 	.lpfn = 0,
++	.flags = VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED | TTM_PL_FLAG_NO_EVICT
++};
++
++struct ttm_placement vmw_vram_placement = {
+ 	.num_placement = 1,
+ 	.placement = &vram_placement_flags,
+ 	.num_busy_placement = 1,
+ 	.busy_placement = &vram_placement_flags
+ };
+ 
+-static uint32_t vram_gmr_placement_flags[] = {
+-	TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED,
+-	VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED
++static struct ttm_place vram_gmr_placement_flags[] = {
++	{
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED
++	}, {
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED
++	}
+ };
+ 
+-static uint32_t gmr_vram_placement_flags[] = {
+-	VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED,
+-	TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED
++static struct ttm_place gmr_vram_placement_flags[] = {
++	{
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED
++	}, {
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED
++	}
+ };
+ 
+ struct ttm_placement vmw_vram_gmr_placement = {
+-	.fpfn = 0,
+-	.lpfn = 0,
+ 	.num_placement = 2,
+ 	.placement = vram_gmr_placement_flags,
+ 	.num_busy_placement = 1,
+ 	.busy_placement = &gmr_placement_flags
+ };
+ 
+-static uint32_t vram_gmr_ne_placement_flags[] = {
+-	TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED | TTM_PL_FLAG_NO_EVICT,
+-	VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED | TTM_PL_FLAG_NO_EVICT
++static struct ttm_place vram_gmr_ne_placement_flags[] = {
++	{
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED |
++			 TTM_PL_FLAG_NO_EVICT
++	}, {
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED |
++			 TTM_PL_FLAG_NO_EVICT
++	}
+ };
+ 
+ struct ttm_placement vmw_vram_gmr_ne_placement = {
+-	.fpfn = 0,
+-	.lpfn = 0,
+ 	.num_placement = 2,
+ 	.placement = vram_gmr_ne_placement_flags,
+ 	.num_busy_placement = 1,
+@@ -90,8 +120,6 @@ struct ttm_placement vmw_vram_gmr_ne_placement = {
+ };
+ 
+ struct ttm_placement vmw_vram_sys_placement = {
+-	.fpfn = 0,
+-	.lpfn = 0,
+ 	.num_placement = 1,
+ 	.placement = &vram_placement_flags,
+ 	.num_busy_placement = 1,
+@@ -99,8 +127,6 @@ struct ttm_placement vmw_vram_sys_placement = {
+ };
+ 
+ struct ttm_placement vmw_vram_ne_placement = {
+-	.fpfn = 0,
+-	.lpfn = 0,
+ 	.num_placement = 1,
+ 	.placement = &vram_ne_placement_flags,
+ 	.num_busy_placement = 1,
+@@ -108,23 +134,29 @@ struct ttm_placement vmw_vram_ne_placement = {
+ };
+ 
+ struct ttm_placement vmw_sys_placement = {
+-	.fpfn = 0,
+-	.lpfn = 0,
+ 	.num_placement = 1,
+ 	.placement = &sys_placement_flags,
+ 	.num_busy_placement = 1,
+ 	.busy_placement = &sys_placement_flags
+ };
+ 
+-static uint32_t evictable_placement_flags[] = {
+-	TTM_PL_FLAG_SYSTEM | TTM_PL_FLAG_CACHED,
+-	TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED,
+-	VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED
++static struct ttm_place evictable_placement_flags[] = {
++	{
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = TTM_PL_FLAG_SYSTEM | TTM_PL_FLAG_CACHED
++	}, {
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED
++	}, {
++		.fpfn = 0,
++		.lpfn = 0,
++		.flags = VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED
++	}
+ };
+ 
+ struct ttm_placement vmw_evictable_placement = {
+-	.fpfn = 0,
+-	.lpfn = 0,
+ 	.num_placement = 3,
+ 	.placement = evictable_placement_flags,
+ 	.num_busy_placement = 1,
+@@ -132,8 +164,6 @@ struct ttm_placement vmw_evictable_placement = {
+ };
+ 
+ struct ttm_placement vmw_srf_placement = {
+-	.fpfn = 0,
+-	.lpfn = 0,
+ 	.num_placement = 1,
+ 	.num_busy_placement = 2,
+ 	.placement = &gmr_placement_flags,
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c b/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
+index d4e54fc..a22346d 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
+@@ -201,13 +201,19 @@ int vmw_dmabuf_to_start_of_vram(struct vmw_private *dev_priv,
+ 	struct vmw_master *vmaster = dev_priv->active_master;
+ 	struct ttm_buffer_object *bo = &buf->base;
+ 	struct ttm_placement placement;
++	struct ttm_place place;
+ 	int ret = 0;
+ 
+ 	if (pin)
+-		placement = vmw_vram_ne_placement;
++		place = vmw_vram_ne_placement.placement[0];
+ 	else
+-		placement = vmw_vram_placement;
+-	placement.lpfn = bo->num_pages;
++		place = vmw_vram_placement.placement[0];
++	place.lpfn = bo->num_pages;
++
++	placement.num_placement = 1;
++	placement.placement = &place;
++	placement.num_busy_placement = 1;
++	placement.busy_placement = &place;
+ 
+ 	ret = ttm_write_lock(&vmaster->lock, interruptible);
+ 	if (unlikely(ret != 0))
+@@ -297,7 +303,7 @@ void vmw_bo_get_guest_ptr(const struct ttm_buffer_object *bo,
+  */
+ void vmw_bo_pin(struct ttm_buffer_object *bo, bool pin)
+ {
+-	uint32_t pl_flags;
++	struct ttm_place pl;
+ 	struct ttm_placement placement;
+ 	uint32_t old_mem_type = bo->mem.mem_type;
+ 	int ret;
+@@ -306,13 +312,15 @@ void vmw_bo_pin(struct ttm_buffer_object *bo, bool pin)
+ 	BUG_ON(old_mem_type != TTM_PL_VRAM &&
+ 	       old_mem_type != VMW_PL_GMR);
+ 
+-	pl_flags = TTM_PL_FLAG_VRAM | VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED;
++	pl.fpfn = 0;
++	pl.lpfn = 0;
++	pl.flags = TTM_PL_FLAG_VRAM | VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED;
+ 	if (pin)
+-		pl_flags |= TTM_PL_FLAG_NO_EVICT;
++		pl.flags |= TTM_PL_FLAG_NO_EVICT;
+ 
+ 	memset(&placement, 0, sizeof(placement));
+ 	placement.num_placement = 1;
+-	placement.placement = &pl_flags;
++	placement.placement = &pl;
+ 
+ 	ret = ttm_bo_validate(bo, &placement, false, true);
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
+index 1b0f34b..b26a92c 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
+@@ -374,10 +374,16 @@ static int vmw_fb_create_bo(struct vmw_private *vmw_priv,
+ 			    size_t size, struct vmw_dma_buffer **out)
+ {
+ 	struct vmw_dma_buffer *vmw_bo;
+-	struct ttm_placement ne_placement = vmw_vram_ne_placement;
++	struct ttm_place ne_place = vmw_vram_ne_placement.placement[0];
++	struct ttm_placement ne_placement;
+ 	int ret;
+ 
+-	ne_placement.lpfn = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
++	ne_placement.num_placement = 1;
++	ne_placement.placement = &ne_place;
++	ne_placement.num_busy_placement = 1;
++	ne_placement.busy_placement = &ne_place;
++
++	ne_place.lpfn = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ 
+ 	/* interuptable? */
+ 	ret = ttm_write_lock(&vmw_priv->fbdev_master.lock, false);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_gmrid_manager.c b/drivers/gpu/drm/vmwgfx/vmwgfx_gmrid_manager.c
+index c5c054a..f2a3b18 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_gmrid_manager.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_gmrid_manager.c
+@@ -46,7 +46,7 @@ struct vmwgfx_gmrid_man {
+ 
+ static int vmw_gmrid_man_get_node(struct ttm_mem_type_manager *man,
+ 				  struct ttm_buffer_object *bo,
+-				  struct ttm_placement *placement,
++				  const struct ttm_place *place,
+ 				  struct ttm_mem_reg *mem)
+ {
+ 	struct vmwgfx_gmrid_man *gman =
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index 751eaff..809830f 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -45,12 +45,24 @@ struct ttm_bo_device;
+ 
+ struct drm_mm_node;
+ 
++/**
++ * struct ttm_place
++ *
++ * @fpfn:	first valid page frame number to put the object
++ * @lpfn:	last valid page frame number to put the object
++ * @flags:	memory domain and caching flags for the object
++ *
++ * Structure indicating a possible place to put an object.
++ */
++struct ttm_place {
++	unsigned	fpfn;
++	unsigned	lpfn;
++	uint32_t	flags;
++};
+ 
+ /**
+  * struct ttm_placement
+  *
+- * @fpfn:		first valid page frame number to put the object
+- * @lpfn:		last valid page frame number to put the object
+  * @num_placement:	number of preferred placements
+  * @placement:		preferred placements
+  * @num_busy_placement:	number of preferred placements when need to evict buffer
+@@ -59,12 +71,10 @@ struct drm_mm_node;
+  * Structure indicating the placement you request for an object.
+  */
+ struct ttm_placement {
+-	unsigned	fpfn;
+-	unsigned	lpfn;
+-	unsigned	num_placement;
+-	const uint32_t	*placement;
+-	unsigned	num_busy_placement;
+-	const uint32_t	*busy_placement;
++	unsigned		num_placement;
++	const struct ttm_place	*placement;
++	unsigned		num_busy_placement;
++	const struct ttm_place	*busy_placement;
+ };
+ 
+ /**
+@@ -518,20 +528,6 @@ extern int ttm_bo_create(struct ttm_bo_device *bdev,
+ 				struct ttm_buffer_object **p_bo);
+ 
+ /**
+- * ttm_bo_check_placement
+- *
+- * @bo:		the buffer object.
+- * @placement:	placements
+- *
+- * Performs minimal validity checking on an intended change of
+- * placement flags.
+- * Returns
+- * -EINVAL: Intended change is invalid or not allowed.
+- */
+-extern int ttm_bo_check_placement(struct ttm_buffer_object *bo,
+-					struct ttm_placement *placement);
+-
+-/**
+  * ttm_bo_init_mm
+  *
+  * @bdev: Pointer to a ttm_bo_device struct.
+diff --git a/include/drm/ttm/ttm_bo_driver.h b/include/drm/ttm/ttm_bo_driver.h
+index 8639c85..c7dc02f 100644
+--- a/include/drm/ttm/ttm_bo_driver.h
++++ b/include/drm/ttm/ttm_bo_driver.h
+@@ -205,7 +205,7 @@ struct ttm_mem_type_manager_func {
+ 	 */
+ 	int  (*get_node)(struct ttm_mem_type_manager *man,
+ 			 struct ttm_buffer_object *bo,
+-			 struct ttm_placement *placement,
++			 const struct ttm_place *place,
+ 			 struct ttm_mem_reg *mem);
+ 
+ 	/**
+-- 
+1.9.1
+

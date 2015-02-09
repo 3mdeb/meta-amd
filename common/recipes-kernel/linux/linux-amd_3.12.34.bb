@@ -62,6 +62,14 @@ SRC_URI = "https://www.kernel.org/pub/linux/kernel/v3.x/linux-${PV}.tar.xz;name=
            file://0053-ACPI-Set-acpi_enforce_resources-to-ENFORCE_RESOURCES.patch;striplevel=1 \
            file://0059-yocto-amd-staging-add-support-to-enable-and-disable-.patch;striplevel=1 \
            file://0060-yocto-amd-i2c-dev-add-calls-to-enable-and-disable-IM.patch;striplevel=1 \
+	   file://0061-drm-radeon-dpm-updates-for-KV-KB.patch;striplevel=1 \
+	   file://0062-drm-radeon-dpm-select-the-appropriate-vce-power-stat.patch;striplevel=1 \
+	   file://0063-drm-ttm-move-fpfn-and-lpfn-into-each-placement.patch;striplevel=1 \
+	   file://0064-drm-radeon-allow-UVD-to-use-a-second-256MB-segment.patch;striplevel=1 \
+	   file://0065-drm-crtc-helper-don-t-disable-disconnected-outputs.patch;striplevel=1 \
+	   file://0066-drm-radeon-dpm-fix-resume-on-mullins.patch;striplevel=1 \
+	   file://0067-drm-radeon-disable-dynamic-powering-uvd.patch;striplevel=1 \
+	   file://0068-drm-radeon-increase-uvd-ring-buffer-sizes.patch;striplevel=1 \
  	   file://logo.cfg \
            file://console.cfg \
            file://logitech.cfg \
