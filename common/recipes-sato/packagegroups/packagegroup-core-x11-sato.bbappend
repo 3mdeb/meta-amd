@@ -1,2 +1,1 @@
-RDEPENDS_${PN}-apps_remove := "${@base_contains("DISTRO", "mel-lite", "gaku", "", d)}"
-
+RDEPENDS_${PN}-apps_remove := "${@bb.utils.contains("DISTRO", "mel", "", "gaku", d)}"

@@ -32,6 +32,9 @@ SRC_URI_append_amd += " \
 	   file://0009-omxvideodec-fix-startup-race-condition.patch \
 	   file://0010-omxvideoenc-fix-startup-race-condition.patch \
 	   file://0011-omx-fix-two-serious-message-handling-bugs.patch \
+	   file://0012-gstomxvideoenc-implement-capture-configuration-suppo.patch \
+	   file://0013-gstomxvideoenc-add-capture-geometry-support.patch \
+	   file://0014-gstomxvideoenc-reduce-shutdown-timeout-for-tunnellin.patch \
 	   file://0001-Adjust-gstomx.conf-for-Radeon.patch \
 	  "
 
