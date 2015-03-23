@@ -1,8 +1,5 @@
-SRCREV_amd = "9f1149876f2d010c871751a53d02d4d2b6aef1fe"
-LIC_FILES_CHKSUM_amd = "file://docs/license.html;md5=6a23445982a7a972ac198e93cc1cb3de"
-PV_amd = "10.2.0+git${SRCPV}"
 DEPENDS_append_amd = " libvdpau"
-PACKAGECONFIG_append_amd = " xvmc openvg gallium gallium-egl gallium-gbm r600"
+PACKAGECONFIG_append_amd = " xvmc gallium r600"
 PACKAGECONFIG_append_amd = " gallium-llvm"
 MESA_LLVM_RELEASE_amd = "3.4"
 
@@ -14,8 +11,6 @@ python __anonymous () {
 
 # Install the demos onto the target
 RRECOMMENDS_libgl-mesa_append_amd = " mesa-demos"
-
-SRC_URI_amd = "git://anongit.freedesktop.org/git/mesa/mesa;branch=10.2"
 
 DEPENDS_append_amd = " libomxil"
 EXTRA_OECONF_append_amd = " \

@@ -23,8 +23,7 @@ SRC_URI = " \
 
 S = "${WORKDIR}/git"
 
-RDEPENDS_${PN} += "libgbm-gallium \
-		   mesa-driver-radeon \
+RDEPENDS_${PN} += "mesa-driver-radeon \
 		   mesa-driver-radeonsi \
 		   mesa-driver-swrast \
 "
