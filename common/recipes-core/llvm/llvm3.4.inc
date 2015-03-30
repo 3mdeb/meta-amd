@@ -47,3 +47,7 @@ do_install() {
     install -d ${D}${docdir}/${LLVM_DIR}
     mv ${LLVM_INSTALL_DIR}${prefix}/docs/llvm/* ${D}${docdir}/${LLVM_DIR}
 }
+
+llvm_sysroot_preprocess_append_amd() {
+    ln -sf ${SYSROOT_DESTDIR}${bindir_crossscripts}/llvm-config${PV} ${SYSROOT_DESTDIR}${bindir_crossscripts}/llvm-config${PREFERRED_VERSION_llvm}
+}
