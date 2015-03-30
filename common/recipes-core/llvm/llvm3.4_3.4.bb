@@ -3,7 +3,7 @@ require llvm3.4.inc
 
 LIC_FILES_CHKSUM = "file://LICENSE.TXT;md5=71df953c321b5b31ae94316a7fb6a7f3"
 
-DEPENDS += "zlib"
+DEPENDS += "zlib ncurses"
 EXTRA_OECONF += "--enable-zlib"
 
 S = "${WORKDIR}/llvm-${PV}"
