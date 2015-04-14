@@ -3,6 +3,15 @@ PACKAGECONFIG_append_amd = " xvmc gallium r600"
 PACKAGECONFIG_append_amd = " gallium-llvm"
 MESA_LLVM_RELEASE_amd = "3.4"
 
+#
+# Use the "--enable-llvm-shared-libs" option rather than
+# "--with-llvm-shared-libs".  This is fixed in the poky
+# master version of mesa.inc so rather than do something
+# smart, we'll just completely override the setting here.
+#
+PACKAGECONFIG[gallium-llvm] = "--enable-gallium-llvm --enable-llvm-shared-libs, --disable-gallium-llvm, llvm${MESA_LLVM_RELEASE} \
+                               ${@'elfutils' if ${GALLIUMDRIVERS_LLVM33_ENABLED} else ''}"
+
 # Set DRIDRIVERS with anonymous python so we can effectively
 # override the _append_x86-64 assignement from mesa.inc.
 python __anonymous () {
