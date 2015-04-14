@@ -2,7 +2,7 @@ SRCREV_amd = "9f1149876f2d010c871751a53d02d4d2b6aef1fe"
 LIC_FILES_CHKSUM_amd = "file://docs/license.html;md5=6a23445982a7a972ac198e93cc1cb3de"
 PV_amd = "10.2.0+git${SRCPV}"
 DEPENDS_append_amd = " libvdpau"
-PACKAGECONFIG_append_amd = " xvmc openvg gallium gallium-egl gallium-gbm r600"
+PACKAGECONFIG_append_amd = " xvmc gallium gallium-egl gallium-gbm r600"
 PACKAGECONFIG_append_amd = " gallium-llvm"
 MESA_LLVM_RELEASE_amd = "3.4"
 
