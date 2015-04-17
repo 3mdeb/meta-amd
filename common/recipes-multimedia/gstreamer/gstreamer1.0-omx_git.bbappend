@@ -26,10 +26,12 @@ SRC_URI_append_amd = " \
 	   file://0012-gstomxvideoenc-implement-capture-configuration-suppo.patch \
 	   file://0013-gstomxvideoenc-add-capture-geometry-support.patch \
 	   file://0014-gstomxvideoenc-reduce-shutdown-timeout-for-tunnellin.patch \
-	   file://0001-Adjust-gstomx.conf-for-Radeon.patch \
 	  "
 
 SRCREV_amd = "c44cd849400b90f5f4b1f4f429278d9685b1daca"
+
+SRC_URI_append_steppeeagle += " file://0001-Adjust-gstomx.conf-for-Radeon.patch"
+SRC_URI_append_baldeagle += " file://0001-Adjust-gstomx.conf-for-Radeon.patch"
 
 PV .= "+git${SRCPV}"
 
