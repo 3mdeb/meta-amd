@@ -72,7 +72,7 @@ SRC_URI = "https://www.kernel.org/pub/linux/kernel/v3.x/linux-${PV}.tar.xz;name=
 	   file://0068-drm-radeon-increase-uvd-ring-buffer-sizes.patch;striplevel=1 \
  	   file://logo.cfg \
            file://console.cfg \
-           file://logitech.cfg \
+           file://hid.cfg \
            file://efi-partition.cfg \
            file://sound.cfg \
            ${@bb.utils.contains("DISTRO_FEATURES", "bluetooth", "file://bluetooth.cfg", "", d)} \
