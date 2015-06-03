@@ -7,3 +7,6 @@ SRC_URI_append_amd = " file://consolidate-startup-scripts.patch \
 		       file://avoid-specifically-starting-PA-rely-on-autospawn.patch \
 "
 
+SRC_URI_append_amd = " file://disable_autospawn_by_default.patch \
+"
+
