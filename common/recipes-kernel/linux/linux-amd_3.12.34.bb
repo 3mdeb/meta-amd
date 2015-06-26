@@ -80,6 +80,16 @@ SRC_URI = "https://www.kernel.org/pub/linux/kernel/v3.x/linux-${PV}.tar.xz;name=
            ${@bb.utils.contains("DISTRO", "mel", "", "file://disable-kgdb.cfg", d)} \
            file://disable-sata-pmp.cfg \
            file://usb-serial.cfg \
+           file://kernel-isofs-CVE-2014-9420.patch \
+           file://kernel-isofs-CVE-2014-9584.patch \
+           file://kernel-ttusb-dec-CVE-2014-8884.patch \
+           file://security-keys-CVE-2014-9529.patch \
+           file://disable-generic-tracking-for-known-protocols-fix-CVE-2014-8160.patch \
+           file://CVE-2014-8989/0004-groups-Consolidate-the-setgroups-permission-checks.patch \
+           file://CVE-2014-8989/0005-userns-Document-what-the-invariant-required-for-safe.patch \
+           file://CVE-2014-8989/0006-userns-Don-t-allow-setgroups-until-a-gid-mapping-has.patch \
+           file://ipv6-Dont-reduce-hop-limit-for-an-interface-CVE-2015-2922.patch \
+           file://eCryptfs-Remove-buggy-and-unnecessary-write-in-file-name-decode-routine-CVE-2014-9683.patch \
 "
 
 S = "${WORKDIR}/linux-${PV}"
