@@ -9,7 +9,7 @@ do_install_append_amd() {
     [ -e ${D}/usr/lib ] && rmdir ${D}/usr/lib
 }
 
-PNBLACKLIST[mplayer2] = ""
+PNBLACKLIST_amd[mplayer2] = ""
 
 #
 # mplayer has broken auto-tools scripts for
