@@ -9,6 +9,6 @@ S = "${WORKDIR}/git"
 
 inherit autotools pkgconfig
 
-DEPENDS += "virtual/libx11 libvdpau"
+DEPENDS += "virtual/libx11 libvdpau mesa"
 
 RDEPENDS_${PN} += "libvdpau-mesa"
