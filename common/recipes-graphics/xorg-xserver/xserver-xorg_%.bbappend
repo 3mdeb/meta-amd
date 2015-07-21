@@ -1,4 +1,4 @@
-PR = "${INC_PR}.1"
+PR_amd = "${INC_PR}.1"
 EXTRA_OECONF_append_amd = " \
 		 --enable-aiglx \
 		 --enable-xvmc \
