@@ -5,10 +5,6 @@ do_compile_prepend_amd() {
     export PATH="${PATH}:${STAGING_BINDIR_NATIVE}/python3-native"
 }
 
-do_install_append_amd() {
-    [ -e ${D}/usr/lib ] && rmdir ${D}/usr/lib
-}
-
 # Clear PNBLACKLIST conditionally for AMD.
 # Suffix overrides and flags don't work well together.
 # Anonymous python would be less convoluted but that appears
