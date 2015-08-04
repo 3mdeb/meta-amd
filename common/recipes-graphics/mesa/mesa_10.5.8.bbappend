@@ -3,15 +3,6 @@ PACKAGECONFIG_append_amd = " xvmc gallium r600"
 PACKAGECONFIG_append_amd = " gallium-llvm"
 MESA_LLVM_RELEASE_amd = "3.4"
 
-#
-# Use the "--enable-llvm-shared-libs" option rather than
-# "--with-llvm-shared-libs".  This is fixed in the poky
-# master version of mesa.inc so rather than do something
-# smart, we'll just completely override the setting here.
-#
-PACKAGECONFIG[gallium-llvm] = "--enable-gallium-llvm --enable-llvm-shared-libs, --disable-gallium-llvm, llvm${MESA_LLVM_RELEASE} \
-                               ${@'elfutils' if ${GALLIUMDRIVERS_LLVM33_ENABLED} else ''}"
-
 # Set DRIDRIVERS with anonymous python so we can effectively
 # override the _append_x86-64 assignement from mesa.inc.
 python __anonymous () {
@@ -32,15 +23,13 @@ EXTRA_OECONF_append_amd = " \
 		 --with-omx-libdir=${libdir}/bellagio \
 		"
 
-PACKAGES =+ "libxvmcr600-${PN} libxvmcr600-${PN}-dev"
-FILES_libxvmcr600-${PN} = "${libdir}/libXvMCr600${SOLIBS}"
-FILES_libxvmcr600-${PN}-dev = "${libdir}/libXvMCr600${SOLIBSDEV} \
-                               ${libdir}/libXvMCr600.la"
-
-PACKAGES =+ "libxvmcnouveau-${PN} libxvmcnouveau-${PN}-dev"
-FILES_libxvmcnouveau-${PN} = "${libdir}/libXvMCnouveau${SOLIBS}"
-FILES_libxvmcnouveau-${PN}-dev = "${libdir}/libXvMCnouveau${SOLIBSDEV} \
-                                  ${libdir}/libXvMCnouveau.la"
+# Package all the libXvMC gallium extensions together
+# they provide the shared lib libXvMCGallium and splitting
+# them up creates trouble in rpm packaging
+PACKAGES =+ "libxvmcgallium-${PN} libxvmcgallium-${PN}-dev"
+FILES_libxvmcgallium-${PN} = "${libdir}/libXvMC*${SOLIBS}"
+FILES_libxvmcgallium-${PN}-dev = "${libdir}/libXvMC*${SOLIBSDEV} \
+                               ${libdir}/libXvMC*.la"
 
 PACKAGES =+ "libvdpau-${PN} libvdpau-${PN}-dev"
 FILES_libvdpau-${PN} = "${libdir}/vdpau/libvdpau*${SOLIBS}"
