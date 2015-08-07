@@ -4,7 +4,7 @@ PR := "${INC_PR}.10"
 
 KBRANCH_amdfalconx86 ?= "standard/common-pc-64/base"
 SRCREV_machine_amdfalconx86 ?= "c100e8665052051487a17169748c457829d3f88c"
-SRCREV_meta_amdfalconx86 ?= "0dafe73796dffc0747d2b24eb7c5569a803b8892"
+SRCREV_meta_amdfalconx86 ?= "fb6271a942b57bdc40c6e49f0203be153699f81c"
 
 LINUX_VERSION_amdfalconx86 = "3.14.24"
 
