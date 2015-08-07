@@ -1,0 +1,659 @@
+From 05dc7cf915ee1555dac2eb4e86953dcc0d6b8c51 Mon Sep 17 00:00:00 2001
+From: Jammy Zhou <Jammy.Zhou@amd.com>
+Date: Fri, 29 May 2015 12:59:59 +0200
+Subject: [PATCH 23/55] amdgpu: get rid of IB pool management v3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+v1: by Jammy Zhou
+v2: remove bo wait when destroy IB by Jammy Zhou
+v3: more cleanups by Marek
+
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Arindam Nath <arindam.nath@amd.com>
+---
+ amdgpu/amdgpu.h          |  19 ---
+ amdgpu/amdgpu_cs.c       | 430 ++---------------------------------------------
+ amdgpu/amdgpu_internal.h |  20 +--
+ 3 files changed, 14 insertions(+), 455 deletions(-)
+
+diff --git a/amdgpu/amdgpu.h b/amdgpu/amdgpu.h
+index 302f1dc..bef7bf5 100644
+--- a/amdgpu/amdgpu.h
++++ b/amdgpu/amdgpu.h
+@@ -56,14 +56,6 @@ struct drm_amdgpu_info_hw_ip;
+  */
+ #define AMDGPU_TIMEOUT_INFINITE			0xffffffffffffffffull
+ 
+-/**
+- * The special flag to mark that this IB will re-used
+- * by client and should not be automatically return back
+- * to free pool by libdrm_amdgpu when submission is completed.
+- *
+- * \sa amdgpu_cs_ib_info
+-*/
+-#define AMDGPU_CS_REUSE_IB			0x2
+ 
+ /*--------------------------------------------------------------------------*/
+ /* ----------------------------- Enums ------------------------------------ */
+@@ -969,9 +961,6 @@ int amdgpu_cs_alloc_ib(amdgpu_context_handle context,
+  *          >0 - AMD specific error code\n
+  *          <0 - Negative POSIX Error code
+  *
+- * \note Libdrm_amdgpu will guarantee that it will correctly detect when it
+- *	is safe to return IB to free pool
+- *
+  * \sa amdgpu_cs_alloc_ib()
+  *
+ */
+@@ -1007,14 +996,6 @@ int amdgpu_cs_free_ib(amdgpu_ib_handle handle);
+  *          >0 - AMD specific error code\n
+  *          <0 - Negative POSIX Error code
+  *
+- * \note It is assumed that by default IB will be returned to free pool
+- *	 automatically by libdrm_amdgpu when submission will completed.
+- *	 It is possible for UMD to make decision to re-use the same IB in
+- *	 this case it should be explicitly freed.\n
+- *	 Accordingly, by default, after submission UMD should not touch passed
+- *	 IBs. If UMD needs to re-use IB then the special flag AMDGPU_CS_REUSE_IB
+- *	 must be passed.
+- *
+  * \note It is required to pass correct resource list with buffer handles
+  *	 which will be accessible by command buffers from submission
+  *	 This will allow kernel driver to correctly implement "paging".
+diff --git a/amdgpu/amdgpu_cs.c b/amdgpu/amdgpu_cs.c
+index 5e406e8..1f153ad 100644
+--- a/amdgpu/amdgpu_cs.c
++++ b/amdgpu/amdgpu_cs.c
+@@ -75,7 +75,6 @@ static int amdgpu_cs_create_ib(amdgpu_context_handle context,
+ 	}
+ 
+ 	alloc_buffer.phys_alignment = 4 * 1024;
+-
+ 	alloc_buffer.preferred_heap = AMDGPU_GEM_DOMAIN_GTT;
+ 
+ 	r = amdgpu_bo_alloc(context->dev,
+@@ -101,7 +100,6 @@ static int amdgpu_cs_create_ib(amdgpu_context_handle context,
+ 	new_ib->buf_handle = info.buf_handle;
+ 	new_ib->cpu = cpu;
+ 	new_ib->virtual_mc_base_address = info.virtual_mc_base_address;
+-	new_ib->ib_size = ib_size;
+ 	*ib = new_ib;
+ 	return 0;
+ }
+@@ -109,15 +107,17 @@ static int amdgpu_cs_create_ib(amdgpu_context_handle context,
+ /**
+  * Destroy an IB buffer.
+  *
+- * \param   dev - \c [in]  Device handle
+- * \param   ib - \c [in] the IB buffer
++ * \param   ib - \c [in] IB handle
+  *
+  * \return  0 on success otherwise POSIX Error code
+ */
+-static int amdgpu_cs_destroy_ib(amdgpu_ib_handle ib)
++int amdgpu_cs_free_ib(amdgpu_ib_handle ib)
+ {
+ 	int r;
+ 
++	if (!ib)
++		return -EINVAL;
++
+ 	r = amdgpu_bo_cpu_unmap(ib->buf_handle);
+ 	if (r)
+ 		return r;
+@@ -130,344 +130,6 @@ static int amdgpu_cs_destroy_ib(amdgpu_ib_handle ib)
+ 	return 0;
+ }
+ 
+-/**
+- * Initialize IB pools to empty.
+- *
+- * \param   context - \c [in]  GPU Context
+- *
+- * \return  0 on success otherwise POSIX Error code
+-*/
+-static int amdgpu_cs_init_ib_pool(amdgpu_context_handle context)
+-{
+-	int i;
+-	int r;
+-
+-	r = pthread_mutex_init(&context->pool_mutex, NULL);
+-	if (r)
+-		return r;
+-
+-	for (i = 0; i < AMDGPU_CS_IB_SIZE_NUM; i++)
+-		LIST_INITHEAD(&context->ib_pools[i]);
+-
+-	return 0;
+-}
+-
+-/**
+- * Allocate an IB buffer from IB pools.
+- *
+- * \param   dev - \c [in]  Device handle
+- * \param   context - \c [in] GPU Context
+- * \param   ib_size - \c [in]  Size of allocation
+- * \param   ib - \c [out] return the pointer to the allocated IB buffer
+- *
+- * \return  0 on success otherwise POSIX Error code
+-*/
+-static int amdgpu_cs_alloc_from_ib_pool(amdgpu_context_handle context,
+-					enum amdgpu_cs_ib_size ib_size,
+-					amdgpu_ib_handle *ib)
+-{
+-	int r;
+-	struct list_head *head;
+-	head = &context->ib_pools[ib_size];
+-
+-	r = -ENOMEM;
+-	pthread_mutex_lock(&context->pool_mutex);
+-	if (!LIST_IS_EMPTY(head)) {
+-		*ib = LIST_ENTRY(struct amdgpu_ib, head->next, list_node);
+-		LIST_DEL(&(*ib)->list_node);
+-		r = 0;
+-	}
+-	pthread_mutex_unlock(&context->pool_mutex);
+-
+-	return r;
+-}
+-
+-/**
+- * Free an IB buffer to IB pools.
+- *
+- * \param   context - \c [in]  GPU Context
+- * \param   ib - \c [in] the IB buffer
+- *
+- * \return  N/A
+-*/
+-static void amdgpu_cs_free_to_ib_pool(amdgpu_context_handle context,
+-				      amdgpu_ib_handle ib)
+-{
+-	struct list_head *head;
+-	head = &context->ib_pools[ib->ib_size];
+-	pthread_mutex_lock(&context->pool_mutex);
+-	LIST_ADD(&ib->list_node, head);
+-	pthread_mutex_unlock(&context->pool_mutex);
+-	return;
+-}
+-
+-/**
+- * Destroy all IB buffers in pools
+- *
+- * \param   dev - \c [in]  Device handle
+- * \param   context - \c [in]  GPU Context
+- *
+- * \return  0 on success otherwise POSIX Error code
+-*/
+-static int amdgpu_cs_destroy_ib_pool(amdgpu_context_handle context)
+-{
+-	struct list_head *head;
+-	struct amdgpu_ib *next;
+-	struct amdgpu_ib *storage;
+-	int i, r;
+-
+-	r = 0;
+-	pthread_mutex_lock(&context->pool_mutex);
+-	for (i = 0; i < AMDGPU_CS_IB_SIZE_NUM; i++) {
+-		head = &context->ib_pools[i];
+-		LIST_FOR_EACH_ENTRY_SAFE(next, storage, head, list_node) {
+-			r = amdgpu_cs_destroy_ib(next);
+-			if (r)
+-				break;
+-		}
+-	}
+-	pthread_mutex_unlock(&context->pool_mutex);
+-	pthread_mutex_destroy(&context->pool_mutex);
+-	return r;
+-}
+-
+-/**
+- * Initialize pending IB lists
+- *
+- * \param   context - \c [in]  GPU Context
+- *
+- * \return  0 on success otherwise POSIX Error code
+-*/
+-static int amdgpu_cs_init_pendings(amdgpu_context_handle context)
+-{
+-	unsigned ip, inst;
+-	uint32_t ring;
+-	int r;
+-
+-	r = pthread_mutex_init(&context->pendings_mutex, NULL);
+-	if (r)
+-		return r;
+-
+-	for (ip = 0; ip < AMDGPU_HW_IP_NUM; ip++)
+-		for (inst = 0; inst < AMDGPU_HW_IP_INSTANCE_MAX_COUNT; inst++)
+-			for (ring = 0; ring < AMDGPU_CS_MAX_RINGS; ring++)
+-				LIST_INITHEAD(&context->pendings[ip][inst][ring]);
+-
+-	LIST_INITHEAD(&context->freed);
+-	return 0;
+-}
+-
+-/**
+- * Free pending IBs
+- *
+- * \param   dev - \c [in]  Device handle
+- * \param   context - \c [in]  GPU Context
+- *
+- * \return  0 on success otherwise POSIX Error code
+-*/
+-static int amdgpu_cs_destroy_pendings(amdgpu_context_handle context)
+-{
+-	int ip, inst;
+-	uint32_t ring;
+-	int r;
+-	struct amdgpu_ib *next;
+-	struct amdgpu_ib *s;
+-	struct list_head *head;
+-
+-	r = 0;
+-	pthread_mutex_lock(&context->pendings_mutex);
+-	for (ip = 0; ip < AMDGPU_HW_IP_NUM; ip++)
+-		for (inst = 0; inst < AMDGPU_HW_IP_INSTANCE_MAX_COUNT; inst++)
+-			for (ring = 0; ring < AMDGPU_CS_MAX_RINGS; ring++) {
+-				head = &context->pendings[ip][inst][ring];
+-				LIST_FOR_EACH_ENTRY_SAFE(next, s, head, list_node) {
+-					r = amdgpu_cs_destroy_ib(next);
+-					if (r)
+-						break;
+-				}
+-			}
+-
+-	head = &context->freed;
+-	LIST_FOR_EACH_ENTRY_SAFE(next, s, head, list_node) {
+-		r = amdgpu_cs_destroy_ib(next);
+-		if (r)
+-			break;
+-	}
+-
+-	pthread_mutex_unlock(&context->pendings_mutex);
+-	pthread_mutex_destroy(&context->pendings_mutex);
+-	return r;
+-}
+-
+-/**
+- * Add IB to pending IB lists without holding sequence_mutex.
+- *
+- * \param   context - \c [in]  GPU Context
+- * \param   ib - \c [in]  ib to added to pending lists
+- * \param   ip - \c [in]  hw ip block
+- * \param   ip_instance - \c [in]  instance of the hw ip block
+- * \param   ring - \c [in]  Ring of hw ip
+- *
+- * \return  N/A
+-*/
+-static void amdgpu_cs_add_pending(amdgpu_context_handle context,
+-				  amdgpu_ib_handle ib,
+-				  unsigned ip, unsigned ip_instance,
+-				  uint32_t ring)
+-{
+-	struct list_head *head;
+-	struct amdgpu_ib *next;
+-	struct amdgpu_ib *s;
+-
+-	pthread_mutex_lock(&context->pendings_mutex);
+-	head = &context->pendings[ip][ip_instance][ring];
+-	LIST_FOR_EACH_ENTRY_SAFE(next, s, head, list_node)
+-		if (next == ib) {
+-			pthread_mutex_unlock(&context->pendings_mutex);
+-			return;
+-		}
+-
+-	LIST_ADDTAIL(&ib->list_node, head);
+-	pthread_mutex_unlock(&context->pendings_mutex);
+-	return;
+-}
+-
+-/**
+- * Garbage collector on a pending IB list without holding pendings_mutex.
+- * This function by itself is not multithread safe.
+- *
+- * \param   context - \c [in]  GPU Context
+- * \param   ip - \c [in]  hw ip block
+- * \param   ip_instance - \c [in]  instance of the hw ip block
+- * \param   ring - \c [in]  Ring of hw ip
+- * \param   expired_fence - \c [in]  fence expired
+- *
+- * \return  N/A
+- * \note Hold pendings_mutex before calling this function.
+-*/
+-static void amdgpu_cs_pending_gc_not_safe(amdgpu_context_handle context,
+-					  unsigned ip, unsigned ip_instance,
+-					  uint32_t ring,
+-					  uint64_t expired_fence)
+-{
+-	struct list_head *head;
+-	struct amdgpu_ib *next;
+-	struct amdgpu_ib *s;
+-	int r;
+-
+-	head = &context->pendings[ip][ip_instance][ring];
+-	LIST_FOR_EACH_ENTRY_SAFE(next, s, head, list_node)
+-		if (next->cs_handle <= expired_fence) {
+-			LIST_DEL(&next->list_node);
+-			amdgpu_cs_free_to_ib_pool(context, next);
+-		} else {
+-			/* The pending list is a sorted list.
+-			   There is no need to continue. */
+-			break;
+-		}
+-
+-	/* walk the freed list as well */
+-	head = &context->freed;
+-	LIST_FOR_EACH_ENTRY_SAFE(next, s, head, list_node) {
+-		bool busy;
+-
+-		r = amdgpu_bo_wait_for_idle(next->buf_handle, 0, &busy);
+-		if (r || busy)
+-			break;
+-
+-		LIST_DEL(&next->list_node);
+-		amdgpu_cs_free_to_ib_pool(context, next);
+-	}
+-
+-	return;
+-}
+-
+-/**
+- * Garbage collector on a pending IB list
+- *
+- * \param   context - \c [in]  GPU Context
+- * \param   ip - \c [in]  hw ip block
+- * \param   ip_instance - \c [in]  instance of the hw ip block
+- * \param   ring - \c [in]  Ring of hw ip
+- * \param   expired_fence - \c [in]  fence expired
+- *
+- * \return  N/A
+-*/
+-static void amdgpu_cs_pending_gc(amdgpu_context_handle context,
+-				 unsigned ip, unsigned ip_instance,
+-				 uint32_t ring,
+-				 uint64_t expired_fence)
+-{
+-	pthread_mutex_lock(&context->pendings_mutex);
+-	amdgpu_cs_pending_gc_not_safe(context, ip, ip_instance, ring,
+-				      expired_fence);
+-	pthread_mutex_unlock(&context->pendings_mutex);
+-	return;
+-}
+-
+-/**
+- * Garbage collector on all pending IB lists
+- *
+- * \param   context - \c [in]  GPU Context
+- *
+- * \return  N/A
+-*/
+-static void amdgpu_cs_all_pending_gc(amdgpu_context_handle context)
+-{
+-	unsigned ip, inst;
+-	uint32_t ring;
+-	uint64_t expired_fences[AMDGPU_HW_IP_NUM][AMDGPU_HW_IP_INSTANCE_MAX_COUNT][AMDGPU_CS_MAX_RINGS];
+-
+-	pthread_mutex_lock(&context->sequence_mutex);
+-	for (ip = 0; ip < AMDGPU_HW_IP_NUM; ip++)
+-		for (inst = 0; inst < AMDGPU_HW_IP_INSTANCE_MAX_COUNT; inst++)
+-			for (ring = 0; ring < AMDGPU_CS_MAX_RINGS; ring++)
+-				expired_fences[ip][inst][ring] =
+-					context->expired_fences[ip][inst][ring];
+-	pthread_mutex_unlock(&context->sequence_mutex);
+-
+-	pthread_mutex_lock(&context->pendings_mutex);
+-	for (ip = 0; ip < AMDGPU_HW_IP_NUM; ip++)
+-		for (inst = 0; inst < AMDGPU_HW_IP_INSTANCE_MAX_COUNT; inst++)
+-			for (ring = 0; ring < AMDGPU_CS_MAX_RINGS; ring++)
+-				amdgpu_cs_pending_gc_not_safe(context, ip, inst, ring,
+-					expired_fences[ip][inst][ring]);
+-	pthread_mutex_unlock(&context->pendings_mutex);
+-}
+-
+-/**
+- * Allocate an IB buffer
+- * If there is no free IB buffer in pools, create one.
+- *
+- * \param   dev - \c [in] Device handle
+- * \param   context - \c [in] GPU Context
+- * \param   ib_size - \c [in] Size of allocation
+- * \param   ib - \c [out] return the pointer to the allocated IB buffer
+- *
+- * \return  0 on success otherwise POSIX Error code
+-*/
+-static int amdgpu_cs_alloc_ib_local(amdgpu_context_handle context,
+-				    enum amdgpu_cs_ib_size ib_size,
+-				    amdgpu_ib_handle *ib)
+-{
+-	int r;
+-
+-	r = amdgpu_cs_alloc_from_ib_pool(context, ib_size, ib);
+-	if (!r)
+-		return r;
+-
+-	amdgpu_cs_all_pending_gc(context);
+-
+-	/* Retry to allocate from free IB pools after garbage collector. */
+-	r = amdgpu_cs_alloc_from_ib_pool(context, ib_size, ib);
+-	if (!r)
+-		return r;
+-
+-	/* There is no suitable IB in free pools. Create one. */
+-	r = amdgpu_cs_create_ib(context, ib_size, ib);
+-	return r;
+-}
+-
+ int amdgpu_cs_alloc_ib(amdgpu_context_handle context,
+ 		       enum amdgpu_cs_ib_size ib_size,
+ 		       struct amdgpu_cs_ib_alloc_result *output)
+@@ -482,7 +144,7 @@ int amdgpu_cs_alloc_ib(amdgpu_context_handle context,
+ 	if (ib_size >= AMDGPU_CS_IB_SIZE_NUM)
+ 		return -EINVAL;
+ 
+-	r = amdgpu_cs_alloc_ib_local(context, ib_size, &ib);
++	r = amdgpu_cs_create_ib(context, ib_size, &ib);
+ 	if (!r) {
+ 		output->handle = ib;
+ 		output->cpu = ib->cpu;
+@@ -492,20 +154,6 @@ int amdgpu_cs_alloc_ib(amdgpu_context_handle context,
+ 	return r;
+ }
+ 
+-int amdgpu_cs_free_ib(amdgpu_ib_handle handle)
+-{
+-	amdgpu_context_handle context;
+-
+-	if (NULL == handle)
+-		return -EINVAL;
+-
+-	context = handle->context;
+-	pthread_mutex_lock(&context->pendings_mutex);
+-	LIST_ADD(&handle->list_node, &context->freed);
+-	pthread_mutex_unlock(&context->pendings_mutex);
+-	return 0;
+-}
+-
+ /**
+  * Create command submission context
+  *
+@@ -536,16 +184,8 @@ int amdgpu_cs_ctx_create(amdgpu_device_handle dev,
+ 	if (r)
+ 		goto error_mutex;
+ 
+-	r = amdgpu_cs_init_ib_pool(gpu_context);
+-	if (r)
+-		goto error_pool;
+-
+-	r = amdgpu_cs_init_pendings(gpu_context);
+-	if (r)
+-		goto error_pendings;
+-
+-	r = amdgpu_cs_alloc_ib_local(gpu_context, amdgpu_cs_ib_size_4K,
+-				     &gpu_context->fence_ib);
++	r = amdgpu_cs_create_ib(gpu_context, amdgpu_cs_ib_size_4K,
++			       &gpu_context->fence_ib);
+ 	if (r)
+ 		goto error_fence_ib;
+ 
+@@ -565,12 +205,6 @@ error_kernel:
+ 	amdgpu_cs_free_ib(gpu_context->fence_ib);
+ 
+ error_fence_ib:
+-	amdgpu_cs_destroy_pendings(gpu_context);
+-
+-error_pendings:
+-	amdgpu_cs_destroy_ib_pool(gpu_context);
+-
+-error_pool:
+ 	pthread_mutex_destroy(&gpu_context->sequence_mutex);
+ 
+ error_mutex:
+@@ -598,14 +232,6 @@ int amdgpu_cs_ctx_free(amdgpu_context_handle context)
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_cs_destroy_pendings(context);
+-	if (r)
+-		return r;
+-
+-	r = amdgpu_cs_destroy_ib_pool(context);
+-	if (r)
+-		return r;
+-
+ 	pthread_mutex_destroy(&context->sequence_mutex);
+ 
+ 	/* now deal with kernel side */
+@@ -660,7 +286,7 @@ static int amdgpu_cs_submit_one(amdgpu_context_handle context,
+ 				struct amdgpu_cs_request *ibs_request,
+ 				uint64_t *fence)
+ {
+-	int r;
++	int r = 0;
+ 	uint32_t i, size;
+ 	union drm_amdgpu_cs cs;
+ 	uint64_t *chunk_array;
+@@ -678,10 +304,10 @@ static int amdgpu_cs_submit_one(amdgpu_context_handle context,
+ 		sizeof(uint64_t) +
+ 		sizeof(struct drm_amdgpu_cs_chunk) +
+ 		sizeof(struct drm_amdgpu_cs_chunk_data));
+-	chunk_array = malloc(size);
++
++	chunk_array = calloc(1, size);
+ 	if (NULL == chunk_array)
+ 		return -ENOMEM;
+-	memset(chunk_array, 0, size);
+ 
+ 	chunks = (struct drm_amdgpu_cs_chunk *)(chunk_array + ibs_request->number_of_ibs + 1);
+ 	chunk_data = (struct drm_amdgpu_cs_chunk_data *)(chunks + ibs_request->number_of_ibs + 1);
+@@ -737,31 +363,8 @@ static int amdgpu_cs_submit_one(amdgpu_context_handle context,
+ 	if (r)
+ 		goto error_unlock;
+ 
+-
+-	/* Hold sequence_mutex while adding record to the pending list.
+-	   So the pending list is a sorted list according to fence value. */
+-
+-	for (i = 0; i < ibs_request->number_of_ibs; i++) {
+-		struct amdgpu_cs_ib_info *ib;
+-
+-		ib = &ibs_request->ibs[i];
+-		if (ib->flags & AMDGPU_CS_REUSE_IB)
+-			continue;
+-
+-		ib->ib_handle->cs_handle = cs.out.handle;
+-
+-		amdgpu_cs_add_pending(context, ib->ib_handle, ibs_request->ip_type,
+-				      ibs_request->ip_instance,
+-				      ibs_request->ring);
+-	}
+-
+ 	*fence = cs.out.handle;
+ 
+-	pthread_mutex_unlock(&context->sequence_mutex);
+-
+-	free(chunk_array);
+-	return 0;
+-
+ error_unlock:
+ 	pthread_mutex_unlock(&context->sequence_mutex);
+ 	free(chunk_array);
+@@ -894,8 +497,6 @@ int amdgpu_cs_query_fence_status(struct amdgpu_cs_query_fence *fence,
+ 		/* This fence value is signaled already. */
+ 		*expired_fence = *signaled_fence;
+ 		pthread_mutex_unlock(&context->sequence_mutex);
+-		amdgpu_cs_pending_gc(context, ip_type, ip_instance, ring,
+-				     fence->fence);
+ 		*expired = true;
+ 		return 0;
+ 	}
+@@ -910,14 +511,9 @@ int amdgpu_cs_query_fence_status(struct amdgpu_cs_query_fence *fence,
+ 		/* The thread doesn't hold sequence_mutex. Other thread could
+ 		   update *expired_fence already. Check whether there is a
+ 		   newerly expired fence. */
+-		if (fence->fence > *expired_fence) {
++		if (fence->fence > *expired_fence)
+ 			*expired_fence = fence->fence;
+-			pthread_mutex_unlock(&context->sequence_mutex);
+-			amdgpu_cs_pending_gc(context, ip_type, ip_instance,
+-					     ring, fence->fence);
+-		} else {
+-			pthread_mutex_unlock(&context->sequence_mutex);
+-		}
++		pthread_mutex_unlock(&context->sequence_mutex);
+ 	}
+ 
+ 	return r;
+diff --git a/amdgpu/amdgpu_internal.h b/amdgpu/amdgpu_internal.h
+index c1cd4da..e5a457a 100644
+--- a/amdgpu/amdgpu_internal.h
++++ b/amdgpu/amdgpu_internal.h
+@@ -97,42 +97,24 @@ struct amdgpu_bo_list {
+ 	uint32_t handle;
+ };
+ 
+-/*
+- * There are three mutexes.
+- * To avoid deadlock, only hold the mutexes in this order:
+- * sequence_mutex -> pendings_mutex -> pool_mutex.
+-*/
+ struct amdgpu_context {
+ 	struct amdgpu_device *dev;
+ 	/** Mutex for accessing fences and to maintain command submissions
+-	    and pending lists in good sequence. */
++	    in good sequence. */
+ 	pthread_mutex_t sequence_mutex;
+ 	/** Buffer for user fences */
+ 	struct amdgpu_ib *fence_ib;
+ 	/** The newest expired fence for the ring of the ip blocks. */
+ 	uint64_t expired_fences[AMDGPU_HW_IP_NUM][AMDGPU_HW_IP_INSTANCE_MAX_COUNT][AMDGPU_CS_MAX_RINGS];
+-	/** Mutex for accessing pendings list. */
+-	pthread_mutex_t pendings_mutex;
+-	/** Pending IBs. */
+-	struct list_head pendings[AMDGPU_HW_IP_NUM][AMDGPU_HW_IP_INSTANCE_MAX_COUNT][AMDGPU_CS_MAX_RINGS];
+-	/** Freed IBs not yet in pool */
+-	struct list_head freed;
+-	/** Mutex for accessing free ib pool. */
+-	pthread_mutex_t pool_mutex;
+-	/** Internal free IB pools. */
+-	struct list_head ib_pools[AMDGPU_CS_IB_SIZE_NUM];
+ 	/* context id*/
+ 	uint32_t id;
+ };
+ 
+ struct amdgpu_ib {
+ 	amdgpu_context_handle context;
+-	struct list_head list_node;
+ 	amdgpu_bo_handle buf_handle;
+ 	void *cpu;
+ 	uint64_t virtual_mc_base_address;
+-	enum amdgpu_cs_ib_size ib_size;
+-	uint64_t cs_handle;
+ };
+ 
+ /**
+-- 
+1.9.1
+
