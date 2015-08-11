@@ -1,0 +1,154 @@
+From 8a24b4c8cbfc49deceb5595b76c5d9fc8dc5e602 Mon Sep 17 00:00:00 2001
+From: Arindam Nath <arindam.nath@amd.com>
+Date: Fri, 31 Jul 2015 13:05:36 +0530
+Subject: [PATCH 4/4] gstomxvideoenc: add force-keyframe-period property
+
+Add property to allow overriding the default keyframe period.
+
+Signed-off-by: Brijesh Singh <brijeshkumar.singh@amd.com>
+Signed-off-by: Arindam Nath <arindam.nath@amd.com>
+---
+ omx/gstomxvideoenc.c | 56 +++++++++++++++++++++++++++++++++++++++-------------
+ omx/gstomxvideoenc.h |  3 +++
+ 2 files changed, 45 insertions(+), 14 deletions(-)
+
+diff --git a/omx/gstomxvideoenc.c b/omx/gstomxvideoenc.c
+index bba349a..e7c7db5 100644
+--- a/omx/gstomxvideoenc.c
++++ b/omx/gstomxvideoenc.c
+@@ -102,7 +102,8 @@ enum
+   PROP_CAPTURE,
+   PROP_POS_X,
+   PROP_POS_Y,
+-  PROP_FIX_TIMESTAMP
++  PROP_FIX_TIMESTAMP,
++  PROP_FORCE_KEYFRAME_PERIOD
+ };
+ 
+ /* FIXME: Better defaults */
+@@ -117,6 +118,7 @@ enum
+ #define GST_OMX_VIDEO_ENC_POS_X_DEFAULT (0)
+ #define GST_OMX_VIDEO_ENC_POS_Y_DEFAULT (0)
+ #define GST_OMX_VIDEO_ENC_FIX_TIMESTAMP_DEFAULT FALSE
++#define GST_OMX_VIDEO_ENC_FORCE_KEYFRAME_PERIOD (0xffffffff)
+ 
+ /* class initialization */
+ 
+@@ -209,6 +211,13 @@ gst_omx_video_enc_class_init (GstOMXVideoEncClass * klass)
+           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+           GST_PARAM_MUTABLE_READY));
+ 
++  g_object_class_install_property (gobject_class, PROP_FORCE_KEYFRAME_PERIOD,
++      g_param_spec_uint ("force-keyframe-period", "Force key frame",
++          "Generate keyframe after a specified number of frames (0xffffffff=component default)",
++          0, G_MAXUINT, GST_OMX_VIDEO_ENC_FORCE_KEYFRAME_PERIOD,
++          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
++          GST_PARAM_MUTABLE_READY));
++
+   g_object_class_install_property (gobject_class, PROP_FIX_TIMESTAMP,
+       g_param_spec_boolean ("fix-timestamp", "Calculate timestamp",
+           "Calculate timestamp (dts/pts) based on duration",
+@@ -255,6 +264,7 @@ gst_omx_video_enc_init (GstOMXVideoEnc * self)
+   self->pos_y = GST_OMX_VIDEO_ENC_POS_Y_DEFAULT;
+   self->prev_timestamp = 0;
+   self->fix_timestamp = GST_OMX_VIDEO_ENC_FIX_TIMESTAMP_DEFAULT;
++  self->force_keyframe_period = GST_OMX_VIDEO_ENC_FORCE_KEYFRAME_PERIOD;
+ 
+   g_mutex_init (&self->drain_lock);
+   g_cond_init (&self->drain_cond);
+@@ -635,6 +645,9 @@ gst_omx_video_enc_set_property (GObject * object, guint prop_id,
+     case PROP_FIX_TIMESTAMP:
+       self->fix_timestamp = g_value_get_boolean (value);
+       break;
++    case PROP_FORCE_KEYFRAME_PERIOD:
++      self->force_keyframe_period = g_value_get_uint (value);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+@@ -681,6 +694,9 @@ gst_omx_video_enc_get_property (GObject * object, guint prop_id, GValue * value,
+     case PROP_FIX_TIMESTAMP:
+       g_value_set_boolean (value, self->fix_timestamp);
+       break;
++    case PROP_FORCE_KEYFRAME_PERIOD:
++      g_value_set_uint (value, self->force_keyframe_period);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+@@ -1708,6 +1724,25 @@ done:
+   return ret;
+ }
+ 
++static void
++gst_omx_video_enc_force_keyframe (GstOMXVideoEnc * self, GstOMXPort * port)
++{
++  OMX_ERRORTYPE err;
++  OMX_CONFIG_INTRAREFRESHVOPTYPE config;
++
++  GST_OMX_INIT_STRUCT (&config);
++  config.nPortIndex = port->index;
++  config.IntraRefreshVOP = OMX_TRUE;
++
++  GST_DEBUG_OBJECT (self, "Forcing a keyframe");
++  err =
++      gst_omx_component_set_config (self->enc,
++      OMX_IndexConfigVideoIntraVOPRefresh, &config);
++  if (err != OMX_ErrorNone)
++    GST_ERROR_OBJECT (self, "Failed to force a keyframe: %s (0x%08x)",
++        gst_omx_error_to_string (err), err);
++}
++
+ static GstFlowReturn
+ gst_omx_video_enc_handle_frame (GstVideoEncoder * encoder,
+     GstVideoCodecFrame * frame)
+@@ -1735,6 +1770,11 @@ gst_omx_video_enc_handle_frame (GstVideoEncoder * encoder,
+ 
+   port = self->enc_in_port;
+ 
++  /* do we need to force key frame ? */
++  if ((self->force_keyframe_period != 0xffffffff) &&
++      (self->input_frame_count++ % self->force_keyframe_period == 0))
++    gst_omx_video_enc_force_keyframe (self, port);
++
+   if (port->tunneled) {
+     gst_video_codec_frame_unref (frame);
+     return self->downstream_flow_ret;
+@@ -1827,19 +1867,7 @@ gst_omx_video_enc_handle_frame (GstVideoEncoder * encoder,
+     GST_DEBUG_OBJECT (self, "Handling frame");
+ 
+     if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame)) {
+-      OMX_CONFIG_INTRAREFRESHVOPTYPE config;
+-
+-      GST_OMX_INIT_STRUCT (&config);
+-      config.nPortIndex = port->index;
+-      config.IntraRefreshVOP = OMX_TRUE;
+-
+-      GST_DEBUG_OBJECT (self, "Forcing a keyframe");
+-      err =
+-          gst_omx_component_set_config (self->enc,
+-          OMX_IndexConfigVideoIntraVOPRefresh, &config);
+-      if (err != OMX_ErrorNone)
+-        GST_ERROR_OBJECT (self, "Failed to force a keyframe: %s (0x%08x)",
+-            gst_omx_error_to_string (err), err);
++      gst_omx_video_enc_force_keyframe (self, port);
+     }
+ 
+     /* Copy the buffer content in chunks of size as requested
+diff --git a/omx/gstomxvideoenc.h b/omx/gstomxvideoenc.h
+index 064583f..bb8bff7 100644
+--- a/omx/gstomxvideoenc.h
++++ b/omx/gstomxvideoenc.h
+@@ -87,6 +87,9 @@ struct _GstOMXVideoEnc
+   guint32 pos_x;
+   guint32 pos_y;
+ 
++  guint32 force_keyframe_period;
++  guint64 input_frame_count;
++
+   GstFlowReturn downstream_flow_ret;
+ };
+ 
+-- 
+1.9.1
+
