@@ -4,7 +4,7 @@ PR := "${INC_PR}.10"
 
 KBRANCH_amdfalconx86 ?= "standard/common-pc-64/base"
 SRCREV_machine_amdfalconx86 ?= "c100e8665052051487a17169748c457829d3f88c"
-SRCREV_meta_amdfalconx86 ?= "fb6271a942b57bdc40c6e49f0203be153699f81c"
+SRCREV_meta_amdfalconx86 ?= "2c21e694e2bf211c858a32fab1c03a398b599439"
 
 LINUX_VERSION_amdfalconx86 = "3.14.24"
 
@@ -20,3 +20,11 @@ SRC_URI_append_amdfalconx86 += "file://amdfalconx86-standard.scc \
 				${@bb.utils.contains("DISTRO", "mel", "", "file://disable-kgdb.cfg", d)} \
 				file://usb-serial.cfg \
 			       "
+
+do_validate_branches_append() {
+    # Fixed in 3.14.29 tag of yocto-kernel-cache branch yocto-3.14
+    rm -r ${WORKDIR}/${KMETA}/meta
+
+    # Fixed in >3.14.29 tag of yocto-kernel-cache branch yocto-3.14
+    sed -i '/crui.scc/d' ${WORKDIR}/${KMETA}/ktypes/standard/standard.scc
+}
