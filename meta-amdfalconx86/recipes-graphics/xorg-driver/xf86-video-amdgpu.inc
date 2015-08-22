@@ -19,7 +19,7 @@ PR = "${INC_PR}.1"
 EXTRA_OECONF += "--enable-udev --enable-glamor"
 
 SRC_URI = " \
-	    git://people.freedesktop.org/~agd5f/xf86-video-amdgpu;branch=amdgpu \
+	    git://anongit.freedesktop.org/xorg/driver/xf86-video-amdgpu;branch=master \
 "
 
 S = "${WORKDIR}/git"
