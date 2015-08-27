@@ -1,0 +1,181 @@
+From b87f2f5a4bc3232b780fadb9dc4357970bf1afa2 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <David1.Zhou@amd.com>
+Date: Fri, 22 May 2015 12:11:29 -0400
+Subject: [PATCH 232/343] drm/amdgpu: Implement irq interfaces for CGS
+
+This implements the irq src registrar.
+
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+Signed-off-by: Chunming Zhou <David1.Zhou@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c | 81 ++++++++++++++++++++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c  |  2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h  |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c |  5 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h |  1 +
+ 5 files changed, 84 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c
+index 6ac3df8..93fbf35 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c
+@@ -290,26 +290,95 @@ static int amdgpu_cgs_set_camera_voltages(void *cgs_device, uint32_t mask,
+ 	return -EPERM;
+ }
+ 
++struct cgs_irq_params {
++	unsigned src_id;
++	cgs_irq_source_set_func_t set;
++	cgs_irq_handler_func_t handler;
++	void *private_data;
++};
++
++static int cgs_set_irq_state(struct amdgpu_device *adev,
++			     struct amdgpu_irq_src *src,
++			     unsigned type,
++			     enum amdgpu_interrupt_state state)
++{
++	struct cgs_irq_params *irq_params =
++		(struct cgs_irq_params *)src->data;
++	if (!irq_params)
++		return -EINVAL;
++	if (!irq_params->set)
++		return -EINVAL;
++	return irq_params->set(irq_params->private_data,
++			       irq_params->src_id,
++			       type,
++			       (int)state);
++}
++
++static int cgs_process_irq(struct amdgpu_device *adev,
++			   struct amdgpu_irq_src *source,
++			   struct amdgpu_iv_entry *entry)
++{
++	struct cgs_irq_params *irq_params =
++		(struct cgs_irq_params *)source->data;
++	if (!irq_params)
++		return -EINVAL;
++	if (!irq_params->handler)
++		return -EINVAL;
++	return irq_params->handler(irq_params->private_data,
++				   irq_params->src_id,
++				   entry->iv_entry);
++}
++
++static const struct amdgpu_irq_src_funcs cgs_irq_funcs = {
++	.set = cgs_set_irq_state,
++	.process = cgs_process_irq,
++};
++
+ static int amdgpu_cgs_add_irq_source(void *cgs_device, unsigned src_id,
+ 				     unsigned num_types,
+ 				     cgs_irq_source_set_func_t set,
+ 				     cgs_irq_handler_func_t handler,
+ 				     void *private_data)
+ {
+-	/* TODO */
+-	return 0;
++	CGS_FUNC_ADEV;
++	int ret = 0;
++	struct cgs_irq_params *irq_params;
++	struct amdgpu_irq_src *source =
++		kzalloc(sizeof(struct amdgpu_irq_src), GFP_KERNEL);
++	if (!source)
++		return -ENOMEM;
++	irq_params =
++		kzalloc(sizeof(struct cgs_irq_params), GFP_KERNEL);
++	if (!irq_params) {
++		kfree(source);
++		return -ENOMEM;
++	}
++	source->num_types = num_types;
++	source->funcs = &cgs_irq_funcs;
++	irq_params->src_id = src_id;
++	irq_params->set = set;
++	irq_params->handler = handler;
++	irq_params->private_data = private_data;
++	source->data = (void *)irq_params;
++	ret = amdgpu_irq_add_id(adev, src_id, source);
++	if (ret) {
++		kfree(irq_params);
++		kfree(source);
++	}
++
++	return ret;
+ }
+ 
+ static int amdgpu_cgs_irq_get(void *cgs_device, unsigned src_id, unsigned type)
+ {
+-	/* TODO */
+-	return 0;
++	CGS_FUNC_ADEV;
++	return amdgpu_irq_get(adev, adev->irq.sources[src_id], type);
+ }
+ 
+ static int amdgpu_cgs_irq_put(void *cgs_device, unsigned src_id, unsigned type)
+ {
+-	/* TODO */
+-	return 0;
++	CGS_FUNC_ADEV;
++	return amdgpu_irq_put(adev, adev->irq.sources[src_id], type);
+ }
+ 
+ static const struct cgs_ops amdgpu_cgs_ops = {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
+index db5422e..272275a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
+@@ -199,6 +199,8 @@ restart_ih:
+ 	rmb();
+ 
+ 	while (adev->irq.ih.rptr != wptr) {
++		entry.iv_entry = (const uint32_t *)
++			&adev->irq.ih.ring[adev->irq.ih.rptr >> 2];
+ 		amdgpu_ih_decode_iv(adev, &entry);
+ 		adev->irq.ih.rptr &= adev->irq.ih.ptr_mask;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
+index c62b09e..ba38ae6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
+@@ -52,6 +52,7 @@ struct amdgpu_iv_entry {
+ 	unsigned ring_id;
+ 	unsigned vm_id;
+ 	unsigned pas_id;
++	const uint32_t *iv_entry;
+ };
+ 
+ int amdgpu_ih_ring_init(struct amdgpu_device *adev, unsigned ring_size,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+index b4d36f0..0aba8e9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+@@ -272,6 +272,11 @@ void amdgpu_irq_fini(struct amdgpu_device *adev)
+ 
+ 		kfree(src->enabled_types);
+ 		src->enabled_types = NULL;
++		if (src->data) {
++			kfree(src->data);
++			kfree(src);
++			adev->irq.sources[i] = NULL;
++		}
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
+index 8299795..17b01aef 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
+@@ -40,6 +40,7 @@ struct amdgpu_irq_src {
+ 	unsigned				num_types;
+ 	atomic_t				*enabled_types;
+ 	const struct amdgpu_irq_src_funcs	*funcs;
++	void *data;
+ };
+ 
+ /* provided by interrupt generating IP blocks */
+-- 
+1.9.1
+

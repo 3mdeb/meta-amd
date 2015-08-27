@@ -14,6 +14,7 @@ KERNEL_FEATURES_append_amdfalconx86 += " cfg/smp.scc cfg/sound.scc"
 
 SRC_URI_append_amdfalconx86 += "file://amdfalconx86-standard.scc \
 				file://amdfalconx86-user-config.cfg \
+				file://amdfalconx86-gpu-config.cfg \
 				file://amdfalconx86-user-features.scc \
 				file://amdfalconx86-user-patches.scc \
 				${@bb.utils.contains("DISTRO_FEATURES", "bluetooth", "file://bluetooth.cfg", "", d)} \
