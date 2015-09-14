@@ -1,4 +1,4 @@
-FIRMWARE_DIR="/lib/firmware/"
+FIRMWARE_DIR="/lib/firmware"
 do_install_amd() {
 	install -d  ${D}${FIRMWARE_DIR}
 	for dir in */; do
