@@ -1,0 +1,197 @@
+From 763abe45e0fb8f17251ce36115d557d925fa43eb Mon Sep 17 00:00:00 2001
+From: Sabre Shao <Sabre.Shao@amd.com>
+Date: Thu, 9 Jul 2015 13:50:36 +0800
+Subject: [PATCH 54/67] amdgpu: add va allocation intefaces
+
+Two new interfaces are added to support client request for
+allocate virtual address without physical memory committed to.
+The virtual address space can be managed by client itself.
+
+Signed-off-by: Sabre Shao <Sabre.Shao@amd.com>
+Signed-off-by: Ken Wang <Qingqing.Wang@amd.com>
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+Signed-off-by: Arindam Nath <arindam.nath@amd.com>
+---
+ amdgpu/amdgpu.h          | 66 ++++++++++++++++++++++++++++++++++++++++++++++++
+ amdgpu/amdgpu_internal.h |  9 ++++++-
+ amdgpu/amdgpu_vamgr.c    | 44 ++++++++++++++++++++++++++++++++
+ 3 files changed, 118 insertions(+), 1 deletion(-)
+
+diff --git a/amdgpu/amdgpu.h b/amdgpu/amdgpu.h
+index 9d16430..fcd12b3 100644
+--- a/amdgpu/amdgpu.h
++++ b/amdgpu/amdgpu.h
+@@ -83,6 +83,12 @@ enum amdgpu_bo_handle_type {
+ 	amdgpu_bo_handle_type_dma_buf_fd = 2
+ };
+ 
++/** Define known types of GPU VM VA ranges */
++enum amdgpu_gpu_va_range
++{
++	/** Allocate from "normal"/general range */
++	amdgpu_gpu_va_range_general = 0
++};
+ 
+ /*--------------------------------------------------------------------------*/
+ /* -------------------------- Datatypes ----------------------------------- */
+@@ -113,6 +119,10 @@ typedef struct amdgpu_bo *amdgpu_bo_handle;
+  */
+ typedef struct amdgpu_bo_list *amdgpu_bo_list_handle;
+ 
++/**
++ * Define handle to be used to work with VA allocated ranges
++ */
++typedef struct amdgpu_va *amdgpu_va_handle;
+ 
+ /*--------------------------------------------------------------------------*/
+ /* -------------------------- Structures ---------------------------------- */
+@@ -1089,4 +1099,60 @@ int amdgpu_read_mm_registers(amdgpu_device_handle dev, unsigned dword_offset,
+ 			     unsigned count, uint32_t instance, uint32_t flags,
+ 			     uint32_t *values);
+ 
++/**
++ * Allocate virtual address range
++ *
++ * \param dev - [in] Device handle. See #amdgpu_device_initialize()
++ * \param va_range_type - \c [in] Type of MC va range from which to allocate
++ * \param size - \c [in] Size of range. Size must be correctly* aligned.
++ * It is client responsibility to correctly aligned size based on the future
++ * usage of allocated range.
++ * \param va_base_alignment - \c [in] Overwrite base address alignment
++ * requirement for GPU VM MC virtual
++ * address assignment. Must be multiple of size alignments received as
++ * 'amdgpu_buffer_size_alignments'.
++ * If 0 use the default one.
++ * \param va_base_required - \c [in] Specified required va base address.
++ * If 0 then library choose available one.
++ * If !0 value will be passed and those value already "in use" then
++ * corresponding error status will be returned.
++ * \param va_base_allocated - \c [out] On return: Allocated VA base to be used
++ * by client.
++ * \param va_range_handle - \c [out] On return: Handle assigned to allocation
++ *
++ * \return 0 on success\n
++ * >0 - AMD specific error code\n
++ * <0 - Negative POSIX Error code
++ *
++ * \notes \n
++ * It is client responsibility to correctly handle VA assignments and usage.
++ * Neither kernel driver nor libdrm_amdpgu are able to prevent and
++ * detect wrong va assignemnt.
++ *
++ * It is client responsibility to correctly handle multi-GPU cases and to pass
++ * the corresponding arrays of all devices handles where corresponding VA will
++ * be used.
++ *
++*/
++int amdgpu_va_range_alloc(amdgpu_device_handle dev,
++			   enum amdgpu_gpu_va_range va_range_type,
++			   uint64_t size,
++			   uint64_t va_base_alignment,
++			   uint64_t va_base_required,
++			   uint64_t *va_base_allocated,
++			   amdgpu_va_handle *va_range_handle);
++
++/**
++ * Free previously allocated virtual address range
++ *
++ *
++ * \param va_range_handle - \c [in] Handle assigned to VA allocation
++ *
++ * \return 0 on success\n
++ * >0 - AMD specific error code\n
++ * <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_va_range_free(amdgpu_va_handle va_range_handle);
++
+ #endif /* #ifdef _AMDGPU_H_ */
+diff --git a/amdgpu/amdgpu_internal.h b/amdgpu/amdgpu_internal.h
+index 8e6fbf4..e35923f 100644
+--- a/amdgpu/amdgpu_internal.h
++++ b/amdgpu/amdgpu_internal.h
+@@ -58,6 +58,13 @@ struct amdgpu_bo_va_mgr {
+ 	uint32_t va_alignment;
+ };
+ 
++struct amdgpu_va {
++	amdgpu_device_handle dev;
++	uint64_t address;
++	uint64_t size;
++	enum amdgpu_gpu_va_range range;
++};
++
+ struct amdgpu_device {
+ 	atomic_t refcount;
+ 	int fd;
+@@ -124,7 +131,7 @@ struct amdgpu_bo_va_mgr* amdgpu_vamgr_get_global(struct amdgpu_device *dev);
+ void amdgpu_vamgr_reference(struct amdgpu_bo_va_mgr **dst, struct amdgpu_bo_va_mgr *src);
+ 
+ uint64_t amdgpu_vamgr_find_va(struct amdgpu_bo_va_mgr *mgr, uint64_t size,
+-				uint64_t alignment, uint64_t base_preferred);
++				uint64_t alignment, uint64_t base_required);
+ 
+ void amdgpu_vamgr_free_va(struct amdgpu_bo_va_mgr *mgr, uint64_t va, 
+ 				uint64_t size);
+diff --git a/amdgpu/amdgpu_vamgr.c b/amdgpu/amdgpu_vamgr.c
+index 2328e5d..faffba2 100644
+--- a/amdgpu/amdgpu_vamgr.c
++++ b/amdgpu/amdgpu_vamgr.c
+@@ -23,6 +23,7 @@
+ 
+ #include <stdlib.h>
+ #include <string.h>
++#include <errno.h>
+ #include "amdgpu.h"
+ #include "amdgpu_drm.h"
+ #include "amdgpu_internal.h"
+@@ -223,3 +224,46 @@ void amdgpu_vamgr_free_va(struct amdgpu_bo_va_mgr *mgr,
+ out:
+ 	pthread_mutex_unlock(&mgr->bo_va_mutex);
+ }
++
++int amdgpu_va_range_alloc(amdgpu_device_handle dev,
++			  enum amdgpu_gpu_va_range va_range_type,
++			  uint64_t size,
++			  uint64_t va_base_alignment,
++			  uint64_t va_base_required,
++			  uint64_t *va_base_allocated,
++			  amdgpu_va_handle *va_range_handle)
++{
++	va_base_alignment = MAX2(va_base_alignment, dev->vamgr->va_alignment);
++	size = ALIGN(size, vamgr.va_alignment);
++
++	*va_base_allocated = amdgpu_vamgr_find_va(dev->vamgr, size,
++					va_base_alignment, va_base_required);
++
++	if (*va_base_allocated != AMDGPU_INVALID_VA_ADDRESS) {
++		struct amdgpu_va* va;
++		va = calloc(1, sizeof(struct amdgpu_va));
++		if(!va){
++			amdgpu_vamgr_free_va(dev->vamgr, *va_base_allocated, size);
++			return -ENOMEM;
++		}
++		va->dev = dev;
++		va->address = *va_base_allocated;
++		va->size = size;
++		va->range = va_range_type;
++		*va_range_handle = va;
++	} else {
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++int amdgpu_va_range_free(amdgpu_va_handle va_range_handle)
++{
++	if(!va_range_handle || !va_range_handle->address)
++		return 0;
++	amdgpu_vamgr_free_va(va_range_handle->dev->vamgr, va_range_handle->address,
++			va_range_handle->size);
++	free(va_range_handle);
++	return 0;
++}
+-- 
+1.9.1
+

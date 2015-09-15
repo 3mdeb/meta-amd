@@ -1,0 +1,313 @@
+From 00b5ac50f4b4d56812627ac6eabf0573616805b8 Mon Sep 17 00:00:00 2001
+From: Jammy Zhou <Jammy.Zhou@amd.com>
+Date: Tue, 14 Jul 2015 11:31:54 +0800
+Subject: [PATCH 02/16] winsys/amdgpu: use amdgpu_bo_va_op for va map/unmap v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The VA map/unmap should be done explicitly now, which was done by
+libdrm_amdgpu.
+
+v2: adapt to the interface change and do the rebase
+
+Signed-off-by: Jammy Zhou <Jammy.Zhou@amd.com>
+Reviewed-by: Marek Olšák <marek.olsak@amd.com>
+Signed-off-by: Arindam Nath <arindam.nath@amd.com>
+---
+ src/gallium/winsys/amdgpu/drm/amdgpu_bo.c | 116 +++++++++++++++++++++++-------
+ src/gallium/winsys/amdgpu/drm/amdgpu_bo.h |   1 +
+ src/gallium/winsys/amdgpu/drm/amdgpu_cs.c |  11 +--
+ 3 files changed, 97 insertions(+), 31 deletions(-)
+
+diff --git a/src/gallium/winsys/amdgpu/drm/amdgpu_bo.c b/src/gallium/winsys/amdgpu/drm/amdgpu_bo.c
+index 5f67413..89a7183 100644
+--- a/src/gallium/winsys/amdgpu/drm/amdgpu_bo.c
++++ b/src/gallium/winsys/amdgpu/drm/amdgpu_bo.c
+@@ -151,6 +151,8 @@ static void amdgpu_bo_destroy(struct pb_buffer *_buf)
+    struct amdgpu_winsys_bo *bo = amdgpu_winsys_bo(_buf);
+    int i;
+ 
++   amdgpu_bo_va_op(bo->bo, 0, bo->base.size, bo->va, 0, AMDGPU_VA_OP_UNMAP);
++   amdgpu_va_range_free(bo->va_handle);
+    amdgpu_bo_free(bo->bo);
+ 
+    for (i = 0; i < RING_LAST; i++)
+@@ -294,11 +296,17 @@ static struct pb_buffer *amdgpu_bomgr_create_bo(struct pb_manager *_mgr,
+    struct amdgpu_winsys *rws = get_winsys(_mgr);
+    struct amdgpu_bo_desc *rdesc = (struct amdgpu_bo_desc*)desc;
+    struct amdgpu_bo_alloc_request request = {0};
+-   struct amdgpu_bo_alloc_result result = {0};
++   amdgpu_bo_handle buf_handle;
++   uint64_t va = 0;
+    struct amdgpu_winsys_bo *bo;
++   amdgpu_va_handle va_handle;
+    int r;
+ 
+    assert(rdesc->initial_domain & RADEON_DOMAIN_VRAM_GTT);
++   bo = CALLOC_STRUCT(amdgpu_winsys_bo);
++   if (!bo) {
++      return NULL;
++   }
+ 
+    request.alloc_size = size;
+    request.phys_alignment = desc->alignment;
+@@ -314,18 +322,23 @@ static struct pb_buffer *amdgpu_bomgr_create_bo(struct pb_manager *_mgr,
+          request.flags |= AMDGPU_GEM_CREATE_CPU_GTT_USWC;
+    }
+ 
+-   r = amdgpu_bo_alloc(rws->dev, &request, &result);
++   r = amdgpu_bo_alloc(rws->dev, &request, &buf_handle);
+    if (r) {
+       fprintf(stderr, "amdgpu: Failed to allocate a buffer:\n");
+       fprintf(stderr, "amdgpu:    size      : %d bytes\n", size);
+       fprintf(stderr, "amdgpu:    alignment : %d bytes\n", desc->alignment);
+       fprintf(stderr, "amdgpu:    domains   : %d\n", rdesc->initial_domain);
+-      return NULL;
++      goto error_bo_alloc;
+    }
+ 
+-   bo = CALLOC_STRUCT(amdgpu_winsys_bo);
+-   if (!bo)
+-      return NULL;
++   r = amdgpu_va_range_alloc(rws->dev, amdgpu_gpu_va_range_general,
++                             size, desc->alignment, 0, &va, &va_handle, 0);
++   if (r)
++      goto error_va_alloc;
++
++   r = amdgpu_bo_va_op(buf_handle, 0, size, va, 0, AMDGPU_VA_OP_MAP);
++   if (r)
++      goto error_va_map;
+ 
+    pipe_reference_init(&bo->base.reference, 1);
+    bo->base.alignment = desc->alignment;
+@@ -333,8 +346,9 @@ static struct pb_buffer *amdgpu_bomgr_create_bo(struct pb_manager *_mgr,
+    bo->base.size = size;
+    bo->base.vtbl = &amdgpu_winsys_bo_vtbl;
+    bo->rws = rws;
+-   bo->bo = result.buf_handle;
+-   bo->va = result.virtual_mc_base_address;
++   bo->bo = buf_handle;
++   bo->va = va;
++   bo->va_handle = va_handle;
+    bo->initial_domain = rdesc->initial_domain;
+    bo->unique_id = __sync_fetch_and_add(&rws->next_bo_unique_id, 1);
+ 
+@@ -344,6 +358,16 @@ static struct pb_buffer *amdgpu_bomgr_create_bo(struct pb_manager *_mgr,
+       rws->allocated_gtt += align(size, rws->gart_page_size);
+ 
+    return &bo->base;
++
++error_va_map:
++   amdgpu_va_range_free(va_handle);
++
++error_va_alloc:
++   amdgpu_bo_free(buf_handle);
++
++error_bo_alloc:
++   FREE(bo);
++   return NULL;
+ }
+ 
+ static void amdgpu_bomgr_flush(struct pb_manager *mgr)
+@@ -570,10 +594,18 @@ static struct pb_buffer *amdgpu_bo_from_handle(struct radeon_winsys *rws,
+    struct amdgpu_winsys_bo *bo;
+    enum amdgpu_bo_handle_type type;
+    struct amdgpu_bo_import_result result = {0};
++   uint64_t va;
++   amdgpu_va_handle va_handle;
+    struct amdgpu_bo_info info = {0};
+    enum radeon_bo_domain initial = 0;
+    int r;
+ 
++   /* Initialize the structure. */
++   bo = CALLOC_STRUCT(amdgpu_winsys_bo);
++   if (!bo) {
++      return NULL;
++   }
++
+    switch (whandle->type) {
+    case DRM_API_HANDLE_TYPE_SHARED:
+       type = amdgpu_bo_handle_type_gem_flink_name;
+@@ -587,26 +619,27 @@ static struct pb_buffer *amdgpu_bo_from_handle(struct radeon_winsys *rws,
+ 
+    r = amdgpu_bo_import(ws->dev, type, whandle->handle, &result);
+    if (r)
+-      return NULL;
++      goto error;
+ 
+    /* Get initial domains. */
+    r = amdgpu_bo_query_info(result.buf_handle, &info);
+-   if (r) {
+-      amdgpu_bo_free(result.buf_handle);
+-      return NULL;
+-   }
++   if (r)
++      goto error_query;
++
++   r = amdgpu_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general,
++                             result.alloc_size, 1 << 20, 0, &va, &va_handle, 0);
++   if (r)
++      goto error_query;
++
++   r = amdgpu_bo_va_op(result.buf_handle, 0, result.alloc_size, va, 0, AMDGPU_VA_OP_MAP);
++   if (r)
++      goto error_va_map;
+ 
+    if (info.preferred_heap & AMDGPU_GEM_DOMAIN_VRAM)
+       initial |= RADEON_DOMAIN_VRAM;
+    if (info.preferred_heap & AMDGPU_GEM_DOMAIN_GTT)
+       initial |= RADEON_DOMAIN_GTT;
+ 
+-   /* Initialize the structure. */
+-   bo = CALLOC_STRUCT(amdgpu_winsys_bo);
+-   if (!bo) {
+-      amdgpu_bo_free(result.buf_handle);
+-      return NULL;
+-   }
+ 
+    pipe_reference_init(&bo->base.reference, 1);
+    bo->base.alignment = info.phys_alignment;
+@@ -615,7 +648,8 @@ static struct pb_buffer *amdgpu_bo_from_handle(struct radeon_winsys *rws,
+    bo->base.size = result.alloc_size;
+    bo->base.vtbl = &amdgpu_winsys_bo_vtbl;
+    bo->rws = ws;
+-   bo->va = result.virtual_mc_base_address;
++   bo->va = va;
++   bo->va_handle = va_handle;
+    bo->initial_domain = initial;
+    bo->unique_id = __sync_fetch_and_add(&ws->next_bo_unique_id, 1);
+ 
+@@ -628,6 +662,16 @@ static struct pb_buffer *amdgpu_bo_from_handle(struct radeon_winsys *rws,
+       ws->allocated_gtt += align(bo->base.size, ws->gart_page_size);
+ 
+    return &bo->base;
++
++error_va_map:
++   amdgpu_va_range_free(va_handle);
++
++error_query:
++   amdgpu_bo_free(result.buf_handle);
++
++error:
++   FREE(bo);
++   return NULL;
+ }
+ 
+ static boolean amdgpu_bo_get_handle(struct pb_buffer *buffer,
+@@ -664,34 +708,52 @@ static struct pb_buffer *amdgpu_bo_from_ptr(struct radeon_winsys *rws,
+ 					    void *pointer, unsigned size)
+ {
+     struct amdgpu_winsys *ws = amdgpu_winsys(rws);
+-    struct amdgpu_bo_alloc_result result;
++    amdgpu_bo_handle buf_handle;
+     struct amdgpu_winsys_bo *bo;
++    uint64_t va;
++    amdgpu_va_handle va_handle;
+ 
+     bo = CALLOC_STRUCT(amdgpu_winsys_bo);
+     if (!bo)
+         return NULL;
+ 
+-    if (amdgpu_create_bo_from_user_mem(ws->dev, pointer, size, &result)) {
+-        FREE(bo);
+-        return NULL;
+-    }
++    if (amdgpu_create_bo_from_user_mem(ws->dev, pointer, size, &buf_handle))
++        goto error;
++
++    if (amdgpu_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general,
++                              size, 1 << 12, 0, &va, &va_handle, 0))
++        goto error_va_alloc;
++
++    if (amdgpu_bo_va_op(buf_handle, 0, size, va, 0, AMDGPU_VA_OP_MAP))
++        goto error_va_map;
+ 
+     /* Initialize it. */
+     pipe_reference_init(&bo->base.reference, 1);
+-    bo->bo = result.buf_handle;
++    bo->bo = buf_handle;
+     bo->base.alignment = 0;
+     bo->base.usage = PB_USAGE_GPU_WRITE | PB_USAGE_GPU_READ;
+     bo->base.size = size;
+     bo->base.vtbl = &amdgpu_winsys_bo_vtbl;
+     bo->rws = ws;
+     bo->user_ptr = pointer;
+-    bo->va = result.virtual_mc_base_address;
++    bo->va = va;
++    bo->va_handle = va_handle;
+     bo->initial_domain = RADEON_DOMAIN_GTT;
+     bo->unique_id = __sync_fetch_and_add(&ws->next_bo_unique_id, 1);
+ 
+     ws->allocated_gtt += align(bo->base.size, ws->gart_page_size);
+ 
+     return (struct pb_buffer*)bo;
++
++error_va_map:
++    amdgpu_va_range_free(va_handle);
++
++error_va_alloc:
++    amdgpu_bo_free(buf_handle);
++
++error:
++    FREE(bo);
++    return NULL;
+ }
+ 
+ static uint64_t amdgpu_bo_get_va(struct radeon_winsys_cs_handle *buf)
+diff --git a/src/gallium/winsys/amdgpu/drm/amdgpu_bo.h b/src/gallium/winsys/amdgpu/drm/amdgpu_bo.h
+index cd6f772..65eb77d 100644
+--- a/src/gallium/winsys/amdgpu/drm/amdgpu_bo.h
++++ b/src/gallium/winsys/amdgpu/drm/amdgpu_bo.h
+@@ -51,6 +51,7 @@ struct amdgpu_winsys_bo {
+ 
+    amdgpu_bo_handle bo;
+    uint32_t unique_id;
++   amdgpu_va_handle va_handle;
+    uint64_t va;
+    enum radeon_bo_domain initial_domain;
+ 
+diff --git a/src/gallium/winsys/amdgpu/drm/amdgpu_cs.c b/src/gallium/winsys/amdgpu/drm/amdgpu_cs.c
+index 69698c2..a0a8595 100644
+--- a/src/gallium/winsys/amdgpu/drm/amdgpu_cs.c
++++ b/src/gallium/winsys/amdgpu/drm/amdgpu_cs.c
+@@ -142,7 +142,7 @@ static struct radeon_winsys_ctx *amdgpu_ctx_create(struct radeon_winsys *ws)
+    struct amdgpu_ctx *ctx = CALLOC_STRUCT(amdgpu_ctx);
+    int r;
+    struct amdgpu_bo_alloc_request alloc_buffer = {};
+-   struct amdgpu_bo_alloc_result info = {};
++   amdgpu_bo_handle buf_handle;
+ 
+    ctx->ws = amdgpu_winsys(ws);
+    ctx->refcount = 1;
+@@ -158,21 +158,24 @@ static struct radeon_winsys_ctx *amdgpu_ctx_create(struct radeon_winsys *ws)
+    alloc_buffer.phys_alignment = 4 *1024;
+    alloc_buffer.preferred_heap = AMDGPU_GEM_DOMAIN_GTT;
+ 
+-   r = amdgpu_bo_alloc(ctx->ws->dev, &alloc_buffer, &info);
++   r = amdgpu_bo_alloc(ctx->ws->dev, &alloc_buffer, &buf_handle);
+    if (r) {
+       fprintf(stderr, "amdgpu: amdgpu_bo_alloc failed. (%i)\n", r);
++      amdgpu_cs_ctx_free(ctx->ctx);
+       FREE(ctx);
+       return NULL;
+    }
+ 
+-   r = amdgpu_bo_cpu_map(info.buf_handle, (void**)&ctx->user_fence_cpu_address_base);
++   r = amdgpu_bo_cpu_map(buf_handle, (void**)&ctx->user_fence_cpu_address_base);
+    if (r) {
+       fprintf(stderr, "amdgpu: amdgpu_bo_cpu_map failed. (%i)\n", r);
++      amdgpu_bo_free(buf_handle);
++      amdgpu_cs_ctx_free(ctx->ctx);
+       FREE(ctx);
+       return NULL;
+    }
+ 
+-   ctx->user_fence_bo = info.buf_handle;
++   ctx->user_fence_bo = buf_handle;
+ 
+    return (struct radeon_winsys_ctx*)ctx;
+ }
+-- 
+1.9.1
+

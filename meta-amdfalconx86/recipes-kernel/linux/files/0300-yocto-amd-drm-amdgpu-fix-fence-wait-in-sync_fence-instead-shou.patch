@@ -1,0 +1,164 @@
+From 7243c942934399fe5e35a5b454bbbf1b96ca7e44 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 20 Aug 2015 14:47:40 +0800
+Subject: [PATCH 10/14] drm/amdgpu: fix fence wait in sync_fence, instead
+ should be in sync_rings
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+Reviewed-by: Christian K?nig <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h      |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c   |  6 +++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c | 56 ++++++++++++++++++++++++++++++--
+ 3 files changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 8109a97..f9d3776 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -699,6 +699,7 @@ void amdgpu_semaphore_free(struct amdgpu_device *adev,
+ struct amdgpu_sync {
+ 	struct amdgpu_semaphore *semaphores[AMDGPU_NUM_SYNCS];
+ 	struct amdgpu_fence	*sync_to[AMDGPU_MAX_RINGS];
++	DECLARE_HASHTABLE(fences, 4);
+ 	struct amdgpu_fence	*last_vm_update;
+ };
+ 
+@@ -711,6 +712,7 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 		     void *owner);
+ int amdgpu_sync_rings(struct amdgpu_sync *sync,
+ 		      struct amdgpu_ring *ring);
++int amdgpu_sync_wait(struct amdgpu_sync *sync);
+ void amdgpu_sync_free(struct amdgpu_device *adev, struct amdgpu_sync *sync,
+ 		      struct amdgpu_fence *fence);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index b788ea2..093ede3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -156,7 +156,11 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 		dev_err(adev->dev, "couldn't schedule ib\n");
+ 		return -EINVAL;
+ 	}
+-
++	r = amdgpu_sync_wait(&ibs->sync);
++	if (r) {
++		dev_err(adev->dev, "IB sync failed (%d).\n", r);
++		return r;
++	}
+ 	r = amdgpu_ring_lock(ring, (256 + AMDGPU_NUM_SYNCS * 8) * num_ibs);
+ 	if (r) {
+ 		dev_err(adev->dev, "scheduling IB failed (%d).\n", r);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+index 9c292cf..36a59ec 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+@@ -32,6 +32,11 @@
+ #include "amdgpu.h"
+ #include "amdgpu_trace.h"
+ 
++struct amdgpu_sync_entry {
++	struct hlist_node	node;
++	struct fence		*fence;
++};
++
+ /**
+  * amdgpu_sync_create - zero init sync object
+  *
+@@ -49,6 +54,7 @@ void amdgpu_sync_create(struct amdgpu_sync *sync)
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; ++i)
+ 		sync->sync_to[i] = NULL;
+ 
++	hash_init(sync->fences);
+ 	sync->last_vm_update = NULL;
+ }
+ 
+@@ -62,6 +68,7 @@ void amdgpu_sync_create(struct amdgpu_sync *sync)
+ int amdgpu_sync_fence(struct amdgpu_device *adev, struct amdgpu_sync *sync,
+ 		      struct fence *f)
+ {
++	struct amdgpu_sync_entry *e;
+ 	struct amdgpu_fence *fence;
+ 	struct amdgpu_fence *other;
+ 
+@@ -69,8 +76,27 @@ int amdgpu_sync_fence(struct amdgpu_device *adev, struct amdgpu_sync *sync,
+ 		return 0;
+ 
+ 	fence = to_amdgpu_fence(f);
+-	if (!fence || fence->ring->adev != adev)
+-		return fence_wait(f, true);
++	if (!fence || fence->ring->adev != adev) {
++		hash_for_each_possible(sync->fences, e, node, f->context) {
++			struct fence *new;
++			if (unlikely(e->fence->context != f->context))
++				continue;
++			new = fence_get(fence_later(e->fence, f));
++			if (new) {
++				fence_put(e->fence);
++				e->fence = new;
++			}
++			return 0;
++		}
++
++		e = kmalloc(sizeof(struct amdgpu_sync_entry), GFP_KERNEL);
++		if (!e)
++			return -ENOMEM;
++
++		hash_add(sync->fences, &e->node, f->context);
++		e->fence = fence_get(f);
++		return 0;
++	}
+ 
+ 	other = sync->sync_to[fence->ring->idx];
+ 	sync->sync_to[fence->ring->idx] = amdgpu_fence_ref(
+@@ -134,6 +160,24 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 	return r;
+ }
+ 
++int amdgpu_sync_wait(struct amdgpu_sync *sync)
++{
++	struct amdgpu_sync_entry *e;
++	struct hlist_node *tmp;
++	int i, r;
++
++	hash_for_each_safe(sync->fences, i, tmp, e, node) {
++		r = fence_wait(e->fence, false);
++		if (r)
++			return r;
++
++		hash_del(&e->node);
++		fence_put(e->fence);
++		kfree(e);
++	}
++	return 0;
++}
++
+ /**
+  * amdgpu_sync_rings - sync ring to all registered fences
+  *
+@@ -223,8 +267,16 @@ void amdgpu_sync_free(struct amdgpu_device *adev,
+ 		      struct amdgpu_sync *sync,
+ 		      struct amdgpu_fence *fence)
+ {
++	struct amdgpu_sync_entry *e;
++	struct hlist_node *tmp;
+ 	unsigned i;
+ 
++	hash_for_each_safe(sync->fences, i, tmp, e, node) {
++		hash_del(&e->node);
++		fence_put(e->fence);
++		kfree(e);
++	}
++
+ 	for (i = 0; i < AMDGPU_NUM_SYNCS; ++i)
+ 		amdgpu_semaphore_free(adev, &sync->semaphores[i], fence);
+ 
+-- 
+2.1.4
+

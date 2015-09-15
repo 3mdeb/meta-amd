@@ -1,0 +1,240 @@
+From 57a967b7bd13d7c28e8fe45f156bf7daa2f59370 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 30 Jul 2015 11:53:42 +0200
+Subject: [PATCH 384/401] drm/amdgpu: stop using addr to check for BO move v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+It is theoretically possible that a swapped out BO gets the
+same GTT address, but different backing pages while being swapped in.
+
+Instead just use another VA state to note updated areas.
+Ported from not upstream yet radeon commit with the same name.
+
+v2: fix some bugs in the original implementation found in the radeon code.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    | 15 +++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 67 ++++++++++++++++++++--------------
+ 3 files changed, 50 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 099a877..28e3c53 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -536,14 +536,16 @@ struct amdgpu_bo_va_mapping {
+ struct amdgpu_bo_va {
+ 	/* protected by bo being reserved */
+ 	struct list_head		bo_list;
+-	uint64_t			addr;
+ 	struct amdgpu_fence		*last_pt_update;
+ 	unsigned			ref_count;
+ 
+-	/* protected by vm mutex */
+-	struct list_head		mappings;
++	/* protected by vm mutex and spinlock */
+ 	struct list_head		vm_status;
+ 
++	/* mappings for this bo_va */
++	struct list_head		invalids;
++	struct list_head		valids;
++
+ 	/* constant after initialization */
+ 	struct amdgpu_vm		*vm;
+ 	struct amdgpu_bo		*bo;
+@@ -947,13 +949,16 @@ struct amdgpu_vm {
+ 
+ 	struct rb_root		va;
+ 
+-	/* protecting invalidated and freed */
++	/* protecting invalidated */
+ 	spinlock_t		status_lock;
+ 
+ 	/* BOs moved, but not yet updated in the PT */
+ 	struct list_head	invalidated;
+ 
+-	/* BOs freed, but not yet updated in the PT */
++	/* BOs cleared in the PT because of a move */
++	struct list_head	cleared;
++
++	/* BO mappings freed, but not yet updated in the PT */
+ 	struct list_head	freed;
+ 
+ 	/* contains the page directory */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 1f040d8..7194e84 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -864,7 +864,7 @@ amdgpu_cs_find_mapping(struct amdgpu_cs_parser *parser,
+ 		if (!reloc->bo_va)
+ 			continue;
+ 
+-		list_for_each_entry(mapping, &reloc->bo_va->mappings, list) {
++		list_for_each_entry(mapping, &reloc->bo_va->valids, list) {
+ 			if (mapping->it.start > addr ||
+ 			    addr > mapping->it.last)
+ 				continue;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 9a4e3b6..b38b8dc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -794,21 +794,24 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 		addr = 0;
+ 	}
+ 
+-	if (addr == bo_va->addr)
+-		return 0;
+-
+ 	flags = amdgpu_ttm_tt_pte_flags(adev, bo_va->bo->tbo.ttm, mem);
+ 
+-	list_for_each_entry(mapping, &bo_va->mappings, list) {
++	spin_lock(&vm->status_lock);
++	if (!list_empty(&bo_va->vm_status))
++		list_splice_init(&bo_va->valids, &bo_va->invalids);
++	spin_unlock(&vm->status_lock);
++
++	list_for_each_entry(mapping, &bo_va->invalids, list) {
+ 		r = amdgpu_vm_bo_update_mapping(adev, vm, mapping, addr,
+ 						flags, &bo_va->last_pt_update);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+-	bo_va->addr = addr;
+ 	spin_lock(&vm->status_lock);
+ 	list_del_init(&bo_va->vm_status);
++	if (!mem)
++		list_add(&bo_va->vm_status, &vm->cleared);
+ 	spin_unlock(&vm->status_lock);
+ 
+ 	return 0;
+@@ -907,10 +910,10 @@ struct amdgpu_bo_va *amdgpu_vm_bo_add(struct amdgpu_device *adev,
+ 	}
+ 	bo_va->vm = vm;
+ 	bo_va->bo = bo;
+-	bo_va->addr = 0;
+ 	bo_va->ref_count = 1;
+ 	INIT_LIST_HEAD(&bo_va->bo_list);
+-	INIT_LIST_HEAD(&bo_va->mappings);
++	INIT_LIST_HEAD(&bo_va->valids);
++	INIT_LIST_HEAD(&bo_va->invalids);
+ 	INIT_LIST_HEAD(&bo_va->vm_status);
+ 
+ 	mutex_lock(&vm->mutex);
+@@ -999,12 +1002,10 @@ int amdgpu_vm_bo_map(struct amdgpu_device *adev,
+ 	mapping->offset = offset;
+ 	mapping->flags = flags;
+ 
+-	list_add(&mapping->list, &bo_va->mappings);
++	list_add(&mapping->list, &bo_va->invalids);
+ 	interval_tree_insert(&mapping->it, &vm->va);
+ 	trace_amdgpu_vm_bo_map(bo_va, mapping);
+ 
+-	bo_va->addr = 0;
+-
+ 	/* Make sure the page tables are allocated */
+ 	saddr >>= amdgpu_vm_block_size;
+ 	eaddr >>= amdgpu_vm_block_size;
+@@ -1085,17 +1086,27 @@ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
+ {
+ 	struct amdgpu_bo_va_mapping *mapping;
+ 	struct amdgpu_vm *vm = bo_va->vm;
++	bool valid = true;
+ 
+ 	saddr /= AMDGPU_GPU_PAGE_SIZE;
+ 
+-	list_for_each_entry(mapping, &bo_va->mappings, list) {
++	list_for_each_entry(mapping, &bo_va->valids, list) {
+ 		if (mapping->it.start == saddr)
+ 			break;
+ 	}
+ 
+-	if (&mapping->list == &bo_va->mappings) {
+-		amdgpu_bo_unreserve(bo_va->bo);
+-		return -ENOENT;
++	if (&mapping->list == &bo_va->valids) {
++		valid = false;
++
++		list_for_each_entry(mapping, &bo_va->invalids, list) {
++			if (mapping->it.start == saddr)
++				break;
++		}
++
++		if (&mapping->list == &bo_va->invalids) {
++			amdgpu_bo_unreserve(bo_va->bo);
++			return -ENOENT;
++		}
+ 	}
+ 
+ 	mutex_lock(&vm->mutex);
+@@ -1103,12 +1114,10 @@ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
+ 	interval_tree_remove(&mapping->it, &vm->va);
+ 	trace_amdgpu_vm_bo_unmap(bo_va, mapping);
+ 
+-	if (bo_va->addr) {
+-		/* clear the old address */
++	if (valid)
+ 		list_add(&mapping->list, &vm->freed);
+-	} else {
++	else
+ 		kfree(mapping);
+-	}
+ 	mutex_unlock(&vm->mutex);
+ 	amdgpu_bo_unreserve(bo_va->bo);
+ 
+@@ -1139,15 +1148,18 @@ void amdgpu_vm_bo_rmv(struct amdgpu_device *adev,
+ 	list_del(&bo_va->vm_status);
+ 	spin_unlock(&vm->status_lock);
+ 
+-	list_for_each_entry_safe(mapping, next, &bo_va->mappings, list) {
++	list_for_each_entry_safe(mapping, next, &bo_va->valids, list) {
+ 		list_del(&mapping->list);
+ 		interval_tree_remove(&mapping->it, &vm->va);
+ 		trace_amdgpu_vm_bo_unmap(bo_va, mapping);
+-		if (bo_va->addr)
+-			list_add(&mapping->list, &vm->freed);
+-		else
+-			kfree(mapping);
++		list_add(&mapping->list, &vm->freed);
++	}
++	list_for_each_entry_safe(mapping, next, &bo_va->invalids, list) {
++		list_del(&mapping->list);
++		interval_tree_remove(&mapping->it, &vm->va);
++		kfree(mapping);
+ 	}
++
+ 	amdgpu_fence_unref(&bo_va->last_pt_update);
+ 	kfree(bo_va);
+ 
+@@ -1169,12 +1181,10 @@ void amdgpu_vm_bo_invalidate(struct amdgpu_device *adev,
+ 	struct amdgpu_bo_va *bo_va;
+ 
+ 	list_for_each_entry(bo_va, &bo->va, bo_list) {
+-		if (bo_va->addr) {
+-			spin_lock(&bo_va->vm->status_lock);
+-			list_del(&bo_va->vm_status);
++		spin_lock(&bo_va->vm->status_lock);
++		if (list_empty(&bo_va->vm_status))
+ 			list_add(&bo_va->vm_status, &bo_va->vm->invalidated);
+-			spin_unlock(&bo_va->vm->status_lock);
+-		}
++		spin_unlock(&bo_va->vm->status_lock);
+ 	}
+ }
+ 
+@@ -1202,6 +1212,7 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ 	vm->va = RB_ROOT;
+ 	spin_lock_init(&vm->status_lock);
+ 	INIT_LIST_HEAD(&vm->invalidated);
++	INIT_LIST_HEAD(&vm->cleared);
+ 	INIT_LIST_HEAD(&vm->freed);
+ 
+ 	pd_size = amdgpu_vm_directory_size(adev);
+-- 
+1.9.1
+

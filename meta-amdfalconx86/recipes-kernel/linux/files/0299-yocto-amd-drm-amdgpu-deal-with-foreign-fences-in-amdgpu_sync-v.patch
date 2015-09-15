@@ -1,0 +1,227 @@
+From 9feb1004c6dd671c6214486e23b1ec3bcc28bd90 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 6 Jul 2015 22:06:40 +0200
+Subject: [PATCH 09/14] drm/amdgpu: deal with foreign fences in amdgpu_sync v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This also requires some error handling from the callers of that function.
+
+v2: rebased on amd-mainline
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com> (v1)
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com> (v1)
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h      |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c   | 16 ++++++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c   |  6 ++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c | 41 ++++++++++++++++----------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c   | 11 +++++----
+ 5 files changed, 48 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 29f4d5b..8109a97 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -703,8 +703,8 @@ struct amdgpu_sync {
+ };
+ 
+ void amdgpu_sync_create(struct amdgpu_sync *sync);
+-void amdgpu_sync_fence(struct amdgpu_sync *sync,
+-		       struct amdgpu_fence *fence);
++int amdgpu_sync_fence(struct amdgpu_device *adev, struct amdgpu_sync *sync,
++		      struct fence *f);
+ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 		     struct amdgpu_sync *sync,
+ 		     struct reservation_object *resv,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index f56d9e6..23d3b64 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -476,7 +476,9 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p,
+ 	if (r)
+ 		return r;
+ 
+-	amdgpu_sync_fence(&p->ibs[0].sync, vm->page_directory_fence);
++	if (vm->page_directory_fence)
++		amdgpu_sync_fence(adev, &p->ibs[0].sync,
++				  &vm->page_directory_fence->base);
+ 
+ 	r = amdgpu_vm_clear_freed(adev, vm);
+ 	if (r)
+@@ -484,6 +486,8 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p,
+ 
+ 	if (p->bo_list) {
+ 		for (i = 0; i < p->bo_list->num_entries; i++) {
++			struct fence *f;
++
+ 			/* ignore duplicates */
+ 			bo = p->bo_list->array[i].robj;
+ 			if (!bo)
+@@ -497,7 +501,10 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p,
+ 			if (r)
+ 				return r;
+ 
+-			amdgpu_sync_fence(&p->ibs[0].sync, bo_va->last_pt_update);
++			f = &bo_va->last_pt_update->base;
++			r = amdgpu_sync_fence(adev, &p->ibs[0].sync, f);
++			if (r)
++				return r;
+ 		}
+ 	}
+ 
+@@ -717,9 +724,12 @@ static int amdgpu_cs_dependencies(struct amdgpu_device *adev,
+ 				return r;
+ 			}
+ 
+-			amdgpu_sync_fence(&ib->sync, fence);
++			r = amdgpu_sync_fence(adev, &ib->sync, &fence->base);
+ 			amdgpu_fence_unref(&fence);
+ 			amdgpu_ctx_put(ctx);
++
++			if (r)
++				return r;
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 52dff75..b788ea2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -167,7 +167,11 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 		/* grab a vm id if necessary */
+ 		struct amdgpu_fence *vm_id_fence = NULL;
+ 		vm_id_fence = amdgpu_vm_grab_id(ibs->ring, ibs->vm);
+-		amdgpu_sync_fence(&ibs->sync, vm_id_fence);
++		r = amdgpu_sync_fence(adev, &ibs->sync, &vm_id_fence->base);
++		if (r) {
++			amdgpu_ring_unlock_undo(ring);
++			return r;
++		}
+ 	}
+ 
+ 	r = amdgpu_sync_rings(&ibs->sync, ring);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+index 21accbd..9c292cf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+@@ -53,20 +53,24 @@ void amdgpu_sync_create(struct amdgpu_sync *sync)
+ }
+ 
+ /**
+- * amdgpu_sync_fence - use the semaphore to sync to a fence
++ * amdgpu_sync_fence - remember to sync to this fence
+  *
+  * @sync: sync object to add fence to
+  * @fence: fence to sync to
+  *
+- * Sync to the fence using the semaphore objects
+  */
+-void amdgpu_sync_fence(struct amdgpu_sync *sync,
+-		       struct amdgpu_fence *fence)
++int amdgpu_sync_fence(struct amdgpu_device *adev, struct amdgpu_sync *sync,
++		      struct fence *f)
+ {
++	struct amdgpu_fence *fence;
+ 	struct amdgpu_fence *other;
+ 
+-	if (!fence)
+-		return;
++	if (!f)
++		return 0;
++
++	fence = to_amdgpu_fence(f);
++	if (!fence || fence->ring->adev != adev)
++		return fence_wait(f, true);
+ 
+ 	other = sync->sync_to[fence->ring->idx];
+ 	sync->sync_to[fence->ring->idx] = amdgpu_fence_ref(
+@@ -79,6 +83,8 @@ void amdgpu_sync_fence(struct amdgpu_sync *sync,
+ 			amdgpu_fence_later(fence, other));
+ 		amdgpu_fence_unref(&other);
+ 	}
++
++	return 0;
+ }
+ 
+ /**
+@@ -106,11 +112,7 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 
+ 	/* always sync to the exclusive fence */
+ 	f = reservation_object_get_excl(resv);
+-	fence = f ? to_amdgpu_fence(f) : NULL;
+-	if (fence && fence->ring->adev == adev)
+-		amdgpu_sync_fence(sync, fence);
+-	else if (f)
+-		r = fence_wait(f, true);
++	r = amdgpu_sync_fence(adev, sync, f);
+ 
+ 	flist = reservation_object_get_list(resv);
+ 	if (!flist || r)
+@@ -120,15 +122,14 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 		f = rcu_dereference_protected(flist->shared[i],
+ 					      reservation_object_held(resv));
+ 		fence = f ? to_amdgpu_fence(f) : NULL;
+-		if (fence && fence->ring->adev == adev) {
+-			if (fence->owner != owner ||
+-			    fence->owner == AMDGPU_FENCE_OWNER_UNDEFINED)
+-				amdgpu_sync_fence(sync, fence);
+-		} else if (f) {
+-			r = fence_wait(f, true);
+-			if (r)
+-				break;
+-		}
++		if (fence && fence->ring->adev == adev &&
++		    fence->owner == owner &&
++		    fence->owner != AMDGPU_FENCE_OWNER_UNDEFINED)
++				continue;
++
++		r = amdgpu_sync_fence(adev, sync, f);
++		if (r)
++			break;
+ 	}
+ 	return r;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 71d5ad9..316dc83 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -734,7 +734,9 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 
+ 		for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+ 			struct amdgpu_fence *f = vm->ids[i].last_id_use;
+-			amdgpu_sync_fence(&ib.sync, f);
++			r = amdgpu_sync_fence(adev, &ib.sync, &f->base);
++			if (r)
++				return r;
+ 		}
+ 	}
+ 
+@@ -867,7 +869,7 @@ int amdgpu_vm_clear_invalids(struct amdgpu_device *adev,
+ 			     struct amdgpu_vm *vm, struct amdgpu_sync *sync)
+ {
+ 	struct amdgpu_bo_va *bo_va = NULL;
+-	int r;
++	int r = 0;
+ 
+ 	spin_lock(&vm->status_lock);
+ 	while (!list_empty(&vm->invalidated)) {
+@@ -884,8 +886,9 @@ int amdgpu_vm_clear_invalids(struct amdgpu_device *adev,
+ 	spin_unlock(&vm->status_lock);
+ 
+ 	if (bo_va)
+-		amdgpu_sync_fence(sync, bo_va->last_pt_update);
+-	return 0;
++		r = amdgpu_sync_fence(adev, sync, &bo_va->last_pt_update->base);
++
++	return r;
+ }
+ 
+ /**
+-- 
+2.1.4
+
