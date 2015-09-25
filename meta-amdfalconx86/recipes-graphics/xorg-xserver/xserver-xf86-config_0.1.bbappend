@@ -6,4 +6,5 @@ do_install_append_amdfalconx86 () {
 	        sed -i -e 's/^\tDriver      "radeon"/\tDriver      "amdgpu"/' ${D}/${sysconfdir}/X11/xorg.conf
 	        sed -i -e 's/^\tDriver      "fbdev"/\tDriver      "amdgpu"/' ${D}/${sysconfdir}/X11/xorg.conf
 	fi
+	sed -i '/.\"SWcursor\"./c\\tOption      "SWcursor"           \t"True"' ${D}/${sysconfdir}/X11/xorg.conf
 }
