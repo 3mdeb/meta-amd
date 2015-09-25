@@ -1,0 +1,187 @@
+From 04a51f4ab7e7a5e45e75781decaea1d8ac13167b Mon Sep 17 00:00:00 2001
+From: Ken Wang <Qingqing.Wang@amd.com>
+Date: Thu, 21 May 2015 17:21:21 +0800
+Subject: [PATCH 17/67] amdgpu: make vamgr global
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This is the first sub-patch of va interface task, the va task is
+about adding more va management interfaces for UMD, by design, the
+vamgr should be per-process rather than per-device.
+
+Signed-off-by: Ken Wang <Qingqing.Wang@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Arindam Nath <arindam.nath@amd.com>
+---
+ amdgpu/amdgpu_bo.c       |  4 ++--
+ amdgpu/amdgpu_device.c   |  4 ++--
+ amdgpu/amdgpu_internal.h | 13 ++++++++-----
+ amdgpu/amdgpu_vamgr.c    | 48 ++++++++++++++++++++++++++++++++++++++----------
+ 4 files changed, 50 insertions(+), 19 deletions(-)
+
+diff --git a/amdgpu/amdgpu_bo.c b/amdgpu/amdgpu_bo.c
+index e171719..f8d9c87 100644
+--- a/amdgpu/amdgpu_bo.c
++++ b/amdgpu/amdgpu_bo.c
+@@ -71,7 +71,7 @@ void amdgpu_bo_free_internal(amdgpu_bo_handle bo)
+ 
+ 	amdgpu_close_kms_handle(bo->dev, bo->handle);
+ 	pthread_mutex_destroy(&bo->cpu_access_mutex);
+-	amdgpu_vamgr_free_va(&bo->dev->vamgr, bo->virtual_mc_base_address, bo->alloc_size);
++	amdgpu_vamgr_free_va(bo->dev->vamgr, bo->virtual_mc_base_address, bo->alloc_size);
+ 	free(bo);
+ }
+ 
+@@ -84,7 +84,7 @@ static int amdgpu_bo_map(amdgpu_bo_handle bo, uint32_t alignment)
+ 
+ 	memset(&va, 0, sizeof(va));
+ 
+-	bo->virtual_mc_base_address = amdgpu_vamgr_find_va(&dev->vamgr,
++	bo->virtual_mc_base_address = amdgpu_vamgr_find_va(dev->vamgr,
+ 					 bo->alloc_size, alignment);
+ 
+ 	if (bo->virtual_mc_base_address == AMDGPU_INVALID_VA_ADDRESS)
+diff --git a/amdgpu/amdgpu_device.c b/amdgpu/amdgpu_device.c
+index 7a997cb..212e707 100644
+--- a/amdgpu/amdgpu_device.c
++++ b/amdgpu/amdgpu_device.c
+@@ -207,7 +207,7 @@ int amdgpu_device_initialize(int fd,
+ 	if (r)
+ 		goto cleanup;
+ 
+-	amdgpu_vamgr_init(dev);
++	dev->vamgr = amdgpu_vamgr_get_global(dev);
+ 
+ 	*major_version = dev->major_version;
+ 	*minor_version = dev->minor_version;
+@@ -225,10 +225,10 @@ cleanup:
+ 
+ void amdgpu_device_free_internal(amdgpu_device_handle dev)
+ {
++	amdgpu_vamgr_reference(&dev->vamgr, NULL);
+ 	util_hash_table_destroy(dev->bo_flink_names);
+ 	util_hash_table_destroy(dev->bo_handles);
+ 	pthread_mutex_destroy(&dev->bo_table_mutex);
+-	pthread_mutex_destroy(&(dev->vamgr.bo_va_mutex));
+ 	util_hash_table_remove(fd_tab, UINT_TO_PTR(dev->fd));
+ 	free(dev);
+ }
+diff --git a/amdgpu/amdgpu_internal.h b/amdgpu/amdgpu_internal.h
+index 77b1244..c1cd4da 100644
+--- a/amdgpu/amdgpu_internal.h
++++ b/amdgpu/amdgpu_internal.h
+@@ -49,6 +49,7 @@ struct amdgpu_bo_va_hole {
+ };
+ 
+ struct amdgpu_bo_va_mgr {
++	atomic_t refcount;
+ 	/* the start virtual address */
+ 	uint64_t va_offset;
+ 	uint64_t va_max;
+@@ -70,9 +71,9 @@ struct amdgpu_device {
+ 	struct util_hash_table *bo_flink_names;
+ 	/** This protects all hash tables. */
+ 	pthread_mutex_t bo_table_mutex;
+-	struct amdgpu_bo_va_mgr vamgr;
+ 	struct drm_amdgpu_info_device dev_info;
+ 	struct amdgpu_gpu_info info;
++	struct amdgpu_bo_va_mgr *vamgr;
+ };
+ 
+ struct amdgpu_bo {
+@@ -142,13 +143,15 @@ void amdgpu_device_free_internal(amdgpu_device_handle dev);
+ 
+ void amdgpu_bo_free_internal(amdgpu_bo_handle bo);
+ 
+-void amdgpu_vamgr_init(struct amdgpu_device *dev);
++struct amdgpu_bo_va_mgr* amdgpu_vamgr_get_global(struct amdgpu_device *dev);
++
++void amdgpu_vamgr_reference(struct amdgpu_bo_va_mgr **dst, struct amdgpu_bo_va_mgr *src);
+ 
+ uint64_t amdgpu_vamgr_find_va(struct amdgpu_bo_va_mgr *mgr,
+-                               uint64_t size, uint64_t alignment);
++				uint64_t size, uint64_t alignment);
+ 
+-void amdgpu_vamgr_free_va(struct amdgpu_bo_va_mgr *mgr, uint64_t va,
+-                           uint64_t size);
++void amdgpu_vamgr_free_va(struct amdgpu_bo_va_mgr *mgr, uint64_t va, 
++				uint64_t size);
+ 
+ int amdgpu_query_gpu_info_init(amdgpu_device_handle dev);
+ 
+diff --git a/amdgpu/amdgpu_vamgr.c b/amdgpu/amdgpu_vamgr.c
+index 34c2887..b15729f 100644
+--- a/amdgpu/amdgpu_vamgr.c
++++ b/amdgpu/amdgpu_vamgr.c
+@@ -28,20 +28,48 @@
+ #include "amdgpu_internal.h"
+ #include "util_math.h"
+ 
+-void amdgpu_vamgr_init(struct amdgpu_device *dev)
++static struct amdgpu_bo_va_mgr vamgr = {{0}};
++
++static void amdgpu_vamgr_init(struct amdgpu_bo_va_mgr *mgr, struct amdgpu_device *dev)
++{
++	mgr->va_offset = dev->dev_info.virtual_address_offset;
++	mgr->va_max = dev->dev_info.virtual_address_max;
++	mgr->va_alignment = dev->dev_info.virtual_address_alignment;
++
++	list_inithead(&mgr->va_holes);
++	pthread_mutex_init(&mgr->bo_va_mutex, NULL);
++}
++
++static void amdgpu_vamgr_deinit(struct amdgpu_bo_va_mgr *mgr)
++{
++	struct amdgpu_bo_va_hole *hole;
++	LIST_FOR_EACH_ENTRY(hole, &mgr->va_holes, list) {
++		list_del(&hole->list);
++		free(hole);
++	}
++	pthread_mutex_destroy(&mgr->bo_va_mutex);
++}
++
++struct amdgpu_bo_va_mgr * amdgpu_vamgr_get_global(struct amdgpu_device *dev)
+ {
+-	struct amdgpu_bo_va_mgr *vamgr = &dev->vamgr;
++	int ref;
++	ref = atomic_inc_return(&vamgr.refcount);
+ 
+-	vamgr->va_offset = dev->dev_info.virtual_address_offset;
+-	vamgr->va_max = dev->dev_info.virtual_address_max;
+-	vamgr->va_alignment = dev->dev_info.virtual_address_alignment;
++	if (ref == 1)
++		amdgpu_vamgr_init(&vamgr, dev);
++	return &vamgr;
++}
+ 
+-	list_inithead(&vamgr->va_holes);
+-	pthread_mutex_init(&vamgr->bo_va_mutex, NULL);
++void amdgpu_vamgr_reference(struct amdgpu_bo_va_mgr **dst,
++				struct amdgpu_bo_va_mgr *src)
++{
++	if (update_references(&(*dst)->refcount, NULL))
++		amdgpu_vamgr_deinit(*dst);
++	*dst = src;
+ }
+ 
+ uint64_t amdgpu_vamgr_find_va(struct amdgpu_bo_va_mgr *mgr,
+-                               uint64_t size, uint64_t alignment)
++				uint64_t size, uint64_t alignment)
+ {
+ 	struct amdgpu_bo_va_hole *hole, *n;
+ 	uint64_t offset = 0, waste = 0;
+@@ -108,8 +136,8 @@ uint64_t amdgpu_vamgr_find_va(struct amdgpu_bo_va_mgr *mgr,
+ 	return offset;
+ }
+ 
+-void amdgpu_vamgr_free_va(struct amdgpu_bo_va_mgr *mgr, uint64_t va,
+-                           uint64_t size)
++void amdgpu_vamgr_free_va(struct amdgpu_bo_va_mgr *mgr,
++				uint64_t va, uint64_t size)
+ {
+ 	struct amdgpu_bo_va_hole *hole;
+ 
+-- 
+1.9.1
+

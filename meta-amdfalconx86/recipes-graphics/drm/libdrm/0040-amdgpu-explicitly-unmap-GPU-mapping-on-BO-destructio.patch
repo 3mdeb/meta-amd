@@ -1,0 +1,119 @@
+From ae62db34ba11b028a3f00844b43caff99d7d35cd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Sat, 6 Jun 2015 12:00:17 +0200
+Subject: [PATCH 40/67] amdgpu: explicitly unmap GPU mapping on BO destruction
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+That exercises the IOCTL and stops relying us on implicit unmapping.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Arindam Nath <arindam.nath@amd.com>
+---
+ amdgpu/amdgpu_bo.c | 81 ++++++++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 57 insertions(+), 24 deletions(-)
+
+diff --git a/amdgpu/amdgpu_bo.c b/amdgpu/amdgpu_bo.c
+index 66f1b9f..961ab04 100644
+--- a/amdgpu/amdgpu_bo.c
++++ b/amdgpu/amdgpu_bo.c
+@@ -52,30 +52,6 @@ static void amdgpu_close_kms_handle(amdgpu_device_handle dev,
+ 	drmIoctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &args);
+ }
+ 
+-void amdgpu_bo_free_internal(amdgpu_bo_handle bo)
+-{
+-	/* Remove the buffer from the hash tables. */
+-	pthread_mutex_lock(&bo->dev->bo_table_mutex);
+-	util_hash_table_remove(bo->dev->bo_handles,
+-			       (void*)(uintptr_t)bo->handle);
+-	if (bo->flink_name) {
+-		util_hash_table_remove(bo->dev->bo_flink_names,
+-				       (void*)(uintptr_t)bo->flink_name);
+-	}
+-	pthread_mutex_unlock(&bo->dev->bo_table_mutex);
+-
+-	/* Release CPU access. */
+-	if (bo->cpu_map_count > 0) {
+-		bo->cpu_map_count = 1;
+-		amdgpu_bo_cpu_unmap(bo);
+-	}
+-
+-	amdgpu_close_kms_handle(bo->dev, bo->handle);
+-	pthread_mutex_destroy(&bo->cpu_access_mutex);
+-	amdgpu_vamgr_free_va(bo->dev->vamgr, bo->virtual_mc_base_address, bo->alloc_size);
+-	free(bo);
+-}
+-
+ /* map the buffer to the GPU virtual address space */
+ static int amdgpu_bo_map(amdgpu_bo_handle bo, uint32_t alignment)
+ {
+@@ -109,6 +85,63 @@ static int amdgpu_bo_map(amdgpu_bo_handle bo, uint32_t alignment)
+ 	return 0;
+ }
+ 
++/* unmap the buffer from the GPU virtual address space */
++static void amdgpu_bo_unmap(amdgpu_bo_handle bo)
++{
++	amdgpu_device_handle dev = bo->dev;
++	union drm_amdgpu_gem_va va;
++	int r;
++
++	if (bo->virtual_mc_base_address == AMDGPU_INVALID_VA_ADDRESS)
++		return;
++
++	memset(&va, 0, sizeof(va));
++
++	va.in.handle = bo->handle;
++	va.in.operation = AMDGPU_VA_OP_UNMAP;
++	va.in.flags = 	AMDGPU_VM_PAGE_READABLE |
++			AMDGPU_VM_PAGE_WRITEABLE |
++			AMDGPU_VM_PAGE_EXECUTABLE;
++	va.in.va_address = bo->virtual_mc_base_address;
++	va.in.offset_in_bo = 0;
++	va.in.map_size = ALIGN(bo->alloc_size, getpagesize());
++
++	r = drmCommandWriteRead(dev->fd, DRM_AMDGPU_GEM_VA, &va, sizeof(va));
++	if (r || va.out.result == AMDGPU_VA_RESULT_ERROR) {
++		fprintf(stderr, "amdgpu: VA_OP_UNMAP failed with %d\n", r);
++		return;
++	}
++
++	amdgpu_vamgr_free_va(bo->dev->vamgr, bo->virtual_mc_base_address,
++			     bo->alloc_size);
++
++	bo->virtual_mc_base_address = AMDGPU_INVALID_VA_ADDRESS;
++}
++
++void amdgpu_bo_free_internal(amdgpu_bo_handle bo)
++{
++	/* Remove the buffer from the hash tables. */
++	pthread_mutex_lock(&bo->dev->bo_table_mutex);
++	util_hash_table_remove(bo->dev->bo_handles,
++			       (void*)(uintptr_t)bo->handle);
++	if (bo->flink_name) {
++		util_hash_table_remove(bo->dev->bo_flink_names,
++				       (void*)(uintptr_t)bo->flink_name);
++	}
++	pthread_mutex_unlock(&bo->dev->bo_table_mutex);
++
++	/* Release CPU access. */
++	if (bo->cpu_map_count > 0) {
++		bo->cpu_map_count = 1;
++		amdgpu_bo_cpu_unmap(bo);
++	}
++
++	amdgpu_bo_unmap(bo);
++	amdgpu_close_kms_handle(bo->dev, bo->handle);
++	pthread_mutex_destroy(&bo->cpu_access_mutex);
++	free(bo);
++}
++
+ int amdgpu_bo_alloc(amdgpu_device_handle dev,
+ 		    struct amdgpu_bo_alloc_request *alloc_buffer,
+ 		    struct amdgpu_bo_alloc_result *info)
+-- 
+1.9.1
+
