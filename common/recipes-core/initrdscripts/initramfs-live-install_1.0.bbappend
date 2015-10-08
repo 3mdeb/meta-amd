@@ -6,4 +6,5 @@ SRC_URI_append_amd = " \
      file://0007-init-install.sh-Add-extra-sync-time.patch;striplevel=0;patchdir=${WORKDIR} \
      file://0008-init-install.sh-uniquely-identify-boot-device.patch;striplevel=0;patchdir=${WORKDIR} \
      file://0011-init-install.sh-handle-mmc-device-as-installation-media.patch;striplevel=0;patchdir=${WORKDIR} \
+     file://0012-init-install.sh-drop-all-automount-rules-whil.patch;striplevel=0;patchdir=${WORKDIR} \
 "
