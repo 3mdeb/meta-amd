@@ -71,6 +71,17 @@ static DEFINE_MUTEX(device_list_lock);
 
 /*-------------------------------------------------------------------------*/
 
+/* We need to keep the device pointer because we explicity add the device
+ * by using spi_new_device at the end of spirom_init. In order to confirm
+ * a clean exit we need to unregister the device while exiting.
+ * This cannot be done in the driver's remove call as that would generate
+ * a recursive loop.
+ */
+
+static struct spi_device *spirom_device;
+
+/*-------------------------------------------------------------------------*/
+
 /*
  * We can't use the standard synchronous wrappers for file I/O; we
  * need to protect against async removal of the underlying spi_device.
@@ -345,7 +356,6 @@ static const struct file_operations spirom_fops = {
 static int __init add_spi_device_to_bus(void)
 {
 	struct spi_master *spi_master;
-	struct spi_device *spi_device;
 	struct spi_board_info spi_info;
 
 	spi_master = spi_busnum_to_master(SPI_BUS);
@@ -360,11 +370,17 @@ static int __init add_spi_device_to_bus(void)
 	spi_info.bus_num = SPI_BUS; //Bus number of SPI master
 	spi_info.chip_select = SPI_BUS_CS1; //CS on which SPI device is connected
 
-	spi_device = spi_new_device(spi_master, &spi_info);
-	if (!spi_device)
+	spirom_device = spi_new_device(spi_master, &spi_info);
+	if (!spirom_device)
 		return -ENODEV;
 
 	return 0;
+}
+
+static void remove_spi_device_from_bus(void)
+{
+	if (spirom_device)
+		spi_unregister_device(spirom_device);
 }
 
 /*-------------------------------------------------------------------------*/
@@ -507,6 +523,7 @@ module_init(spirom_init);
 
 static void __exit spirom_exit(void)
 {
+	remove_spi_device_from_bus();
 	spi_unregister_driver(&spirom_spi);
 	class_destroy(spirom_class);
 	unregister_chrdev(SPIROM_MAJOR, spirom_spi.driver.name);
