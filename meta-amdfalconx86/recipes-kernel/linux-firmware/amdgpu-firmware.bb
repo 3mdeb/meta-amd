@@ -1,6 +1,6 @@
 DESCRIPTION = "These binaries provide kernel support for newer AMD GPUs"
 SECTION = "kernel"
-LICENSE = "Proprietary"
+LICENSE = "Firmware-amd"
 
 SRC_URI = "file://carrizo_ce.bin \
 	   file://carrizo_me.bin \
@@ -12,10 +12,10 @@ SRC_URI = "file://carrizo_ce.bin \
 	   file://carrizo_sdma.bin \
 	   file://carrizo_uvd.bin \
 	   file://carrizo_vce.bin \
-	   file://LICENSE.radeon \
+	   file://LICENSE \
 	  "
 
-LIC_FILES_CHKSUM = "file://LICENSE.radeon;md5=07b0c31777bd686d8e1609c6940b5e74"
+LIC_FILES_CHKSUM = "file://LICENSE;md5=07b0c31777bd686d8e1609c6940b5e74"
 
 S = "${WORKDIR}"
 
@@ -28,7 +28,7 @@ do_compile() {
 }
 
 do_install() {
-	install -v -m 444 -D ${S}/LICENSE.radeon ${D}/lib/firmware/amdgpu/LICENSE.radeon
+	install -v -m 444 -D ${S}/LICENSE ${D}/lib/firmware/amdgpu/LICENSE
 	install -v -m 0644 ${S}/*.bin ${D}/lib/firmware/amdgpu
 }
 
