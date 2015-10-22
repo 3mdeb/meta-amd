@@ -91,6 +91,7 @@ SRC_URI = "https://www.kernel.org/pub/linux/kernel/v3.x/linux-${PV}.tar.xz;name=
            file://ipv6-Dont-reduce-hop-limit-for-an-interface-CVE-2015-2922.patch \
            file://eCryptfs-Remove-buggy-and-unnecessary-write-in-file-name-decode-routine-CVE-2014-9683.patch \
 	   ${@bb.utils.contains('DISTRO_FEATURES', 'selinux', 'file://selinux.cfg', '', d)} \
+           file://wifi-drivers.cfg \
 "
 
 S = "${WORKDIR}/linux-${PV}"
