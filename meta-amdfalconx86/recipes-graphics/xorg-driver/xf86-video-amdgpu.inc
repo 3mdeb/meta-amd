@@ -31,3 +31,6 @@ RDEPENDS_${PN} += "glamor-egl \
 "
 
 COMPATIBLE_HOST = '(i.86|x86_64).*-linux'
+
+PACKAGES += "${PN}-conf"
+FILES_${PN}-conf = "${datadir}/X11"
