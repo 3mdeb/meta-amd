@@ -12,6 +12,10 @@ COMPATIBLE_MACHINE_amdfalconx86 = "amdfalconx86"
 
 KERNEL_FEATURES_append_amdfalconx86 += " cfg/smp.scc cfg/sound.scc"
 
+# do no print configuration warnings on build console
+KCONF_AUDIT_LEVEL = "0"
+KCONF_BSP_AUDIT_LEVEL = "0"
+
 SRC_URI_append_amdfalconx86 += "file://amdfalconx86-standard.scc \
 				file://amdfalconx86-user-config.cfg \
 				file://amdfalconx86-gpu-config.cfg \
