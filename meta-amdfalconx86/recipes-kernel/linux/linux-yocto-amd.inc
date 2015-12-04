@@ -22,4 +22,7 @@ do_validate_branches_append() {
 
     # Fixed in >3.14.29 tag of yocto-kernel-cache branch yocto-3.14
     sed -i '/crui.scc/d' ${WORKDIR}/${KMETA}/ktypes/standard/standard.scc
+
+    # Fixed in >3.14.29 tag of yocto-kernel-cache branch yocto-3.14
+    sed -i '/crui.scc/d' ${WORKDIR}/${KMETA}/ktypes/preempt-rt/preempt-rt.scc
 }
