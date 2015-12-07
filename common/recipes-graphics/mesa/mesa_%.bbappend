@@ -9,9 +9,6 @@ python __anonymous () {
     d.setVar("DRIDRIVERS_amd", "radeon")
 }
 
-# Install the demos onto the target
-RRECOMMENDS_libgl-mesa_append_amd = " mesa-demos"
-
 DEPENDS_append_amd = " libomxil"
 EXTRA_OECONF_append_amd = " \
 		 --disable-dri3 \
