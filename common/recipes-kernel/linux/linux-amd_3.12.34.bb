@@ -90,6 +90,7 @@ SRC_URI = "https://www.kernel.org/pub/linux/kernel/v3.x/linux-${PV}.tar.xz;name=
            file://CVE-2014-8989/0006-userns-Don-t-allow-setgroups-until-a-gid-mapping-has.patch \
            file://ipv6-Dont-reduce-hop-limit-for-an-interface-CVE-2015-2922.patch \
            file://eCryptfs-Remove-buggy-and-unnecessary-write-in-file-name-decode-routine-CVE-2014-9683.patch \
+           file://x86-Stop-relying-on-magic-jmp-behavior-for-early_idt_handlers.patch \
 	   ${@bb.utils.contains('DISTRO_FEATURES', 'selinux', 'file://selinux.cfg', '', d)} \
            file://wifi-drivers.cfg \
 "
