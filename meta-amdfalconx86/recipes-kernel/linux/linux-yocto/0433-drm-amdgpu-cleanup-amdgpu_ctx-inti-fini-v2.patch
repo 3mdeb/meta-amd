@@ -1,0 +1,373 @@
+From 47f38501f11fa45d8a7797f1965448c1e20049d4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 4 Aug 2015 17:51:05 +0200
+Subject: [PATCH 0433/1050] drm/amdgpu: cleanup amdgpu_ctx inti/fini v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Cleanup the kernel context handling.
+
+v2: rebased
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com> (v1)
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |   9 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c    | 145 ++++++++++++++---------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  13 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c  |   8 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c     |  18 ++--
+ 5 files changed, 89 insertions(+), 104 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 0cd776a..53d70f7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1033,10 +1033,9 @@ struct amdgpu_ctx_mgr {
+ 	struct idr		ctx_handles;
+ };
+ 
+-int amdgpu_ctx_alloc(struct amdgpu_device *adev, struct amdgpu_fpriv *fpriv,
+-		     uint32_t *id);
+-int amdgpu_ctx_free(struct amdgpu_device *adev, struct amdgpu_fpriv *fpriv,
+-		    uint32_t id);
++int amdgpu_ctx_init(struct amdgpu_device *adev, bool kernel,
++		    struct amdgpu_ctx *ctx);
++void amdgpu_ctx_fini(struct amdgpu_ctx *ctx);
+ 
+ struct amdgpu_ctx *amdgpu_ctx_get(struct amdgpu_fpriv *fpriv, uint32_t id);
+ int amdgpu_ctx_put(struct amdgpu_ctx *ctx);
+@@ -2095,7 +2094,7 @@ struct amdgpu_device {
+ 	struct kfd_dev          *kfd;
+ 
+ 	/* kernel conext for IB submission */
+-	struct amdgpu_ctx *kernel_ctx;
++	struct amdgpu_ctx	kernel_ctx;
+ };
+ 
+ bool amdgpu_device_is_px(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index c2290ae..08a9292 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -25,82 +25,27 @@
+ #include <drm/drmP.h>
+ #include "amdgpu.h"
+ 
+-static void amdgpu_ctx_do_release(struct kref *ref)
++int amdgpu_ctx_init(struct amdgpu_device *adev, bool kernel,
++		    struct amdgpu_ctx *ctx)
+ {
+-	struct amdgpu_ctx *ctx;
+-	struct amdgpu_device *adev;
+ 	unsigned i, j;
++	int r;
+ 
+-	ctx = container_of(ref, struct amdgpu_ctx, refcount);
+-	adev = ctx->adev;
+-
+-
+-	for (i = 0; i < AMDGPU_MAX_RINGS; ++i)
+-		for (j = 0; j < AMDGPU_CTX_MAX_CS_PENDING; ++j)
+-			fence_put(ctx->rings[i].fences[j]);
+-
+-	if (amdgpu_enable_scheduler) {
+-		for (i = 0; i < adev->num_rings; i++)
+-			amd_context_entity_fini(adev->rings[i]->scheduler,
+-						&ctx->rings[i].c_entity);
+-	}
+-
+-	kfree(ctx);
+-}
+-
+-static void amdgpu_ctx_init(struct amdgpu_device *adev,
+-			    struct amdgpu_fpriv *fpriv,
+-			    struct amdgpu_ctx *ctx)
+-{
+-	int i;
+ 	memset(ctx, 0, sizeof(*ctx));
+ 	ctx->adev = adev;
+ 	kref_init(&ctx->refcount);
+ 	spin_lock_init(&ctx->ring_lock);
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; ++i)
+ 		ctx->rings[i].sequence = 1;
+-}
+-
+-int amdgpu_ctx_alloc(struct amdgpu_device *adev, struct amdgpu_fpriv *fpriv,
+-		     uint32_t *id)
+-{
+-	struct amdgpu_ctx *ctx;
+-	int i, j, r;
+-
+-	ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+-	if (!ctx)
+-		return -ENOMEM;
+-	if (fpriv) {
+-		struct amdgpu_ctx_mgr *mgr = &fpriv->ctx_mgr;
+-		mutex_lock(&mgr->lock);
+-		r = idr_alloc(&mgr->ctx_handles, ctx, 1, 0, GFP_KERNEL);
+-		if (r < 0) {
+-			mutex_unlock(&mgr->lock);
+-			kfree(ctx);
+-			return r;
+-		}
+-		*id = (uint32_t)r;
+-		amdgpu_ctx_init(adev, fpriv, ctx);
+-		mutex_unlock(&mgr->lock);
+-	} else {
+-		if (adev->kernel_ctx) {
+-			DRM_ERROR("kernel cnotext has been created.\n");
+-			kfree(ctx);
+-			return 0;
+-		}
+-		amdgpu_ctx_init(adev, fpriv, ctx);
+-
+-		adev->kernel_ctx = ctx;
+-	}
+ 
+ 	if (amdgpu_enable_scheduler) {
+ 		/* create context entity for each ring */
+ 		for (i = 0; i < adev->num_rings; i++) {
+ 			struct amd_run_queue *rq;
+-			if (fpriv)
+-				rq = &adev->rings[i]->scheduler->sched_rq;
+-			else
++			if (kernel)
+ 				rq = &adev->rings[i]->scheduler->kernel_rq;
++			else
++				rq = &adev->rings[i]->scheduler->sched_rq;
+ 			r = amd_context_entity_init(adev->rings[i]->scheduler,
+ 						    &ctx->rings[i].c_entity,
+ 						    NULL, rq, amdgpu_sched_jobs);
+@@ -113,33 +58,79 @@ int amdgpu_ctx_alloc(struct amdgpu_device *adev, struct amdgpu_fpriv *fpriv,
+ 				amd_context_entity_fini(adev->rings[j]->scheduler,
+ 							&ctx->rings[j].c_entity);
+ 			kfree(ctx);
+-			return -EINVAL;
++			return r;
+ 		}
+ 	}
+-
+ 	return 0;
+ }
+ 
+-int amdgpu_ctx_free(struct amdgpu_device *adev, struct amdgpu_fpriv *fpriv, uint32_t id)
++void amdgpu_ctx_fini(struct amdgpu_ctx *ctx)
+ {
++	struct amdgpu_device *adev = ctx->adev;
++	unsigned i, j;
++
++	for (i = 0; i < AMDGPU_MAX_RINGS; ++i)
++		for (j = 0; j < AMDGPU_CTX_MAX_CS_PENDING; ++j)
++			fence_put(ctx->rings[i].fences[j]);
++
++	if (amdgpu_enable_scheduler) {
++		for (i = 0; i < adev->num_rings; i++)
++			amd_context_entity_fini(adev->rings[i]->scheduler,
++						&ctx->rings[i].c_entity);
++	}
++}
++
++static int amdgpu_ctx_alloc(struct amdgpu_device *adev,
++			    struct amdgpu_fpriv *fpriv,
++			    uint32_t *id)
++{
++	struct amdgpu_ctx_mgr *mgr = &fpriv->ctx_mgr;
+ 	struct amdgpu_ctx *ctx;
++	int r;
+ 
+-	if (fpriv) {
+-		struct amdgpu_ctx_mgr *mgr = &fpriv->ctx_mgr;
+-		mutex_lock(&mgr->lock);
+-		ctx = idr_find(&mgr->ctx_handles, id);
+-		if (ctx) {
+-			idr_remove(&mgr->ctx_handles, id);
+-			kref_put(&ctx->refcount, amdgpu_ctx_do_release);
+-			mutex_unlock(&mgr->lock);
+-			return 0;
+-		}
++	ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++
++	mutex_lock(&mgr->lock);
++	r = idr_alloc(&mgr->ctx_handles, ctx, 1, 0, GFP_KERNEL);
++	if (r < 0) {
+ 		mutex_unlock(&mgr->lock);
+-	} else {
+-		ctx = adev->kernel_ctx;
++		kfree(ctx);
++		return r;
++	}
++	*id = (uint32_t)r;
++	r = amdgpu_ctx_init(adev, false, ctx);
++	mutex_unlock(&mgr->lock);
++
++	return r;
++}
++
++static void amdgpu_ctx_do_release(struct kref *ref)
++{
++	struct amdgpu_ctx *ctx;
++
++	ctx = container_of(ref, struct amdgpu_ctx, refcount);
++
++	amdgpu_ctx_fini(ctx);
++
++	kfree(ctx);
++}
++
++static int amdgpu_ctx_free(struct amdgpu_fpriv *fpriv, uint32_t id)
++{
++	struct amdgpu_ctx_mgr *mgr = &fpriv->ctx_mgr;
++	struct amdgpu_ctx *ctx;
++
++	mutex_lock(&mgr->lock);
++	ctx = idr_find(&mgr->ctx_handles, id);
++	if (ctx) {
++		idr_remove(&mgr->ctx_handles, id);
+ 		kref_put(&ctx->refcount, amdgpu_ctx_do_release);
++		mutex_unlock(&mgr->lock);
+ 		return 0;
+ 	}
++	mutex_unlock(&mgr->lock);
+ 	return -EINVAL;
+ }
+ 
+@@ -198,7 +189,7 @@ int amdgpu_ctx_ioctl(struct drm_device *dev, void *data,
+ 			args->out.alloc.ctx_id = id;
+ 			break;
+ 		case AMDGPU_CTX_OP_FREE_CTX:
+-			r = amdgpu_ctx_free(adev, fpriv, id);
++			r = amdgpu_ctx_free(fpriv, id);
+ 			break;
+ 		case AMDGPU_CTX_OP_QUERY_STATE:
+ 			r = amdgpu_ctx_query(adev, fpriv, id, &args->out);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 801ebfc..42d1a22 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1525,13 +1525,10 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 		return r;
+ 	}
+ 
+-	if (!adev->kernel_ctx) {
+-		uint32_t id = 0;
+-		r = amdgpu_ctx_alloc(adev, NULL, &id);
+-		if (r) {
+-			dev_err(adev->dev, "failed to create kernel context (%d).\n", r);
+-			return r;
+-		}
++	r = amdgpu_ctx_init(adev, true, &adev->kernel_ctx);
++	if (r) {
++		dev_err(adev->dev, "failed to create kernel context (%d).\n", r);
++		return r;
+ 	}
+ 	r = amdgpu_ib_ring_tests(adev);
+ 	if (r)
+@@ -1594,7 +1591,7 @@ void amdgpu_device_fini(struct amdgpu_device *adev)
+ 	adev->shutdown = true;
+ 	/* evict vram memory */
+ 	amdgpu_bo_evict_vram(adev);
+-	amdgpu_ctx_free(adev, NULL, 0);
++	amdgpu_ctx_fini(&adev->kernel_ctx);
+ 	amdgpu_ib_pool_fini(adev);
+ 	amdgpu_fence_driver_fini(adev);
+ 	amdgpu_fbdev_fini(adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index 9f2f19c..995901b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -122,19 +122,17 @@ int amdgpu_sched_ib_submit_kernel_helper(struct amdgpu_device *adev,
+ 	int r = 0;
+ 	if (amdgpu_enable_scheduler) {
+ 		struct amdgpu_cs_parser *sched_job =
+-			amdgpu_cs_parser_create(adev,
+-						owner,
+-						adev->kernel_ctx,
++			amdgpu_cs_parser_create(adev, owner, &adev->kernel_ctx,
+ 						ibs, 1);
+ 		if(!sched_job) {
+ 			return -ENOMEM;
+ 		}
+ 		sched_job->free_job = free_job;
+ 		ibs[num_ibs - 1].sequence = amd_sched_push_job(ring->scheduler,
+-				   &adev->kernel_ctx->rings[ring->idx].c_entity,
++				   &adev->kernel_ctx.rings[ring->idx].c_entity,
+ 				   sched_job);
+ 		r = amd_sched_wait_emit(
+-			&adev->kernel_ctx->rings[ring->idx].c_entity,
++			&adev->kernel_ctx.rings[ring->idx].c_entity,
+ 			ibs[num_ibs - 1].sequence, false, -1);
+ 		if (r)
+ 			WARN(true, "emit timeout\n");
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index ab9c65a..78713ae 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -372,16 +372,16 @@ static int amdgpu_vm_clear_bo(struct amdgpu_device *adev,
+ 	if (amdgpu_enable_scheduler) {
+ 		int r;
+ 		sched_job = amdgpu_cs_parser_create(adev, AMDGPU_FENCE_OWNER_VM,
+-						    adev->kernel_ctx, ib, 1);
++						    &adev->kernel_ctx, ib, 1);
+ 		if(!sched_job)
+ 			goto error_free;
+ 		sched_job->job_param.vm.bo = bo;
+ 		sched_job->run_job = amdgpu_vm_run_job;
+ 		sched_job->free_job = amdgpu_vm_free_job;
+ 		ib->sequence = amd_sched_push_job(ring->scheduler,
+-				   &adev->kernel_ctx->rings[ring->idx].c_entity,
++				   &adev->kernel_ctx.rings[ring->idx].c_entity,
+ 				   sched_job);
+-		r = amd_sched_wait_emit(&adev->kernel_ctx->rings[ring->idx].c_entity,
++		r = amd_sched_wait_emit(&adev->kernel_ctx.rings[ring->idx].c_entity,
+ 					ib->sequence, false, -1);
+ 		if (r)
+ 			DRM_ERROR("emit timeout\n");
+@@ -517,7 +517,7 @@ int amdgpu_vm_update_page_directory(struct amdgpu_device *adev,
+ 		if (amdgpu_enable_scheduler) {
+ 			int r;
+ 			sched_job = amdgpu_cs_parser_create(adev, AMDGPU_FENCE_OWNER_VM,
+-							    adev->kernel_ctx,
++							    &adev->kernel_ctx,
+ 							    ib, 1);
+ 			if(!sched_job)
+ 				goto error_free;
+@@ -525,9 +525,9 @@ int amdgpu_vm_update_page_directory(struct amdgpu_device *adev,
+ 			sched_job->run_job = amdgpu_vm_run_job;
+ 			sched_job->free_job = amdgpu_vm_free_job;
+ 			ib->sequence = amd_sched_push_job(ring->scheduler,
+-					   &adev->kernel_ctx->rings[ring->idx].c_entity,
++					   &adev->kernel_ctx.rings[ring->idx].c_entity,
+ 					   sched_job);
+-			r = amd_sched_wait_emit(&adev->kernel_ctx->rings[ring->idx].c_entity,
++			r = amd_sched_wait_emit(&adev->kernel_ctx.rings[ring->idx].c_entity,
+ 						ib->sequence, false, -1);
+ 			if (r)
+ 				DRM_ERROR("emit timeout\n");
+@@ -863,7 +863,7 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 	if (amdgpu_enable_scheduler) {
+ 		int r;
+ 		sched_job = amdgpu_cs_parser_create(adev, AMDGPU_FENCE_OWNER_VM,
+-						    adev->kernel_ctx, ib, 1);
++						    &adev->kernel_ctx, ib, 1);
+ 		if(!sched_job)
+ 			goto error_free;
+ 		sched_job->job_param.vm_mapping.vm = vm;
+@@ -873,9 +873,9 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 		sched_job->run_job = amdgpu_vm_bo_update_mapping_run_job;
+ 		sched_job->free_job = amdgpu_vm_free_job;
+ 		ib->sequence = amd_sched_push_job(ring->scheduler,
+-				   &adev->kernel_ctx->rings[ring->idx].c_entity,
++				   &adev->kernel_ctx.rings[ring->idx].c_entity,
+ 				   sched_job);
+-		r = amd_sched_wait_emit(&adev->kernel_ctx->rings[ring->idx].c_entity,
++		r = amd_sched_wait_emit(&adev->kernel_ctx.rings[ring->idx].c_entity,
+ 					ib->sequence, false, -1);
+ 		if (r)
+ 			DRM_ERROR("emit timeout\n");
+-- 
+1.9.1
+

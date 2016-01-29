@@ -1,0 +1,195 @@
+From c3447e815062bb48d70a5afa0567fd6f30bc7f1b Mon Sep 17 00:00:00 2001
+From: Ben Goz <ben.goz@amd.com>
+Date: Wed, 20 May 2015 18:05:44 +0300
+Subject: [PATCH 0139/1050] drm/amdkfd: Enforce kill all waves on process
+ termination
+
+This commit makes sure that on process termination, after
+we're destroying all the active queues, we're killing all the
+existing wave front of the current process.
+
+By doing this we're making sure that if any of the CUs were blocked
+by infinite loop we're enforcing it to end the shader explicitly.
+
+Signed-off-by: Ben Goz <ben.goz@amd.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c            | 65 ++++++++++++++++++++++
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  |  8 ++-
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h              |  7 +++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c           | 11 ++++
+ 4 files changed, 90 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c b/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
+index 00d8fcf..96153f2 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
+@@ -792,6 +792,71 @@ static int dbgdev_wave_control_nodiq(struct kfd_dbgdev *dbgdev,
+ 							reg_sq_cmd.u32All);
+ }
+ 
++int dbgdev_wave_reset_wavefronts(struct kfd_dev *dev, struct kfd_process *p)
++{
++	int status = 0;
++	unsigned int vmid;
++	union SQ_CMD_BITS reg_sq_cmd;
++	union GRBM_GFX_INDEX_BITS reg_gfx_index;
++	struct kfd_process_device *pdd;
++	struct dbg_wave_control_info wac_info;
++	int temp;
++	int first_vmid_to_scan = 8;
++	int last_vmid_to_scan = 15;
++
++	first_vmid_to_scan = ffs(dev->shared_resources.compute_vmid_bitmap) - 1;
++	temp = dev->shared_resources.compute_vmid_bitmap >> first_vmid_to_scan;
++	last_vmid_to_scan = first_vmid_to_scan + ffz(temp);
++
++	reg_sq_cmd.u32All = 0;
++	status = 0;
++
++	wac_info.mode = HSA_DBG_WAVEMODE_BROADCAST_PROCESS;
++	wac_info.operand = HSA_DBG_WAVEOP_KILL;
++
++	pr_debug("Killing all process wavefronts\n");
++
++	/* Scan all registers in the range ATC_VMID8_PASID_MAPPING ..
++	 * ATC_VMID15_PASID_MAPPING
++	 * to check which VMID the current process is mapped to. */
++
++	for (vmid = first_vmid_to_scan; vmid <= last_vmid_to_scan; vmid++) {
++		if (dev->kfd2kgd->get_atc_vmid_pasid_mapping_valid
++				(dev->kgd, vmid)) {
++			if (dev->kfd2kgd->get_atc_vmid_pasid_mapping_valid
++					(dev->kgd, vmid) == p->pasid) {
++				pr_debug("Killing wave fronts of vmid %d and pasid %d\n",
++						vmid, p->pasid);
++				break;
++			}
++		}
++	}
++
++	if (vmid > last_vmid_to_scan) {
++		pr_err("amdkfd: didn't found vmid for pasid (%d)\n", p->pasid);
++		return -EFAULT;
++	}
++
++	/* taking the VMID for that process on the safe way using PDD */
++	pdd = kfd_get_process_device_data(dev, p);
++	if (!pdd)
++		return -EFAULT;
++
++	status = dbgdev_wave_control_set_registers(&wac_info, &reg_sq_cmd,
++			&reg_gfx_index);
++	if (status != 0)
++		return -EINVAL;
++
++	/* for non DIQ we need to patch the VMID: */
++	reg_sq_cmd.bits.vm_id = vmid;
++
++	dev->kfd2kgd->wave_control_execute(dev->kgd,
++					reg_gfx_index.u32All,
++					reg_sq_cmd.u32All);
++
++	return 0;
++}
++
+ void kfd_dbgdev_init(struct kfd_dbgdev *pdbgdev, struct kfd_dev *pdev,
+ 			enum DBGDEV_TYPE type)
+ {
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index b08ec05..547b0a5 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -946,6 +946,7 @@ static int destroy_queues_cpsch(struct device_queue_manager *dqm,
+ {
+ 	int retval;
+ 	enum kfd_preempt_type_filter preempt_type;
++	struct kfd_process *p;
+ 
+ 	BUG_ON(!dqm);
+ 
+@@ -977,8 +978,13 @@ static int destroy_queues_cpsch(struct device_queue_manager *dqm,
+ 	pm_send_query_status(&dqm->packets, dqm->fence_gpu_addr,
+ 				KFD_FENCE_COMPLETED);
+ 	/* should be timed out */
+-	amdkfd_fence_wait_timeout(dqm->fence_addr, KFD_FENCE_COMPLETED,
++	retval = amdkfd_fence_wait_timeout(dqm->fence_addr, KFD_FENCE_COMPLETED,
+ 				QUEUE_PREEMPT_DEFAULT_TIMEOUT_MS);
++	if (retval != 0) {
++		p = kfd_get_process(current);
++		p->reset_wavefronts = true;
++		goto out;
++	}
+ 	pm_release_ib(&dqm->packets);
+ 	dqm->active_runlist = false;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index cd1f033..cb79046 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -519,6 +519,11 @@ struct kfd_process {
+ 								event_pages */
+ 	u32 next_nonsignal_event_id;
+ 	size_t signal_event_count;
++	/*
++	 * This flag tells if we should reset all wavefronts on
++	 * process termination
++	 */
++	bool reset_wavefronts;
+ };
+ 
+ /**
+@@ -726,4 +731,6 @@ int kfd_event_create(struct file *devkfd, struct kfd_process *p,
+ 		     uint64_t *event_page_offset, uint32_t *event_slot_index);
+ int kfd_event_destroy(struct kfd_process *p, uint32_t event_id);
+ 
++int dbgdev_wave_reset_wavefronts(struct kfd_dev *dev, struct kfd_process *p);
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index dc910af..56b904f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -31,6 +31,7 @@
+ struct mm_struct;
+ 
+ #include "kfd_priv.h"
++#include "kfd_dbgmgr.h"
+ 
+ /*
+  * Initial size for the array of queues.
+@@ -172,6 +173,9 @@ static void kfd_process_wq_release(struct work_struct *work)
+ 		pr_debug("Releasing pdd (topology id %d) for process (pasid %d) in workqueue\n",
+ 				pdd->dev->id, p->pasid);
+ 
++		if (p->reset_wavefronts)
++			dbgdev_wave_reset_wavefronts(pdd->dev, p);
++
+ 		amd_iommu_unbind_pasid(pdd->dev->pdev, p->pasid);
+ 		list_del(&pdd->per_device_list);
+ 
+@@ -301,6 +305,8 @@ static struct kfd_process *create_process(const struct task_struct *thread)
+ 	if (kfd_init_apertures(process) != 0)
+ 		goto err_init_apretures;
+ 
++	process->reset_wavefronts = false;
++
+ 	return process;
+ 
+ err_init_apretures:
+@@ -399,7 +405,12 @@ void kfd_unbind_process_from_device(struct kfd_dev *dev, unsigned int pasid)
+ 
+ 	mutex_lock(&p->mutex);
+ 
++	if ((dev->dbgmgr) && (dev->dbgmgr->pasid == p->pasid))
++		kfd_dbgmgr_destroy(dev->dbgmgr);
++
+ 	pqm_uninit(&p->pqm);
++	if (p->reset_wavefronts)
++		dbgdev_wave_reset_wavefronts(dev, p);
+ 
+ 	pdd = kfd_get_process_device_data(dev, p);
+ 
+-- 
+1.9.1
+

@@ -1,0 +1,1069 @@
+From ff758a12b45b0513dbe9905deba2a29b20412138 Mon Sep 17 00:00:00 2001
+From: Ben Goz <ben.goz@amd.com>
+Date: Tue, 7 Oct 2014 14:43:07 +0300
+Subject: [PATCH 0310/1050] drm/amdgpu: Add amdgpu <--> amdkfd gfx8 interface
+
+This patch adds the gfx8 interface file between amdgpu and amdkfd. This
+interface file is currently in use when running on a Carrizo-based
+system.
+
+The interface itself is represented by a pointer to struct
+kfd_dev. The pointer is located inside amdgpu_device structure.
+
+All the register accesses that amdkfd need are done using this
+interface. This allows us to avoid direct register accesses in
+amdkfd proper, while also allows us to avoid locking between
+amdkfd and amdgpu.
+
+The single exception is the doorbells that are used in both of
+the drivers. However, because they are located in separate pci
+bar pages, the danger of sharing registers between the drivers
+is minimal.
+
+Having said that, we are planning to move the doorbells as well
+to amdgpu.
+
+Signed-off-by: Ben Goz <ben.goz@amd.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile               |   3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c        |   3 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h        |   1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c | 543 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/vid.h                  |   5 +
+ drivers/gpu/drm/amd/include/vi_structs.h          | 417 +++++++++++++++++
+ 6 files changed, 971 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+ create mode 100644 drivers/gpu/drm/amd/include/vi_structs.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index af5397c..9083605 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -74,7 +74,8 @@ amdgpu-y += \
+ # add amdkfd interfaces
+ amdgpu-y += \
+ 	 amdgpu_amdkfd.o \
+-	 amdgpu_amdkfd_gfx_v7.o
++	 amdgpu_amdkfd_gfx_v7.o \
++	 amdgpu_amdkfd_gfx_v8.o
+ 
+ amdgpu-$(CONFIG_COMPAT) += amdgpu_ioc32.o
+ amdgpu-$(CONFIG_VGA_SWITCHEROO) += amdgpu_atpx_handler.o
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index 7aa5ab0..bc763e0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -53,6 +53,9 @@ bool amdgpu_amdkfd_load_interface(struct amdgpu_device *rdev)
+ 	case CHIP_KAVERI:
+ 		kfd2kgd = amdgpu_amdkfd_gfx_7_get_functions();
+ 		break;
++	case CHIP_CARRIZO:
++		kfd2kgd = amdgpu_amdkfd_gfx_8_0_get_functions();
++		break;
+ 	default:
+ 		return false;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index c81242e..a8be765 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -50,6 +50,7 @@ void amdgpu_amdkfd_device_init(struct amdgpu_device *rdev);
+ void amdgpu_amdkfd_device_fini(struct amdgpu_device *rdev);
+ 
+ struct kfd2kgd_calls *amdgpu_amdkfd_gfx_7_get_functions(void);
++struct kfd2kgd_calls *amdgpu_amdkfd_gfx_8_0_get_functions(void);
+ 
+ /* Shared API */
+ int alloc_gtt_mem(struct kgd_dev *kgd, size_t size,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+new file mode 100644
+index 0000000..dfd1d50
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+@@ -0,0 +1,543 @@
++/*
++ * Copyright 2014 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include <linux/module.h>
++#include <linux/fdtable.h>
++#include <linux/uaccess.h>
++#include <linux/firmware.h>
++#include <drm/drmP.h>
++#include "amdgpu.h"
++#include "amdgpu_amdkfd.h"
++#include "amdgpu_ucode.h"
++#include "gca/gfx_8_0_sh_mask.h"
++#include "gca/gfx_8_0_d.h"
++#include "gca/gfx_8_0_enum.h"
++#include "oss/oss_3_0_sh_mask.h"
++#include "oss/oss_3_0_d.h"
++#include "gmc/gmc_8_1_sh_mask.h"
++#include "gmc/gmc_8_1_d.h"
++#include "vi_structs.h"
++#include "vid.h"
++
++#define VI_PIPE_PER_MEC	(4)
++
++struct cik_sdma_rlc_registers;
++
++/*
++ * Register access functions
++ */
++
++static void kgd_program_sh_mem_settings(struct kgd_dev *kgd, uint32_t vmid,
++		uint32_t sh_mem_config,
++		uint32_t sh_mem_ape1_base, uint32_t sh_mem_ape1_limit,
++		uint32_t sh_mem_bases);
++static int kgd_set_pasid_vmid_mapping(struct kgd_dev *kgd, unsigned int pasid,
++		unsigned int vmid);
++static int kgd_init_pipeline(struct kgd_dev *kgd, uint32_t pipe_id,
++		uint32_t hpd_size, uint64_t hpd_gpu_addr);
++static int kgd_init_interrupts(struct kgd_dev *kgd, uint32_t pipe_id);
++static int kgd_hqd_load(struct kgd_dev *kgd, void *mqd, uint32_t pipe_id,
++		uint32_t queue_id, uint32_t __user *wptr);
++static int kgd_hqd_sdma_load(struct kgd_dev *kgd, void *mqd);
++static bool kgd_hqd_is_occupied(struct kgd_dev *kgd, uint64_t queue_address,
++		uint32_t pipe_id, uint32_t queue_id);
++static bool kgd_hqd_sdma_is_occupied(struct kgd_dev *kgd, void *mqd);
++static int kgd_hqd_destroy(struct kgd_dev *kgd, uint32_t reset_type,
++				unsigned int timeout, uint32_t pipe_id,
++				uint32_t queue_id);
++static int kgd_hqd_sdma_destroy(struct kgd_dev *kgd, void *mqd,
++				unsigned int timeout);
++static void write_vmid_invalidate_request(struct kgd_dev *kgd, uint8_t vmid);
++static int kgd_address_watch_disable(struct kgd_dev *kgd);
++static int kgd_address_watch_execute(struct kgd_dev *kgd,
++					unsigned int watch_point_id,
++					uint32_t cntl_val,
++					uint32_t addr_hi,
++					uint32_t addr_lo);
++static int kgd_wave_control_execute(struct kgd_dev *kgd,
++					uint32_t gfx_index_val,
++					uint32_t sq_cmd);
++static uint32_t kgd_address_watch_get_offset(struct kgd_dev *kgd,
++					unsigned int watch_point_id,
++					unsigned int reg_offset);
++
++static bool get_atc_vmid_pasid_mapping_valid(struct kgd_dev *kgd,
++		uint8_t vmid);
++static uint16_t get_atc_vmid_pasid_mapping_pasid(struct kgd_dev *kgd,
++		uint8_t vmid);
++static void write_vmid_invalidate_request(struct kgd_dev *kgd, uint8_t vmid);
++static uint16_t get_fw_version(struct kgd_dev *kgd, enum kgd_engine_type type);
++
++static const struct kfd2kgd_calls kfd2kgd = {
++	.init_gtt_mem_allocation = alloc_gtt_mem,
++	.free_gtt_mem = free_gtt_mem,
++	.get_vmem_size = get_vmem_size,
++	.get_gpu_clock_counter = get_gpu_clock_counter,
++	.get_max_engine_clock_in_mhz = get_max_engine_clock_in_mhz,
++	.program_sh_mem_settings = kgd_program_sh_mem_settings,
++	.set_pasid_vmid_mapping = kgd_set_pasid_vmid_mapping,
++	.init_pipeline = kgd_init_pipeline,
++	.init_interrupts = kgd_init_interrupts,
++	.hqd_load = kgd_hqd_load,
++	.hqd_sdma_load = kgd_hqd_sdma_load,
++	.hqd_is_occupied = kgd_hqd_is_occupied,
++	.hqd_sdma_is_occupied = kgd_hqd_sdma_is_occupied,
++	.hqd_destroy = kgd_hqd_destroy,
++	.hqd_sdma_destroy = kgd_hqd_sdma_destroy,
++	.address_watch_disable = kgd_address_watch_disable,
++	.address_watch_execute = kgd_address_watch_execute,
++	.wave_control_execute = kgd_wave_control_execute,
++	.address_watch_get_offset = kgd_address_watch_get_offset,
++	.get_atc_vmid_pasid_mapping_pasid =
++			get_atc_vmid_pasid_mapping_pasid,
++	.get_atc_vmid_pasid_mapping_valid =
++			get_atc_vmid_pasid_mapping_valid,
++	.write_vmid_invalidate_request = write_vmid_invalidate_request,
++	.get_fw_version = get_fw_version
++};
++
++struct kfd2kgd_calls *amdgpu_amdkfd_gfx_8_0_get_functions()
++{
++	return (struct kfd2kgd_calls *)&kfd2kgd;
++}
++
++static inline struct amdgpu_device *get_amdgpu_device(struct kgd_dev *kgd)
++{
++	return (struct amdgpu_device *)kgd;
++}
++
++static void lock_srbm(struct kgd_dev *kgd, uint32_t mec, uint32_t pipe,
++			uint32_t queue, uint32_t vmid)
++{
++	struct amdgpu_device *adev = get_amdgpu_device(kgd);
++	uint32_t value = PIPEID(pipe) | MEID(mec) | VMID(vmid) | QUEUEID(queue);
++
++	mutex_lock(&adev->srbm_mutex);
++	WREG32(mmSRBM_GFX_CNTL, value);
++}
++
++static void unlock_srbm(struct kgd_dev *kgd)
++{
++	struct amdgpu_device *adev = get_amdgpu_device(kgd);
++
++	WREG32(mmSRBM_GFX_CNTL, 0);
++	mutex_unlock(&adev->srbm_mutex);
++}
++
++static void acquire_queue(struct kgd_dev *kgd, uint32_t pipe_id,
++				uint32_t queue_id)
++{
++	uint32_t mec = (++pipe_id / VI_PIPE_PER_MEC) + 1;
++	uint32_t pipe = (pipe_id % VI_PIPE_PER_MEC);
++
++	lock_srbm(kgd, mec, pipe, queue_id, 0);
++}
++
++static void release_queue(struct kgd_dev *kgd)
++{
++	unlock_srbm(kgd);
++}
++
++static void kgd_program_sh_mem_settings(struct kgd_dev *kgd, uint32_t vmid,
++					uint32_t sh_mem_config,
++					uint32_t sh_mem_ape1_base,
++					uint32_t sh_mem_ape1_limit,
++					uint32_t sh_mem_bases)
++{
++	struct amdgpu_device *adev = get_amdgpu_device(kgd);
++
++	lock_srbm(kgd, 0, 0, 0, vmid);
++
++	WREG32(mmSH_MEM_CONFIG, sh_mem_config);
++	WREG32(mmSH_MEM_APE1_BASE, sh_mem_ape1_base);
++	WREG32(mmSH_MEM_APE1_LIMIT, sh_mem_ape1_limit);
++	WREG32(mmSH_MEM_BASES, sh_mem_bases);
++
++	unlock_srbm(kgd);
++}
++
++static int kgd_set_pasid_vmid_mapping(struct kgd_dev *kgd, unsigned int pasid,
++					unsigned int vmid)
++{
++	struct amdgpu_device *adev = get_amdgpu_device(kgd);
++
++	/*
++	 * We have to assume that there is no outstanding mapping.
++	 * The ATC_VMID_PASID_MAPPING_UPDATE_STATUS bit could be 0 because
++	 * a mapping is in progress or because a mapping finished
++	 * and the SW cleared it.
++	 * So the protocol is to always wait & clear.
++	 */
++	uint32_t pasid_mapping = (pasid == 0) ? 0 : (uint32_t)pasid |
++			ATC_VMID0_PASID_MAPPING__VALID_MASK;
++
++	WREG32(mmATC_VMID0_PASID_MAPPING + vmid, pasid_mapping);
++
++	while (!(RREG32(mmATC_VMID_PASID_MAPPING_UPDATE_STATUS) & (1U << vmid)))
++		cpu_relax();
++	WREG32(mmATC_VMID_PASID_MAPPING_UPDATE_STATUS, 1U << vmid);
++
++	/* Mapping vmid to pasid also for IH block */
++	WREG32(mmIH_VMID_0_LUT + vmid, pasid_mapping);
++
++	return 0;
++}
++
++static int kgd_init_pipeline(struct kgd_dev *kgd, uint32_t pipe_id,
++				uint32_t hpd_size, uint64_t hpd_gpu_addr)
++{
++	return 0;
++}
++
++static int kgd_init_interrupts(struct kgd_dev *kgd, uint32_t pipe_id)
++{
++	struct amdgpu_device *adev = get_amdgpu_device(kgd);
++	uint32_t mec;
++	uint32_t pipe;
++
++	mec = (++pipe_id / VI_PIPE_PER_MEC) + 1;
++	pipe = (pipe_id % VI_PIPE_PER_MEC);
++
++	lock_srbm(kgd, mec, pipe, 0, 0);
++
++	WREG32(mmCPC_INT_CNTL, CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK);
++
++	unlock_srbm(kgd);
++
++	return 0;
++}
++
++static inline uint32_t get_sdma_base_addr(struct cik_sdma_rlc_registers *m)
++{
++	return 0;
++}
++
++static inline struct vi_mqd *get_mqd(void *mqd)
++{
++	return (struct vi_mqd *)mqd;
++}
++
++static inline struct cik_sdma_rlc_registers *get_sdma_mqd(void *mqd)
++{
++	return (struct cik_sdma_rlc_registers *)mqd;
++}
++
++static int kgd_hqd_load(struct kgd_dev *kgd, void *mqd, uint32_t pipe_id,
++			uint32_t queue_id, uint32_t __user *wptr)
++{
++	struct vi_mqd *m;
++	uint32_t shadow_wptr, valid_wptr;
++	struct amdgpu_device *adev = get_amdgpu_device(kgd);
++
++	m = get_mqd(mqd);
++
++	valid_wptr = copy_from_user(&shadow_wptr, wptr, sizeof(shadow_wptr));
++	acquire_queue(kgd, pipe_id, queue_id);
++
++	WREG32(mmCP_MQD_CONTROL, m->cp_mqd_control);
++	WREG32(mmCP_MQD_BASE_ADDR, m->cp_mqd_base_addr_lo);
++	WREG32(mmCP_MQD_BASE_ADDR_HI, m->cp_mqd_base_addr_hi);
++
++	WREG32(mmCP_HQD_VMID, m->cp_hqd_vmid);
++	WREG32(mmCP_HQD_PERSISTENT_STATE, m->cp_hqd_persistent_state);
++	WREG32(mmCP_HQD_PIPE_PRIORITY, m->cp_hqd_pipe_priority);
++	WREG32(mmCP_HQD_QUEUE_PRIORITY, m->cp_hqd_queue_priority);
++	WREG32(mmCP_HQD_QUANTUM, m->cp_hqd_quantum);
++	WREG32(mmCP_HQD_PQ_BASE, m->cp_hqd_pq_base_lo);
++	WREG32(mmCP_HQD_PQ_BASE_HI, m->cp_hqd_pq_base_hi);
++	WREG32(mmCP_HQD_PQ_RPTR_REPORT_ADDR, m->cp_hqd_pq_rptr_report_addr_lo);
++	WREG32(mmCP_HQD_PQ_RPTR_REPORT_ADDR_HI,
++			m->cp_hqd_pq_rptr_report_addr_hi);
++
++	if (valid_wptr > 0)
++		WREG32(mmCP_HQD_PQ_WPTR, shadow_wptr);
++
++	WREG32(mmCP_HQD_PQ_CONTROL, m->cp_hqd_pq_control);
++	WREG32(mmCP_HQD_PQ_DOORBELL_CONTROL, m->cp_hqd_pq_doorbell_control);
++
++	WREG32(mmCP_HQD_EOP_BASE_ADDR, m->cp_hqd_eop_base_addr_lo);
++	WREG32(mmCP_HQD_EOP_BASE_ADDR_HI, m->cp_hqd_eop_base_addr_hi);
++	WREG32(mmCP_HQD_EOP_CONTROL, m->cp_hqd_eop_control);
++	WREG32(mmCP_HQD_EOP_RPTR, m->cp_hqd_eop_rptr);
++	WREG32(mmCP_HQD_EOP_WPTR, m->cp_hqd_eop_wptr);
++	WREG32(mmCP_HQD_EOP_EVENTS, m->cp_hqd_eop_done_events);
++
++	WREG32(mmCP_HQD_CTX_SAVE_BASE_ADDR_LO, m->cp_hqd_ctx_save_base_addr_lo);
++	WREG32(mmCP_HQD_CTX_SAVE_BASE_ADDR_HI, m->cp_hqd_ctx_save_base_addr_hi);
++	WREG32(mmCP_HQD_CTX_SAVE_CONTROL, m->cp_hqd_ctx_save_control);
++	WREG32(mmCP_HQD_CNTL_STACK_OFFSET, m->cp_hqd_cntl_stack_offset);
++	WREG32(mmCP_HQD_CNTL_STACK_SIZE, m->cp_hqd_cntl_stack_size);
++	WREG32(mmCP_HQD_WG_STATE_OFFSET, m->cp_hqd_wg_state_offset);
++	WREG32(mmCP_HQD_CTX_SAVE_SIZE, m->cp_hqd_ctx_save_size);
++
++	WREG32(mmCP_HQD_IB_CONTROL, m->cp_hqd_ib_control);
++
++	WREG32(mmCP_HQD_DEQUEUE_REQUEST, m->cp_hqd_dequeue_request);
++	WREG32(mmCP_HQD_ERROR, m->cp_hqd_error);
++	WREG32(mmCP_HQD_EOP_WPTR_MEM, m->cp_hqd_eop_wptr_mem);
++	WREG32(mmCP_HQD_EOP_DONES, m->cp_hqd_eop_dones);
++
++	WREG32(mmCP_HQD_ACTIVE, m->cp_hqd_active);
++
++	release_queue(kgd);
++
++	return 0;
++}
++
++static int kgd_hqd_sdma_load(struct kgd_dev *kgd, void *mqd)
++{
++	return 0;
++}
++
++static bool kgd_hqd_is_occupied(struct kgd_dev *kgd, uint64_t queue_address,
++				uint32_t pipe_id, uint32_t queue_id)
++{
++	struct amdgpu_device *adev = get_amdgpu_device(kgd);
++	uint32_t act;
++	bool retval = false;
++	uint32_t low, high;
++
++	acquire_queue(kgd, pipe_id, queue_id);
++	act = RREG32(mmCP_HQD_ACTIVE);
++	if (act) {
++		low = lower_32_bits(queue_address >> 8);
++		high = upper_32_bits(queue_address >> 8);
++
++		if (low == RREG32(mmCP_HQD_PQ_BASE) &&
++				high == RREG32(mmCP_HQD_PQ_BASE_HI))
++			retval = true;
++	}
++	release_queue(kgd);
++	return retval;
++}
++
++static bool kgd_hqd_sdma_is_occupied(struct kgd_dev *kgd, void *mqd)
++{
++	struct amdgpu_device *adev = get_amdgpu_device(kgd);
++	struct cik_sdma_rlc_registers *m;
++	uint32_t sdma_base_addr;
++	uint32_t sdma_rlc_rb_cntl;
++
++	m = get_sdma_mqd(mqd);
++	sdma_base_addr = get_sdma_base_addr(m);
++
++	sdma_rlc_rb_cntl = RREG32(sdma_base_addr + mmSDMA0_RLC0_RB_CNTL);
++
++	if (sdma_rlc_rb_cntl & SDMA0_RLC0_RB_CNTL__RB_ENABLE_MASK)
++		return true;
++
++	return false;
++}
++
++static int kgd_hqd_destroy(struct kgd_dev *kgd, uint32_t reset_type,
++				unsigned int timeout, uint32_t pipe_id,
++				uint32_t queue_id)
++{
++	struct amdgpu_device *adev = get_amdgpu_device(kgd);
++	uint32_t temp;
++
++	acquire_queue(kgd, pipe_id, queue_id);
++
++	WREG32(mmCP_HQD_DEQUEUE_REQUEST, reset_type);
++
++	while (true) {
++		temp = RREG32(mmCP_HQD_ACTIVE);
++		if (temp & CP_HQD_ACTIVE__ACTIVE_MASK)
++			break;
++		if (timeout == 0) {
++			pr_err("kfd: cp queue preemption time out (%dms)\n",
++				temp);
++			release_queue(kgd);
++			return -ETIME;
++		}
++		msleep(20);
++		timeout -= 20;
++	}
++
++	release_queue(kgd);
++	return 0;
++}
++
++static int kgd_hqd_sdma_destroy(struct kgd_dev *kgd, void *mqd,
++				unsigned int timeout)
++{
++	struct amdgpu_device *adev = get_amdgpu_device(kgd);
++	struct cik_sdma_rlc_registers *m;
++	uint32_t sdma_base_addr;
++	uint32_t temp;
++
++	m = get_sdma_mqd(mqd);
++	sdma_base_addr = get_sdma_base_addr(m);
++
++	temp = RREG32(sdma_base_addr + mmSDMA0_RLC0_RB_CNTL);
++	temp = temp & ~SDMA0_RLC0_RB_CNTL__RB_ENABLE_MASK;
++	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_CNTL, temp);
++
++	while (true) {
++		temp = RREG32(sdma_base_addr + mmSDMA0_RLC0_CONTEXT_STATUS);
++		if (temp & SDMA0_STATUS_REG__RB_CMD_IDLE__SHIFT)
++			break;
++		if (timeout == 0)
++			return -ETIME;
++		msleep(20);
++		timeout -= 20;
++	}
++
++	WREG32(sdma_base_addr + mmSDMA0_RLC0_DOORBELL, 0);
++	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_RPTR, 0);
++	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_WPTR, 0);
++	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_BASE, 0);
++
++	return 0;
++}
++
++static bool get_atc_vmid_pasid_mapping_valid(struct kgd_dev *kgd,
++							uint8_t vmid)
++{
++	uint32_t reg;
++	struct amdgpu_device *adev = (struct amdgpu_device *) kgd;
++
++	reg = RREG32(mmATC_VMID0_PASID_MAPPING + vmid);
++	return reg & ATC_VMID0_PASID_MAPPING__VALID_MASK;
++}
++
++static uint16_t get_atc_vmid_pasid_mapping_pasid(struct kgd_dev *kgd,
++								uint8_t vmid)
++{
++	uint32_t reg;
++	struct amdgpu_device *adev = (struct amdgpu_device *) kgd;
++
++	reg = RREG32(mmATC_VMID0_PASID_MAPPING + vmid);
++	return reg & ATC_VMID0_PASID_MAPPING__VALID_MASK;
++}
++
++static void write_vmid_invalidate_request(struct kgd_dev *kgd, uint8_t vmid)
++{
++	struct amdgpu_device *adev = (struct amdgpu_device *) kgd;
++
++	WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);
++}
++
++static int kgd_address_watch_disable(struct kgd_dev *kgd)
++{
++	return 0;
++}
++
++static int kgd_address_watch_execute(struct kgd_dev *kgd,
++					unsigned int watch_point_id,
++					uint32_t cntl_val,
++					uint32_t addr_hi,
++					uint32_t addr_lo)
++{
++	return 0;
++}
++
++static int kgd_wave_control_execute(struct kgd_dev *kgd,
++					uint32_t gfx_index_val,
++					uint32_t sq_cmd)
++{
++	struct amdgpu_device *adev = get_amdgpu_device(kgd);
++	uint32_t data = 0;
++
++	mutex_lock(&adev->grbm_idx_mutex);
++
++	WREG32(mmGRBM_GFX_INDEX, gfx_index_val);
++	WREG32(mmSQ_CMD, sq_cmd);
++
++	data = REG_SET_FIELD(data, GRBM_GFX_INDEX,
++		INSTANCE_BROADCAST_WRITES, 1);
++	data = REG_SET_FIELD(data, GRBM_GFX_INDEX,
++		SH_BROADCAST_WRITES, 1);
++	data = REG_SET_FIELD(data, GRBM_GFX_INDEX,
++		SE_BROADCAST_WRITES, 1);
++
++	WREG32(mmGRBM_GFX_INDEX, data);
++	mutex_unlock(&adev->grbm_idx_mutex);
++
++	return 0;
++}
++
++static uint32_t kgd_address_watch_get_offset(struct kgd_dev *kgd,
++					unsigned int watch_point_id,
++					unsigned int reg_offset)
++{
++	return 0;
++}
++
++static uint16_t get_fw_version(struct kgd_dev *kgd, enum kgd_engine_type type)
++{
++	struct amdgpu_device *adev = (struct amdgpu_device *) kgd;
++	const union amdgpu_firmware_header *hdr;
++
++	BUG_ON(kgd == NULL);
++
++	switch (type) {
++	case KGD_ENGINE_PFP:
++		hdr = (const union amdgpu_firmware_header *)
++							adev->gfx.pfp_fw->data;
++		break;
++
++	case KGD_ENGINE_ME:
++		hdr = (const union amdgpu_firmware_header *)
++							adev->gfx.me_fw->data;
++		break;
++
++	case KGD_ENGINE_CE:
++		hdr = (const union amdgpu_firmware_header *)
++							adev->gfx.ce_fw->data;
++		break;
++
++	case KGD_ENGINE_MEC1:
++		hdr = (const union amdgpu_firmware_header *)
++							adev->gfx.mec_fw->data;
++		break;
++
++	case KGD_ENGINE_MEC2:
++		hdr = (const union amdgpu_firmware_header *)
++							adev->gfx.mec2_fw->data;
++		break;
++
++	case KGD_ENGINE_RLC:
++		hdr = (const union amdgpu_firmware_header *)
++							adev->gfx.rlc_fw->data;
++		break;
++
++	case KGD_ENGINE_SDMA1:
++		hdr = (const union amdgpu_firmware_header *)
++							adev->sdma[0].fw->data;
++		break;
++
++	case KGD_ENGINE_SDMA2:
++		hdr = (const union amdgpu_firmware_header *)
++							adev->sdma[1].fw->data;
++		break;
++
++	default:
++		return 0;
++	}
++
++	if (hdr == NULL)
++		return 0;
++
++	/* Only 12 bit in use*/
++	return hdr->common.ucode_version;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/vid.h b/drivers/gpu/drm/amd/amdgpu/vid.h
+index 31bb894..d98aa9d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vid.h
++++ b/drivers/gpu/drm/amd/amdgpu/vid.h
+@@ -66,6 +66,11 @@
+ 
+ #define AMDGPU_NUM_OF_VMIDS			8
+ 
++#define		PIPEID(x)					((x) << 0)
++#define		MEID(x)						((x) << 2)
++#define		VMID(x)						((x) << 4)
++#define		QUEUEID(x)					((x) << 8)
++
+ #define RB_BITMAP_WIDTH_PER_SH     2
+ 
+ #define MC_SEQ_MISC0__MT__MASK	0xf0000000
+diff --git a/drivers/gpu/drm/amd/include/vi_structs.h b/drivers/gpu/drm/amd/include/vi_structs.h
+new file mode 100644
+index 0000000..65cfacd
+--- /dev/null
++++ b/drivers/gpu/drm/amd/include/vi_structs.h
+@@ -0,0 +1,417 @@
++/*
++ * Copyright 2012 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef VI_STRUCTS_H_
++#define VI_STRUCTS_H_
++
++struct vi_sdma_mqd {
++	uint32_t sdmax_rlcx_rb_cntl;
++	uint32_t sdmax_rlcx_rb_base;
++	uint32_t sdmax_rlcx_rb_base_hi;
++	uint32_t sdmax_rlcx_rb_rptr;
++	uint32_t sdmax_rlcx_rb_wptr;
++	uint32_t sdmax_rlcx_rb_wptr_poll_cntl;
++	uint32_t sdmax_rlcx_rb_wptr_poll_addr_hi;
++	uint32_t sdmax_rlcx_rb_wptr_poll_addr_lo;
++	uint32_t sdmax_rlcx_rb_rptr_addr_hi;
++	uint32_t sdmax_rlcx_rb_rptr_addr_lo;
++	uint32_t sdmax_rlcx_ib_cntl;
++	uint32_t sdmax_rlcx_ib_rptr;
++	uint32_t sdmax_rlcx_ib_offset;
++	uint32_t sdmax_rlcx_ib_base_lo;
++	uint32_t sdmax_rlcx_ib_base_hi;
++	uint32_t sdmax_rlcx_ib_size;
++	uint32_t sdmax_rlcx_skip_cntl;
++	uint32_t sdmax_rlcx_context_status;
++	uint32_t sdmax_rlcx_doorbell;
++	uint32_t sdmax_rlcx_virtual_addr;
++	uint32_t sdmax_rlcx_ape1_cntl;
++	uint32_t sdmax_rlcx_doorbell_log;
++	uint32_t reserved_22;
++	uint32_t reserved_23;
++	uint32_t reserved_24;
++	uint32_t reserved_25;
++	uint32_t reserved_26;
++	uint32_t reserved_27;
++	uint32_t reserved_28;
++	uint32_t reserved_29;
++	uint32_t reserved_30;
++	uint32_t reserved_31;
++	uint32_t reserved_32;
++	uint32_t reserved_33;
++	uint32_t reserved_34;
++	uint32_t reserved_35;
++	uint32_t reserved_36;
++	uint32_t reserved_37;
++	uint32_t reserved_38;
++	uint32_t reserved_39;
++	uint32_t reserved_40;
++	uint32_t reserved_41;
++	uint32_t reserved_42;
++	uint32_t reserved_43;
++	uint32_t reserved_44;
++	uint32_t reserved_45;
++	uint32_t reserved_46;
++	uint32_t reserved_47;
++	uint32_t reserved_48;
++	uint32_t reserved_49;
++	uint32_t reserved_50;
++	uint32_t reserved_51;
++	uint32_t reserved_52;
++	uint32_t reserved_53;
++	uint32_t reserved_54;
++	uint32_t reserved_55;
++	uint32_t reserved_56;
++	uint32_t reserved_57;
++	uint32_t reserved_58;
++	uint32_t reserved_59;
++	uint32_t reserved_60;
++	uint32_t reserved_61;
++	uint32_t reserved_62;
++	uint32_t reserved_63;
++	uint32_t reserved_64;
++	uint32_t reserved_65;
++	uint32_t reserved_66;
++	uint32_t reserved_67;
++	uint32_t reserved_68;
++	uint32_t reserved_69;
++	uint32_t reserved_70;
++	uint32_t reserved_71;
++	uint32_t reserved_72;
++	uint32_t reserved_73;
++	uint32_t reserved_74;
++	uint32_t reserved_75;
++	uint32_t reserved_76;
++	uint32_t reserved_77;
++	uint32_t reserved_78;
++	uint32_t reserved_79;
++	uint32_t reserved_80;
++	uint32_t reserved_81;
++	uint32_t reserved_82;
++	uint32_t reserved_83;
++	uint32_t reserved_84;
++	uint32_t reserved_85;
++	uint32_t reserved_86;
++	uint32_t reserved_87;
++	uint32_t reserved_88;
++	uint32_t reserved_89;
++	uint32_t reserved_90;
++	uint32_t reserved_91;
++	uint32_t reserved_92;
++	uint32_t reserved_93;
++	uint32_t reserved_94;
++	uint32_t reserved_95;
++	uint32_t reserved_96;
++	uint32_t reserved_97;
++	uint32_t reserved_98;
++	uint32_t reserved_99;
++	uint32_t reserved_100;
++	uint32_t reserved_101;
++	uint32_t reserved_102;
++	uint32_t reserved_103;
++	uint32_t reserved_104;
++	uint32_t reserved_105;
++	uint32_t reserved_106;
++	uint32_t reserved_107;
++	uint32_t reserved_108;
++	uint32_t reserved_109;
++	uint32_t reserved_110;
++	uint32_t reserved_111;
++	uint32_t reserved_112;
++	uint32_t reserved_113;
++	uint32_t reserved_114;
++	uint32_t reserved_115;
++	uint32_t reserved_116;
++	uint32_t reserved_117;
++	uint32_t reserved_118;
++	uint32_t reserved_119;
++	uint32_t reserved_120;
++	uint32_t reserved_121;
++	uint32_t reserved_122;
++	uint32_t reserved_123;
++	uint32_t reserved_124;
++	uint32_t reserved_125;
++	uint32_t reserved_126;
++	uint32_t reserved_127;
++};
++
++struct vi_mqd {
++	uint32_t header;
++	uint32_t compute_dispatch_initiator;
++	uint32_t compute_dim_x;
++	uint32_t compute_dim_y;
++	uint32_t compute_dim_z;
++	uint32_t compute_start_x;
++	uint32_t compute_start_y;
++	uint32_t compute_start_z;
++	uint32_t compute_num_thread_x;
++	uint32_t compute_num_thread_y;
++	uint32_t compute_num_thread_z;
++	uint32_t compute_pipelinestat_enable;
++	uint32_t compute_perfcount_enable;
++	uint32_t compute_pgm_lo;
++	uint32_t compute_pgm_hi;
++	uint32_t compute_tba_lo;
++	uint32_t compute_tba_hi;
++	uint32_t compute_tma_lo;
++	uint32_t compute_tma_hi;
++	uint32_t compute_pgm_rsrc1;
++	uint32_t compute_pgm_rsrc2;
++	uint32_t compute_vmid;
++	uint32_t compute_resource_limits;
++	uint32_t compute_static_thread_mgmt_se0;
++	uint32_t compute_static_thread_mgmt_se1;
++	uint32_t compute_tmpring_size;
++	uint32_t compute_static_thread_mgmt_se2;
++	uint32_t compute_static_thread_mgmt_se3;
++	uint32_t compute_restart_x;
++	uint32_t compute_restart_y;
++	uint32_t compute_restart_z;
++	uint32_t compute_thread_trace_enable;
++	uint32_t compute_misc_reserved;
++	uint32_t compute_dispatch_id;
++	uint32_t compute_threadgroup_id;
++	uint32_t compute_relaunch;
++	uint32_t compute_wave_restore_addr_lo;
++	uint32_t compute_wave_restore_addr_hi;
++	uint32_t compute_wave_restore_control;
++	uint32_t reserved_39;
++	uint32_t reserved_40;
++	uint32_t reserved_41;
++	uint32_t reserved_42;
++	uint32_t reserved_43;
++	uint32_t reserved_44;
++	uint32_t reserved_45;
++	uint32_t reserved_46;
++	uint32_t reserved_47;
++	uint32_t reserved_48;
++	uint32_t reserved_49;
++	uint32_t reserved_50;
++	uint32_t reserved_51;
++	uint32_t reserved_52;
++	uint32_t reserved_53;
++	uint32_t reserved_54;
++	uint32_t reserved_55;
++	uint32_t reserved_56;
++	uint32_t reserved_57;
++	uint32_t reserved_58;
++	uint32_t reserved_59;
++	uint32_t reserved_60;
++	uint32_t reserved_61;
++	uint32_t reserved_62;
++	uint32_t reserved_63;
++	uint32_t reserved_64;
++	uint32_t compute_user_data_0;
++	uint32_t compute_user_data_1;
++	uint32_t compute_user_data_2;
++	uint32_t compute_user_data_3;
++	uint32_t compute_user_data_4;
++	uint32_t compute_user_data_5;
++	uint32_t compute_user_data_6;
++	uint32_t compute_user_data_7;
++	uint32_t compute_user_data_8;
++	uint32_t compute_user_data_9;
++	uint32_t compute_user_data_10;
++	uint32_t compute_user_data_11;
++	uint32_t compute_user_data_12;
++	uint32_t compute_user_data_13;
++	uint32_t compute_user_data_14;
++	uint32_t compute_user_data_15;
++	uint32_t cp_compute_csinvoc_count_lo;
++	uint32_t cp_compute_csinvoc_count_hi;
++	uint32_t reserved_83;
++	uint32_t reserved_84;
++	uint32_t reserved_85;
++	uint32_t cp_mqd_query_time_lo;
++	uint32_t cp_mqd_query_time_hi;
++	uint32_t cp_mqd_connect_start_time_lo;
++	uint32_t cp_mqd_connect_start_time_hi;
++	uint32_t cp_mqd_connect_end_time_lo;
++	uint32_t cp_mqd_connect_end_time_hi;
++	uint32_t cp_mqd_connect_end_wf_count;
++	uint32_t cp_mqd_connect_end_pq_rptr;
++	uint32_t cp_mqd_connect_end_pq_wptr;
++	uint32_t cp_mqd_connect_end_ib_rptr;
++	uint32_t reserved_96;
++	uint32_t reserved_97;
++	uint32_t cp_mqd_save_start_time_lo;
++	uint32_t cp_mqd_save_start_time_hi;
++	uint32_t cp_mqd_save_end_time_lo;
++	uint32_t cp_mqd_save_end_time_hi;
++	uint32_t cp_mqd_restore_start_time_lo;
++	uint32_t cp_mqd_restore_start_time_hi;
++	uint32_t cp_mqd_restore_end_time_lo;
++	uint32_t cp_mqd_restore_end_time_hi;
++	uint32_t reserved_106;
++	uint32_t reserved_107;
++	uint32_t gds_cs_ctxsw_cnt0;
++	uint32_t gds_cs_ctxsw_cnt1;
++	uint32_t gds_cs_ctxsw_cnt2;
++	uint32_t gds_cs_ctxsw_cnt3;
++	uint32_t reserved_112;
++	uint32_t reserved_113;
++	uint32_t cp_pq_exe_status_lo;
++	uint32_t cp_pq_exe_status_hi;
++	uint32_t cp_packet_id_lo;
++	uint32_t cp_packet_id_hi;
++	uint32_t cp_packet_exe_status_lo;
++	uint32_t cp_packet_exe_status_hi;
++	uint32_t gds_save_base_addr_lo;
++	uint32_t gds_save_base_addr_hi;
++	uint32_t gds_save_mask_lo;
++	uint32_t gds_save_mask_hi;
++	uint32_t ctx_save_base_addr_lo;
++	uint32_t ctx_save_base_addr_hi;
++	uint32_t reserved_126;
++	uint32_t reserved_127;
++	uint32_t cp_mqd_base_addr_lo;
++	uint32_t cp_mqd_base_addr_hi;
++	uint32_t cp_hqd_active;
++	uint32_t cp_hqd_vmid;
++	uint32_t cp_hqd_persistent_state;
++	uint32_t cp_hqd_pipe_priority;
++	uint32_t cp_hqd_queue_priority;
++	uint32_t cp_hqd_quantum;
++	uint32_t cp_hqd_pq_base_lo;
++	uint32_t cp_hqd_pq_base_hi;
++	uint32_t cp_hqd_pq_rptr;
++	uint32_t cp_hqd_pq_rptr_report_addr_lo;
++	uint32_t cp_hqd_pq_rptr_report_addr_hi;
++	uint32_t cp_hqd_pq_wptr_poll_addr_lo;
++	uint32_t cp_hqd_pq_wptr_poll_addr_hi;
++	uint32_t cp_hqd_pq_doorbell_control;
++	uint32_t cp_hqd_pq_wptr;
++	uint32_t cp_hqd_pq_control;
++	uint32_t cp_hqd_ib_base_addr_lo;
++	uint32_t cp_hqd_ib_base_addr_hi;
++	uint32_t cp_hqd_ib_rptr;
++	uint32_t cp_hqd_ib_control;
++	uint32_t cp_hqd_iq_timer;
++	uint32_t cp_hqd_iq_rptr;
++	uint32_t cp_hqd_dequeue_request;
++	uint32_t cp_hqd_dma_offload;
++	uint32_t cp_hqd_sema_cmd;
++	uint32_t cp_hqd_msg_type;
++	uint32_t cp_hqd_atomic0_preop_lo;
++	uint32_t cp_hqd_atomic0_preop_hi;
++	uint32_t cp_hqd_atomic1_preop_lo;
++	uint32_t cp_hqd_atomic1_preop_hi;
++	uint32_t cp_hqd_hq_status0;
++	uint32_t cp_hqd_hq_control0;
++	uint32_t cp_mqd_control;
++	uint32_t cp_hqd_hq_status1;
++	uint32_t cp_hqd_hq_control1;
++	uint32_t cp_hqd_eop_base_addr_lo;
++	uint32_t cp_hqd_eop_base_addr_hi;
++	uint32_t cp_hqd_eop_control;
++	uint32_t cp_hqd_eop_rptr;
++	uint32_t cp_hqd_eop_wptr;
++	uint32_t cp_hqd_eop_done_events;
++	uint32_t cp_hqd_ctx_save_base_addr_lo;
++	uint32_t cp_hqd_ctx_save_base_addr_hi;
++	uint32_t cp_hqd_ctx_save_control;
++	uint32_t cp_hqd_cntl_stack_offset;
++	uint32_t cp_hqd_cntl_stack_size;
++	uint32_t cp_hqd_wg_state_offset;
++	uint32_t cp_hqd_ctx_save_size;
++	uint32_t cp_hqd_gds_resource_state;
++	uint32_t cp_hqd_error;
++	uint32_t cp_hqd_eop_wptr_mem;
++	uint32_t cp_hqd_eop_dones;
++	uint32_t reserved_182;
++	uint32_t reserved_183;
++	uint32_t reserved_184;
++	uint32_t reserved_185;
++	uint32_t reserved_186;
++	uint32_t reserved_187;
++	uint32_t reserved_188;
++	uint32_t reserved_189;
++	uint32_t reserved_190;
++	uint32_t reserved_191;
++	uint32_t iqtimer_pkt_header;
++	uint32_t iqtimer_pkt_dw0;
++	uint32_t iqtimer_pkt_dw1;
++	uint32_t iqtimer_pkt_dw2;
++	uint32_t iqtimer_pkt_dw3;
++	uint32_t iqtimer_pkt_dw4;
++	uint32_t iqtimer_pkt_dw5;
++	uint32_t iqtimer_pkt_dw6;
++	uint32_t iqtimer_pkt_dw7;
++	uint32_t iqtimer_pkt_dw8;
++	uint32_t iqtimer_pkt_dw9;
++	uint32_t iqtimer_pkt_dw10;
++	uint32_t iqtimer_pkt_dw11;
++	uint32_t iqtimer_pkt_dw12;
++	uint32_t iqtimer_pkt_dw13;
++	uint32_t iqtimer_pkt_dw14;
++	uint32_t iqtimer_pkt_dw15;
++	uint32_t iqtimer_pkt_dw16;
++	uint32_t iqtimer_pkt_dw17;
++	uint32_t iqtimer_pkt_dw18;
++	uint32_t iqtimer_pkt_dw19;
++	uint32_t iqtimer_pkt_dw20;
++	uint32_t iqtimer_pkt_dw21;
++	uint32_t iqtimer_pkt_dw22;
++	uint32_t iqtimer_pkt_dw23;
++	uint32_t iqtimer_pkt_dw24;
++	uint32_t iqtimer_pkt_dw25;
++	uint32_t iqtimer_pkt_dw26;
++	uint32_t iqtimer_pkt_dw27;
++	uint32_t iqtimer_pkt_dw28;
++	uint32_t iqtimer_pkt_dw29;
++	uint32_t iqtimer_pkt_dw30;
++	uint32_t iqtimer_pkt_dw31;
++	uint32_t reserved_225;
++	uint32_t reserved_226;
++	uint32_t reserved_227;
++	uint32_t set_resources_header;
++	uint32_t set_resources_dw1;
++	uint32_t set_resources_dw2;
++	uint32_t set_resources_dw3;
++	uint32_t set_resources_dw4;
++	uint32_t set_resources_dw5;
++	uint32_t set_resources_dw6;
++	uint32_t set_resources_dw7;
++	uint32_t reserved_236;
++	uint32_t reserved_237;
++	uint32_t reserved_238;
++	uint32_t reserved_239;
++	uint32_t queue_doorbell_id0;
++	uint32_t queue_doorbell_id1;
++	uint32_t queue_doorbell_id2;
++	uint32_t queue_doorbell_id3;
++	uint32_t queue_doorbell_id4;
++	uint32_t queue_doorbell_id5;
++	uint32_t queue_doorbell_id6;
++	uint32_t queue_doorbell_id7;
++	uint32_t queue_doorbell_id8;
++	uint32_t queue_doorbell_id9;
++	uint32_t queue_doorbell_id10;
++	uint32_t queue_doorbell_id11;
++	uint32_t queue_doorbell_id12;
++	uint32_t queue_doorbell_id13;
++	uint32_t queue_doorbell_id14;
++	uint32_t queue_doorbell_id15;
++};
++
++#endif /* VI_STRUCTS_H_ */
+-- 
+1.9.1
+
