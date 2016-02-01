@@ -1,0 +1,395 @@
+From c7ae72c01be10f539f385f624713f8ba0aa11a8f Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <david1.zhou@amd.com>
+Date: Tue, 25 Aug 2015 17:23:45 +0800
+Subject: [PATCH 0501/1050] drm/amdgpu: use IB for copy buffer of eviction
+
+This aids handling buffers moves with the scheduler.
+
+Signed-off-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Christian K?nig <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  8 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_benchmark.c |  8 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_test.c      | 12 ++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c       | 77 ++++++++++++++-------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c        |  3 +-
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c         | 16 +++---
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c        | 18 +++----
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c        | 18 +++----
+ 8 files changed, 81 insertions(+), 79 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index c916043..aa2dcf5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -247,7 +247,7 @@ struct amdgpu_buffer_funcs {
+ 	unsigned	copy_num_dw;
+ 
+ 	/* used for buffer migration */
+-	void (*emit_copy_buffer)(struct amdgpu_ring *ring,
++	void (*emit_copy_buffer)(struct amdgpu_ib *ib,
+ 				 /* src addr in bytes */
+ 				 uint64_t src_offset,
+ 				 /* dst addr in bytes */
+@@ -518,7 +518,7 @@ int amdgpu_copy_buffer(struct amdgpu_ring *ring,
+ 		       uint64_t dst_offset,
+ 		       uint32_t byte_count,
+ 		       struct reservation_object *resv,
+-		       struct amdgpu_fence **fence);
++		       struct fence **fence);
+ int amdgpu_mmap(struct file *filp, struct vm_area_struct *vma);
+ 
+ struct amdgpu_bo_list_entry {
+@@ -2247,7 +2247,7 @@ static inline void amdgpu_ring_write(struct amdgpu_ring *ring, uint32_t v)
+ #define amdgpu_display_add_connector(adev, ci, sd, ct, ib, coi, h, r) (adev)->mode_info.funcs->add_connector((adev), (ci), (sd), (ct), (ib), (coi), (h), (r))
+ #define amdgpu_display_stop_mc_access(adev, s) (adev)->mode_info.funcs->stop_mc_access((adev), (s))
+ #define amdgpu_display_resume_mc_access(adev, s) (adev)->mode_info.funcs->resume_mc_access((adev), (s))
+-#define amdgpu_emit_copy_buffer(adev, r, s, d, b) (adev)->mman.buffer_funcs->emit_copy_buffer((r), (s), (d), (b))
++#define amdgpu_emit_copy_buffer(adev, ib, s, d, b) (adev)->mman.buffer_funcs->emit_copy_buffer((ib),  (s), (d), (b))
+ #define amdgpu_emit_fill_buffer(adev, r, s, d, b) (adev)->mman.buffer_funcs->emit_fill_buffer((r), (s), (d), (b))
+ #define amdgpu_dpm_get_temperature(adev) (adev)->pm.funcs->get_temperature((adev))
+ #define amdgpu_dpm_pre_set_power_state(adev) (adev)->pm.funcs->pre_set_power_state((adev))
+@@ -2379,7 +2379,7 @@ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
+ 		       uint64_t addr);
+ void amdgpu_vm_bo_rmv(struct amdgpu_device *adev,
+ 		      struct amdgpu_bo_va *bo_va);
+-
++int amdgpu_vm_free_job(struct amdgpu_job *job);
+ /*
+  * functions used by amdgpu_encoder.c
+  */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_benchmark.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_benchmark.c
+index 759482e..98d59ee 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_benchmark.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_benchmark.c
+@@ -33,7 +33,7 @@ static int amdgpu_benchmark_do_move(struct amdgpu_device *adev, unsigned size,
+ {
+ 	unsigned long start_jiffies;
+ 	unsigned long end_jiffies;
+-	struct amdgpu_fence *fence = NULL;
++	struct fence *fence = NULL;
+ 	int i, r;
+ 
+ 	start_jiffies = jiffies;
+@@ -42,17 +42,17 @@ static int amdgpu_benchmark_do_move(struct amdgpu_device *adev, unsigned size,
+ 		r = amdgpu_copy_buffer(ring, saddr, daddr, size, NULL, &fence);
+ 		if (r)
+ 			goto exit_do_move;
+-		r = fence_wait(&fence->base, false);
++		r = fence_wait(fence, false);
+ 		if (r)
+ 			goto exit_do_move;
+-		amdgpu_fence_unref(&fence);
++		fence_put(fence);
+ 	}
+ 	end_jiffies = jiffies;
+ 	r = jiffies_to_msecs(end_jiffies - start_jiffies);
+ 
+ exit_do_move:
+ 	if (fence)
+-		amdgpu_fence_unref(&fence);
++		fence_put(fence);
+ 	return r;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_test.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_test.c
+index 962dd55..f80b1a4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_test.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_test.c
+@@ -77,7 +77,7 @@ static void amdgpu_do_test_moves(struct amdgpu_device *adev)
+ 		void *gtt_map, *vram_map;
+ 		void **gtt_start, **gtt_end;
+ 		void **vram_start, **vram_end;
+-		struct amdgpu_fence *fence = NULL;
++		struct fence *fence = NULL;
+ 
+ 		r = amdgpu_bo_create(adev, size, PAGE_SIZE, true,
+ 				     AMDGPU_GEM_DOMAIN_GTT, 0, NULL, gtt_obj + i);
+@@ -116,13 +116,13 @@ static void amdgpu_do_test_moves(struct amdgpu_device *adev)
+ 			goto out_lclean_unpin;
+ 		}
+ 
+-		r = fence_wait(&fence->base, false);
++		r = fence_wait(fence, false);
+ 		if (r) {
+ 			DRM_ERROR("Failed to wait for GTT->VRAM fence %d\n", i);
+ 			goto out_lclean_unpin;
+ 		}
+ 
+-		amdgpu_fence_unref(&fence);
++		fence_put(fence);
+ 
+ 		r = amdgpu_bo_kmap(vram_obj, &vram_map);
+ 		if (r) {
+@@ -161,13 +161,13 @@ static void amdgpu_do_test_moves(struct amdgpu_device *adev)
+ 			goto out_lclean_unpin;
+ 		}
+ 
+-		r = fence_wait(&fence->base, false);
++		r = fence_wait(fence, false);
+ 		if (r) {
+ 			DRM_ERROR("Failed to wait for VRAM->GTT fence %d\n", i);
+ 			goto out_lclean_unpin;
+ 		}
+ 
+-		amdgpu_fence_unref(&fence);
++		fence_put(fence);
+ 
+ 		r = amdgpu_bo_kmap(gtt_obj[i], &gtt_map);
+ 		if (r) {
+@@ -214,7 +214,7 @@ out_lclean:
+ 			amdgpu_bo_unref(&gtt_obj[i]);
+ 		}
+ 		if (fence)
+-			amdgpu_fence_unref(&fence);
++			fence_put(fence);
+ 		break;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 4cb8132..3991435 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -228,7 +228,7 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
+ 	struct amdgpu_device *adev;
+ 	struct amdgpu_ring *ring;
+ 	uint64_t old_start, new_start;
+-	struct amdgpu_fence *fence;
++	struct fence *fence;
+ 	int r;
+ 
+ 	adev = amdgpu_get_adev(bo->bdev);
+@@ -269,9 +269,9 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
+ 			       new_mem->num_pages * PAGE_SIZE, /* bytes */
+ 			       bo->resv, &fence);
+ 	/* FIXME: handle copy error */
+-	r = ttm_bo_move_accel_cleanup(bo, &fence->base,
++	r = ttm_bo_move_accel_cleanup(bo, fence,
+ 				      evict, no_wait_gpu, new_mem);
+-	amdgpu_fence_unref(&fence);
++	fence_put(fence);
+ 	return r;
+ }
+ 
+@@ -987,52 +987,48 @@ int amdgpu_copy_buffer(struct amdgpu_ring *ring,
+ 		       uint64_t dst_offset,
+ 		       uint32_t byte_count,
+ 		       struct reservation_object *resv,
+-		       struct amdgpu_fence **fence)
++		       struct fence **fence)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+-	struct amdgpu_sync sync;
+ 	uint32_t max_bytes;
+ 	unsigned num_loops, num_dw;
++	struct amdgpu_ib *ib;
+ 	unsigned i;
+ 	int r;
+ 
+-	/* sync other rings */
+-	amdgpu_sync_create(&sync);
+-	if (resv) {
+-		r = amdgpu_sync_resv(adev, &sync, resv, false);
+-		if (r) {
+-			DRM_ERROR("sync failed (%d).\n", r);
+-			amdgpu_sync_free(adev, &sync, NULL);
+-			return r;
+-		}
+-	}
+-
+ 	max_bytes = adev->mman.buffer_funcs->copy_max_bytes;
+ 	num_loops = DIV_ROUND_UP(byte_count, max_bytes);
+ 	num_dw = num_loops * adev->mman.buffer_funcs->copy_num_dw;
+ 
+-	/* for fence and sync */
+-	num_dw += 64 + AMDGPU_NUM_SYNCS * 8;
++	/* for IB padding */
++	while (num_dw & 0x7)
++		num_dw++;
++
++	ib = kzalloc(sizeof(struct amdgpu_ib), GFP_KERNEL);
++	if (!ib)
++		return -ENOMEM;
+ 
+-	r = amdgpu_sync_wait(&sync);
++	r = amdgpu_ib_get(ring, NULL, num_dw * 4, ib);
+ 	if (r) {
+-		DRM_ERROR("sync wait failed (%d).\n", r);
+-		amdgpu_sync_free(adev, &sync, NULL);
++		kfree(ib);
+ 		return r;
+ 	}
+ 
+-	r = amdgpu_ring_lock(ring, num_dw);
+-	if (r) {
+-		DRM_ERROR("ring lock failed (%d).\n", r);
+-		amdgpu_sync_free(adev, &sync, NULL);
+-		return r;
++	ib->length_dw = 0;
++
++	if (resv) {
++		r = amdgpu_sync_resv(adev, &ib->sync, resv,
++				     AMDGPU_FENCE_OWNER_UNDEFINED);
++		if (r) {
++			DRM_ERROR("sync failed (%d).\n", r);
++			goto error_free;
++		}
+ 	}
+-	amdgpu_sync_rings(&sync, ring);
+ 
+ 	for (i = 0; i < num_loops; i++) {
+ 		uint32_t cur_size_in_bytes = min(byte_count, max_bytes);
+ 
+-		amdgpu_emit_copy_buffer(adev, ring, src_offset, dst_offset,
++		amdgpu_emit_copy_buffer(adev, ib, src_offset, dst_offset,
+ 					cur_size_in_bytes);
+ 
+ 		src_offset += cur_size_in_bytes;
+@@ -1040,17 +1036,24 @@ int amdgpu_copy_buffer(struct amdgpu_ring *ring,
+ 		byte_count -= cur_size_in_bytes;
+ 	}
+ 
+-	r = amdgpu_fence_emit(ring, AMDGPU_FENCE_OWNER_MOVE, fence);
+-	if (r) {
+-		amdgpu_ring_unlock_undo(ring);
+-		amdgpu_sync_free(adev, &sync, NULL);
+-		return r;
+-	}
+-
+-	amdgpu_ring_unlock_commit(ring);
+-	amdgpu_sync_free(adev, &sync, &(*fence)->base);
++	amdgpu_vm_pad_ib(adev, ib);
++	WARN_ON(ib->length_dw > num_dw);
++	r = amdgpu_sched_ib_submit_kernel_helper(adev, ring, ib, 1,
++						 &amdgpu_vm_free_job,
++						 AMDGPU_FENCE_OWNER_MOVE,
++						 fence);
++	if (r)
++		goto error_free;
+ 
++	if (!amdgpu_enable_scheduler) {
++		amdgpu_ib_free(adev, ib);
++		kfree(ib);
++	}
+ 	return 0;
++error_free:
++	amdgpu_ib_free(adev, ib);
++	kfree(ib);
++	return r;
+ }
+ 
+ #if defined(CONFIG_DEBUG_FS)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 677266b..83b7ce6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -316,8 +316,7 @@ static void amdgpu_vm_update_pages(struct amdgpu_device *adev,
+ 	}
+ }
+ 
+-static int amdgpu_vm_free_job(
+-	struct amdgpu_job *sched_job)
++int amdgpu_vm_free_job(struct amdgpu_job *sched_job)
+ {
+ 	int i;
+ 	for (i = 0; i < sched_job->num_ibs; i++)
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index af52655..3920c1e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -1339,18 +1339,18 @@ static void cik_sdma_set_irq_funcs(struct amdgpu_device *adev)
+  * Used by the amdgpu ttm implementation to move pages if
+  * registered as the asic copy callback.
+  */
+-static void cik_sdma_emit_copy_buffer(struct amdgpu_ring *ring,
++static void cik_sdma_emit_copy_buffer(struct amdgpu_ib *ib,
+ 				      uint64_t src_offset,
+ 				      uint64_t dst_offset,
+ 				      uint32_t byte_count)
+ {
+-	amdgpu_ring_write(ring, SDMA_PACKET(SDMA_OPCODE_COPY, SDMA_COPY_SUB_OPCODE_LINEAR, 0));
+-	amdgpu_ring_write(ring, byte_count);
+-	amdgpu_ring_write(ring, 0); /* src/dst endian swap */
+-	amdgpu_ring_write(ring, lower_32_bits(src_offset));
+-	amdgpu_ring_write(ring, upper_32_bits(src_offset));
+-	amdgpu_ring_write(ring, lower_32_bits(dst_offset));
+-	amdgpu_ring_write(ring, upper_32_bits(dst_offset));
++	ib->ptr[ib->length_dw++] = SDMA_PACKET(SDMA_OPCODE_COPY, SDMA_COPY_SUB_OPCODE_LINEAR, 0);
++	ib->ptr[ib->length_dw++] = byte_count;
++	ib->ptr[ib->length_dw++] = 0; /* src/dst endian swap */
++	ib->ptr[ib->length_dw++] = lower_32_bits(src_offset);
++	ib->ptr[ib->length_dw++] = upper_32_bits(src_offset);
++	ib->ptr[ib->length_dw++] = lower_32_bits(dst_offset);
++	ib->ptr[ib->length_dw++] = upper_32_bits(dst_offset);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index 2b0e89e..715e02d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -1350,19 +1350,19 @@ static void sdma_v2_4_set_irq_funcs(struct amdgpu_device *adev)
+  * Used by the amdgpu ttm implementation to move pages if
+  * registered as the asic copy callback.
+  */
+-static void sdma_v2_4_emit_copy_buffer(struct amdgpu_ring *ring,
++static void sdma_v2_4_emit_copy_buffer(struct amdgpu_ib *ib,
+ 				       uint64_t src_offset,
+ 				       uint64_t dst_offset,
+ 				       uint32_t byte_count)
+ {
+-	amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_COPY) |
+-			  SDMA_PKT_HEADER_SUB_OP(SDMA_SUBOP_COPY_LINEAR));
+-	amdgpu_ring_write(ring, byte_count);
+-	amdgpu_ring_write(ring, 0); /* src/dst endian swap */
+-	amdgpu_ring_write(ring, lower_32_bits(src_offset));
+-	amdgpu_ring_write(ring, upper_32_bits(src_offset));
+-	amdgpu_ring_write(ring, lower_32_bits(dst_offset));
+-	amdgpu_ring_write(ring, upper_32_bits(dst_offset));
++	ib->ptr[ib->length_dw++] = SDMA_PKT_HEADER_OP(SDMA_OP_COPY) |
++		SDMA_PKT_HEADER_SUB_OP(SDMA_SUBOP_COPY_LINEAR);
++	ib->ptr[ib->length_dw++] = byte_count;
++	ib->ptr[ib->length_dw++] = 0; /* src/dst endian swap */
++	ib->ptr[ib->length_dw++] = lower_32_bits(src_offset);
++	ib->ptr[ib->length_dw++] = upper_32_bits(src_offset);
++	ib->ptr[ib->length_dw++] = lower_32_bits(dst_offset);
++	ib->ptr[ib->length_dw++] = upper_32_bits(dst_offset);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index 6f1df03..67128c8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -1474,19 +1474,19 @@ static void sdma_v3_0_set_irq_funcs(struct amdgpu_device *adev)
+  * Used by the amdgpu ttm implementation to move pages if
+  * registered as the asic copy callback.
+  */
+-static void sdma_v3_0_emit_copy_buffer(struct amdgpu_ring *ring,
++static void sdma_v3_0_emit_copy_buffer(struct amdgpu_ib *ib,
+ 				       uint64_t src_offset,
+ 				       uint64_t dst_offset,
+ 				       uint32_t byte_count)
+ {
+-	amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_COPY) |
+-			  SDMA_PKT_HEADER_SUB_OP(SDMA_SUBOP_COPY_LINEAR));
+-	amdgpu_ring_write(ring, byte_count);
+-	amdgpu_ring_write(ring, 0); /* src/dst endian swap */
+-	amdgpu_ring_write(ring, lower_32_bits(src_offset));
+-	amdgpu_ring_write(ring, upper_32_bits(src_offset));
+-	amdgpu_ring_write(ring, lower_32_bits(dst_offset));
+-	amdgpu_ring_write(ring, upper_32_bits(dst_offset));
++	ib->ptr[ib->length_dw++] = SDMA_PKT_HEADER_OP(SDMA_OP_COPY) |
++		SDMA_PKT_HEADER_SUB_OP(SDMA_SUBOP_COPY_LINEAR);
++	ib->ptr[ib->length_dw++] = byte_count;
++	ib->ptr[ib->length_dw++] = 0; /* src/dst endian swap */
++	ib->ptr[ib->length_dw++] = lower_32_bits(src_offset);
++	ib->ptr[ib->length_dw++] = upper_32_bits(src_offset);
++	ib->ptr[ib->length_dw++] = lower_32_bits(dst_offset);
++	ib->ptr[ib->length_dw++] = upper_32_bits(dst_offset);
+ }
+ 
+ /**
+-- 
+1.9.1
+

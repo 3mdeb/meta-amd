@@ -1,0 +1,338 @@
+From 4ce9891ee17c6e064cc334e3297f7e992d47f3a6 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <david1.zhou@amd.com>
+Date: Wed, 19 Aug 2015 16:41:19 +0800
+Subject: [PATCH 0478/1050] drm/amdgpu: improve sa_bo->fence by kernel fence
+
+Signed-off-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Christian K?nig <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  8 ++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c     | 22 ++++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c        |  4 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h    |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c        | 50 ++++++++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_semaphore.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c      |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c       |  2 +-
+ 8 files changed, 58 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 4addac5..80f2cea 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -441,7 +441,7 @@ int amdgpu_fence_wait_empty(struct amdgpu_ring *ring);
+ unsigned amdgpu_fence_count_emitted(struct amdgpu_ring *ring);
+ 
+ signed long amdgpu_fence_wait_multiple(struct amdgpu_device *adev,
+-				       struct amdgpu_fence **array,
++				       struct fence **array,
+ 				       uint32_t count,
+ 				       bool wait_all,
+ 				       bool intr,
+@@ -654,7 +654,7 @@ struct amdgpu_sa_bo {
+ 	struct amdgpu_sa_manager	*manager;
+ 	unsigned			soffset;
+ 	unsigned			eoffset;
+-	struct amdgpu_fence		*fence;
++	struct fence		        *fence;
+ };
+ 
+ /*
+@@ -696,7 +696,7 @@ bool amdgpu_semaphore_emit_wait(struct amdgpu_ring *ring,
+ 				struct amdgpu_semaphore *semaphore);
+ void amdgpu_semaphore_free(struct amdgpu_device *adev,
+ 			   struct amdgpu_semaphore **semaphore,
+-			   struct amdgpu_fence *fence);
++			   struct fence *fence);
+ 
+ /*
+  * Synchronization
+@@ -717,7 +717,7 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ int amdgpu_sync_rings(struct amdgpu_sync *sync,
+ 		      struct amdgpu_ring *ring);
+ void amdgpu_sync_free(struct amdgpu_device *adev, struct amdgpu_sync *sync,
+-		      struct amdgpu_fence *fence);
++		      struct fence *fence);
+ 
+ /*
+  * GART structures, functions & helpers
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index ae014fc..9a87372 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -836,30 +836,30 @@ static inline bool amdgpu_test_signaled(struct amdgpu_fence *fence)
+ 	return test_bit(FENCE_FLAG_SIGNALED_BIT, &fence->base.flags);
+ }
+ 
+-static bool amdgpu_test_signaled_any(struct amdgpu_fence **fences, uint32_t count)
++static bool amdgpu_test_signaled_any(struct fence **fences, uint32_t count)
+ {
+ 	int idx;
+-	struct amdgpu_fence *fence;
++	struct fence *fence;
+ 
+ 	for (idx = 0; idx < count; ++idx) {
+ 		fence = fences[idx];
+ 		if (fence) {
+-			if (test_bit(FENCE_FLAG_SIGNALED_BIT, &fence->base.flags))
++			if (test_bit(FENCE_FLAG_SIGNALED_BIT, &fence->flags))
+ 				return true;
+ 		}
+ 	}
+ 	return false;
+ }
+ 
+-static bool amdgpu_test_signaled_all(struct amdgpu_fence **fences, uint32_t count)
++static bool amdgpu_test_signaled_all(struct fence **fences, uint32_t count)
+ {
+ 	int idx;
+-	struct amdgpu_fence *fence;
++	struct fence *fence;
+ 
+ 	for (idx = 0; idx < count; ++idx) {
+ 		fence = fences[idx];
+ 		if (fence) {
+-			if (!test_bit(FENCE_FLAG_SIGNALED_BIT, &fence->base.flags))
++			if (!test_bit(FENCE_FLAG_SIGNALED_BIT, &fence->flags))
+ 				return false;
+ 		}
+ 	}
+@@ -885,7 +885,7 @@ static signed long amdgpu_fence_default_wait(struct fence *f, bool intr,
+ 	struct amdgpu_fence *fence = to_amdgpu_fence(f);
+ 	struct amdgpu_device *adev = fence->ring->adev;
+ 
+-	return amdgpu_fence_wait_multiple(adev, &fence, 1, false, intr, t);
++	return amdgpu_fence_wait_multiple(adev, &f, 1, false, intr, t);
+ }
+ 
+ /**
+@@ -902,7 +902,7 @@ static signed long amdgpu_fence_default_wait(struct fence *f, bool intr,
+  * If wait_all is false, it will return when any fence is signaled or timeout.
+  */
+ signed long amdgpu_fence_wait_multiple(struct amdgpu_device *adev,
+-				       struct amdgpu_fence **array,
++				       struct fence **array,
+ 				       uint32_t count,
+ 				       bool wait_all,
+ 				       bool intr,
+@@ -910,7 +910,7 @@ signed long amdgpu_fence_wait_multiple(struct amdgpu_device *adev,
+ {
+ 	long idx = 0;
+ 	struct amdgpu_wait_cb *cb;
+-	struct amdgpu_fence *fence;
++	struct fence *fence;
+ 
+ 	BUG_ON(!array);
+ 
+@@ -924,7 +924,7 @@ signed long amdgpu_fence_wait_multiple(struct amdgpu_device *adev,
+ 		fence = array[idx];
+ 		if (fence) {
+ 			cb[idx].task = current;
+-			if (fence_add_callback(&fence->base,
++			if (fence_add_callback(fence,
+ 					&cb[idx].base, amdgpu_fence_wait_cb)) {
+ 				/* The fence is already signaled */
+ 				if (wait_all)
+@@ -967,7 +967,7 @@ fence_rm_cb:
+ 	for (idx = 0; idx < count; ++idx) {
+ 		fence = array[idx];
+ 		if (fence)
+-			fence_remove_callback(&fence->base, &cb[idx].base);
++			fence_remove_callback(fence, &cb[idx].base);
+ 	}
+ 
+ err_free_cb:
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 1c237f5..13c5978 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -93,8 +93,8 @@ int amdgpu_ib_get(struct amdgpu_ring *ring, struct amdgpu_vm *vm,
+  */
+ void amdgpu_ib_free(struct amdgpu_device *adev, struct amdgpu_ib *ib)
+ {
+-	amdgpu_sync_free(adev, &ib->sync, ib->fence);
+-	amdgpu_sa_bo_free(adev, &ib->sa_bo, ib->fence);
++	amdgpu_sync_free(adev, &ib->sync, &ib->fence->base);
++	amdgpu_sa_bo_free(adev, &ib->sa_bo, &ib->fence->base);
+ 	amdgpu_fence_unref(&ib->fence);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index 238465a..6ea18dc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -193,7 +193,7 @@ int amdgpu_sa_bo_new(struct amdgpu_device *adev,
+ 			    unsigned size, unsigned align);
+ void amdgpu_sa_bo_free(struct amdgpu_device *adev,
+ 			      struct amdgpu_sa_bo **sa_bo,
+-			      struct amdgpu_fence *fence);
++			      struct fence *fence);
+ #if defined(CONFIG_DEBUG_FS)
+ void amdgpu_sa_bo_dump_debug_info(struct amdgpu_sa_manager *sa_manager,
+ 					 struct seq_file *m);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
+index 4597899..b7cbaa9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
+@@ -139,6 +139,20 @@ int amdgpu_sa_bo_manager_suspend(struct amdgpu_device *adev,
+ 	return r;
+ }
+ 
++static uint32_t amdgpu_sa_get_ring_from_fence(struct fence *f)
++{
++	struct amdgpu_fence *a_fence;
++	struct amd_sched_fence *s_fence;
++
++	s_fence = to_amd_sched_fence(f);
++	if (s_fence)
++		return s_fence->entity->scheduler->ring_id;
++	a_fence = to_amdgpu_fence(f);
++	if (a_fence)
++		return a_fence->ring->idx;
++	return 0;
++}
++
+ static void amdgpu_sa_bo_remove_locked(struct amdgpu_sa_bo *sa_bo)
+ {
+ 	struct amdgpu_sa_manager *sa_manager = sa_bo->manager;
+@@ -147,7 +161,7 @@ static void amdgpu_sa_bo_remove_locked(struct amdgpu_sa_bo *sa_bo)
+ 	}
+ 	list_del_init(&sa_bo->olist);
+ 	list_del_init(&sa_bo->flist);
+-	amdgpu_fence_unref(&sa_bo->fence);
++	fence_put(sa_bo->fence);
+ 	kfree(sa_bo);
+ }
+ 
+@@ -161,7 +175,7 @@ static void amdgpu_sa_bo_try_free(struct amdgpu_sa_manager *sa_manager)
+ 	sa_bo = list_entry(sa_manager->hole->next, struct amdgpu_sa_bo, olist);
+ 	list_for_each_entry_safe_from(sa_bo, tmp, &sa_manager->olist, olist) {
+ 		if (sa_bo->fence == NULL ||
+-		    !fence_is_signaled(&sa_bo->fence->base)) {
++		    !fence_is_signaled(sa_bo->fence)) {
+ 			return;
+ 		}
+ 		amdgpu_sa_bo_remove_locked(sa_bo);
+@@ -246,7 +260,7 @@ static bool amdgpu_sa_event(struct amdgpu_sa_manager *sa_manager,
+ }
+ 
+ static bool amdgpu_sa_bo_next_hole(struct amdgpu_sa_manager *sa_manager,
+-				   struct amdgpu_fence **fences,
++				   struct fence **fences,
+ 				   unsigned *tries)
+ {
+ 	struct amdgpu_sa_bo *best_bo = NULL;
+@@ -275,7 +289,7 @@ static bool amdgpu_sa_bo_next_hole(struct amdgpu_sa_manager *sa_manager,
+ 		sa_bo = list_first_entry(&sa_manager->flist[i],
+ 					 struct amdgpu_sa_bo, flist);
+ 
+-		if (!fence_is_signaled(&sa_bo->fence->base)) {
++		if (!fence_is_signaled(sa_bo->fence)) {
+ 			fences[i] = sa_bo->fence;
+ 			continue;
+ 		}
+@@ -299,7 +313,8 @@ static bool amdgpu_sa_bo_next_hole(struct amdgpu_sa_manager *sa_manager,
+ 	}
+ 
+ 	if (best_bo) {
+-		++tries[best_bo->fence->ring->idx];
++		uint32_t idx = amdgpu_sa_get_ring_from_fence(best_bo->fence);
++		++tries[idx];
+ 		sa_manager->hole = best_bo->olist.prev;
+ 
+ 		/* we knew that this one is signaled,
+@@ -315,7 +330,7 @@ int amdgpu_sa_bo_new(struct amdgpu_device *adev,
+ 		     struct amdgpu_sa_bo **sa_bo,
+ 		     unsigned size, unsigned align)
+ {
+-	struct amdgpu_fence *fences[AMDGPU_MAX_RINGS];
++	struct fence *fences[AMDGPU_MAX_RINGS];
+ 	unsigned tries[AMDGPU_MAX_RINGS];
+ 	int i, r;
+ 	signed long t;
+@@ -373,7 +388,7 @@ int amdgpu_sa_bo_new(struct amdgpu_device *adev,
+ }
+ 
+ void amdgpu_sa_bo_free(struct amdgpu_device *adev, struct amdgpu_sa_bo **sa_bo,
+-		       struct amdgpu_fence *fence)
++		       struct fence *fence)
+ {
+ 	struct amdgpu_sa_manager *sa_manager;
+ 
+@@ -383,10 +398,11 @@ void amdgpu_sa_bo_free(struct amdgpu_device *adev, struct amdgpu_sa_bo **sa_bo,
+ 
+ 	sa_manager = (*sa_bo)->manager;
+ 	spin_lock(&sa_manager->wq.lock);
+-	if (fence && !fence_is_signaled(&fence->base)) {
+-		(*sa_bo)->fence = amdgpu_fence_ref(fence);
+-		list_add_tail(&(*sa_bo)->flist,
+-			      &sa_manager->flist[fence->ring->idx]);
++	if (fence && !fence_is_signaled(fence)) {
++		uint32_t idx;
++		(*sa_bo)->fence = fence_get(fence);
++		idx = amdgpu_sa_get_ring_from_fence(fence);
++		list_add_tail(&(*sa_bo)->flist, &sa_manager->flist[idx]);
+ 	} else {
+ 		amdgpu_sa_bo_remove_locked(*sa_bo);
+ 	}
+@@ -413,8 +429,16 @@ void amdgpu_sa_bo_dump_debug_info(struct amdgpu_sa_manager *sa_manager,
+ 		seq_printf(m, "[0x%010llx 0x%010llx] size %8lld",
+ 			   soffset, eoffset, eoffset - soffset);
+ 		if (i->fence) {
+-			seq_printf(m, " protected by 0x%016llx on ring %d",
+-				   i->fence->seq, i->fence->ring->idx);
++			struct amdgpu_fence *a_fence = to_amdgpu_fence(i->fence);
++			struct amd_sched_fence *s_fence = to_amd_sched_fence(i->fence);
++			if (a_fence)
++				seq_printf(m, " protected by 0x%016llx on ring %d",
++					   a_fence->seq, a_fence->ring->idx);
++			if (s_fence)
++				seq_printf(m, " protected by 0x%016llx on ring %d",
++					   s_fence->v_seq,
++					   s_fence->entity->scheduler->ring_id);
++
+ 		}
+ 		seq_printf(m, "\n");
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_semaphore.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_semaphore.c
+index d6d41a4..ff3ca52 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_semaphore.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_semaphore.c
+@@ -87,7 +87,7 @@ bool amdgpu_semaphore_emit_wait(struct amdgpu_ring *ring,
+ 
+ void amdgpu_semaphore_free(struct amdgpu_device *adev,
+ 			   struct amdgpu_semaphore **semaphore,
+-			   struct amdgpu_fence *fence)
++			   struct fence *fence)
+ {
+ 	if (semaphore == NULL || *semaphore == NULL) {
+ 		return;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+index 7cb711f..ee68eeb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+@@ -234,7 +234,7 @@ int amdgpu_sync_rings(struct amdgpu_sync *sync,
+  */
+ void amdgpu_sync_free(struct amdgpu_device *adev,
+ 		      struct amdgpu_sync *sync,
+-		      struct amdgpu_fence *fence)
++		      struct fence *fence)
+ {
+ 	unsigned i;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index dd3415d..d7c02e1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1042,7 +1042,7 @@ int amdgpu_copy_buffer(struct amdgpu_ring *ring,
+ 	}
+ 
+ 	amdgpu_ring_unlock_commit(ring);
+-	amdgpu_sync_free(adev, &sync, *fence);
++	amdgpu_sync_free(adev, &sync, &(*fence)->base);
+ 
+ 	return 0;
+ }
+-- 
+1.9.1
+

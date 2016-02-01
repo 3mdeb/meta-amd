@@ -1,0 +1,280 @@
+From 1763552ee8a7f39a1788d24e27b50d4dee383520 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <david1.zhou@amd.com>
+Date: Mon, 3 Aug 2015 11:43:19 +0800
+Subject: [PATCH 0421/1050] drm/amdgpu: add kernel fence in
+ ib_submit_kernel_helper
+
+every sbumission should be able to get a fence.
+
+Signed-off-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Christian K?nig <christian.koenig@amd.com>
+Reviewed-by: Jammy Zhou <jammy.zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c |  8 ++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c   |  8 +++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c   | 12 ++++++++----
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c     |  6 ++++--
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c     |  6 ++++--
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c     |  6 ++++--
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c    |  6 ++++--
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c    |  6 ++++--
+ 9 files changed, 41 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 371ff08..e1f093c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -872,7 +872,8 @@ int amdgpu_sched_ib_submit_kernel_helper(struct amdgpu_device *adev,
+ 					 struct amdgpu_ib *ibs,
+ 					 unsigned num_ibs,
+ 					 int (*free_job)(struct amdgpu_cs_parser *),
+-					 void *owner);
++					 void *owner,
++					 struct fence **fence);
+ 
+ struct amdgpu_ring {
+ 	struct amdgpu_device		*adev;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index 161c83a..23a17ec 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -107,7 +107,8 @@ int amdgpu_sched_ib_submit_kernel_helper(struct amdgpu_device *adev,
+ 					 struct amdgpu_ib *ibs,
+ 					 unsigned num_ibs,
+ 					 int (*free_job)(struct amdgpu_cs_parser *),
+-					 void *owner)
++					 void *owner,
++					 struct fence **f)
+ {
+ 	int r = 0;
+ 	if (amdgpu_enable_scheduler) {
+@@ -135,5 +136,8 @@ int amdgpu_sched_ib_submit_kernel_helper(struct amdgpu_device *adev,
+ 			WARN(true, "emit timeout\n");
+ 	} else
+ 		r = amdgpu_ib_schedule(adev, 1, ibs, owner);
+-	return r;
++	if (r)
++		return r;
++	*f = &ibs[num_ibs - 1].fence->base;
++	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+index 9b27305..f114c6b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+@@ -825,6 +825,7 @@ static int amdgpu_uvd_send_msg(struct amdgpu_ring *ring,
+ 	struct ww_acquire_ctx ticket;
+ 	struct list_head head;
+ 	struct amdgpu_ib *ib = NULL;
++	struct fence *f = NULL;
+ 	struct amdgpu_device *adev = ring->adev;
+ 	uint64_t addr;
+ 	int i, r;
+@@ -869,14 +870,15 @@ static int amdgpu_uvd_send_msg(struct amdgpu_ring *ring,
+ 
+ 	r = amdgpu_sched_ib_submit_kernel_helper(adev, ring, ib, 1,
+ 						 &amdgpu_uvd_free_job,
+-						 AMDGPU_FENCE_OWNER_UNDEFINED);
++						 AMDGPU_FENCE_OWNER_UNDEFINED,
++						 &f);
+ 	if (r)
+ 		goto err2;
+ 
+-	ttm_eu_fence_buffer_objects(&ticket, &head, &ib->fence->base);
++	ttm_eu_fence_buffer_objects(&ticket, &head, f);
+ 
+ 	if (fence)
+-		*fence = fence_get(&ib->fence->base);
++		*fence = fence_get(f);
+ 	amdgpu_bo_unref(&bo);
+ 
+ 	if (amdgpu_enable_scheduler)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+index 94c40ca..38660ea 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+@@ -362,6 +362,7 @@ int amdgpu_vce_get_create_msg(struct amdgpu_ring *ring, uint32_t handle,
+ {
+ 	const unsigned ib_size_dw = 1024;
+ 	struct amdgpu_ib *ib = NULL;
++	struct fence *f = NULL;
+ 	struct amdgpu_device *adev = ring->adev;
+ 	uint64_t dummy;
+ 	int i, r;
+@@ -408,11 +409,12 @@ int amdgpu_vce_get_create_msg(struct amdgpu_ring *ring, uint32_t handle,
+ 
+ 	r = amdgpu_sched_ib_submit_kernel_helper(adev, ring, ib, 1,
+ 						 &amdgpu_vce_free_job,
+-						 AMDGPU_FENCE_OWNER_UNDEFINED);
++						 AMDGPU_FENCE_OWNER_UNDEFINED,
++						 &f);
+ 	if (r)
+ 		goto err;
+ 	if (fence)
+-		*fence = fence_get(&ib->fence->base);
++		*fence = fence_get(f);
+ 	if (amdgpu_enable_scheduler)
+ 		return 0;
+ err:
+@@ -436,6 +438,7 @@ int amdgpu_vce_get_destroy_msg(struct amdgpu_ring *ring, uint32_t handle,
+ {
+ 	const unsigned ib_size_dw = 1024;
+ 	struct amdgpu_ib *ib = NULL;
++	struct fence *f = NULL;
+ 	struct amdgpu_device *adev = ring->adev;
+ 	uint64_t dummy;
+ 	int i, r;
+@@ -472,11 +475,12 @@ int amdgpu_vce_get_destroy_msg(struct amdgpu_ring *ring, uint32_t handle,
+ 		ib->ptr[i] = 0x0;
+ 	r = amdgpu_sched_ib_submit_kernel_helper(adev, ring, ib, 1,
+ 						 &amdgpu_vce_free_job,
+-						 AMDGPU_FENCE_OWNER_UNDEFINED);
++						 AMDGPU_FENCE_OWNER_UNDEFINED,
++						 &f);
+ 	if (r)
+ 		goto err;
+ 	if (fence)
+-		*fence = fence_get(&ib->fence->base);
++		*fence = fence_get(f);
+ 	if (amdgpu_enable_scheduler)
+ 		return 0;
+ err:
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 115b770..c3ed5b2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -614,6 +614,7 @@ static int cik_sdma_ring_test_ib(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib ib;
++	struct fence *f = NULL;
+ 	unsigned i;
+ 	unsigned index;
+ 	int r;
+@@ -642,11 +643,12 @@ static int cik_sdma_ring_test_ib(struct amdgpu_ring *ring)
+ 	ib.ptr[4] = 0xDEADBEEF;
+ 	ib.length_dw = 5;
+ 	r = amdgpu_sched_ib_submit_kernel_helper(adev, ring, &ib, 1, NULL,
+-						 AMDGPU_FENCE_OWNER_UNDEFINED);
++						 AMDGPU_FENCE_OWNER_UNDEFINED,
++						 &f);
+ 	if (r)
+ 		goto err1;
+ 
+-	r = fence_wait(&ib.fence->base, false);
++	r = fence_wait(f, false);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
+ 		goto err1;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 521d811..ee1c47f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2648,6 +2648,7 @@ static int gfx_v7_0_ring_test_ib(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib ib;
++	struct fence *f = NULL;
+ 	uint32_t scratch;
+ 	uint32_t tmp = 0;
+ 	unsigned i;
+@@ -2670,11 +2671,12 @@ static int gfx_v7_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	ib.length_dw = 3;
+ 
+ 	r = amdgpu_sched_ib_submit_kernel_helper(adev, ring, &ib, 1, NULL,
+-						 AMDGPU_FENCE_OWNER_UNDEFINED);
++						 AMDGPU_FENCE_OWNER_UNDEFINED,
++						 &f);
+ 	if (r)
+ 		goto err2;
+ 
+-	r = fence_wait(&ib.fence->base, false);
++	r = fence_wait(f, false);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
+ 		goto err2;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 59eae93..a865d96 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -610,6 +610,7 @@ static int gfx_v8_0_ring_test_ib(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib ib;
++	struct fence *f = NULL;
+ 	uint32_t scratch;
+ 	uint32_t tmp = 0;
+ 	unsigned i;
+@@ -632,11 +633,12 @@ static int gfx_v8_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	ib.length_dw = 3;
+ 
+ 	r = amdgpu_sched_ib_submit_kernel_helper(adev, ring, &ib, 1, NULL,
+-						 AMDGPU_FENCE_OWNER_UNDEFINED);
++						 AMDGPU_FENCE_OWNER_UNDEFINED,
++						 &f);
+ 	if (r)
+ 		goto err2;
+ 
+-	r = fence_wait(&ib.fence->base, false);
++	r = fence_wait(f, false);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
+ 		goto err2;
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index 2b7ce93..6de7dc8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -673,6 +673,7 @@ static int sdma_v2_4_ring_test_ib(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib ib;
++	struct fence *f = NULL;
+ 	unsigned i;
+ 	unsigned index;
+ 	int r;
+@@ -706,11 +707,12 @@ static int sdma_v2_4_ring_test_ib(struct amdgpu_ring *ring)
+ 	ib.length_dw = 8;
+ 
+ 	r = amdgpu_sched_ib_submit_kernel_helper(adev, ring, &ib, 1, NULL,
+-						 AMDGPU_FENCE_OWNER_UNDEFINED);
++						 AMDGPU_FENCE_OWNER_UNDEFINED,
++						 &f);
+ 	if (r)
+ 		goto err1;
+ 
+-	r = fence_wait(&ib.fence->base, false);
++	r = fence_wait(f, false);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
+ 		goto err1;
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index cba45e6..963a991 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -794,6 +794,7 @@ static int sdma_v3_0_ring_test_ib(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib ib;
++	struct fence *f = NULL;
+ 	unsigned i;
+ 	unsigned index;
+ 	int r;
+@@ -827,11 +828,12 @@ static int sdma_v3_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	ib.length_dw = 8;
+ 
+ 	r = amdgpu_sched_ib_submit_kernel_helper(adev, ring, &ib, 1, NULL,
+-						 AMDGPU_FENCE_OWNER_UNDEFINED);
++						 AMDGPU_FENCE_OWNER_UNDEFINED,
++						 &f);
+ 	if (r)
+ 		goto err1;
+ 
+-	r = fence_wait(&ib.fence->base, false);
++	r = fence_wait(f, false);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
+ 		goto err1;
+-- 
+1.9.1
+

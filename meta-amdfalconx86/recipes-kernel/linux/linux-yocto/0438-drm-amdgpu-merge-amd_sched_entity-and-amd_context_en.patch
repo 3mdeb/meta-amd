@@ -1,0 +1,549 @@
+From 91404fb20825418fd9ab8e6533bc336e1ffc748e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 5 Aug 2015 18:33:21 +0200
+Subject: [PATCH 0438/1050] drm/amdgpu: merge amd_sched_entity and
+ amd_context_entity v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Avoiding a couple of casts.
+
+v2: rename c_entity to entity as well
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  6 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c        |  4 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c       | 18 +++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c     | 12 ++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c        | 18 +++----
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 67 +++++++++++----------------
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h | 57 ++++++++++-------------
+ 7 files changed, 81 insertions(+), 101 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 423cf91..1e68000 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1013,9 +1013,9 @@ struct amdgpu_vm_manager {
+ #define AMDGPU_CTX_MAX_CS_PENDING	16
+ 
+ struct amdgpu_ctx_ring {
+-	uint64_t	sequence;
+-	struct fence	*fences[AMDGPU_CTX_MAX_CS_PENDING];
+-	struct amd_context_entity c_entity;
++	uint64_t		sequence;
++	struct fence		*fences[AMDGPU_CTX_MAX_CS_PENDING];
++	struct amd_sched_entity	entity;
+ };
+ 
+ struct amdgpu_ctx {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index d26688d..b1dc7e1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -900,7 +900,7 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		struct amdgpu_ring * ring =
+ 			amdgpu_cs_parser_get_ring(adev, parser);
+ 		parser->ibs[parser->num_ibs - 1].sequence = atomic64_inc_return(
+-			&parser->ctx->rings[ring->idx].c_entity.last_queued_v_seq);
++			&parser->ctx->rings[ring->idx].entity.last_queued_v_seq);
+ 		if (ring->is_pte_ring || (parser->bo_list && parser->bo_list->has_userptr)) {
+ 			r = amdgpu_cs_parser_prepare_job(parser);
+ 			if (r)
+@@ -911,7 +911,7 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		parser->run_job = amdgpu_cs_parser_run_job;
+ 		parser->free_job = amdgpu_cs_parser_free_job;
+ 		amd_sched_push_job(ring->scheduler,
+-				   &parser->ctx->rings[ring->idx].c_entity,
++				   &parser->ctx->rings[ring->idx].entity,
+ 				   parser);
+ 		cs->out.handle = parser->ibs[parser->num_ibs - 1].sequence;
+ 		up_read(&adev->exclusive_lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index e04364c..232e800 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -46,17 +46,17 @@ int amdgpu_ctx_init(struct amdgpu_device *adev, bool kernel,
+ 				rq = &adev->rings[i]->scheduler->kernel_rq;
+ 			else
+ 				rq = &adev->rings[i]->scheduler->sched_rq;
+-			r = amd_context_entity_init(adev->rings[i]->scheduler,
+-						    &ctx->rings[i].c_entity,
+-						    rq, amdgpu_sched_jobs);
++			r = amd_sched_entity_init(adev->rings[i]->scheduler,
++						  &ctx->rings[i].entity,
++						  rq, amdgpu_sched_jobs);
+ 			if (r)
+ 				break;
+ 		}
+ 
+ 		if (i < adev->num_rings) {
+ 			for (j = 0; j < i; j++)
+-				amd_context_entity_fini(adev->rings[j]->scheduler,
+-							&ctx->rings[j].c_entity);
++				amd_sched_entity_fini(adev->rings[j]->scheduler,
++						      &ctx->rings[j].entity);
+ 			kfree(ctx);
+ 			return r;
+ 		}
+@@ -75,8 +75,8 @@ void amdgpu_ctx_fini(struct amdgpu_ctx *ctx)
+ 
+ 	if (amdgpu_enable_scheduler) {
+ 		for (i = 0; i < adev->num_rings; i++)
+-			amd_context_entity_fini(adev->rings[i]->scheduler,
+-						&ctx->rings[i].c_entity);
++			amd_sched_entity_fini(adev->rings[i]->scheduler,
++					      &ctx->rings[i].entity);
+ 	}
+ }
+ 
+@@ -271,7 +271,7 @@ struct fence *amdgpu_ctx_get_fence(struct amdgpu_ctx *ctx,
+ 	int r;
+ 
+ 	if (amdgpu_enable_scheduler) {
+-		r = amd_sched_wait_emit(&cring->c_entity,
++		r = amd_sched_wait_emit(&cring->entity,
+ 					seq,
+ 					false,
+ 					-1);
+@@ -281,7 +281,7 @@ struct fence *amdgpu_ctx_get_fence(struct amdgpu_ctx *ctx,
+ 
+ 	spin_lock(&ctx->ring_lock);
+ 	if (amdgpu_enable_scheduler)
+-		queued_seq = amd_sched_next_queued_seq(&cring->c_entity);
++		queued_seq = amd_sched_next_queued_seq(&cring->entity);
+ 	else
+ 		queued_seq = cring->sequence;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index 71a4a7e4..787b93d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -28,7 +28,7 @@
+ #include "amdgpu.h"
+ 
+ static int amdgpu_sched_prepare_job(struct amd_gpu_scheduler *sched,
+-				    struct amd_context_entity *c_entity,
++				    struct amd_sched_entity *entity,
+ 				    void *job)
+ {
+ 	int r = 0;
+@@ -51,7 +51,7 @@ static void amdgpu_fence_sched_cb(struct fence *f, struct fence_cb *cb)
+ }
+ 
+ static void amdgpu_sched_run_job(struct amd_gpu_scheduler *sched,
+-				 struct amd_context_entity *c_entity,
++				 struct amd_sched_entity *entity,
+ 				 struct amd_sched_job *job)
+ {
+ 	int r = 0;
+@@ -83,7 +83,7 @@ static void amdgpu_sched_run_job(struct amd_gpu_scheduler *sched,
+ 			goto err;
+ 	}
+ 
+-	amd_sched_emit(c_entity, sched_job->ibs[sched_job->num_ibs - 1].sequence);
++	amd_sched_emit(entity, sched_job->ibs[sched_job->num_ibs - 1].sequence);
+ 
+ 	mutex_unlock(&sched_job->job_lock);
+ 	return;
+@@ -136,13 +136,13 @@ int amdgpu_sched_ib_submit_kernel_helper(struct amdgpu_device *adev,
+ 			return -ENOMEM;
+ 		}
+ 		sched_job->free_job = free_job;
+-		v_seq = atomic64_inc_return(&adev->kernel_ctx.rings[ring->idx].c_entity.last_queued_v_seq);
++		v_seq = atomic64_inc_return(&adev->kernel_ctx.rings[ring->idx].entity.last_queued_v_seq);
+ 		ibs[num_ibs - 1].sequence = v_seq;
+ 		amd_sched_push_job(ring->scheduler,
+-				   &adev->kernel_ctx.rings[ring->idx].c_entity,
++				   &adev->kernel_ctx.rings[ring->idx].entity,
+ 				   sched_job);
+ 		r = amd_sched_wait_emit(
+-			&adev->kernel_ctx.rings[ring->idx].c_entity,
++			&adev->kernel_ctx.rings[ring->idx].entity,
+ 			v_seq,
+ 			false,
+ 			-1);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 9d5043c..230bf1f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -379,12 +379,12 @@ static int amdgpu_vm_clear_bo(struct amdgpu_device *adev,
+ 		sched_job->job_param.vm.bo = bo;
+ 		sched_job->run_job = amdgpu_vm_run_job;
+ 		sched_job->free_job = amdgpu_vm_free_job;
+-		v_seq = atomic64_inc_return(&adev->kernel_ctx.rings[ring->idx].c_entity.last_queued_v_seq);
++		v_seq = atomic64_inc_return(&adev->kernel_ctx.rings[ring->idx].entity.last_queued_v_seq);
+ 		ib->sequence = v_seq;
+ 		amd_sched_push_job(ring->scheduler,
+-				   &adev->kernel_ctx.rings[ring->idx].c_entity,
++				   &adev->kernel_ctx.rings[ring->idx].entity,
+ 				   sched_job);
+-		r = amd_sched_wait_emit(&adev->kernel_ctx.rings[ring->idx].c_entity,
++		r = amd_sched_wait_emit(&adev->kernel_ctx.rings[ring->idx].entity,
+ 					v_seq,
+ 					false,
+ 					-1);
+@@ -530,12 +530,12 @@ int amdgpu_vm_update_page_directory(struct amdgpu_device *adev,
+ 			sched_job->job_param.vm.bo = pd;
+ 			sched_job->run_job = amdgpu_vm_run_job;
+ 			sched_job->free_job = amdgpu_vm_free_job;
+-			v_seq = atomic64_inc_return(&adev->kernel_ctx.rings[ring->idx].c_entity.last_queued_v_seq);
++			v_seq = atomic64_inc_return(&adev->kernel_ctx.rings[ring->idx].entity.last_queued_v_seq);
+ 			ib->sequence = v_seq;
+ 			amd_sched_push_job(ring->scheduler,
+-					   &adev->kernel_ctx.rings[ring->idx].c_entity,
++					   &adev->kernel_ctx.rings[ring->idx].entity,
+ 					   sched_job);
+-			r = amd_sched_wait_emit(&adev->kernel_ctx.rings[ring->idx].c_entity,
++			r = amd_sched_wait_emit(&adev->kernel_ctx.rings[ring->idx].entity,
+ 						v_seq,
+ 						false,
+ 						-1);
+@@ -883,12 +883,12 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 		sched_job->job_param.vm_mapping.fence = fence;
+ 		sched_job->run_job = amdgpu_vm_bo_update_mapping_run_job;
+ 		sched_job->free_job = amdgpu_vm_free_job;
+-		v_seq = atomic64_inc_return(&adev->kernel_ctx.rings[ring->idx].c_entity.last_queued_v_seq);
++		v_seq = atomic64_inc_return(&adev->kernel_ctx.rings[ring->idx].entity.last_queued_v_seq);
+ 		ib->sequence = v_seq;
+ 		amd_sched_push_job(ring->scheduler,
+-				   &adev->kernel_ctx.rings[ring->idx].c_entity,
++				   &adev->kernel_ctx.rings[ring->idx].entity,
+ 				   sched_job);
+-		r = amd_sched_wait_emit(&adev->kernel_ctx.rings[ring->idx].c_entity,
++		r = amd_sched_wait_emit(&adev->kernel_ctx.rings[ring->idx].entity,
+ 					v_seq,
+ 					false,
+ 					-1);
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index 1f78ad6..eb3b099 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -76,7 +76,7 @@ static struct amd_sched_entity *rq_select_entity(struct amd_run_queue *rq)
+ 	return i ? p : NULL;
+ }
+ 
+-static bool context_entity_is_waiting(struct amd_context_entity *entity)
++static bool context_entity_is_waiting(struct amd_sched_entity *entity)
+ {
+ 	/* TODO: sync obj for multi-ring synchronization */
+ 	return false;
+@@ -84,14 +84,11 @@ static bool context_entity_is_waiting(struct amd_context_entity *entity)
+ 
+ static int gpu_entity_check_status(struct amd_sched_entity *entity)
+ {
+-	struct amd_context_entity *tmp;
+-
+ 	if (entity == &entity->belongto_rq->head)
+ 		return -1;
+ 
+-	tmp = container_of(entity, typeof(*tmp), generic_entity);
+-	if (kfifo_is_empty(&tmp->job_queue) ||
+-	    context_entity_is_waiting(tmp))
++	if (kfifo_is_empty(&entity->job_queue) ||
++	    context_entity_is_waiting(entity))
+ 		return -1;
+ 
+ 	return 0;
+@@ -123,31 +120,26 @@ static bool is_scheduler_ready(struct amd_gpu_scheduler *sched)
+  * Select next entity from the kernel run queue, if not available,
+  * return null.
+ */
+-static struct amd_context_entity *
++static struct amd_sched_entity *
+ kernel_rq_select_context(struct amd_gpu_scheduler *sched)
+ {
+ 	struct amd_sched_entity *sched_entity;
+-	struct amd_context_entity *tmp = NULL;
+ 	struct amd_run_queue *rq = &sched->kernel_rq;
+ 
+ 	mutex_lock(&rq->lock);
+ 	sched_entity = rq_select_entity(rq);
+-	if (sched_entity)
+-		tmp = container_of(sched_entity,
+-				   typeof(*tmp),
+-				   generic_entity);
+ 	mutex_unlock(&rq->lock);
+-	return tmp;
++	return sched_entity;
+ }
+ 
+ /**
+  * Select next entity containing real IB submissions
+ */
+-static struct amd_context_entity *
++static struct amd_sched_entity *
+ select_context(struct amd_gpu_scheduler *sched)
+ {
+-	struct amd_context_entity *wake_entity = NULL;
+-	struct amd_context_entity *tmp;
++	struct amd_sched_entity *wake_entity = NULL;
++	struct amd_sched_entity *tmp;
+ 	struct amd_run_queue *rq;
+ 
+ 	if (!is_scheduler_ready(sched))
+@@ -158,12 +150,9 @@ select_context(struct amd_gpu_scheduler *sched)
+ 	if (tmp != NULL)
+ 		goto exit;
+ 
+-	WARN_ON(offsetof(struct amd_context_entity, generic_entity) != 0);
+-
+ 	rq = &sched->sched_rq;
+ 	mutex_lock(&rq->lock);
+-	tmp = container_of(rq_select_entity(rq),
+-			   typeof(*tmp), generic_entity);
++	tmp = rq_select_entity(rq);
+ 	mutex_unlock(&rq->lock);
+ exit:
+ 	if (sched->current_entity && (sched->current_entity != tmp))
+@@ -178,15 +167,15 @@ exit:
+  * Init a context entity used by scheduler when submit to HW ring.
+  *
+  * @sched	The pointer to the scheduler
+- * @entity	The pointer to a valid amd_context_entity
++ * @entity	The pointer to a valid amd_sched_entity
+  * @rq		The run queue this entity belongs
+  * @kernel	If this is an entity for the kernel
+  * @jobs	The max number of jobs in the job queue
+  *
+  * return 0 if succeed. negative error code on failure
+ */
+-int amd_context_entity_init(struct amd_gpu_scheduler *sched,
+-			    struct amd_context_entity *entity,
++int amd_sched_entity_init(struct amd_gpu_scheduler *sched,
++			    struct amd_sched_entity *entity,
+ 			    struct amd_run_queue *rq,
+ 			    uint32_t jobs)
+ {
+@@ -195,10 +184,10 @@ int amd_context_entity_init(struct amd_gpu_scheduler *sched,
+ 	if (!(sched && entity && rq))
+ 		return -EINVAL;
+ 
+-	memset(entity, 0, sizeof(struct amd_context_entity));
++	memset(entity, 0, sizeof(struct amd_sched_entity));
+ 	seq_ring = ((uint64_t)sched->ring_id) << 60;
+ 	spin_lock_init(&entity->lock);
+-	entity->generic_entity.belongto_rq = rq;
++	entity->belongto_rq = rq;
+ 	entity->scheduler = sched;
+ 	init_waitqueue_head(&entity->wait_queue);
+ 	init_waitqueue_head(&entity->wait_emit);
+@@ -213,7 +202,7 @@ int amd_context_entity_init(struct amd_gpu_scheduler *sched,
+ 
+ 	/* Add the entity to the run queue */
+ 	mutex_lock(&rq->lock);
+-	rq_add_entity(rq, &entity->generic_entity);
++	rq_add_entity(rq, entity);
+ 	mutex_unlock(&rq->lock);
+ 	return 0;
+ }
+@@ -227,14 +216,14 @@ int amd_context_entity_init(struct amd_gpu_scheduler *sched,
+  * return true if entity is initialized, false otherwise
+ */
+ static bool is_context_entity_initialized(struct amd_gpu_scheduler *sched,
+-					  struct amd_context_entity *entity)
++					  struct amd_sched_entity *entity)
+ {
+ 	return entity->scheduler == sched &&
+-		entity->generic_entity.belongto_rq != NULL;
++		entity->belongto_rq != NULL;
+ }
+ 
+ static bool is_context_entity_idle(struct amd_gpu_scheduler *sched,
+-				   struct amd_context_entity *entity)
++				   struct amd_sched_entity *entity)
+ {
+ 	/**
+ 	 * Idle means no pending IBs, and the entity is not
+@@ -256,11 +245,11 @@ static bool is_context_entity_idle(struct amd_gpu_scheduler *sched,
+  *
+  * return 0 if succeed. negative error code on failure
+  */
+-int amd_context_entity_fini(struct amd_gpu_scheduler *sched,
+-			    struct amd_context_entity *entity)
++int amd_sched_entity_fini(struct amd_gpu_scheduler *sched,
++			    struct amd_sched_entity *entity)
+ {
+ 	int r = 0;
+-	struct amd_run_queue *rq = entity->generic_entity.belongto_rq;
++	struct amd_run_queue *rq = entity->belongto_rq;
+ 
+ 	if (!is_context_entity_initialized(sched, entity))
+ 		return 0;
+@@ -283,7 +272,7 @@ int amd_context_entity_fini(struct amd_gpu_scheduler *sched,
+ 	}
+ 
+ 	mutex_lock(&rq->lock);
+-	rq_remove_entity(rq, &entity->generic_entity);
++	rq_remove_entity(rq, entity);
+ 	mutex_unlock(&rq->lock);
+ 	kfifo_free(&entity->job_queue);
+ 	return r;
+@@ -293,7 +282,7 @@ int amd_context_entity_fini(struct amd_gpu_scheduler *sched,
+  * Submit a normal job to the job queue
+  *
+  * @sched	The pointer to the scheduler
+- * @c_entity    The pointer to amd_context_entity
++ * @c_entity    The pointer to amd_sched_entity
+  * @job		The pointer to job required to submit
+  * return 0 if succeed. -1 if failed.
+  *        -2 indicate queue is full for this client, client should wait untill
+@@ -301,7 +290,7 @@ int amd_context_entity_fini(struct amd_gpu_scheduler *sched,
+  *	  -1 other fail.
+ */
+ int amd_sched_push_job(struct amd_gpu_scheduler *sched,
+-		       struct amd_context_entity *c_entity,
++		       struct amd_sched_entity *c_entity,
+ 		       void *job)
+ {
+ 	while (kfifo_in_spinlocked(&c_entity->job_queue, &job, sizeof(void *),
+@@ -328,7 +317,7 @@ int amd_sched_push_job(struct amd_gpu_scheduler *sched,
+  *
+  * return =0 signaled ,  <0 failed
+ */
+-int amd_sched_wait_emit(struct amd_context_entity *c_entity,
++int amd_sched_wait_emit(struct amd_sched_entity *c_entity,
+ 			uint64_t seq,
+ 			bool intr,
+ 			long timeout)
+@@ -369,7 +358,7 @@ static int amd_sched_main(void *param)
+ 	int r;
+ 	void *job;
+ 	struct sched_param sparam = {.sched_priority = 1};
+-	struct amd_context_entity *c_entity = NULL;
++	struct amd_sched_entity *c_entity = NULL;
+ 	struct amd_gpu_scheduler *sched = (struct amd_gpu_scheduler *)param;
+ 
+ 	sched_setscheduler(current, SCHED_FIFO, &sparam);
+@@ -505,7 +494,7 @@ int amd_sched_destroy(struct amd_gpu_scheduler *sched)
+  * @entity The context entity
+  * @seq The sequence number for the latest emitted job
+ */
+-void amd_sched_emit(struct amd_context_entity *c_entity, uint64_t seq)
++void amd_sched_emit(struct amd_sched_entity *c_entity, uint64_t seq)
+ {
+ 	atomic64_set(&c_entity->last_emitted_v_seq, seq);
+ 	wake_up_all(&c_entity->wait_emit);
+@@ -518,7 +507,7 @@ void amd_sched_emit(struct amd_context_entity *c_entity, uint64_t seq)
+  *
+  * return the next queued sequence number
+ */
+-uint64_t amd_sched_next_queued_seq(struct amd_context_entity *c_entity)
++uint64_t amd_sched_next_queued_seq(struct amd_sched_entity *c_entity)
+ {
+ 	return atomic64_read(&c_entity->last_queued_v_seq) + 1;
+ }
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index 64ef0e2..a3e29df 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -41,6 +41,17 @@ struct amd_run_queue;
+ struct amd_sched_entity {
+ 	struct list_head		list;
+ 	struct amd_run_queue		*belongto_rq;
++	spinlock_t			lock;
++	/* the virtual_seq is unique per context per ring */
++	atomic64_t			last_queued_v_seq;
++	atomic64_t			last_emitted_v_seq;
++	/* the job_queue maintains the jobs submitted by clients */
++	struct kfifo                    job_queue;
++	spinlock_t			queue_lock;
++	struct amd_gpu_scheduler	*scheduler;
++	wait_queue_head_t		wait_queue;
++	wait_queue_head_t		wait_emit;
++	bool                            is_pending;
+ };
+ 
+ /**
+@@ -61,25 +72,6 @@ struct amd_run_queue {
+ 	int (*check_entity_status)(struct amd_sched_entity *entity);
+ };
+ 
+-/**
+- * Context based scheduler entity, there can be multiple entities for
+- * each context, and one entity per ring
+-*/
+-struct amd_context_entity {
+-	struct amd_sched_entity	        generic_entity;
+-	spinlock_t			lock;
+-	/* the virtual_seq is unique per context per ring */
+-	atomic64_t			last_queued_v_seq;
+-	atomic64_t			last_emitted_v_seq;
+-	/* the job_queue maintains the jobs submitted by clients */
+-	struct kfifo                    job_queue;
+-	spinlock_t			queue_lock;
+-	struct amd_gpu_scheduler	*scheduler;
+-	wait_queue_head_t		wait_queue;
+-	wait_queue_head_t		wait_emit;
+-	bool                            is_pending;
+-};
+-
+ struct amd_sched_job {
+ 	struct list_head		list;
+ 	struct fence_cb                 cb;
+@@ -93,10 +85,10 @@ struct amd_sched_job {
+ */
+ struct amd_sched_backend_ops {
+ 	int (*prepare_job)(struct amd_gpu_scheduler *sched,
+-			   struct amd_context_entity *c_entity,
++			   struct amd_sched_entity *c_entity,
+ 			   void *job);
+ 	void (*run_job)(struct amd_gpu_scheduler *sched,
+-			struct amd_context_entity *c_entity,
++			struct amd_sched_entity *c_entity,
+ 			struct amd_sched_job *job);
+ 	void (*process_job)(struct amd_gpu_scheduler *sched, void *job);
+ };
+@@ -116,7 +108,7 @@ struct amd_gpu_scheduler {
+ 	uint32_t			granularity; /* in ms unit */
+ 	uint32_t			preemption;
+ 	wait_queue_head_t		wait_queue;
+-	struct amd_context_entity	*current_entity;
++	struct amd_sched_entity	*current_entity;
+ 	struct mutex			sched_lock;
+ 	spinlock_t			queue_lock;
+ 	uint32_t                        hw_submission_limit;
+@@ -132,10 +124,10 @@ struct amd_gpu_scheduler *amd_sched_create(void *device,
+ int amd_sched_destroy(struct amd_gpu_scheduler *sched);
+ 
+ int amd_sched_push_job(struct amd_gpu_scheduler *sched,
+-		       struct amd_context_entity *c_entity,
++		       struct amd_sched_entity *c_entity,
+ 		       void *job);
+ 
+-int amd_sched_wait_emit(struct amd_context_entity *c_entity,
++int amd_sched_wait_emit(struct amd_sched_entity *c_entity,
+ 			uint64_t seq,
+ 			bool intr,
+ 			long timeout);
+@@ -143,16 +135,15 @@ int amd_sched_wait_emit(struct amd_context_entity *c_entity,
+ void amd_sched_process_job(struct amd_sched_job *sched_job);
+ uint64_t amd_sched_get_handled_seq(struct amd_gpu_scheduler *sched);
+ 
+-int amd_context_entity_fini(struct amd_gpu_scheduler *sched,
+-			    struct amd_context_entity *entity);
+-
+-int amd_context_entity_init(struct amd_gpu_scheduler *sched,
+-			    struct amd_context_entity *entity,
+-			    struct amd_run_queue *rq,
+-			    uint32_t jobs);
++int amd_sched_entity_init(struct amd_gpu_scheduler *sched,
++			  struct amd_sched_entity *entity,
++			  struct amd_run_queue *rq,
++			  uint32_t jobs);
++int amd_sched_entity_fini(struct amd_gpu_scheduler *sched,
++			  struct amd_sched_entity *entity);
+ 
+-void amd_sched_emit(struct amd_context_entity *c_entity, uint64_t seq);
++void amd_sched_emit(struct amd_sched_entity *c_entity, uint64_t seq);
+ 
+-uint64_t amd_sched_next_queued_seq(struct amd_context_entity *c_entity);
++uint64_t amd_sched_next_queued_seq(struct amd_sched_entity *c_entity);
+ 
+ #endif
+-- 
+1.9.1
+

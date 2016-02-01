@@ -1,0 +1,221 @@
+From 3cb485f34049b7f3a00f6f73d2325e0858f64ddb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 11 May 2015 15:34:59 +0200
+Subject: [PATCH 0201/1050] drm/amdgpu: fix context switch
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Properly protect the state and also handle submission failures.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+Reviewed-by: Monk Liu <monk.liu@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    |  7 +++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c | 16 ++++++++--------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c |  8 +++++++-
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c  |  8 ++++----
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c  |  8 ++++----
+ 5 files changed, 26 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 72d9d9e..003fa2d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -893,6 +893,7 @@ struct amdgpu_ib {
+ 	struct amdgpu_fence		*fence;
+ 	struct amdgpu_user_fence        *user;
+ 	struct amdgpu_vm		*vm;
++	struct amdgpu_ctx		*ctx;
+ 	struct amdgpu_sync		sync;
+ 	uint32_t			gds_base, gds_size;
+ 	uint32_t			gws_base, gws_size;
+@@ -943,9 +944,7 @@ struct amdgpu_ring {
+ 	unsigned		wptr_offs;
+ 	unsigned		next_rptr_offs;
+ 	unsigned		fence_offs;
+-	struct drm_file		*current_filp;
+-	unsigned		current_ctx;
+-	bool			need_ctx_switch;
++	struct amdgpu_ctx	*current_ctx;
+ 	enum amdgpu_ring_type	type;
+ 	char			name[16];
+ };
+@@ -1236,7 +1235,7 @@ struct amdgpu_cs_chunk {
+ struct amdgpu_cs_parser {
+ 	struct amdgpu_device	*adev;
+ 	struct drm_file		*filp;
+-	uint32_t ctx_id;
++	struct amdgpu_ctx	*ctx;
+ 	struct amdgpu_bo_list *bo_list;
+ 	/* chunks */
+ 	unsigned		nchunks;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index de17f84..ecb30a1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -138,7 +138,11 @@ int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
+ 	if (!cs->in.num_chunks)
+ 		goto out;
+ 
+-	p->ctx_id = cs->in.ctx_id;
++	p->ctx = amdgpu_ctx_get(fpriv, cs->in.ctx_id);
++	if (!p->ctx) {
++		r = -EINVAL;
++		goto out;
++	}
+ 	p->bo_list = amdgpu_bo_list_get(fpriv, cs->in.bo_list_handle);
+ 
+ 	/* get chunks */
+@@ -445,6 +449,8 @@ static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser, int error, bo
+ 					   &parser->validated);
+ 	}
+ 
++	if (parser->ctx)
++		amdgpu_ctx_put(parser->ctx);
+ 	if (parser->bo_list)
+ 		amdgpu_bo_list_put(parser->bo_list);
+ 	drm_free_large(parser->vm_bos);
+@@ -639,13 +645,7 @@ static int amdgpu_cs_ib_fill(struct amdgpu_device *adev,
+ 		ib->length_dw = chunk_ib->ib_bytes / 4;
+ 
+ 		ib->flags = chunk_ib->flags;
+-
+-		if ((ib->ring->current_filp != parser->filp) ||
+-		    (ib->ring->current_ctx != parser->ctx_id)) {
+-			ib->ring->need_ctx_switch = true;
+-			ib->ring->current_ctx = parser->ctx_id;
+-			ib->ring->current_filp = parser->filp;
+-		}
++		ib->ctx = parser->ctx;
+ 
+ 		ib_bo = &parser->ib_bos[j];
+ 		ib_bo->robj = aobj;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 74ed94e..560c5fd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -140,6 +140,7 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ {
+ 	struct amdgpu_ib *ib = &ibs[0];
+ 	struct amdgpu_ring *ring;
++	struct amdgpu_ctx *ctx, *old_ctx;
+ 	struct amdgpu_vm *vm;
+ 	unsigned i;
+ 	int r = 0;
+@@ -148,6 +149,7 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 		return -EINVAL;
+ 
+ 	ring = ibs->ring;
++	ctx = ibs->ctx;
+ 	vm = ibs->vm;
+ 
+ 	if (!ring->ready) {
+@@ -189,19 +191,23 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 	if (ring->funcs->emit_hdp_flush)
+ 		amdgpu_ring_emit_hdp_flush(ring);
+ 
++	old_ctx = ring->current_ctx;
+ 	for (i = 0; i < num_ibs; ++i) {
+ 		ib = &ibs[i];
+ 
+-		if (ib->ring != ring) {
++		if (ib->ring != ring || ib->ctx != ctx || ib->vm != vm) {
++			ring->current_ctx = old_ctx;
+ 			amdgpu_ring_unlock_undo(ring);
+ 			return -EINVAL;
+ 		}
+ 		amdgpu_ring_emit_ib(ring, ib);
++		ring->current_ctx = ctx;
+ 	}
+ 
+ 	r = amdgpu_fence_emit(ring, owner, &ib->fence);
+ 	if (r) {
+ 		dev_err(adev->dev, "failed to emit fence (%d)\n", r);
++		ring->current_ctx = old_ctx;
+ 		amdgpu_ring_unlock_undo(ring);
+ 		return r;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 855b527..5315c13 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2516,19 +2516,20 @@ static bool gfx_v7_0_ring_emit_semaphore(struct amdgpu_ring *ring,
+ static void gfx_v7_0_ring_emit_ib(struct amdgpu_ring *ring,
+ 				  struct amdgpu_ib *ib)
+ {
++	bool need_ctx_switch = ring->current_ctx != ib->ctx;
+ 	u32 header, control = 0;
+ 	u32 next_rptr = ring->wptr + 5;
+ 
+ 	/* drop the CE preamble IB for the same context */
+ 	if ((ring->type == AMDGPU_RING_TYPE_GFX) &&
+ 	    (ib->flags & AMDGPU_IB_FLAG_PREAMBLE) &&
+-	    !ring->need_ctx_switch)
++	    !need_ctx_switch)
+ 		return;
+ 
+ 	if (ring->type == AMDGPU_RING_TYPE_COMPUTE)
+ 		control |= INDIRECT_BUFFER_VALID;
+ 
+-	if (ring->need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX)
++	if (need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX)
+ 		next_rptr += 2;
+ 
+ 	next_rptr += 4;
+@@ -2539,10 +2540,9 @@ static void gfx_v7_0_ring_emit_ib(struct amdgpu_ring *ring,
+ 	amdgpu_ring_write(ring, next_rptr);
+ 
+ 	/* insert SWITCH_BUFFER packet before first IB in the ring frame */
+-	if (ring->need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX) {
++	if (need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX) {
+ 		amdgpu_ring_write(ring, PACKET3(PACKET3_SWITCH_BUFFER, 0));
+ 		amdgpu_ring_write(ring, 0);
+-		ring->need_ctx_switch = false;
+ 	}
+ 
+ 	if (ib->flags & AMDGPU_IB_FLAG_CE)
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 63ed3b0..188a7ab 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -3645,19 +3645,20 @@ static void gfx_v8_0_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+ static void gfx_v8_0_ring_emit_ib(struct amdgpu_ring *ring,
+ 				  struct amdgpu_ib *ib)
+ {
++	bool need_ctx_switch = ring->current_ctx != ib->ctx;
+ 	u32 header, control = 0;
+ 	u32 next_rptr = ring->wptr + 5;
+ 
+ 	/* drop the CE preamble IB for the same context */
+ 	if ((ring->type == AMDGPU_RING_TYPE_GFX) &&
+ 	    (ib->flags & AMDGPU_IB_FLAG_PREAMBLE) &&
+-	    !ring->need_ctx_switch)
++	    !need_ctx_switch)
+ 		return;
+ 
+ 	if (ring->type == AMDGPU_RING_TYPE_COMPUTE)
+ 		control |= INDIRECT_BUFFER_VALID;
+ 
+-	if (ring->need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX)
++	if (need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX)
+ 		next_rptr += 2;
+ 
+ 	next_rptr += 4;
+@@ -3668,10 +3669,9 @@ static void gfx_v8_0_ring_emit_ib(struct amdgpu_ring *ring,
+ 	amdgpu_ring_write(ring, next_rptr);
+ 
+ 	/* insert SWITCH_BUFFER packet before first IB in the ring frame */
+-	if (ring->need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX) {
++	if (need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX) {
+ 		amdgpu_ring_write(ring, PACKET3(PACKET3_SWITCH_BUFFER, 0));
+ 		amdgpu_ring_write(ring, 0);
+-		ring->need_ctx_switch = false;
+ 	}
+ 
+ 	if (ib->flags & AMDGPU_IB_FLAG_CE)
+-- 
+1.9.1
+
