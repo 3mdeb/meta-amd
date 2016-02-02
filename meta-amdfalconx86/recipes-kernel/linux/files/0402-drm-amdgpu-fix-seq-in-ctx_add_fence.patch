@@ -1,0 +1,174 @@
+From d1ff9086c1b8e67390161599006a34056b437a72 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <david1.zhou@amd.com>
+Date: Thu, 30 Jul 2015 17:59:43 +0800
+Subject: [PATCH 0402/1050] drm/amdgpu: fix seq in ctx_add_fence
+
+if enabling scheduler, then the queued seq is assigned
+when pushing job before emitting job.
+
+Signed-off-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Christian K?nig <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       | 3 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c    | 5 ++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c   | 4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c    | 6 +++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c | 4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c    | 6 +++---
+ 6 files changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 6e1fea4..2619c78 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -419,7 +419,6 @@ struct amdgpu_user_fence {
+ 	struct amdgpu_bo 	*bo;
+ 	/* write-back address offset to bo start */
+ 	uint32_t                offset;
+-	uint64_t                sequence;
+ };
+ 
+ int amdgpu_fence_driver_init(struct amdgpu_device *adev);
+@@ -1031,7 +1030,7 @@ struct amdgpu_ctx *amdgpu_ctx_get(struct amdgpu_fpriv *fpriv, uint32_t id);
+ int amdgpu_ctx_put(struct amdgpu_ctx *ctx);
+ 
+ uint64_t amdgpu_ctx_add_fence(struct amdgpu_ctx *ctx, struct amdgpu_ring *ring,
+-			      struct fence *fence);
++			      struct fence *fence, uint64_t queued_seq);
+ struct fence *amdgpu_ctx_get_fence(struct amdgpu_ctx *ctx,
+ 				   struct amdgpu_ring *ring, uint64_t seq);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index c41360e..40e85bf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -739,7 +739,6 @@ static int amdgpu_cs_ib_fill(struct amdgpu_device *adev,
+ 			ib->oa_size = amdgpu_bo_size(oa);
+ 		}
+ 	}
+-
+ 	/* wrap the last IB with user fence */
+ 	if (parser->uf.bo) {
+ 		struct amdgpu_ib *ib = &parser->ibs[parser->num_ibs - 1];
+@@ -908,7 +907,7 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 	if (amdgpu_enable_scheduler && parser->num_ibs) {
+ 		struct amdgpu_ring * ring =
+ 			amdgpu_cs_parser_get_ring(adev, parser);
+-		parser->uf.sequence = atomic64_inc_return(
++		parser->ibs[parser->num_ibs - 1].sequence = atomic64_inc_return(
+ 			&parser->ctx->rings[ring->idx].c_entity.last_queued_v_seq);
+ 		if (ring->is_pte_ring || (parser->bo_list && parser->bo_list->has_userptr)) {
+ 			r = amdgpu_cs_parser_prepare_job(parser);
+@@ -922,7 +921,7 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		amd_sched_push_job(ring->scheduler,
+ 				   &parser->ctx->rings[ring->idx].c_entity,
+ 				   parser);
+-		cs->out.handle = parser->uf.sequence;
++		cs->out.handle = parser->ibs[parser->num_ibs - 1].sequence;
+ 		up_read(&adev->exclusive_lock);
+ 		return 0;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index 95807b6..e0eaa55 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -258,7 +258,7 @@ int amdgpu_ctx_put(struct amdgpu_ctx *ctx)
+ }
+ 
+ uint64_t amdgpu_ctx_add_fence(struct amdgpu_ctx *ctx, struct amdgpu_ring *ring,
+-			      struct fence *fence)
++			      struct fence *fence, uint64_t queued_seq)
+ {
+ 	struct amdgpu_ctx_ring *cring = & ctx->rings[ring->idx];
+ 	uint64_t seq = 0;
+@@ -266,7 +266,7 @@ uint64_t amdgpu_ctx_add_fence(struct amdgpu_ctx *ctx, struct amdgpu_ring *ring,
+ 	struct fence *other = NULL;
+ 
+ 	if (amdgpu_enable_scheduler)
+-		seq = atomic64_read(&cring->c_entity.last_queued_v_seq);
++		seq = queued_seq;
+ 	else
+ 		seq = cring->sequence;
+ 	idx = seq % AMDGPU_CTX_MAX_CS_PENDING;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 42d6298..eed409c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -143,6 +143,7 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 	struct amdgpu_ring *ring;
+ 	struct amdgpu_ctx *ctx, *old_ctx;
+ 	struct amdgpu_vm *vm;
++	uint64_t sequence;
+ 	unsigned i;
+ 	int r = 0;
+ 
+@@ -215,9 +216,12 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 		return r;
+ 	}
+ 
++	sequence = amdgpu_enable_scheduler ? ib->sequence : 0;
++
+ 	if (ib->ctx)
+ 		ib->sequence = amdgpu_ctx_add_fence(ib->ctx, ring,
+-						    &ib->fence->base);
++						    &ib->fence->base,
++						    sequence);
+ 
+ 	/* wrap the last IB with fence */
+ 	if (ib->user) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index 46ec915..b913c22 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -62,7 +62,7 @@ static void amdgpu_sched_run_job(struct amd_gpu_scheduler *sched,
+ 			goto err;
+ 	}
+ 	atomic64_set(&c_entity->last_emitted_v_seq,
+-		     sched_job->uf.sequence);
++		     sched_job->ibs[sched_job->num_ibs - 1].sequence);
+ 	wake_up_all(&c_entity->wait_emit);
+ 
+ 	mutex_unlock(&sched_job->job_lock);
+@@ -93,7 +93,7 @@ static void amdgpu_sched_process_job(struct amd_gpu_scheduler *sched, void *job)
+ 	if (sched_job->ctx) {
+ 		c_entity = &sched_job->ctx->rings[ring->idx].c_entity;
+ 		atomic64_set(&c_entity->last_signaled_v_seq,
+-			     sched_job->uf.sequence);
++			     sched_job->ibs[sched_job->num_ibs - 1].sequence);
+ 	}
+ 
+ 	/* wake up users waiting for time stamp */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 26c55a7..5624d44 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -380,7 +380,7 @@ static int amdgpu_vm_clear_bo(struct amdgpu_device *adev,
+ 		sched_job->run_job = amdgpu_vm_run_job;
+ 		sched_job->free_job = amdgpu_vm_free_job;
+ 		v_seq = atomic64_inc_return(&adev->kernel_ctx->rings[ring->idx].c_entity.last_queued_v_seq);
+-		sched_job->uf.sequence = v_seq;
++		ib->sequence = v_seq;
+ 		amd_sched_push_job(ring->scheduler,
+ 				   &adev->kernel_ctx->rings[ring->idx].c_entity,
+ 				   sched_job);
+@@ -531,7 +531,7 @@ int amdgpu_vm_update_page_directory(struct amdgpu_device *adev,
+ 			sched_job->run_job = amdgpu_vm_run_job;
+ 			sched_job->free_job = amdgpu_vm_free_job;
+ 			v_seq = atomic64_inc_return(&adev->kernel_ctx->rings[ring->idx].c_entity.last_queued_v_seq);
+-			sched_job->uf.sequence = v_seq;
++			ib->sequence = v_seq;
+ 			amd_sched_push_job(ring->scheduler,
+ 					   &adev->kernel_ctx->rings[ring->idx].c_entity,
+ 					   sched_job);
+@@ -884,7 +884,7 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 		sched_job->run_job = amdgpu_vm_bo_update_mapping_run_job;
+ 		sched_job->free_job = amdgpu_vm_free_job;
+ 		v_seq = atomic64_inc_return(&adev->kernel_ctx->rings[ring->idx].c_entity.last_queued_v_seq);
+-		sched_job->uf.sequence = v_seq;
++		ib->sequence = v_seq;
+ 		amd_sched_push_job(ring->scheduler,
+ 				   &adev->kernel_ctx->rings[ring->idx].c_entity,
+ 				   sched_job);
+-- 
+1.9.1
+

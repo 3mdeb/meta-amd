@@ -1,0 +1,266 @@
+From 81c59f54125f9ff84546b6ba26c321662562703d Mon Sep 17 00:00:00 2001
+From: Ken Wang <Qingqing.Wang@amd.com>
+Date: Wed, 3 Jun 2015 21:02:01 +0800
+Subject: [PATCH 0243/1050] drm/amdgpu: add vram_type and vram_bit_width for
+ interface query (v2)
+
+Track the type of vram on the board and provide a query for it.
+User mode drivers and tools want this information for determining
+bandwidth information and form informational purposes.
+
+v2: fix build when CI support is not enabled
+
+Signed-off-by: Ken Wang <Qingqing.Wang@amd.com>
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c |  2 ++
+ drivers/gpu/drm/amd/amdgpu/ci_dpm.c     | 12 ++++++------
+ drivers/gpu/drm/amd/amdgpu/cikd.h       | 11 ++++++++---
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c   | 32 +++++++++++++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c   | 33 ++++++++++++++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/vid.h        | 11 ++++++++---
+ 7 files changed, 76 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 4bdc326..149b769 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -767,7 +767,7 @@ struct amdgpu_mc {
+ 	const struct firmware   *fw;	/* MC firmware */
+ 	uint32_t                fw_version;
+ 	struct amdgpu_irq_src	vm_fault;
+-	bool                    is_gddr5;
++	uint32_t		vram_type;
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index f1e5d87..5533434 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -457,6 +457,8 @@ static int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file
+ 		dev_info.cu_ao_mask = cu_info.ao_cu_mask;
+ 		dev_info.ce_ram_size = adev->gfx.ce_ram_size;
+ 		memcpy(&dev_info.cu_bitmap[0], &cu_info.bitmap[0], sizeof(cu_info.bitmap));
++		dev_info.vram_type = adev->mc.vram_type;
++		dev_info.vram_bit_width = adev->mc.vram_width;
+ 
+ 		return copy_to_user(out, &dev_info,
+ 				    min((size_t)size, sizeof(dev_info))) ? -EFAULT : 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/ci_dpm.c b/drivers/gpu/drm/amd/amdgpu/ci_dpm.c
+index b1a4fbc..82e8d07 100644
+--- a/drivers/gpu/drm/amd/amdgpu/ci_dpm.c
++++ b/drivers/gpu/drm/amd/amdgpu/ci_dpm.c
+@@ -891,7 +891,7 @@ static void ci_dpm_powergate_uvd(struct amdgpu_device *adev, bool gate)
+ static bool ci_dpm_vblank_too_short(struct amdgpu_device *adev)
+ {
+ 	u32 vblank_time = amdgpu_dpm_get_vblank_time(adev);
+-	u32 switch_limit = adev->mc.is_gddr5 ? 450 : 300;
++	u32 switch_limit = adev->mc.vram_type == AMDGPU_VRAM_TYPE_GDDR5 ? 450 : 300;
+ 
+ 	if (vblank_time < switch_limit)
+ 		return true;
+@@ -2920,7 +2920,7 @@ static int ci_calculate_mclk_params(struct amdgpu_device *adev,
+ 	mpll_ad_func_cntl &= ~MPLL_AD_FUNC_CNTL__YCLK_POST_DIV_MASK;
+ 	mpll_ad_func_cntl |= (mpll_param.post_div << MPLL_AD_FUNC_CNTL__YCLK_POST_DIV__SHIFT);
+ 
+-	if (adev->mc.is_gddr5) {
++	if (adev->mc.vram_type == AMDGPU_VRAM_TYPE_GDDR5) {
+ 		mpll_dq_func_cntl &= ~(MPLL_DQ_FUNC_CNTL__YCLK_SEL_MASK |
+ 				MPLL_AD_FUNC_CNTL__YCLK_POST_DIV_MASK);
+ 		mpll_dq_func_cntl |= (mpll_param.yclk_sel << MPLL_DQ_FUNC_CNTL__YCLK_SEL__SHIFT) |
+@@ -3043,7 +3043,7 @@ static int ci_populate_single_memory_level(struct amdgpu_device *adev,
+ 	    (memory_clock <= pi->mclk_strobe_mode_threshold))
+ 		memory_level->StrobeEnable = 1;
+ 
+-	if (adev->mc.is_gddr5) {
++	if (adev->mc.vram_type == AMDGPU_VRAM_TYPE_GDDR5) {
+ 		memory_level->StrobeRatio =
+ 			ci_get_mclk_frequency_ratio(memory_clock, memory_level->StrobeEnable);
+ 		if (pi->mclk_edc_enable_threshold &&
+@@ -3681,7 +3681,7 @@ static int ci_init_smc_table(struct amdgpu_device *adev)
+ 	if (adev->pm.dpm.platform_caps & ATOM_PP_PLATFORM_CAP_STEPVDDC)
+ 		table->SystemFlags |= PPSMC_SYSTEMFLAG_STEPVDDC;
+ 
+-	if (adev->mc.is_gddr5)
++	if (adev->mc.vram_type == AMDGPU_VRAM_TYPE_GDDR5)
+ 		table->SystemFlags |= PPSMC_SYSTEMFLAG_GDDR5;
+ 
+ 	if (ulv->supported) {
+@@ -4498,14 +4498,14 @@ static int ci_set_mc_special_registers(struct amdgpu_device *adev,
+ 			for (k = 0; k < table->num_entries; k++) {
+ 				table->mc_reg_table_entry[k].mc_data[j] =
+ 					(temp_reg & 0xffff0000) | (table->mc_reg_table_entry[k].mc_data[i] & 0x0000ffff);
+-				if (!adev->mc.is_gddr5)
++				if (adev->mc.vram_type != AMDGPU_VRAM_TYPE_GDDR5)
+ 					table->mc_reg_table_entry[k].mc_data[j] |= 0x100;
+ 			}
+ 			j++;
+ 			if (j > SMU7_DISCRETE_MC_REGISTER_ARRAY_SIZE)
+ 				return -EINVAL;
+ 
+-			if (!adev->mc.is_gddr5) {
++			if (adev->mc.vram_type != AMDGPU_VRAM_TYPE_GDDR5) {
+ 				table->mc_reg_address[j].s1 = mmMC_PMG_AUTO_CMD;
+ 				table->mc_reg_address[j].s0 = mmMC_PMG_AUTO_CMD;
+ 				for (k = 0; k < table->num_entries; k++) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/cikd.h b/drivers/gpu/drm/amd/amdgpu/cikd.h
+index 11828e2..220865a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cikd.h
++++ b/drivers/gpu/drm/amd/amdgpu/cikd.h
+@@ -24,9 +24,14 @@
+ #ifndef CIK_H
+ #define CIK_H
+ 
+-#define MC_SEQ_MISC0__GDDR5__SHIFT	0x1c
+-#define MC_SEQ_MISC0__GDDR5_MASK	0xf0000000
+-#define MC_SEQ_MISC0__GDDR5_VALUE	5
++#define MC_SEQ_MISC0__MT__MASK	0xf0000000
++#define MC_SEQ_MISC0__MT__GDDR1  0x10000000
++#define MC_SEQ_MISC0__MT__DDR2   0x20000000
++#define MC_SEQ_MISC0__MT__GDDR3  0x30000000
++#define MC_SEQ_MISC0__MT__GDDR4  0x40000000
++#define MC_SEQ_MISC0__MT__GDDR5  0x50000000
++#define MC_SEQ_MISC0__MT__HBM    0x60000000
++#define MC_SEQ_MISC0__MT__DDR3   0xB0000000
+ 
+ #define CP_ME_TABLE_SIZE    96
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index 01cd6b2..ae37fce 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -812,6 +812,28 @@ static void gmc_v7_0_enable_hdp_ls(struct amdgpu_device *adev,
+ 		WREG32(mmHDP_MEM_POWER_LS, data);
+ }
+ 
++static int gmc_v7_0_convert_vram_type(int mc_seq_vram_type)
++{
++	switch (mc_seq_vram_type) {
++	case MC_SEQ_MISC0__MT__GDDR1:
++		return AMDGPU_VRAM_TYPE_GDDR1;
++	case MC_SEQ_MISC0__MT__DDR2:
++		return AMDGPU_VRAM_TYPE_DDR2;
++	case MC_SEQ_MISC0__MT__GDDR3:
++		return AMDGPU_VRAM_TYPE_GDDR3;
++	case MC_SEQ_MISC0__MT__GDDR4:
++		return AMDGPU_VRAM_TYPE_GDDR4;
++	case MC_SEQ_MISC0__MT__GDDR5:
++		return AMDGPU_VRAM_TYPE_GDDR5;
++	case MC_SEQ_MISC0__MT__HBM:
++		return AMDGPU_VRAM_TYPE_HBM;
++	case MC_SEQ_MISC0__MT__DDR3:
++		return AMDGPU_VRAM_TYPE_DDR3;
++	default:
++		return AMDGPU_VRAM_TYPE_UNKNOWN;
++	}
++}
++
+ static int gmc_v7_0_early_init(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+@@ -820,15 +842,11 @@ static int gmc_v7_0_early_init(void *handle)
+ 	gmc_v7_0_set_irq_funcs(adev);
+ 
+ 	if (adev->flags & AMDGPU_IS_APU) {
+-		adev->mc.is_gddr5 = false;
++		adev->mc.vram_type = AMDGPU_VRAM_TYPE_UNKNOWN;
+ 	} else {
+ 		u32 tmp = RREG32(mmMC_SEQ_MISC0);
+-
+-		if (((tmp & MC_SEQ_MISC0__GDDR5_MASK) >>
+-		     MC_SEQ_MISC0__GDDR5__SHIFT) == MC_SEQ_MISC0__GDDR5_VALUE)
+-			adev->mc.is_gddr5 = true;
+-		else
+-			adev->mc.is_gddr5 = false;
++		tmp &= MC_SEQ_MISC0__MT__MASK;
++		adev->mc.vram_type = gmc_v7_0_convert_vram_type(tmp);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index 675483a..6206fcd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -38,6 +38,7 @@
+ #include "vid.h"
+ #include "vi.h"
+ 
++
+ static void gmc_v8_0_set_gart_funcs(struct amdgpu_device *adev);
+ static void gmc_v8_0_set_irq_funcs(struct amdgpu_device *adev);
+ 
+@@ -786,6 +787,28 @@ static void gmc_v8_0_vm_decode_fault(struct amdgpu_device *adev,
+ 	       "write" : "read", block, mc_client, mc_id);
+ }
+ 
++static int gmc_v8_0_convert_vram_type(int mc_seq_vram_type)
++{
++	switch (mc_seq_vram_type) {
++	case MC_SEQ_MISC0__MT__GDDR1:
++		return AMDGPU_VRAM_TYPE_GDDR1;
++	case MC_SEQ_MISC0__MT__DDR2:
++		return AMDGPU_VRAM_TYPE_DDR2;
++	case MC_SEQ_MISC0__MT__GDDR3:
++		return AMDGPU_VRAM_TYPE_GDDR3;
++	case MC_SEQ_MISC0__MT__GDDR4:
++		return AMDGPU_VRAM_TYPE_GDDR4;
++	case MC_SEQ_MISC0__MT__GDDR5:
++		return AMDGPU_VRAM_TYPE_GDDR5;
++	case MC_SEQ_MISC0__MT__HBM:
++		return AMDGPU_VRAM_TYPE_HBM;
++	case MC_SEQ_MISC0__MT__DDR3:
++		return AMDGPU_VRAM_TYPE_DDR3;
++	default:
++		return AMDGPU_VRAM_TYPE_UNKNOWN;
++	}
++}
++
+ static int gmc_v8_0_early_init(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+@@ -794,15 +817,11 @@ static int gmc_v8_0_early_init(void *handle)
+ 	gmc_v8_0_set_irq_funcs(adev);
+ 
+ 	if (adev->flags & AMDGPU_IS_APU) {
+-		adev->mc.is_gddr5 = false;
++		adev->mc.vram_type = AMDGPU_VRAM_TYPE_UNKNOWN;
+ 	} else {
+ 		u32 tmp = RREG32(mmMC_SEQ_MISC0);
+-
+-		if (((tmp & MC_SEQ_MISC0__GDDR5_MASK) >>
+-		     MC_SEQ_MISC0__GDDR5__SHIFT) == MC_SEQ_MISC0__GDDR5_VALUE)
+-			adev->mc.is_gddr5 = true;
+-		else
+-			adev->mc.is_gddr5 = false;
++		tmp &= MC_SEQ_MISC0__MT__MASK;
++		adev->mc.vram_type = gmc_v8_0_convert_vram_type(tmp);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/vid.h b/drivers/gpu/drm/amd/amdgpu/vid.h
+index 385267c..31bb894 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vid.h
++++ b/drivers/gpu/drm/amd/amdgpu/vid.h
+@@ -68,9 +68,14 @@
+ 
+ #define RB_BITMAP_WIDTH_PER_SH     2
+ 
+-#define MC_SEQ_MISC0__GDDR5__SHIFT	0x1c
+-#define MC_SEQ_MISC0__GDDR5_MASK	0xf0000000
+-#define MC_SEQ_MISC0__GDDR5_VALUE	5
++#define MC_SEQ_MISC0__MT__MASK	0xf0000000
++#define MC_SEQ_MISC0__MT__GDDR1  0x10000000
++#define MC_SEQ_MISC0__MT__DDR2   0x20000000
++#define MC_SEQ_MISC0__MT__GDDR3  0x30000000
++#define MC_SEQ_MISC0__MT__GDDR4  0x40000000
++#define MC_SEQ_MISC0__MT__GDDR5  0x50000000
++#define MC_SEQ_MISC0__MT__HBM    0x60000000
++#define MC_SEQ_MISC0__MT__DDR3   0xB0000000
+ 
+ /*
+  * PM4
+-- 
+1.9.1
+

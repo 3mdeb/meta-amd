@@ -1,0 +1,83 @@
+From 176e1ab1b534368d0cd338a010aaea99067c3c6e Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <david1.zhou@amd.com>
+Date: Fri, 24 Jul 2015 10:49:47 +0800
+Subject: [PATCH 0394/1050] drm/amdgpu: protect fence_process from multiple
+ context
+
+fence_process may be called from kthread, user thread and interrupt context.
+it is possible to called concurrently, then will wake up fence queue multiple times.
+
+Signed-off-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       | 1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c | 6 +++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c  | 2 +-
+ 3 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 1b8d05f..0703fbf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -869,6 +869,7 @@ struct amdgpu_ring {
+ 	struct amdgpu_fence_driver	fence_drv;
+ 	struct amd_gpu_scheduler 	*scheduler;
+ 
++	spinlock_t              fence_lock;
+ 	struct mutex		*ring_lock;
+ 	struct amdgpu_bo	*ring_obj;
+ 	volatile uint32_t	*ring;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index 1580d8d..b0e15b5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -295,6 +295,7 @@ void amdgpu_fence_process(struct amdgpu_ring *ring)
+ 	uint64_t seq, last_seq, last_emitted;
+ 	unsigned count_loop = 0;
+ 	bool wake = false;
++	unsigned long irqflags;
+ 
+ 	/* Note there is a scenario here for an infinite loop but it's
+ 	 * very unlikely to happen. For it to happen, the current polling
+@@ -317,6 +318,7 @@ void amdgpu_fence_process(struct amdgpu_ring *ring)
+ 	 * have temporarly set the last_seq not to the true real last
+ 	 * seq but to an older one.
+ 	 */
++	spin_lock_irqsave(&ring->fence_lock, irqflags);
+ 	last_seq = atomic64_read(&ring->fence_drv.last_seq);
+ 	do {
+ 		last_emitted = ring->fence_drv.sync_seq[ring->idx];
+@@ -355,7 +357,7 @@ void amdgpu_fence_process(struct amdgpu_ring *ring)
+ 			if (handled_seq == latest_seq) {
+ 				DRM_ERROR("ring %d, EOP without seq update (lastest_seq=%llu)\n",
+ 					  ring->idx, latest_seq);
+-				return;
++				goto exit;
+ 			}
+ 			do {
+ 				amd_sched_isr(ring->scheduler);
+@@ -364,6 +366,8 @@ void amdgpu_fence_process(struct amdgpu_ring *ring)
+ 
+ 		wake_up_all(&ring->adev->fence_queue);
+ 	}
++exit:
++	spin_unlock_irqrestore(&ring->fence_lock, irqflags);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index 855e219..1e68a56 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -367,7 +367,7 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 	}
+ 	ring->next_rptr_gpu_addr = adev->wb.gpu_addr + (ring->next_rptr_offs * 4);
+ 	ring->next_rptr_cpu_addr = &adev->wb.wb[ring->next_rptr_offs];
+-
++	spin_lock_init(&ring->fence_lock);
+ 	r = amdgpu_fence_driver_start_ring(ring, irq_src, irq_type);
+ 	if (r) {
+ 		dev_err(adev->dev, "failed initializing fences (%d).\n", r);
+-- 
+1.9.1
+

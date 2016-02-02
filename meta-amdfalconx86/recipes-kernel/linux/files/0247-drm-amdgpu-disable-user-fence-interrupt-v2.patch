@@ -1,0 +1,325 @@
+From 890ee23fc60193d7c2bca17e099569f1510b3053 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <david1.zhou@amd.com>
+Date: Mon, 1 Jun 2015 14:35:03 +0800
+Subject: [PATCH 0247/1050] drm/amdgpu: disable user fence interrupt (v2)
+
+amdgpu submits both kernel and user fences, but just need one interrupt,
+disable user fence interrupt and don't effect user fence.
+
+v2: fix merge error
+
+Signed-off-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |  7 +++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c |  4 +++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c    |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c   |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c     |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c     | 13 +++++++++----
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c     | 14 ++++++++++----
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c    |  5 +++--
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c    |  5 +++--
+ drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c     |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c     |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c     |  4 ++--
+ 13 files changed, 46 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index c33c1af3..37aeed7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -317,7 +317,7 @@ struct amdgpu_ring_funcs {
+ 	void (*emit_ib)(struct amdgpu_ring *ring,
+ 			struct amdgpu_ib *ib);
+ 	void (*emit_fence)(struct amdgpu_ring *ring, uint64_t addr,
+-			   uint64_t seq, bool write64bit);
++			   uint64_t seq, unsigned flags);
+ 	bool (*emit_semaphore)(struct amdgpu_ring *ring,
+ 			       struct amdgpu_semaphore *semaphore,
+ 			       bool emit_wait);
+@@ -392,6 +392,9 @@ struct amdgpu_fence_driver {
+ #define AMDGPU_FENCE_OWNER_VM		((void*)1ul)
+ #define AMDGPU_FENCE_OWNER_MOVE		((void*)2ul)
+ 
++#define AMDGPU_FENCE_FLAG_64BIT         (1 << 0)
++#define AMDGPU_FENCE_FLAG_INT           (1 << 1)
++
+ struct amdgpu_fence {
+ 	struct fence base;
+ 
+@@ -2142,7 +2145,7 @@ static inline void amdgpu_ring_write(struct amdgpu_ring *ring, uint32_t v)
+ #define amdgpu_ring_set_wptr(r) (r)->funcs->set_wptr((r))
+ #define amdgpu_ring_emit_ib(r, ib) (r)->funcs->emit_ib((r), (ib))
+ #define amdgpu_ring_emit_vm_flush(r, vmid, addr) (r)->funcs->emit_vm_flush((r), (vmid), (addr))
+-#define amdgpu_ring_emit_fence(r, addr, seq, write64bit) (r)->funcs->emit_fence((r), (addr), (seq), (write64bit))
++#define amdgpu_ring_emit_fence(r, addr, seq, flags) (r)->funcs->emit_fence((r), (addr), (seq), (flags))
+ #define amdgpu_ring_emit_semaphore(r, semaphore, emit_wait) (r)->funcs->emit_semaphore((r), (semaphore), (emit_wait))
+ #define amdgpu_ring_emit_gds_switch(r, v, db, ds, wb, ws, ab, as) (r)->funcs->emit_gds_switch((r), (v), (db), (ds), (wb), (ws), (ab), (as))
+ #define amdgpu_ring_emit_hdp_flush(r) (r)->funcs->emit_hdp_flush((r))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index 48ca637..5c9918d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -128,7 +128,9 @@ int amdgpu_fence_emit(struct amdgpu_ring *ring, void *owner,
+ 	fence_init(&(*fence)->base, &amdgpu_fence_ops,
+ 		&adev->fence_queue.lock, adev->fence_context + ring->idx,
+ 		(*fence)->seq);
+-	amdgpu_ring_emit_fence(ring, ring->fence_drv.gpu_addr, (*fence)->seq, false);
++	amdgpu_ring_emit_fence(ring, ring->fence_drv.gpu_addr,
++			       (*fence)->seq,
++			       AMDGPU_FENCE_FLAG_INT);
+ 	trace_amdgpu_fence_emit(ring->adev->ddev, ring->idx, (*fence)->seq);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 560c5fd..52dff75 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -216,7 +216,8 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 	if (ib->user) {
+ 		uint64_t addr = amdgpu_bo_gpu_offset(ib->user->bo);
+ 		addr += ib->user->offset;
+-		amdgpu_ring_emit_fence(ring, addr, ib->fence->seq, true);
++		amdgpu_ring_emit_fence(ring, addr, ib->fence->seq,
++				       AMDGPU_FENCE_FLAG_64BIT);
+ 	}
+ 
+ 	if (ib->vm)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+index 62018b3..1127a50 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+@@ -637,9 +637,9 @@ void amdgpu_vce_ring_emit_ib(struct amdgpu_ring *ring, struct amdgpu_ib *ib)
+  *
+  */
+ void amdgpu_vce_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 seq,
+-				bool write64bits)
++				unsigned flags)
+ {
+-	WARN_ON(write64bits);
++	WARN_ON(flags & AMDGPU_FENCE_FLAG_64BIT);
+ 
+ 	amdgpu_ring_write(ring, VCE_CMD_FENCE);
+ 	amdgpu_ring_write(ring, addr);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h
+index 4294854..b6a9d09 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h
+@@ -40,7 +40,7 @@ bool amdgpu_vce_ring_emit_semaphore(struct amdgpu_ring *ring,
+ 				    bool emit_wait);
+ void amdgpu_vce_ring_emit_ib(struct amdgpu_ring *ring, struct amdgpu_ib *ib);
+ void amdgpu_vce_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 seq,
+-				bool write64bit);
++				unsigned flags);
+ int amdgpu_vce_ring_test_ring(struct amdgpu_ring *ring);
+ int amdgpu_vce_ring_test_ib(struct amdgpu_ring *ring);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index ef5e9f9..fb93163 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -259,8 +259,9 @@ static void cik_sdma_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+  * an interrupt if needed (CIK).
+  */
+ static void cik_sdma_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 seq,
+-				     bool write64bit)
++				     unsigned flags)
+ {
++	bool write64bit = flags & AMDGPU_FENCE_FLAG_64BIT;
+ 	/* write the fence */
+ 	amdgpu_ring_write(ring, SDMA_PACKET(SDMA_OPCODE_FENCE, 0, 0));
+ 	amdgpu_ring_write(ring, lower_32_bits(addr));
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 5fefe40..afa703c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2414,8 +2414,10 @@ static void gfx_v7_0_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+  * GPU caches.
+  */
+ static void gfx_v7_0_ring_emit_fence_gfx(struct amdgpu_ring *ring, u64 addr,
+-					 u64 seq, bool write64bit)
++					 u64 seq, unsigned flags)
+ {
++	bool write64bit = flags & AMDGPU_FENCE_FLAG_64BIT;
++	bool int_sel = flags & AMDGPU_FENCE_FLAG_INT;
+ 	/* Workaround for cache flush problems. First send a dummy EOP
+ 	 * event down the pipe with seq one below.
+ 	 */
+@@ -2438,7 +2440,7 @@ static void gfx_v7_0_ring_emit_fence_gfx(struct amdgpu_ring *ring, u64 addr,
+ 				 EVENT_INDEX(5)));
+ 	amdgpu_ring_write(ring, addr & 0xfffffffc);
+ 	amdgpu_ring_write(ring, (upper_32_bits(addr) & 0xffff) |
+-				DATA_SEL(write64bit ? 2 : 1) | INT_SEL(2));
++				DATA_SEL(write64bit ? 2 : 1) | INT_SEL(int_sel ? 2 : 0));
+ 	amdgpu_ring_write(ring, lower_32_bits(seq));
+ 	amdgpu_ring_write(ring, upper_32_bits(seq));
+ }
+@@ -2454,15 +2456,18 @@ static void gfx_v7_0_ring_emit_fence_gfx(struct amdgpu_ring *ring, u64 addr,
+  */
+ static void gfx_v7_0_ring_emit_fence_compute(struct amdgpu_ring *ring,
+ 					     u64 addr, u64 seq,
+-					     bool write64bits)
++					     unsigned flags)
+ {
++	bool write64bit = flags & AMDGPU_FENCE_FLAG_64BIT;
++	bool int_sel = flags & AMDGPU_FENCE_FLAG_INT;
++
+ 	/* RELEASE_MEM - flush caches, send int */
+ 	amdgpu_ring_write(ring, PACKET3(PACKET3_RELEASE_MEM, 5));
+ 	amdgpu_ring_write(ring, (EOP_TCL1_ACTION_EN |
+ 				 EOP_TC_ACTION_EN |
+ 				 EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) |
+ 				 EVENT_INDEX(5)));
+-	amdgpu_ring_write(ring, DATA_SEL(write64bits ? 2 : 1) | INT_SEL(2));
++	amdgpu_ring_write(ring, DATA_SEL(write64bit ? 2 : 1) | INT_SEL(int_sel ? 2 : 0));
+ 	amdgpu_ring_write(ring, addr & 0xfffffffc);
+ 	amdgpu_ring_write(ring, upper_32_bits(addr));
+ 	amdgpu_ring_write(ring, lower_32_bits(seq));
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 04b9152..6ae2d6b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -3713,8 +3713,11 @@ static void gfx_v8_0_ring_emit_ib(struct amdgpu_ring *ring,
+ }
+ 
+ static void gfx_v8_0_ring_emit_fence_gfx(struct amdgpu_ring *ring, u64 addr,
+-					 u64 seq, bool write64bit)
++					 u64 seq, unsigned flags)
+ {
++	bool write64bit = flags & AMDGPU_FENCE_FLAG_64BIT;
++	bool int_sel = flags & AMDGPU_FENCE_FLAG_INT;
++
+ 	/* EVENT_WRITE_EOP - flush caches, send int */
+ 	amdgpu_ring_write(ring, PACKET3(PACKET3_EVENT_WRITE_EOP, 4));
+ 	amdgpu_ring_write(ring, (EOP_TCL1_ACTION_EN |
+@@ -3723,7 +3726,7 @@ static void gfx_v8_0_ring_emit_fence_gfx(struct amdgpu_ring *ring, u64 addr,
+ 				 EVENT_INDEX(5)));
+ 	amdgpu_ring_write(ring, addr & 0xfffffffc);
+ 	amdgpu_ring_write(ring, (upper_32_bits(addr) & 0xffff) | 
+-			  DATA_SEL(write64bit ? 2 : 1) | INT_SEL(2));
++			  DATA_SEL(write64bit ? 2 : 1) | INT_SEL(int_sel ? 2 : 0));
+ 	amdgpu_ring_write(ring, lower_32_bits(seq));
+ 	amdgpu_ring_write(ring, upper_32_bits(seq));
+ }
+@@ -3880,15 +3883,18 @@ static void gfx_v8_0_ring_set_wptr_compute(struct amdgpu_ring *ring)
+ 
+ static void gfx_v8_0_ring_emit_fence_compute(struct amdgpu_ring *ring,
+ 					     u64 addr, u64 seq,
+-					     bool write64bits)
++					     unsigned flags)
+ {
++	bool write64bit = flags & AMDGPU_FENCE_FLAG_64BIT;
++	bool int_sel = flags & AMDGPU_FENCE_FLAG_INT;
++
+ 	/* RELEASE_MEM - flush caches, send int */
+ 	amdgpu_ring_write(ring, PACKET3(PACKET3_RELEASE_MEM, 5));
+ 	amdgpu_ring_write(ring, (EOP_TCL1_ACTION_EN |
+ 				 EOP_TC_ACTION_EN |
+ 				 EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) |
+ 				 EVENT_INDEX(5)));
+-	amdgpu_ring_write(ring, DATA_SEL(write64bits ? 2 : 1) | INT_SEL(2));
++	amdgpu_ring_write(ring, DATA_SEL(write64bit ? 2 : 1) | INT_SEL(int_sel ? 2 : 0));
+ 	amdgpu_ring_write(ring, addr & 0xfffffffc);
+ 	amdgpu_ring_write(ring, upper_32_bits(addr));
+ 	amdgpu_ring_write(ring, lower_32_bits(seq));
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index d09aa7e..d789588 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -292,8 +292,9 @@ static void sdma_v2_4_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+  * an interrupt if needed (VI).
+  */
+ static void sdma_v2_4_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 seq,
+-				      bool write64bits)
++				      unsigned flags)
+ {
++	bool write64bit = flags & AMDGPU_FENCE_FLAG_64BIT;
+ 	/* write the fence */
+ 	amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_FENCE));
+ 	amdgpu_ring_write(ring, lower_32_bits(addr));
+@@ -301,7 +302,7 @@ static void sdma_v2_4_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 se
+ 	amdgpu_ring_write(ring, lower_32_bits(seq));
+ 
+ 	/* optionally write high bits as well */
+-	if (write64bits) {
++	if (write64bit) {
+ 		addr += 4;
+ 		amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_FENCE));
+ 		amdgpu_ring_write(ring, lower_32_bits(addr));
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index 555c0e1..e3c1fde 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -347,8 +347,9 @@ static void sdma_v3_0_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+  * an interrupt if needed (VI).
+  */
+ static void sdma_v3_0_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 seq,
+-				      bool write64bits)
++				      unsigned flags)
+ {
++	bool write64bit = flags & AMDGPU_FENCE_FLAG_64BIT;
+ 	/* write the fence */
+ 	amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_FENCE));
+ 	amdgpu_ring_write(ring, lower_32_bits(addr));
+@@ -356,7 +357,7 @@ static void sdma_v3_0_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 se
+ 	amdgpu_ring_write(ring, lower_32_bits(seq));
+ 
+ 	/* optionally write high bits as well */
+-	if (write64bits) {
++	if (write64bit) {
+ 		addr += 4;
+ 		amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_FENCE));
+ 		amdgpu_ring_write(ring, lower_32_bits(addr));
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+index 292932a..4efd671 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+@@ -417,9 +417,9 @@ static void uvd_v4_2_stop(struct amdgpu_device *adev)
+  * Write a fence and a trap command to the ring.
+  */
+ static void uvd_v4_2_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 seq,
+-				     bool write64bit)
++				     unsigned flags)
+ {
+-	WARN_ON(write64bit);
++	WARN_ON(flags & AMDGPU_FENCE_FLAG_64BIT);
+ 
+ 	amdgpu_ring_write(ring, PACKET0(mmUVD_CONTEXT_ID, 0));
+ 	amdgpu_ring_write(ring, seq);
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+index 004c564..b756bd9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+@@ -461,9 +461,9 @@ static void uvd_v5_0_stop(struct amdgpu_device *adev)
+  * Write a fence and a trap command to the ring.
+  */
+ static void uvd_v5_0_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 seq,
+-				     bool write64bit)
++				     unsigned flags)
+ {
+-	WARN_ON(write64bit);
++	WARN_ON(flags & AMDGPU_FENCE_FLAG_64BIT);
+ 
+ 	amdgpu_ring_write(ring, PACKET0(mmUVD_CONTEXT_ID, 0));
+ 	amdgpu_ring_write(ring, seq);
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+index 8c790fb..49aa931 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+@@ -457,9 +457,9 @@ static void uvd_v6_0_stop(struct amdgpu_device *adev)
+  * Write a fence and a trap command to the ring.
+  */
+ static void uvd_v6_0_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 seq,
+-				     bool write64bit)
++				     unsigned flags)
+ {
+-	WARN_ON(write64bit);
++	WARN_ON(flags & AMDGPU_FENCE_FLAG_64BIT);
+ 
+ 	amdgpu_ring_write(ring, PACKET0(mmUVD_CONTEXT_ID, 0));
+ 	amdgpu_ring_write(ring, seq);
+-- 
+1.9.1
+

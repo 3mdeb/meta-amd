@@ -1,0 +1,344 @@
+From d2edb07b10fce5127a60671b55ca53921c212bc3 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 11 May 2015 14:10:34 +0200
+Subject: [PATCH 0199/1050] drm/amdgpu: cleanup HDP flush handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+Reviewed-by: Monk Liu <monk.liu@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c |  6 +++---
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c  | 15 +++------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c  | 11 +++--------
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c  |  9 ++-------
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c | 13 ++-----------
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c | 15 +++------------
+ 7 files changed, 18 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index aaa62f3..72d9d9e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -382,6 +382,7 @@ struct amdgpu_ring_funcs {
+ 			       bool emit_wait);
+ 	void (*emit_vm_flush)(struct amdgpu_ring *ring, unsigned vm_id,
+ 			      uint64_t pd_addr);
++	void (*emit_hdp_flush)(struct amdgpu_ring *ring);
+ 	void (*emit_gds_switch)(struct amdgpu_ring *ring, uint32_t vmid,
+ 				uint32_t gds_base, uint32_t gds_size,
+ 				uint32_t gws_base, uint32_t gws_size,
+@@ -892,7 +893,6 @@ struct amdgpu_ib {
+ 	struct amdgpu_fence		*fence;
+ 	struct amdgpu_user_fence        *user;
+ 	struct amdgpu_vm		*vm;
+-	bool				flush_hdp_writefifo;
+ 	struct amdgpu_sync		sync;
+ 	uint32_t			gds_base, gds_size;
+ 	uint32_t			gws_base, gws_size;
+@@ -2203,6 +2203,7 @@ static inline void amdgpu_ring_write(struct amdgpu_ring *ring, uint32_t v)
+ #define amdgpu_ring_emit_fence(r, addr, seq, write64bit) (r)->funcs->emit_fence((r), (addr), (seq), (write64bit))
+ #define amdgpu_ring_emit_semaphore(r, semaphore, emit_wait) (r)->funcs->emit_semaphore((r), (semaphore), (emit_wait))
+ #define amdgpu_ring_emit_gds_switch(r, v, db, ds, wb, ws, ab, as) (r)->funcs->emit_gds_switch((r), (v), (db), (ds), (wb), (ws), (ab), (as))
++#define amdgpu_ring_emit_hdp_flush(r) (r)->funcs->emit_hdp_flush((r))
+ #define amdgpu_ih_get_wptr(adev) (adev)->irq.ih_funcs->get_wptr((adev))
+ #define amdgpu_ih_decode_iv(adev, iv) (adev)->irq.ih_funcs->decode_iv((adev), (iv))
+ #define amdgpu_ih_set_rptr(adev) (adev)->irq.ih_funcs->set_rptr((adev))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index f2442b2..66c66f8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -143,7 +143,6 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 	struct amdgpu_ib *ib = &ibs[0];
+ 	unsigned i;
+ 	int r = 0;
+-	bool flush_hdp = true;
+ 
+ 	if (num_ibs == 0)
+ 		return -EINVAL;
+@@ -185,6 +184,9 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 					    ib->gws_base, ib->gws_size,
+ 					    ib->oa_base, ib->oa_size);
+ 
++	if (ring->funcs->emit_hdp_flush)
++		amdgpu_ring_emit_hdp_flush(ring);
++
+ 	for (i = 0; i < num_ibs; ++i) {
+ 		ib = &ibs[i];
+ 
+@@ -192,8 +194,6 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 			amdgpu_ring_unlock_undo(ring);
+ 			return -EINVAL;
+ 		}
+-		ib->flush_hdp_writefifo = flush_hdp;
+-		flush_hdp = false;
+ 		amdgpu_ring_emit_ib(ring, ib);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 037e3db..d5055ea 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -188,8 +188,6 @@ static void cik_sdma_ring_set_wptr(struct amdgpu_ring *ring)
+ 	WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[me], (ring->wptr << 2) & 0x3fffc);
+ }
+ 
+-static void cik_sdma_hdp_flush_ring_emit(struct amdgpu_ring *);
+-
+ /**
+  * cik_sdma_ring_emit_ib - Schedule an IB on the DMA engine
+  *
+@@ -204,9 +202,6 @@ static void cik_sdma_ring_emit_ib(struct amdgpu_ring *ring,
+ 	u32 extra_bits = (ib->vm ? ib->vm->ids[ring->idx].id : 0) & 0xf;
+ 	u32 next_rptr = ring->wptr + 5;
+ 
+-	if (ib->flush_hdp_writefifo)
+-		next_rptr += 6;
+-
+ 	while ((next_rptr & 7) != 4)
+ 		next_rptr++;
+ 
+@@ -217,11 +212,6 @@ static void cik_sdma_ring_emit_ib(struct amdgpu_ring *ring,
+ 	amdgpu_ring_write(ring, 1); /* number of DWs to follow */
+ 	amdgpu_ring_write(ring, next_rptr);
+ 
+-	if (ib->flush_hdp_writefifo) {
+-		/* flush HDP */
+-		cik_sdma_hdp_flush_ring_emit(ring);
+-	}
+-
+ 	/* IB packet must end on a 8 DW boundary */
+ 	while ((ring->wptr & 7) != 4)
+ 		amdgpu_ring_write(ring, SDMA_PACKET(SDMA_OPCODE_NOP, 0, 0));
+@@ -233,13 +223,13 @@ static void cik_sdma_ring_emit_ib(struct amdgpu_ring *ring,
+ }
+ 
+ /**
+- * cik_sdma_hdp_flush_ring_emit - emit an hdp flush on the DMA ring
++ * cik_sdma_ring_emit_hdp_flush - emit an hdp flush on the DMA ring
+  *
+  * @ring: amdgpu ring pointer
+  *
+  * Emit an hdp flush packet on the requested DMA ring.
+  */
+-static void cik_sdma_hdp_flush_ring_emit(struct amdgpu_ring *ring)
++static void cik_sdma_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+ {
+ 	u32 extra_bits = (SDMA_POLL_REG_MEM_EXTRA_OP(1) |
+ 			  SDMA_POLL_REG_MEM_EXTRA_FUNC(3)); /* == */
+@@ -1317,6 +1307,7 @@ static const struct amdgpu_ring_funcs cik_sdma_ring_funcs = {
+ 	.emit_fence = cik_sdma_ring_emit_fence,
+ 	.emit_semaphore = cik_sdma_ring_emit_semaphore,
+ 	.emit_vm_flush = cik_sdma_ring_emit_vm_flush,
++	.emit_hdp_flush = cik_sdma_ring_emit_hdp_flush,
+ 	.test_ring = cik_sdma_ring_test_ring,
+ 	.test_ib = cik_sdma_ring_test_ib,
+ 	.is_lockup = cik_sdma_ring_is_lockup,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index cec46eb..855b527 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2366,14 +2366,14 @@ static int gfx_v7_0_ring_test_ring(struct amdgpu_ring *ring)
+ }
+ 
+ /**
+- * gfx_v7_0_hdp_flush_cp_ring_emit - emit an hdp flush on the cp
++ * gfx_v7_0_ring_emit_hdp - emit an hdp flush on the cp
+  *
+  * @adev: amdgpu_device pointer
+  * @ridx: amdgpu ring index
+  *
+  * Emits an hdp flush on the cp.
+  */
+-static void gfx_v7_0_hdp_flush_cp_ring_emit(struct amdgpu_ring *ring)
++static void gfx_v7_0_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+ {
+ 	u32 ref_and_mask;
+ 
+@@ -2528,9 +2528,6 @@ static void gfx_v7_0_ring_emit_ib(struct amdgpu_ring *ring,
+ 	if (ring->type == AMDGPU_RING_TYPE_COMPUTE)
+ 		control |= INDIRECT_BUFFER_VALID;
+ 
+-	if (ib->flush_hdp_writefifo)
+-		next_rptr += 7;
+-
+ 	if (ring->need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX)
+ 		next_rptr += 2;
+ 
+@@ -2541,9 +2538,6 @@ static void gfx_v7_0_ring_emit_ib(struct amdgpu_ring *ring,
+ 	amdgpu_ring_write(ring, upper_32_bits(ring->next_rptr_gpu_addr) & 0xffffffff);
+ 	amdgpu_ring_write(ring, next_rptr);
+ 
+-	if (ib->flush_hdp_writefifo)
+-		gfx_v7_0_hdp_flush_cp_ring_emit(ring);
+-
+ 	/* insert SWITCH_BUFFER packet before first IB in the ring frame */
+ 	if (ring->need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX) {
+ 		amdgpu_ring_write(ring, PACKET3(PACKET3_SWITCH_BUFFER, 0));
+@@ -5522,6 +5516,7 @@ static const struct amdgpu_ring_funcs gfx_v7_0_ring_funcs_gfx = {
+ 	.emit_semaphore = gfx_v7_0_ring_emit_semaphore,
+ 	.emit_vm_flush = gfx_v7_0_ring_emit_vm_flush,
+ 	.emit_gds_switch = gfx_v7_0_ring_emit_gds_switch,
++	.emit_hdp_flush = gfx_v7_0_ring_emit_hdp_flush,
+ 	.test_ring = gfx_v7_0_ring_test_ring,
+ 	.test_ib = gfx_v7_0_ring_test_ib,
+ 	.is_lockup = gfx_v7_0_ring_is_lockup,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index fc8c462..63ed3b0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -3610,7 +3610,7 @@ static void gfx_v8_0_ring_set_wptr_gfx(struct amdgpu_ring *ring)
+ 	}
+ }
+ 
+-static void gfx_v8_0_hdp_flush_cp_ring_emit(struct amdgpu_ring *ring)
++static void gfx_v8_0_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+ {
+ 	u32 ref_and_mask, reg_mem_engine;
+ 
+@@ -3657,9 +3657,6 @@ static void gfx_v8_0_ring_emit_ib(struct amdgpu_ring *ring,
+ 	if (ring->type == AMDGPU_RING_TYPE_COMPUTE)
+ 		control |= INDIRECT_BUFFER_VALID;
+ 
+-	if (ib->flush_hdp_writefifo)
+-		next_rptr += 7;
+-
+ 	if (ring->need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX)
+ 		next_rptr += 2;
+ 
+@@ -3670,9 +3667,6 @@ static void gfx_v8_0_ring_emit_ib(struct amdgpu_ring *ring,
+ 	amdgpu_ring_write(ring, upper_32_bits(ring->next_rptr_gpu_addr) & 0xffffffff);
+ 	amdgpu_ring_write(ring, next_rptr);
+ 
+-	if (ib->flush_hdp_writefifo)
+-		gfx_v8_0_hdp_flush_cp_ring_emit(ring);
+-
+ 	/* insert SWITCH_BUFFER packet before first IB in the ring frame */
+ 	if (ring->need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX) {
+ 		amdgpu_ring_write(ring, PACKET3(PACKET3_SWITCH_BUFFER, 0));
+@@ -4149,6 +4143,7 @@ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_gfx = {
+ 	.emit_semaphore = gfx_v8_0_ring_emit_semaphore,
+ 	.emit_vm_flush = gfx_v8_0_ring_emit_vm_flush,
+ 	.emit_gds_switch = gfx_v8_0_ring_emit_gds_switch,
++	.emit_hdp_flush = gfx_v8_0_ring_emit_hdp_flush,
+ 	.test_ring = gfx_v8_0_ring_test_ring,
+ 	.test_ib = gfx_v8_0_ring_test_ib,
+ 	.is_lockup = gfx_v8_0_ring_is_lockup,
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index 389509a..f1423a4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -214,8 +214,6 @@ static void sdma_v2_4_ring_set_wptr(struct amdgpu_ring *ring)
+ 	WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[me], ring->wptr << 2);
+ }
+ 
+-static void sdma_v2_4_hdp_flush_ring_emit(struct amdgpu_ring *);
+-
+ /**
+  * sdma_v2_4_ring_emit_ib - Schedule an IB on the DMA engine
+  *
+@@ -230,9 +228,6 @@ static void sdma_v2_4_ring_emit_ib(struct amdgpu_ring *ring,
+ 	u32 vmid = (ib->vm ? ib->vm->ids[ring->idx].id : 0) & 0xf;
+ 	u32 next_rptr = ring->wptr + 5;
+ 
+-	if (ib->flush_hdp_writefifo)
+-		next_rptr += 6;
+-
+ 	while ((next_rptr & 7) != 2)
+ 		next_rptr++;
+ 
+@@ -245,11 +240,6 @@ static void sdma_v2_4_ring_emit_ib(struct amdgpu_ring *ring,
+ 	amdgpu_ring_write(ring, SDMA_PKT_WRITE_UNTILED_DW_3_COUNT(1));
+ 	amdgpu_ring_write(ring, next_rptr);
+ 
+-	if (ib->flush_hdp_writefifo) {
+-		/* flush HDP */
+-		sdma_v2_4_hdp_flush_ring_emit(ring);
+-	}
+-
+ 	/* IB packet must end on a 8 DW boundary */
+ 	while ((ring->wptr & 7) != 2)
+ 		amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_NOP));
+@@ -271,7 +261,7 @@ static void sdma_v2_4_ring_emit_ib(struct amdgpu_ring *ring,
+  *
+  * Emit an hdp flush packet on the requested DMA ring.
+  */
+-static void sdma_v2_4_hdp_flush_ring_emit(struct amdgpu_ring *ring)
++static void sdma_v2_4_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+ {
+ 	u32 ref_and_mask = 0;
+ 
+@@ -1340,6 +1330,7 @@ static const struct amdgpu_ring_funcs sdma_v2_4_ring_funcs = {
+ 	.emit_fence = sdma_v2_4_ring_emit_fence,
+ 	.emit_semaphore = sdma_v2_4_ring_emit_semaphore,
+ 	.emit_vm_flush = sdma_v2_4_ring_emit_vm_flush,
++	.emit_hdp_flush = sdma_v2_4_ring_emit_hdp_flush,
+ 	.test_ring = sdma_v2_4_ring_test_ring,
+ 	.test_ib = sdma_v2_4_ring_test_ib,
+ 	.is_lockup = sdma_v2_4_ring_is_lockup,
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index d3eda31..7c4abff 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -269,8 +269,6 @@ static void sdma_v3_0_ring_set_wptr(struct amdgpu_ring *ring)
+ 	}
+ }
+ 
+-static void sdma_v3_0_hdp_flush_ring_emit(struct amdgpu_ring *);
+-
+ /**
+  * sdma_v3_0_ring_emit_ib - Schedule an IB on the DMA engine
+  *
+@@ -285,9 +283,6 @@ static void sdma_v3_0_ring_emit_ib(struct amdgpu_ring *ring,
+ 	u32 vmid = (ib->vm ? ib->vm->ids[ring->idx].id : 0) & 0xf;
+ 	u32 next_rptr = ring->wptr + 5;
+ 
+-	if (ib->flush_hdp_writefifo)
+-		next_rptr += 6;
+-
+ 	while ((next_rptr & 7) != 2)
+ 		next_rptr++;
+ 	next_rptr += 6;
+@@ -299,11 +294,6 @@ static void sdma_v3_0_ring_emit_ib(struct amdgpu_ring *ring,
+ 	amdgpu_ring_write(ring, SDMA_PKT_WRITE_UNTILED_DW_3_COUNT(1));
+ 	amdgpu_ring_write(ring, next_rptr);
+ 
+-	/* flush HDP */
+-	if (ib->flush_hdp_writefifo) {
+-		sdma_v3_0_hdp_flush_ring_emit(ring);
+-	}
+-
+ 	/* IB packet must end on a 8 DW boundary */
+ 	while ((ring->wptr & 7) != 2)
+ 		amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_NOP));
+@@ -320,13 +310,13 @@ static void sdma_v3_0_ring_emit_ib(struct amdgpu_ring *ring,
+ }
+ 
+ /**
+- * sdma_v3_0_hdp_flush_ring_emit - emit an hdp flush on the DMA ring
++ * sdma_v3_0_ring_emit_hdp_flush - emit an hdp flush on the DMA ring
+  *
+  * @ring: amdgpu ring pointer
+  *
+  * Emit an hdp flush packet on the requested DMA ring.
+  */
+-static void sdma_v3_0_hdp_flush_ring_emit(struct amdgpu_ring *ring)
++static void sdma_v3_0_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+ {
+ 	u32 ref_and_mask = 0;
+ 
+@@ -1407,6 +1397,7 @@ static const struct amdgpu_ring_funcs sdma_v3_0_ring_funcs = {
+ 	.emit_fence = sdma_v3_0_ring_emit_fence,
+ 	.emit_semaphore = sdma_v3_0_ring_emit_semaphore,
+ 	.emit_vm_flush = sdma_v3_0_ring_emit_vm_flush,
++	.emit_hdp_flush = sdma_v3_0_ring_emit_hdp_flush,
+ 	.test_ring = sdma_v3_0_ring_test_ring,
+ 	.test_ib = sdma_v3_0_ring_test_ib,
+ 	.is_lockup = sdma_v3_0_ring_is_lockup,
+-- 
+1.9.1
+

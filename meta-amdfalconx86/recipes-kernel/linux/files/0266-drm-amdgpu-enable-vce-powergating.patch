@@ -1,0 +1,289 @@
+From b7a0776949a8f9db835ab652b6fa96b6e7d6972d Mon Sep 17 00:00:00 2001
+From: Sonny Jiang <sonny.jiang@amd.com>
+Date: Thu, 28 May 2015 15:47:53 -0400
+Subject: [PATCH 0266/1050] drm/amdgpu: enable vce powergating
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Enable VCE dpm and powergating. VCE dpm dynamically scales the VCE clocks on
+demand.
+
+Signed-off-by: Sonny Jiang <sonny.jiang@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    |   2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c |  26 ++++---
+ drivers/gpu/drm/amd/amdgpu/cz_dpm.c    | 132 ++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/vi.c        |   2 +-
+ 4 files changed, 148 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 37aeed7..22866d1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1509,6 +1509,7 @@ struct amdgpu_dpm_funcs {
+ 	int (*force_performance_level)(struct amdgpu_device *adev, enum amdgpu_dpm_forced_level level);
+ 	bool (*vblank_too_short)(struct amdgpu_device *adev);
+ 	void (*powergate_uvd)(struct amdgpu_device *adev, bool gate);
++	void (*powergate_vce)(struct amdgpu_device *adev, bool gate);
+ 	void (*enable_bapm)(struct amdgpu_device *adev, bool enable);
+ 	void (*set_fan_control_mode)(struct amdgpu_device *adev, u32 mode);
+ 	u32 (*get_fan_control_mode)(struct amdgpu_device *adev);
+@@ -2182,6 +2183,7 @@ static inline void amdgpu_ring_write(struct amdgpu_ring *ring, uint32_t v)
+ #define amdgpu_dpm_force_performance_level(adev, l) (adev)->pm.funcs->force_performance_level((adev), (l))
+ #define amdgpu_dpm_vblank_too_short(adev) (adev)->pm.funcs->vblank_too_short((adev))
+ #define amdgpu_dpm_powergate_uvd(adev, g) (adev)->pm.funcs->powergate_uvd((adev), (g))
++#define amdgpu_dpm_powergate_vce(adev, g) (adev)->pm.funcs->powergate_vce((adev), (g))
+ #define amdgpu_dpm_enable_bapm(adev, e) (adev)->pm.funcs->enable_bapm((adev), (e))
+ #define amdgpu_dpm_set_fan_control_mode(adev, m) (adev)->pm.funcs->set_fan_control_mode((adev), (m))
+ #define amdgpu_dpm_get_fan_control_mode(adev) (adev)->pm.funcs->get_fan_control_mode((adev))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
+index 605a9e4..ed13baa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
+@@ -656,19 +656,27 @@ void amdgpu_dpm_enable_uvd(struct amdgpu_device *adev, bool enable)
+ 
+ void amdgpu_dpm_enable_vce(struct amdgpu_device *adev, bool enable)
+ {
+-	if (enable) {
++	if (adev->pm.funcs->powergate_vce) {
+ 		mutex_lock(&adev->pm.mutex);
+-		adev->pm.dpm.vce_active = true;
+-		/* XXX select vce level based on ring/task */
+-		adev->pm.dpm.vce_level = AMDGPU_VCE_LEVEL_AC_ALL;
++		/* enable/disable VCE */
++		amdgpu_dpm_powergate_vce(adev, !enable);
++
+ 		mutex_unlock(&adev->pm.mutex);
+ 	} else {
+-		mutex_lock(&adev->pm.mutex);
+-		adev->pm.dpm.vce_active = false;
+-		mutex_unlock(&adev->pm.mutex);
+-	}
++		if (enable) {
++			mutex_lock(&adev->pm.mutex);
++			adev->pm.dpm.vce_active = true;
++			/* XXX select vce level based on ring/task */
++			adev->pm.dpm.vce_level = AMDGPU_VCE_LEVEL_AC_ALL;
++			mutex_unlock(&adev->pm.mutex);
++		} else {
++			mutex_lock(&adev->pm.mutex);
++			adev->pm.dpm.vce_active = false;
++			mutex_unlock(&adev->pm.mutex);
++		}
+ 
+-	amdgpu_pm_compute_clocks(adev);
++		amdgpu_pm_compute_clocks(adev);
++	}
+ }
+ 
+ void amdgpu_pm_print_power_states(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/cz_dpm.c b/drivers/gpu/drm/amd/amdgpu/cz_dpm.c
+index 131b473..10a3874 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cz_dpm.c
++++ b/drivers/gpu/drm/amd/amdgpu/cz_dpm.c
+@@ -43,6 +43,7 @@
+ #include "gfx_v8_0.h"
+ 
+ static void cz_dpm_powergate_uvd(struct amdgpu_device *adev, bool gate);
++static void cz_dpm_powergate_vce(struct amdgpu_device *adev, bool gate);
+ 
+ static struct cz_ps *cz_get_ps(struct amdgpu_ps *rps)
+ {
+@@ -558,6 +559,7 @@ static int cz_dpm_late_init(void *handle)
+ 
+ 	/* powerdown unused blocks for now */
+ 	cz_dpm_powergate_uvd(adev, true);
++	cz_dpm_powergate_vce(adev, true);
+ 
+ 	return 0;
+ }
+@@ -826,16 +828,16 @@ static void cz_init_vce_limit(struct amdgpu_device *adev)
+ 		return;
+ 	}
+ 
+-	pi->vce_dpm.soft_min_clk = 0;
+-	pi->vce_dpm.hard_min_clk = 0;
++	pi->vce_dpm.soft_min_clk = table->entries[0].ecclk;
++	pi->vce_dpm.hard_min_clk = table->entries[0].ecclk;
+ 	cz_send_msg_to_smc(adev, PPSMC_MSG_GetMaxEclkLevel);
+ 	level = cz_get_argument(adev);
+ 	if (level < table->count)
+-		clock = table->entries[level].evclk;
++		clock = table->entries[level].ecclk;
+ 	else {
+ 		/* future BIOS would fix this error */
+ 		DRM_ERROR("Invalid VCE Voltage Dependency table entry.\n");
+-		clock = table->entries[table->count - 1].evclk;
++		clock = table->entries[table->count - 1].ecclk;
+ 	}
+ 
+ 	pi->vce_dpm.soft_max_clk = clock;
+@@ -1004,6 +1006,36 @@ static uint32_t cz_get_sclk_level(struct amdgpu_device *adev,
+ 	return i;
+ }
+ 
++static uint32_t cz_get_eclk_level(struct amdgpu_device *adev,
++				uint32_t clock, uint16_t msg)
++{
++	int i = 0;
++	struct amdgpu_vce_clock_voltage_dependency_table *table =
++		&adev->pm.dpm.dyn_state.vce_clock_voltage_dependency_table;
++
++	if (table->count == 0)
++		return 0;
++
++	switch (msg) {
++	case PPSMC_MSG_SetEclkSoftMin:
++	case PPSMC_MSG_SetEclkHardMin:
++		for (i = 0; i < table->count-1; i++)
++			if (clock <= table->entries[i].ecclk)
++				break;
++		break;
++	case PPSMC_MSG_SetEclkSoftMax:
++	case PPSMC_MSG_SetEclkHardMax:
++		for (i = table->count - 1; i > 0; i--)
++			if (clock >= table->entries[i].ecclk)
++				break;
++		break;
++	default:
++		break;
++	}
++
++	return i;
++}
++
+ static int cz_program_bootup_state(struct amdgpu_device *adev)
+ {
+ 	struct cz_power_info *pi = cz_get_pi(adev);
+@@ -1285,6 +1317,7 @@ static int cz_dpm_disable(struct amdgpu_device *adev)
+ 
+ 	/* powerup blocks */
+ 	cz_dpm_powergate_uvd(adev, false);
++	cz_dpm_powergate_vce(adev, false);
+ 
+ 	cz_clear_voting_clients(adev);
+ 	cz_stop_dpm(adev);
+@@ -1775,6 +1808,96 @@ static void cz_dpm_powergate_uvd(struct amdgpu_device *adev, bool gate)
+ 	}
+ }
+ 
++static int cz_enable_vce_dpm(struct amdgpu_device *adev, bool enable)
++{
++	struct cz_power_info *pi = cz_get_pi(adev);
++	int ret = 0;
++
++	if (enable && pi->caps_vce_dpm) {
++		pi->dpm_flags |= DPMFlags_VCE_Enabled;
++		DRM_DEBUG("VCE DPM Enabled.\n");
++
++		ret = cz_send_msg_to_smc_with_parameter(adev,
++			PPSMC_MSG_EnableAllSmuFeatures, VCE_DPM_MASK);
++
++	} else {
++		pi->dpm_flags &= ~DPMFlags_VCE_Enabled;
++		DRM_DEBUG("VCE DPM Stopped\n");
++
++		ret = cz_send_msg_to_smc_with_parameter(adev,
++			PPSMC_MSG_DisableAllSmuFeatures, VCE_DPM_MASK);
++	}
++
++	return ret;
++}
++
++static int cz_update_vce_dpm(struct amdgpu_device *adev)
++{
++	struct cz_power_info *pi = cz_get_pi(adev);
++	struct amdgpu_vce_clock_voltage_dependency_table *table =
++		&adev->pm.dpm.dyn_state.vce_clock_voltage_dependency_table;
++
++	/* Stable Pstate is enabled and we need to set the VCE DPM to highest level */
++	if (pi->caps_stable_power_state) {
++		pi->vce_dpm.hard_min_clk = table->entries[table->count-1].ecclk;
++
++	} else { /* non-stable p-state cases. without vce.Arbiter.EcclkHardMin */
++		pi->vce_dpm.hard_min_clk = table->entries[0].ecclk;
++	}
++
++	cz_send_msg_to_smc_with_parameter(adev,
++		PPSMC_MSG_SetEclkHardMin,
++		cz_get_eclk_level(adev,
++			pi->vce_dpm.hard_min_clk,
++			PPSMC_MSG_SetEclkHardMin));
++	return 0;
++}
++
++static void cz_dpm_powergate_vce(struct amdgpu_device *adev, bool gate)
++{
++	struct cz_power_info *pi = cz_get_pi(adev);
++
++	if (pi->caps_vce_pg) {
++		if (pi->vce_power_gated != gate) {
++			if (gate) {
++				/* disable clockgating so we can properly shut down the block */
++				amdgpu_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
++							    AMD_CG_STATE_UNGATE);
++				/* shutdown the VCE block */
++				amdgpu_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
++							    AMD_PG_STATE_GATE);
++
++				cz_enable_vce_dpm(adev, false);
++				/* TODO: to figure out why vce can't be poweroff. */
++				/* cz_send_msg_to_smc(adev, PPSMC_MSG_VCEPowerOFF); */
++				pi->vce_power_gated = true;
++			} else {
++				cz_send_msg_to_smc(adev, PPSMC_MSG_VCEPowerON);
++				pi->vce_power_gated = false;
++
++				/* re-init the VCE block */
++				amdgpu_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
++							    AMD_PG_STATE_UNGATE);
++				/* enable clockgating. hw will dynamically gate/ungate clocks on the fly */
++				amdgpu_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
++							    AMD_CG_STATE_GATE);
++
++				cz_update_vce_dpm(adev);
++				cz_enable_vce_dpm(adev, true);
++			}
++		} else {
++			if (! pi->vce_power_gated) {
++				cz_update_vce_dpm(adev);
++			}
++		}
++	} else { /*pi->caps_vce_pg*/
++		cz_update_vce_dpm(adev);
++		cz_enable_vce_dpm(adev, true);
++	}
++
++	return;
++}
++
+ const struct amd_ip_funcs cz_dpm_ip_funcs = {
+ 	.early_init = cz_dpm_early_init,
+ 	.late_init = cz_dpm_late_init,
+@@ -1806,6 +1929,7 @@ static const struct amdgpu_dpm_funcs cz_dpm_funcs = {
+ 	.force_performance_level = cz_dpm_force_dpm_level,
+ 	.vblank_too_short = NULL,
+ 	.powergate_uvd = cz_dpm_powergate_uvd,
++	.powergate_vce = cz_dpm_powergate_vce,
+ };
+ 
+ static void cz_dpm_set_funcs(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/vi.c b/drivers/gpu/drm/amd/amdgpu/vi.c
+index b71f414..90fc93c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vi.c
++++ b/drivers/gpu/drm/amd/amdgpu/vi.c
+@@ -1263,7 +1263,7 @@ static int vi_common_early_init(void *handle)
+ 	case CHIP_CARRIZO:
+ 		adev->has_uvd = true;
+ 		adev->cg_flags = 0;
+-		adev->pg_flags = AMDGPU_PG_SUPPORT_UVD;
++		adev->pg_flags = AMDGPU_PG_SUPPORT_UVD | AMDGPU_PG_SUPPORT_VCE;
+ 		adev->external_rev_id = adev->rev_id + 0x1;
+ 		if (amdgpu_smc_load_fw && smc_enabled)
+ 			adev->firmware.smu_load = true;
+-- 
+1.9.1
+
