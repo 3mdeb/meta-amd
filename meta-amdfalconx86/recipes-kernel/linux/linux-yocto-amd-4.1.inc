@@ -7,6 +7,8 @@ SRCREV_meta_amdfalconx86 = "46bb64d605fd336d99fa05bab566b9553b40b4b4"
 LINUX_VERSION_amdfalconx86 = "4.1.15"
 KMACHINE_amdfalconx86 = "amdfalconx86"
 
+KCONF_BSP_AUDIT_LEVEL = "0"
+
 COMPATIBLE_MACHINE_amdfalconx86 = "amdfalconx86"
 KERNEL_FEATURES_append_amdfalconx86 += " cfg/smp.scc cfg/sound.scc"
 
