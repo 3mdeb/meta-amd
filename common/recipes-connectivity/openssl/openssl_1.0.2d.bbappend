@@ -6,5 +6,5 @@ OPENSSL_CVE = " \
     file://DH_small_subgroups_CVE-2015-3197.patch \
 "
 
-# Add CVE fix to all that are not mel
-SRC_URI += "${@bb.utils.contains("DISTRO", "mel", "", "${OPENSSL_CVE}", d)}"
+# Add CVE fix to all that are not mel or mel-lite
+SRC_URI += "${@bb.utils.contains_any("DISTRO", "mel mel-lite", "", "${OPENSSL_CVE}", d)}"
