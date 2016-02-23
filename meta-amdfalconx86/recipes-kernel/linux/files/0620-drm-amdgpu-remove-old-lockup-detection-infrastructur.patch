@@ -1,0 +1,482 @@
+From 8146a8b1106df05bd7cb65ec7967c221437f9e05 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 1 Sep 2015 10:50:26 +0200
+Subject: [PATCH 0620/1050] drm/amdgpu: remove old lockup detection
+ infrastructure
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+It didn't worked to well anyway.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Junwei Zhang <Jerry.Zhang@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  7 -----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  6 -----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c  | 20 +-------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c     |  1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c   | 43 ------------------------------
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c      | 19 -------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c      | 20 --------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c      | 11 --------
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c     | 19 -------------
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c     | 19 -------------
+ drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c      |  1 -
+ drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c      |  1 -
+ drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c      |  1 -
+ drivers/gpu/drm/amd/amdgpu/vce_v2_0.c      |  1 -
+ drivers/gpu/drm/amd/amdgpu/vce_v3_0.c      |  1 -
+ 15 files changed, 1 insertion(+), 169 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 06be1ee..7730bda 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -345,7 +345,6 @@ struct amdgpu_ring_funcs {
+ 	/* testing functions */
+ 	int (*test_ring)(struct amdgpu_ring *ring);
+ 	int (*test_ib)(struct amdgpu_ring *ring);
+-	bool (*is_lockup)(struct amdgpu_ring *ring);
+ 	/* insert NOP packets */
+ 	void (*insert_nop)(struct amdgpu_ring *ring, uint32_t count);
+ };
+@@ -907,8 +906,6 @@ struct amdgpu_ring {
+ 	unsigned		ring_size;
+ 	unsigned		ring_free_dw;
+ 	int			count_dw;
+-	atomic_t		last_rptr;
+-	atomic64_t		last_activity;
+ 	uint64_t		gpu_addr;
+ 	uint32_t		align_mask;
+ 	uint32_t		ptr_mask;
+@@ -1230,8 +1227,6 @@ void amdgpu_ring_commit(struct amdgpu_ring *ring);
+ void amdgpu_ring_unlock_commit(struct amdgpu_ring *ring);
+ void amdgpu_ring_undo(struct amdgpu_ring *ring);
+ void amdgpu_ring_unlock_undo(struct amdgpu_ring *ring);
+-void amdgpu_ring_lockup_update(struct amdgpu_ring *ring);
+-bool amdgpu_ring_test_lockup(struct amdgpu_ring *ring);
+ unsigned amdgpu_ring_backup(struct amdgpu_ring *ring,
+ 			    uint32_t **data);
+ int amdgpu_ring_restore(struct amdgpu_ring *ring,
+@@ -1975,7 +1970,6 @@ struct amdgpu_device {
+ 	bool				suspend;
+ 	bool				need_dma32;
+ 	bool				accel_working;
+-	bool				needs_reset;
+ 	struct work_struct 		reset_work;
+ 	struct notifier_block		acpi_nb;
+ 	struct amdgpu_i2c_chan		*i2c_bus[AMDGPU_MAX_I2C_BUS];
+@@ -2254,7 +2248,6 @@ amdgpu_get_sdma_instance(struct amdgpu_ring *ring)
+ #define amdgpu_ring_parse_cs(r, p, ib) ((r)->funcs->parse_cs((p), (ib)))
+ #define amdgpu_ring_test_ring(r) (r)->funcs->test_ring((r))
+ #define amdgpu_ring_test_ib(r) (r)->funcs->test_ib((r))
+-#define amdgpu_ring_is_lockup(r) (r)->funcs->is_lockup((r))
+ #define amdgpu_ring_get_rptr(r) (r)->funcs->get_rptr((r))
+ #define amdgpu_ring_get_wptr(r) (r)->funcs->get_wptr((r))
+ #define amdgpu_ring_set_wptr(r) (r)->funcs->set_wptr((r))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 901a460..28c9ee3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1816,12 +1816,6 @@ int amdgpu_gpu_reset(struct amdgpu_device *adev)
+ 
+ 	down_write(&adev->exclusive_lock);
+ 
+-	if (!adev->needs_reset) {
+-		up_write(&adev->exclusive_lock);
+-		return 0;
+-	}
+-
+-	adev->needs_reset = false;
+ 	atomic_inc(&adev->gpu_reset_counter);
+ 
+ 	/* block TTM */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index fcad7e0..4010aa6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -269,17 +269,6 @@ static void amdgpu_fence_check_lockup(struct work_struct *work)
+ 	if (amdgpu_fence_activity(ring)) {
+ 		wake_up_all(&ring->fence_drv.fence_queue);
+ 	}
+-	else if (amdgpu_ring_is_lockup(ring)) {
+-		/* good news we believe it's a lockup */
+-		dev_warn(ring->adev->dev, "GPU lockup (current fence id "
+-			"0x%016llx last fence id 0x%016llx on ring %d)\n",
+-			(uint64_t)atomic64_read(&fence_drv->last_seq),
+-			fence_drv->sync_seq[ring->idx], ring->idx);
+-
+-		/* remember that we need an reset */
+-		ring->adev->needs_reset = true;
+-		wake_up_all(&ring->fence_drv.fence_queue);
+-	}
+ 	up_read(&ring->adev->exclusive_lock);
+ }
+ 
+@@ -380,7 +369,6 @@ static bool amdgpu_fence_enable_signaling(struct fence *f)
+  */
+ static int amdgpu_fence_ring_wait_seq(struct amdgpu_ring *ring, uint64_t seq)
+ {
+-	struct amdgpu_device *adev = ring->adev;
+ 	bool signaled = false;
+ 
+ 	BUG_ON(!ring);
+@@ -391,8 +379,7 @@ static int amdgpu_fence_ring_wait_seq(struct amdgpu_ring *ring, uint64_t seq)
+ 		return 0;
+ 
+ 	wait_event(ring->fence_drv.fence_queue, (
+-		   (signaled = amdgpu_fence_seq_signaled(ring, seq))
+-		   || adev->needs_reset));
++		   (signaled = amdgpu_fence_seq_signaled(ring, seq))));
+ 
+ 	if (signaled)
+ 		return 0;
+@@ -939,11 +926,6 @@ signed long amdgpu_fence_wait_any(struct amdgpu_device *adev,
+ 		if (amdgpu_test_signaled_any(array, count))
+ 			break;
+ 
+-		if (adev->needs_reset) {
+-			t = -EDEADLK;
+-			break;
+-		}
+-
+ 		t = schedule_timeout(t);
+ 
+ 		if (t > 0 && intr && signal_pending(current))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index c439735..aad4c1c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -298,7 +298,6 @@ int amdgpu_ib_ring_tests(struct amdgpu_device *adev)
+ 		r = amdgpu_ring_test_ib(ring);
+ 		if (r) {
+ 			ring->ready = false;
+-			adev->needs_reset = false;
+ 
+ 			if (ring == &adev->gfx.gfx_ring[0]) {
+ 				/* oh, oh, that's really bad */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index b13a74b..b2df348 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -67,8 +67,6 @@ void amdgpu_ring_free_size(struct amdgpu_ring *ring)
+ 	if (!ring->ring_free_dw) {
+ 		/* this is an empty ring */
+ 		ring->ring_free_dw = ring->ring_size / 4;
+-		/*  update lockup info to avoid false positive */
+-		amdgpu_ring_lockup_update(ring);
+ 	}
+ }
+ 
+@@ -209,46 +207,6 @@ void amdgpu_ring_unlock_undo(struct amdgpu_ring *ring)
+ }
+ 
+ /**
+- * amdgpu_ring_lockup_update - update lockup variables
+- *
+- * @ring: amdgpu_ring structure holding ring information
+- *
+- * Update the last rptr value and timestamp (all asics).
+- */
+-void amdgpu_ring_lockup_update(struct amdgpu_ring *ring)
+-{
+-	atomic_set(&ring->last_rptr, amdgpu_ring_get_rptr(ring));
+-	atomic64_set(&ring->last_activity, jiffies_64);
+-}
+-
+-/**
+- * amdgpu_ring_test_lockup() - check if ring is lockedup by recording information
+- * @ring:       amdgpu_ring structure holding ring information
+- *
+- */
+-bool amdgpu_ring_test_lockup(struct amdgpu_ring *ring)
+-{
+-	uint32_t rptr = amdgpu_ring_get_rptr(ring);
+-	uint64_t last = atomic64_read(&ring->last_activity);
+-	uint64_t elapsed;
+-
+-	if (rptr != atomic_read(&ring->last_rptr)) {
+-		/* ring is still working, no lockup */
+-		amdgpu_ring_lockup_update(ring);
+-		return false;
+-	}
+-
+-	elapsed = jiffies_to_msecs(jiffies_64 - last);
+-	if (amdgpu_lockup_timeout && elapsed >= amdgpu_lockup_timeout) {
+-		dev_err(ring->adev->dev, "ring %d stalled for more than %llumsec\n",
+-			ring->idx, elapsed);
+-		return true;
+-	}
+-	/* give a chance to the GPU ... */
+-	return false;
+-}
+-
+-/**
+  * amdgpu_ring_backup - Back up the content of a ring
+  *
+  * @ring: the ring we want to back up
+@@ -436,7 +394,6 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 	if (amdgpu_debugfs_ring_init(adev, ring)) {
+ 		DRM_ERROR("Failed to register debugfs file for rings !\n");
+ 	}
+-	amdgpu_ring_lockup_update(ring);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 814598e..5f712ce 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -1290,24 +1290,6 @@ const struct amd_ip_funcs cik_sdma_ip_funcs = {
+ 	.set_powergating_state = cik_sdma_set_powergating_state,
+ };
+ 
+-/**
+- * cik_sdma_ring_is_lockup - Check if the DMA engine is locked up
+- *
+- * @ring: amdgpu_ring structure holding ring information
+- *
+- * Check if the async DMA engine is locked up (CIK).
+- * Returns true if the engine appears to be locked up, false if not.
+- */
+-static bool cik_sdma_ring_is_lockup(struct amdgpu_ring *ring)
+-{
+-
+-	if (cik_sdma_is_idle(ring->adev)) {
+-		amdgpu_ring_lockup_update(ring);
+-		return false;
+-	}
+-	return amdgpu_ring_test_lockup(ring);
+-}
+-
+ static const struct amdgpu_ring_funcs cik_sdma_ring_funcs = {
+ 	.get_rptr = cik_sdma_ring_get_rptr,
+ 	.get_wptr = cik_sdma_ring_get_wptr,
+@@ -1320,7 +1302,6 @@ static const struct amdgpu_ring_funcs cik_sdma_ring_funcs = {
+ 	.emit_hdp_flush = cik_sdma_ring_emit_hdp_flush,
+ 	.test_ring = cik_sdma_ring_test_ring,
+ 	.test_ib = cik_sdma_ring_test_ib,
+-	.is_lockup = cik_sdma_ring_is_lockup,
+ 	.insert_nop = cik_sdma_ring_insert_nop,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index e992bf2..72793f9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -5542,24 +5542,6 @@ const struct amd_ip_funcs gfx_v7_0_ip_funcs = {
+ 	.set_powergating_state = gfx_v7_0_set_powergating_state,
+ };
+ 
+-/**
+- * gfx_v7_0_ring_is_lockup - check if the 3D engine is locked up
+- *
+- * @adev: amdgpu_device pointer
+- * @ring: amdgpu_ring structure holding ring information
+- *
+- * Check if the 3D engine is locked up (CIK).
+- * Returns true if the engine is locked, false if not.
+- */
+-static bool gfx_v7_0_ring_is_lockup(struct amdgpu_ring *ring)
+-{
+-	if (gfx_v7_0_is_idle(ring->adev)) {
+-		amdgpu_ring_lockup_update(ring);
+-		return false;
+-	}
+-	return amdgpu_ring_test_lockup(ring);
+-}
+-
+ static const struct amdgpu_ring_funcs gfx_v7_0_ring_funcs_gfx = {
+ 	.get_rptr = gfx_v7_0_ring_get_rptr_gfx,
+ 	.get_wptr = gfx_v7_0_ring_get_wptr_gfx,
+@@ -5573,7 +5555,6 @@ static const struct amdgpu_ring_funcs gfx_v7_0_ring_funcs_gfx = {
+ 	.emit_hdp_flush = gfx_v7_0_ring_emit_hdp_flush,
+ 	.test_ring = gfx_v7_0_ring_test_ring,
+ 	.test_ib = gfx_v7_0_ring_test_ib,
+-	.is_lockup = gfx_v7_0_ring_is_lockup,
+ 	.insert_nop = amdgpu_ring_insert_nop,
+ };
+ 
+@@ -5590,7 +5571,6 @@ static const struct amdgpu_ring_funcs gfx_v7_0_ring_funcs_compute = {
+ 	.emit_hdp_flush = gfx_v7_0_ring_emit_hdp_flush,
+ 	.test_ring = gfx_v7_0_ring_test_ring,
+ 	.test_ib = gfx_v7_0_ring_test_ib,
+-	.is_lockup = gfx_v7_0_ring_is_lockup,
+ 	.insert_nop = amdgpu_ring_insert_nop,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 7dd7651..e0355ea 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -4075,15 +4075,6 @@ static void gfx_v8_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ 	}
+ }
+ 
+-static bool gfx_v8_0_ring_is_lockup(struct amdgpu_ring *ring)
+-{
+-	if (gfx_v8_0_is_idle(ring->adev)) {
+-		amdgpu_ring_lockup_update(ring);
+-		return false;
+-	}
+-	return amdgpu_ring_test_lockup(ring);
+-}
+-
+ static u32 gfx_v8_0_ring_get_rptr_compute(struct amdgpu_ring *ring)
+ {
+ 	return ring->adev->wb.wb[ring->rptr_offs];
+@@ -4365,7 +4356,6 @@ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_gfx = {
+ 	.emit_hdp_flush = gfx_v8_0_ring_emit_hdp_flush,
+ 	.test_ring = gfx_v8_0_ring_test_ring,
+ 	.test_ib = gfx_v8_0_ring_test_ib,
+-	.is_lockup = gfx_v8_0_ring_is_lockup,
+ 	.insert_nop = amdgpu_ring_insert_nop,
+ };
+ 
+@@ -4382,7 +4372,6 @@ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_compute = {
+ 	.emit_hdp_flush = gfx_v8_0_ring_emit_hdp_flush,
+ 	.test_ring = gfx_v8_0_ring_test_ring,
+ 	.test_ib = gfx_v8_0_ring_test_ib,
+-	.is_lockup = gfx_v8_0_ring_is_lockup,
+ 	.insert_nop = amdgpu_ring_insert_nop,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index f8b868c..2cf5018 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -1295,24 +1295,6 @@ const struct amd_ip_funcs sdma_v2_4_ip_funcs = {
+ 	.set_powergating_state = sdma_v2_4_set_powergating_state,
+ };
+ 
+-/**
+- * sdma_v2_4_ring_is_lockup - Check if the DMA engine is locked up
+- *
+- * @ring: amdgpu_ring structure holding ring information
+- *
+- * Check if the async DMA engine is locked up (VI).
+- * Returns true if the engine appears to be locked up, false if not.
+- */
+-static bool sdma_v2_4_ring_is_lockup(struct amdgpu_ring *ring)
+-{
+-
+-	if (sdma_v2_4_is_idle(ring->adev)) {
+-		amdgpu_ring_lockup_update(ring);
+-		return false;
+-	}
+-	return amdgpu_ring_test_lockup(ring);
+-}
+-
+ static const struct amdgpu_ring_funcs sdma_v2_4_ring_funcs = {
+ 	.get_rptr = sdma_v2_4_ring_get_rptr,
+ 	.get_wptr = sdma_v2_4_ring_get_wptr,
+@@ -1325,7 +1307,6 @@ static const struct amdgpu_ring_funcs sdma_v2_4_ring_funcs = {
+ 	.emit_hdp_flush = sdma_v2_4_ring_emit_hdp_flush,
+ 	.test_ring = sdma_v2_4_ring_test_ring,
+ 	.test_ib = sdma_v2_4_ring_test_ib,
+-	.is_lockup = sdma_v2_4_ring_is_lockup,
+ 	.insert_nop = sdma_v2_4_ring_insert_nop,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index 670555a..0271bf9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -1428,24 +1428,6 @@ const struct amd_ip_funcs sdma_v3_0_ip_funcs = {
+ 	.set_powergating_state = sdma_v3_0_set_powergating_state,
+ };
+ 
+-/**
+- * sdma_v3_0_ring_is_lockup - Check if the DMA engine is locked up
+- *
+- * @ring: amdgpu_ring structure holding ring information
+- *
+- * Check if the async DMA engine is locked up (VI).
+- * Returns true if the engine appears to be locked up, false if not.
+- */
+-static bool sdma_v3_0_ring_is_lockup(struct amdgpu_ring *ring)
+-{
+-
+-	if (sdma_v3_0_is_idle(ring->adev)) {
+-		amdgpu_ring_lockup_update(ring);
+-		return false;
+-	}
+-	return amdgpu_ring_test_lockup(ring);
+-}
+-
+ static const struct amdgpu_ring_funcs sdma_v3_0_ring_funcs = {
+ 	.get_rptr = sdma_v3_0_ring_get_rptr,
+ 	.get_wptr = sdma_v3_0_ring_get_wptr,
+@@ -1458,7 +1440,6 @@ static const struct amdgpu_ring_funcs sdma_v3_0_ring_funcs = {
+ 	.emit_hdp_flush = sdma_v3_0_ring_emit_hdp_flush,
+ 	.test_ring = sdma_v3_0_ring_test_ring,
+ 	.test_ib = sdma_v3_0_ring_test_ib,
+-	.is_lockup = sdma_v3_0_ring_is_lockup,
+ 	.insert_nop = sdma_v3_0_ring_insert_nop,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+index ed50dd7..5e9f73a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+@@ -885,7 +885,6 @@ static const struct amdgpu_ring_funcs uvd_v4_2_ring_funcs = {
+ 	.emit_semaphore = uvd_v4_2_ring_emit_semaphore,
+ 	.test_ring = uvd_v4_2_ring_test_ring,
+ 	.test_ib = uvd_v4_2_ring_test_ib,
+-	.is_lockup = amdgpu_ring_test_lockup,
+ 	.insert_nop = amdgpu_ring_insert_nop,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+index 9ad8b99..38864f56 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+@@ -824,7 +824,6 @@ static const struct amdgpu_ring_funcs uvd_v5_0_ring_funcs = {
+ 	.emit_semaphore = uvd_v5_0_ring_emit_semaphore,
+ 	.test_ring = uvd_v5_0_ring_test_ring,
+ 	.test_ib = uvd_v5_0_ring_test_ib,
+-	.is_lockup = amdgpu_ring_test_lockup,
+ 	.insert_nop = amdgpu_ring_insert_nop,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+index 7e9934f..121915b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+@@ -808,7 +808,6 @@ static const struct amdgpu_ring_funcs uvd_v6_0_ring_funcs = {
+ 	.emit_semaphore = uvd_v6_0_ring_emit_semaphore,
+ 	.test_ring = uvd_v6_0_ring_test_ring,
+ 	.test_ib = uvd_v6_0_ring_test_ib,
+-	.is_lockup = amdgpu_ring_test_lockup,
+ 	.insert_nop = amdgpu_ring_insert_nop,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c
+index cd16df5..52ac7a8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c
+@@ -642,7 +642,6 @@ static const struct amdgpu_ring_funcs vce_v2_0_ring_funcs = {
+ 	.emit_semaphore = amdgpu_vce_ring_emit_semaphore,
+ 	.test_ring = amdgpu_vce_ring_test_ring,
+ 	.test_ib = amdgpu_vce_ring_test_ib,
+-	.is_lockup = amdgpu_ring_test_lockup,
+ 	.insert_nop = amdgpu_ring_insert_nop,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+index f0656df..b1bf27b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+@@ -643,7 +643,6 @@ static const struct amdgpu_ring_funcs vce_v3_0_ring_funcs = {
+ 	.emit_semaphore = amdgpu_vce_ring_emit_semaphore,
+ 	.test_ring = amdgpu_vce_ring_test_ring,
+ 	.test_ib = amdgpu_vce_ring_test_ib,
+-	.is_lockup = amdgpu_ring_test_lockup,
+ 	.insert_nop = amdgpu_ring_insert_nop,
+ };
+ 
+-- 
+1.9.1
+

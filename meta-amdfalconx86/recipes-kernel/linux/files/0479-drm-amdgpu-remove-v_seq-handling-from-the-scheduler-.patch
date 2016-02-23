@@ -1,0 +1,289 @@
+From ce882e6dc241ab8dded0eeeb33a86482d44a5689 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 19 Aug 2015 15:00:55 +0200
+Subject: [PATCH 0479/1050] drm/amdgpu: remove v_seq handling from the
+ scheduler v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Simply not used any more. Only keep 32bit atomic for fence sequence numbering.
+
+v2: trivial rebase
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com> (v1)
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com> (v1)
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com> (v1)
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c        |  6 ++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c       | 20 +++++---------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c        |  6 +-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c        |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c     |  1 -
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 19 +------------------
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  7 +------
+ drivers/gpu/drm/amd/scheduler/sched_fence.c   | 13 ++++++++-----
+ 9 files changed, 21 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 80f2cea..65e0e94 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1047,7 +1047,7 @@ int amdgpu_ctx_put(struct amdgpu_ctx *ctx);
+ struct amdgpu_ctx *amdgpu_ctx_get_ref(struct amdgpu_ctx *ctx);
+ 
+ uint64_t amdgpu_ctx_add_fence(struct amdgpu_ctx *ctx, struct amdgpu_ring *ring,
+-			      struct fence *fence, uint64_t queued_seq);
++			      struct fence *fence);
+ struct fence *amdgpu_ctx_get_fence(struct amdgpu_ctx *ctx,
+ 				   struct amdgpu_ring *ring, uint64_t seq);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index dc8d282..f91849b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -866,11 +866,9 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 			kfree(job);
+ 			goto out;
+ 		}
+-		job->ibs[parser->num_ibs - 1].sequence =
++		cs->out.handle =
+ 			amdgpu_ctx_add_fence(job->ctx, ring,
+-					     &job->base.s_fence->base,
+-					     job->base.s_fence->v_seq);
+-		cs->out.handle = job->base.s_fence->v_seq;
++					     &job->base.s_fence->base);
+ 		list_sort(NULL, &parser->validated, cmp_size_smaller_first);
+ 		ttm_eu_fence_buffer_objects(&parser->ticket,
+ 				&parser->validated,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index 8660c08..f024eff 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -236,17 +236,13 @@ int amdgpu_ctx_put(struct amdgpu_ctx *ctx)
+ }
+ 
+ uint64_t amdgpu_ctx_add_fence(struct amdgpu_ctx *ctx, struct amdgpu_ring *ring,
+-			      struct fence *fence, uint64_t queued_seq)
++			      struct fence *fence)
+ {
+ 	struct amdgpu_ctx_ring *cring = & ctx->rings[ring->idx];
+-	uint64_t seq = 0;
++	uint64_t seq = cring->sequence;
+ 	unsigned idx = 0;
+ 	struct fence *other = NULL;
+ 
+-	if (amdgpu_enable_scheduler)
+-		seq = queued_seq;
+-	else
+-		seq = cring->sequence;
+ 	idx = seq % AMDGPU_CTX_MAX_CS_PENDING;
+ 	other = cring->fences[idx];
+ 	if (other) {
+@@ -260,8 +256,7 @@ uint64_t amdgpu_ctx_add_fence(struct amdgpu_ctx *ctx, struct amdgpu_ring *ring,
+ 
+ 	spin_lock(&ctx->ring_lock);
+ 	cring->fences[idx] = fence;
+-	if (!amdgpu_enable_scheduler)
+-		cring->sequence++;
++	cring->sequence++;
+ 	spin_unlock(&ctx->ring_lock);
+ 
+ 	fence_put(other);
+@@ -274,21 +269,16 @@ struct fence *amdgpu_ctx_get_fence(struct amdgpu_ctx *ctx,
+ {
+ 	struct amdgpu_ctx_ring *cring = & ctx->rings[ring->idx];
+ 	struct fence *fence;
+-	uint64_t queued_seq;
+ 
+ 	spin_lock(&ctx->ring_lock);
+-	if (amdgpu_enable_scheduler)
+-		queued_seq = amd_sched_next_queued_seq(&cring->entity);
+-	else
+-		queued_seq = cring->sequence;
+ 
+-	if (seq >= queued_seq) {
++	if (seq >= cring->sequence) {
+ 		spin_unlock(&ctx->ring_lock);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+ 
+-	if (seq + AMDGPU_CTX_MAX_CS_PENDING < queued_seq) {
++	if (seq + AMDGPU_CTX_MAX_CS_PENDING < cring->sequence) {
+ 		spin_unlock(&ctx->ring_lock);
+ 		return NULL;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 13c5978..737c8e3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -126,7 +126,6 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 	struct amdgpu_ring *ring;
+ 	struct amdgpu_ctx *ctx, *old_ctx;
+ 	struct amdgpu_vm *vm;
+-	uint64_t sequence;
+ 	unsigned i;
+ 	int r = 0;
+ 
+@@ -199,12 +198,9 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 		return r;
+ 	}
+ 
+-	sequence = amdgpu_enable_scheduler ? ib->sequence : 0;
+-
+ 	if (!amdgpu_enable_scheduler && ib->ctx)
+ 		ib->sequence = amdgpu_ctx_add_fence(ib->ctx, ring,
+-						    &ib->fence->base,
+-						    sequence);
++						    &ib->fence->base);
+ 
+ 	/* wrap the last IB with fence */
+ 	if (ib->user) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
+index b7cbaa9..26b1793 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
+@@ -435,8 +435,8 @@ void amdgpu_sa_bo_dump_debug_info(struct amdgpu_sa_manager *sa_manager,
+ 				seq_printf(m, " protected by 0x%016llx on ring %d",
+ 					   a_fence->seq, a_fence->ring->idx);
+ 			if (s_fence)
+-				seq_printf(m, " protected by 0x%016llx on ring %d",
+-					   s_fence->v_seq,
++				seq_printf(m, " protected by 0x%016x on ring %d",
++					   s_fence->base.seqno,
+ 					   s_fence->entity->scheduler->ring_id);
+ 
+ 		}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index 06d7bf5..964b543 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -111,7 +111,6 @@ int amdgpu_sched_ib_submit_kernel_helper(struct amdgpu_device *adev,
+ 			kfree(job);
+ 			return r;
+ 		}
+-		ibs[num_ibs - 1].sequence = job->base.s_fence->v_seq;
+ 		*f = fence_get(&job->base.s_fence->base);
+ 		mutex_unlock(&job->job_lock);
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index 1125aa2..f8d46b0 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -156,14 +156,12 @@ int amd_sched_entity_init(struct amd_gpu_scheduler *sched,
+ 			  struct amd_sched_rq *rq,
+ 			  uint32_t jobs)
+ {
+-	uint64_t seq_ring = 0;
+ 	char name[20];
+ 
+ 	if (!(sched && entity && rq))
+ 		return -EINVAL;
+ 
+ 	memset(entity, 0, sizeof(struct amd_sched_entity));
+-	seq_ring = ((uint64_t)sched->ring_id) << 60;
+ 	spin_lock_init(&entity->lock);
+ 	entity->belongto_rq = rq;
+ 	entity->scheduler = sched;
+@@ -179,8 +177,7 @@ int amd_sched_entity_init(struct amd_gpu_scheduler *sched,
+ 		return -EINVAL;
+ 
+ 	spin_lock_init(&entity->queue_lock);
+-	atomic64_set(&entity->last_queued_v_seq, seq_ring);
+-	atomic64_set(&entity->last_signaled_v_seq, seq_ring);
++	atomic_set(&entity->fence_seq, 0);
+ 
+ 	/* Add the entity to the run queue */
+ 	amd_sched_rq_add_entity(rq, entity);
+@@ -299,8 +296,6 @@ static void amd_sched_process_job(struct fence *f, struct fence_cb *cb)
+ 	unsigned long flags;
+ 
+ 	sched = sched_job->sched;
+-	atomic64_set(&sched_job->s_entity->last_signaled_v_seq,
+-		     sched_job->s_fence->v_seq);
+ 	amd_sched_fence_signal(sched_job->s_fence);
+ 	spin_lock_irqsave(&sched->queue_lock, flags);
+ 	list_del(&sched_job->list);
+@@ -421,15 +416,3 @@ int amd_sched_destroy(struct amd_gpu_scheduler *sched)
+ 	kfree(sched);
+ 	return  0;
+ }
+-
+-/**
+- * Get next queued sequence number
+- *
+- * @entity The context entity
+- *
+- * return the next queued sequence number
+-*/
+-uint64_t amd_sched_next_queued_seq(struct amd_sched_entity *c_entity)
+-{
+-	return atomic64_read(&c_entity->last_queued_v_seq) + 1;
+-}
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index 6597d61..d328e96 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -42,9 +42,7 @@ struct amd_sched_entity {
+ 	struct list_head		list;
+ 	struct amd_sched_rq		*belongto_rq;
+ 	spinlock_t			lock;
+-	/* the virtual_seq is unique per context per ring */
+-	atomic64_t			last_queued_v_seq;
+-	atomic64_t			last_signaled_v_seq;
++	atomic_t			fence_seq;
+ 	/* the job_queue maintains the jobs submitted by clients */
+ 	struct kfifo                    job_queue;
+ 	spinlock_t			queue_lock;
+@@ -72,7 +70,6 @@ struct amd_sched_fence {
+ 	struct fence                    base;
+ 	struct fence_cb                 cb;
+ 	struct amd_sched_entity	        *entity;
+-	uint64_t			v_seq;
+ 	spinlock_t			lock;
+ };
+ 
+@@ -148,8 +145,6 @@ int amd_sched_entity_init(struct amd_gpu_scheduler *sched,
+ int amd_sched_entity_fini(struct amd_gpu_scheduler *sched,
+ 			  struct amd_sched_entity *entity);
+ 
+-uint64_t amd_sched_next_queued_seq(struct amd_sched_entity *c_entity);
+-
+ struct amd_sched_fence *amd_sched_fence_create(
+ 	struct amd_sched_entity *s_entity);
+ void amd_sched_fence_signal(struct amd_sched_fence *fence);
+diff --git a/drivers/gpu/drm/amd/scheduler/sched_fence.c b/drivers/gpu/drm/amd/scheduler/sched_fence.c
+index a475159..266ed7b 100644
+--- a/drivers/gpu/drm/amd/scheduler/sched_fence.c
++++ b/drivers/gpu/drm/amd/scheduler/sched_fence.c
+@@ -30,16 +30,19 @@
+ struct amd_sched_fence *amd_sched_fence_create(struct amd_sched_entity *s_entity)
+ {
+ 	struct amd_sched_fence *fence = NULL;
++	unsigned seq;
++
+ 	fence = kzalloc(sizeof(struct amd_sched_fence), GFP_KERNEL);
+ 	if (fence == NULL)
+ 		return NULL;
+-	fence->v_seq = atomic64_inc_return(&s_entity->last_queued_v_seq);
++
+ 	fence->entity = s_entity;
+ 	spin_lock_init(&fence->lock);
+-	fence_init(&fence->base, &amd_sched_fence_ops,
+-		&fence->lock,
+-		s_entity->fence_context,
+-		fence->v_seq);
++
++	seq = atomic_inc_return(&s_entity->fence_seq);
++	fence_init(&fence->base, &amd_sched_fence_ops, &fence->lock,
++		   s_entity->fence_context, seq);
++
+ 	return fence;
+ }
+ 
+-- 
+1.9.1
+

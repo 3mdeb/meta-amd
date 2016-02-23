@@ -1,0 +1,244 @@
+From dbe3b72e0a2541b0ff4d767288eedfe448d389b0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 5 Nov 2015 19:49:48 +0100
+Subject: [PATCH 0677/1050] drm/amdgpu: fix incorrect mutex usage v3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Before this patch the scheduler fence was created when we push the job
+into the queue, so we could only get the fence after pushing it.
+
+The mutex now was necessary to prevent the thread pushing the jobs to
+the hardware from running faster than the thread pushing the jobs into
+the queue.
+
+Otherwise the thread pushing jobs into the queue would have accessed
+possible freed up memory when it tries to get a reference to the fence.
+
+So what you get in the end is thread A:
+mutex_lock(&job->lock);
+...
+Kick of thread B.
+...
+mutex_unlock(&job->lock);
+
+And thread B:
+mutex_lock(&job->lock);
+....
+mutex_unlock(&job->lock);
+kfree(job);
+
+I'm actually not sure if I'm still up to date on this, but this usage
+pattern used to be not allowed with mutexes. See here as well
+https://lwn.net/Articles/575460/.
+
+v2: remove unrelated changes, fix missing owner
+v3: rebased, add more commit message
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c        | 43 +++++++++++++++------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c     | 27 +++++++----------
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 10 +------
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  3 +-
+ 5 files changed, 37 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 6bb4cea..26064a9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1225,7 +1225,7 @@ struct amdgpu_job {
+ 	struct amdgpu_device	*adev;
+ 	struct amdgpu_ib	*ibs;
+ 	uint32_t		num_ibs;
+-	struct mutex            job_lock;
++	void			*owner;
+ 	struct amdgpu_user_fence uf;
+ 	int (*free_job)(struct amdgpu_job *job);
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 2ae73d5..44cf977 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -845,8 +845,9 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		goto out;
+ 
+ 	if (amdgpu_enable_scheduler && parser.num_ibs) {
+-		struct amdgpu_job *job;
+ 		struct amdgpu_ring * ring = parser.ibs->ring;
++		struct amd_sched_fence *fence;
++		struct amdgpu_job *job;
+ 
+ 		job = kzalloc(sizeof(struct amdgpu_job), GFP_KERNEL);
+ 		if (!job) {
+@@ -859,37 +860,41 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		job->adev = parser.adev;
+ 		job->ibs = parser.ibs;
+ 		job->num_ibs = parser.num_ibs;
+-		job->base.owner = parser.filp;
+-		mutex_init(&job->job_lock);
++		job->owner = parser.filp;
++		job->free_job = amdgpu_cs_free_job;
++
+ 		if (job->ibs[job->num_ibs - 1].user) {
+ 			job->uf = parser.uf;
+ 			job->ibs[job->num_ibs - 1].user = &job->uf;
+ 			parser.uf.bo = NULL;
+ 		}
+ 
+-		parser.ibs = NULL;
+-		parser.num_ibs = 0;
+-
+-		job->free_job = amdgpu_cs_free_job;
+-		mutex_lock(&job->job_lock);
+-		r = amd_sched_entity_push_job(&job->base);
+-		if (r) {
+-			mutex_unlock(&job->job_lock);
++		fence = amd_sched_fence_create(job->base.s_entity,
++					       parser.filp);
++		if (!fence) {
++			r = -ENOMEM;
+ 			amdgpu_cs_free_job(job);
+ 			kfree(job);
+ 			goto out;
+ 		}
+-		cs->out.handle =
+-			amdgpu_ctx_add_fence(parser.ctx, ring,
+-					     &job->base.s_fence->base);
++		job->base.s_fence = fence;
++		fence_get(&fence->base);
++
++		cs->out.handle = amdgpu_ctx_add_fence(parser.ctx, ring,
++						      &fence->base);
+ 		job->ibs[job->num_ibs - 1].sequence = cs->out.handle;
+ 
+-		list_sort(NULL, &parser.validated, cmp_size_smaller_first);
+-		ttm_eu_fence_buffer_objects(&parser.ticket,
+-				&parser.validated,
+-				&job->base.s_fence->base);
++		parser.ibs = NULL;
++		parser.num_ibs = 0;
++
+ 		trace_amdgpu_cs_ioctl(job);
+-		mutex_unlock(&job->job_lock);
++		amd_sched_entity_push_job(&job->base);
++
++		list_sort(NULL, &parser.validated, cmp_size_smaller_first);
++		ttm_eu_fence_buffer_objects(&parser.ticket, &parser.validated,
++					    &fence->base);
++		fence_put(&fence->base);
++
+ 		amdgpu_cs_parser_fini_late(&parser);
+ 		mutex_unlock(&vm->mutex);
+ 		return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index 8ef9e44..438c052 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -45,12 +45,8 @@ static struct fence *amdgpu_sched_run_job(struct amd_sched_job *sched_job)
+ 		return NULL;
+ 	}
+ 	job = to_amdgpu_job(sched_job);
+-	mutex_lock(&job->job_lock);
+ 	trace_amdgpu_sched_run_job(job);
+-	r = amdgpu_ib_schedule(job->adev,
+-			       job->num_ibs,
+-			       job->ibs,
+-			       job->base.owner);
++	r = amdgpu_ib_schedule(job->adev, job->num_ibs, job->ibs, job->owner);
+ 	if (r) {
+ 		DRM_ERROR("Error scheduling IBs (%d)\n", r);
+ 		goto err;
+@@ -63,7 +59,6 @@ err:
+ 	if (job->free_job)
+ 		job->free_job(job);
+ 
+-	mutex_unlock(&job->job_lock);
+ 	kfree(job);
+ 	return fence ? &fence->base : NULL;
+ }
+@@ -89,21 +84,19 @@ int amdgpu_sched_ib_submit_kernel_helper(struct amdgpu_device *adev,
+ 			return -ENOMEM;
+ 		job->base.sched = &ring->sched;
+ 		job->base.s_entity = &adev->kernel_ctx.rings[ring->idx].entity;
++		job->base.s_fence = amd_sched_fence_create(job->base.s_entity, owner);
++		if (!job->base.s_fence) {
++			kfree(job);
++			return -ENOMEM;
++		}
++		*f = fence_get(&job->base.s_fence->base);
++
+ 		job->adev = adev;
+ 		job->ibs = ibs;
+ 		job->num_ibs = num_ibs;
+-		job->base.owner = owner;
+-		mutex_init(&job->job_lock);
++		job->owner = owner;
+ 		job->free_job = free_job;
+-		mutex_lock(&job->job_lock);
+-		r = amd_sched_entity_push_job(&job->base);
+-		if (r) {
+-			mutex_unlock(&job->job_lock);
+-			kfree(job);
+-			return r;
+-		}
+-		*f = fence_get(&job->base.s_fence->base);
+-		mutex_unlock(&job->job_lock);
++		amd_sched_entity_push_job(&job->base);
+ 	} else {
+ 		r = amdgpu_ib_schedule(adev, num_ibs, ibs, owner);
+ 		if (r)
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index ccb7c15..ea30d6a 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -276,21 +276,13 @@ static bool amd_sched_entity_in(struct amd_sched_job *sched_job)
+  *
+  * Returns 0 for success, negative error code otherwise.
+  */
+-int amd_sched_entity_push_job(struct amd_sched_job *sched_job)
++void amd_sched_entity_push_job(struct amd_sched_job *sched_job)
+ {
+ 	struct amd_sched_entity *entity = sched_job->s_entity;
+-	struct amd_sched_fence *fence = amd_sched_fence_create(
+-		entity, sched_job->owner);
+-
+-	if (!fence)
+-		return -ENOMEM;
+-
+-	sched_job->s_fence = fence;
+ 
+ 	wait_event(entity->sched->job_scheduled,
+ 		   amd_sched_entity_in(sched_job));
+ 	trace_amd_sched_job(sched_job);
+-	return 0;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index 4d05ca6..939692b 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -79,7 +79,6 @@ struct amd_sched_job {
+ 	struct amd_gpu_scheduler        *sched;
+ 	struct amd_sched_entity         *s_entity;
+ 	struct amd_sched_fence          *s_fence;
+-	void		                *owner;
+ };
+ 
+ extern const struct fence_ops amd_sched_fence_ops;
+@@ -131,7 +130,7 @@ int amd_sched_entity_init(struct amd_gpu_scheduler *sched,
+ 			  uint32_t jobs);
+ void amd_sched_entity_fini(struct amd_gpu_scheduler *sched,
+ 			   struct amd_sched_entity *entity);
+-int amd_sched_entity_push_job(struct amd_sched_job *sched_job);
++void amd_sched_entity_push_job(struct amd_sched_job *sched_job);
+ 
+ struct amd_sched_fence *amd_sched_fence_create(
+ 	struct amd_sched_entity *s_entity, void *owner);
+-- 
+1.9.1
+

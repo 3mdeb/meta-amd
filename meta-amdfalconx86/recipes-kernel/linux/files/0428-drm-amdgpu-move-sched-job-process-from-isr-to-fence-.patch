@@ -1,0 +1,100 @@
+From 7484667c6a8a9122d139a287454bc9c8799c3def Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <david1.zhou@amd.com>
+Date: Tue, 4 Aug 2015 11:30:09 +0800
+Subject: [PATCH 0428/1050] drm/amdgpu: move sched job process from isr to
+ fence callback
+
+This way can avoid interrupt lost, and can process sched job exactly.
+
+Signed-off-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c | 19 +------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c | 13 +++++++++++++
+ 3 files changed, 15 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index e1f093c..4d6a3e8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -404,7 +404,7 @@ struct amdgpu_fence_driver {
+ 
+ struct amdgpu_fence {
+ 	struct fence base;
+-
++	struct fence_cb cb;
+ 	/* RB, DMA, etc. */
+ 	struct amdgpu_ring		*ring;
+ 	uint64_t			seq;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index 60e6d66..eb41979 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -350,25 +350,8 @@ void amdgpu_fence_process(struct amdgpu_ring *ring)
+ 		}
+ 	} while (atomic64_xchg(&ring->fence_drv.last_seq, seq) > seq);
+ 
+-	if (wake) {
+-		if (amdgpu_enable_scheduler) {
+-			uint64_t handled_seq =
+-				amd_sched_get_handled_seq(ring->scheduler);
+-			uint64_t latest_seq =
+-				atomic64_read(&ring->fence_drv.last_seq);
+-			if (handled_seq == latest_seq) {
+-				DRM_ERROR("ring %d, EOP without seq update (lastest_seq=%llu)\n",
+-					  ring->idx, latest_seq);
+-				goto exit;
+-			}
+-			do {
+-				amd_sched_isr(ring->scheduler);
+-			} while (amd_sched_get_handled_seq(ring->scheduler) < latest_seq);
+-		}
+-
++	if (wake)
+ 		wake_up_all(&ring->fence_drv.fence_queue);
+-	}
+-exit:
+ 	spin_unlock_irqrestore(&ring->fence_lock, irqflags);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index 83138a6..9f2f19c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -43,12 +43,20 @@ static int amdgpu_sched_prepare_job(struct amd_gpu_scheduler *sched,
+ 	return r;
+ }
+ 
++static void amdgpu_fence_sched_cb(struct fence *f, struct fence_cb *cb)
++{
++	struct amdgpu_fence *fence =
++		container_of(cb, struct amdgpu_fence, cb);
++	amd_sched_isr(fence->ring->scheduler);
++}
++
+ static void amdgpu_sched_run_job(struct amd_gpu_scheduler *sched,
+ 				 struct amd_context_entity *c_entity,
+ 				 void *job)
+ {
+ 	int r = 0;
+ 	struct amdgpu_cs_parser *sched_job = (struct amdgpu_cs_parser *)job;
++	struct amdgpu_fence *fence;
+ 
+ 	mutex_lock(&sched_job->job_lock);
+ 	r = amdgpu_ib_schedule(sched_job->adev,
+@@ -57,6 +65,11 @@ static void amdgpu_sched_run_job(struct amd_gpu_scheduler *sched,
+ 			       sched_job->filp);
+ 	if (r)
+ 		goto err;
++	fence = sched_job->ibs[sched_job->num_ibs - 1].fence;
++	if (fence_add_callback(&fence->base,
++			       &fence->cb, amdgpu_fence_sched_cb))
++		goto err;
++
+ 	if (sched_job->run_job) {
+ 		r = sched_job->run_job(sched_job);
+ 		if (r)
+-- 
+1.9.1
+
