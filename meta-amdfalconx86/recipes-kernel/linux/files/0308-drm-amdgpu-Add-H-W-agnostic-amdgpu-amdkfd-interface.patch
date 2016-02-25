@@ -1,0 +1,532 @@
+From 130e0371b7d454bb4a861253c822b9f911ad5d19 Mon Sep 17 00:00:00 2001
+From: Oded Gabbay <oded.gabbay@gmail.com>
+Date: Fri, 12 Jun 2015 21:35:14 +0300
+Subject: [PATCH 0308/1050] drm/amdgpu: Add H/W agnostic amdgpu <--> amdkfd
+ interface
+
+This patch adds an interface file between amdgpu and amdkfd. This
+interface file is H/W agnostic, thus containing functions that
+operate the same for any AMD APU/GPU H/W generation.
+
+The functions in this interface mirror (some) of the functions in
+radeon_kfd.c (the radeon<-->amdkfd interface file). The main functions
+are:
+
+- amdgpu_amdkfd_init - initialize the amdkfd module
+- amdgpu_amdkfd_load_interface - load the H/W interface according to the
+  currently probed device
+- amdgpu_amdkfd_device_probe - probe the device in amdkfd
+- amdgpu_amdkfd_device_init - initialize the device in amdkfd
+- amdgpu_amdkfd_interrupt - call the ISR of amdkfd
+- amdgpu_amdkfd_suspend - suspend callback from amdgpu
+- amdgpu_amdkfd_resume - resume callback from amdgpu
+
+This patch also modifies the relevant amdgpu files, to use this new
+interface.
+
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile        |   4 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |   3 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c | 262 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h |  64 +++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c    |   5 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c     |   7 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c    |   7 +
+ drivers/gpu/drm/amd/amdgpu/cik.c           |  11 +-
+ 8 files changed, 362 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index 616dfd4..891f02c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -71,6 +71,10 @@ amdgpu-y += \
+ 	amdgpu_vce.o \
+ 	vce_v3_0.o
+ 
++# add amdkfd interfaces
++amdgpu-y += \
++	 amdgpu_amdkfd.o
++
+ amdgpu-$(CONFIG_COMPAT) += amdgpu_ioc32.o
+ amdgpu-$(CONFIG_VGA_SWITCHEROO) += amdgpu_atpx_handler.o
+ amdgpu-$(CONFIG_ACPI) += amdgpu_acpi.o
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 0165783..f3791e0d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -2011,6 +2011,9 @@ struct amdgpu_device {
+ 	/* tracking pinned memory */
+ 	u64 vram_pin_size;
+ 	u64 gart_pin_size;
++
++	/* amdkfd interface */
++	struct kfd_dev          *kfd;
+ };
+ 
+ bool amdgpu_device_is_px(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+new file mode 100644
+index 0000000..2071a9b
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -0,0 +1,262 @@
++/*
++ * Copyright 2014 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include "amdgpu_amdkfd.h"
++#include "amdgpu_family.h"
++#include <drm/drmP.h>
++#include "amdgpu.h"
++#include <linux/module.h>
++
++const struct kfd2kgd_calls *kfd2kgd;
++const struct kgd2kfd_calls *kgd2kfd;
++bool (*kgd2kfd_init_p)(unsigned, const struct kgd2kfd_calls**);
++
++bool amdgpu_amdkfd_init(void)
++{
++#if defined(CONFIG_HSA_AMD_MODULE)
++	bool (*kgd2kfd_init_p)(unsigned, const struct kgd2kfd_calls**);
++
++	kgd2kfd_init_p = symbol_request(kgd2kfd_init);
++
++	if (kgd2kfd_init_p == NULL)
++		return false;
++#endif
++	return true;
++}
++
++bool amdgpu_amdkfd_load_interface(struct amdgpu_device *rdev)
++{
++#if defined(CONFIG_HSA_AMD_MODULE)
++	bool (*kgd2kfd_init_p)(unsigned, const struct kgd2kfd_calls**);
++#endif
++
++	switch (rdev->asic_type) {
++	case CHIP_KAVERI:
++	default:
++		return false;
++	}
++
++#if defined(CONFIG_HSA_AMD_MODULE)
++	kgd2kfd_init_p = symbol_request(kgd2kfd_init);
++
++	if (kgd2kfd_init_p == NULL) {
++		kfd2kgd = NULL;
++		return false;
++	}
++
++	if (!kgd2kfd_init_p(KFD_INTERFACE_VERSION, &kgd2kfd)) {
++		symbol_put(kgd2kfd_init);
++		kfd2kgd = NULL;
++		kgd2kfd = NULL;
++
++		return false;
++	}
++
++	return true;
++#elif defined(CONFIG_HSA_AMD)
++	if (!kgd2kfd_init(KFD_INTERFACE_VERSION, &kgd2kfd)) {
++		kfd2kgd = NULL;
++		kgd2kfd = NULL;
++		return false;
++	}
++
++	return true;
++#else
++	kfd2kgd = NULL;
++	return false;
++#endif
++}
++
++void amdgpu_amdkfd_fini(void)
++{
++	if (kgd2kfd) {
++		kgd2kfd->exit();
++		symbol_put(kgd2kfd_init);
++	}
++}
++
++void amdgpu_amdkfd_device_probe(struct amdgpu_device *rdev)
++{
++	if (kgd2kfd)
++		rdev->kfd = kgd2kfd->probe((struct kgd_dev *)rdev,
++					rdev->pdev, kfd2kgd);
++}
++
++void amdgpu_amdkfd_device_init(struct amdgpu_device *rdev)
++{
++	if (rdev->kfd) {
++		struct kgd2kfd_shared_resources gpu_resources = {
++			.compute_vmid_bitmap = 0xFF00,
++
++			.first_compute_pipe = 1,
++			.compute_pipe_count = 4 - 1,
++		};
++
++		amdgpu_doorbell_get_kfd_info(rdev,
++				&gpu_resources.doorbell_physical_address,
++				&gpu_resources.doorbell_aperture_size,
++				&gpu_resources.doorbell_start_offset);
++
++		kgd2kfd->device_init(rdev->kfd, &gpu_resources);
++	}
++}
++
++void amdgpu_amdkfd_device_fini(struct amdgpu_device *rdev)
++{
++	if (rdev->kfd) {
++		kgd2kfd->device_exit(rdev->kfd);
++		rdev->kfd = NULL;
++	}
++}
++
++void amdgpu_amdkfd_interrupt(struct amdgpu_device *rdev,
++		const void *ih_ring_entry)
++{
++	if (rdev->kfd)
++		kgd2kfd->interrupt(rdev->kfd, ih_ring_entry);
++}
++
++void amdgpu_amdkfd_suspend(struct amdgpu_device *rdev)
++{
++	if (rdev->kfd)
++		kgd2kfd->suspend(rdev->kfd);
++}
++
++int amdgpu_amdkfd_resume(struct amdgpu_device *rdev)
++{
++	int r = 0;
++
++	if (rdev->kfd)
++		r = kgd2kfd->resume(rdev->kfd);
++
++	return r;
++}
++
++u32 pool_to_domain(enum kgd_memory_pool p)
++{
++	switch (p) {
++	case KGD_POOL_FRAMEBUFFER: return AMDGPU_GEM_DOMAIN_VRAM;
++	default: return AMDGPU_GEM_DOMAIN_GTT;
++	}
++}
++
++int alloc_gtt_mem(struct kgd_dev *kgd, size_t size,
++			void **mem_obj, uint64_t *gpu_addr,
++			void **cpu_ptr)
++{
++	struct amdgpu_device *rdev = (struct amdgpu_device *)kgd;
++	struct kgd_mem **mem = (struct kgd_mem **) mem_obj;
++	int r;
++
++	BUG_ON(kgd == NULL);
++	BUG_ON(gpu_addr == NULL);
++	BUG_ON(cpu_ptr == NULL);
++
++	*mem = kmalloc(sizeof(struct kgd_mem), GFP_KERNEL);
++	if ((*mem) == NULL)
++		return -ENOMEM;
++
++	r = amdgpu_bo_create(rdev, size, PAGE_SIZE, true, AMDGPU_GEM_DOMAIN_GTT,
++			AMDGPU_GEM_CREATE_CPU_GTT_USWC, NULL, &(*mem)->bo);
++	if (r) {
++		dev_err(rdev->dev,
++			"failed to allocate BO for amdkfd (%d)\n", r);
++		return r;
++	}
++
++	/* map the buffer */
++	r = amdgpu_bo_reserve((*mem)->bo, true);
++	if (r) {
++		dev_err(rdev->dev, "(%d) failed to reserve bo for amdkfd\n", r);
++		goto allocate_mem_reserve_bo_failed;
++	}
++
++	r = amdgpu_bo_pin((*mem)->bo, AMDGPU_GEM_DOMAIN_GTT,
++				&(*mem)->gpu_addr);
++	if (r) {
++		dev_err(rdev->dev, "(%d) failed to pin bo for amdkfd\n", r);
++		goto allocate_mem_pin_bo_failed;
++	}
++	*gpu_addr = (*mem)->gpu_addr;
++
++	r = amdgpu_bo_kmap((*mem)->bo, &(*mem)->cpu_ptr);
++	if (r) {
++		dev_err(rdev->dev,
++			"(%d) failed to map bo to kernel for amdkfd\n", r);
++		goto allocate_mem_kmap_bo_failed;
++	}
++	*cpu_ptr = (*mem)->cpu_ptr;
++
++	amdgpu_bo_unreserve((*mem)->bo);
++
++	return 0;
++
++allocate_mem_kmap_bo_failed:
++	amdgpu_bo_unpin((*mem)->bo);
++allocate_mem_pin_bo_failed:
++	amdgpu_bo_unreserve((*mem)->bo);
++allocate_mem_reserve_bo_failed:
++	amdgpu_bo_unref(&(*mem)->bo);
++
++	return r;
++}
++
++void free_gtt_mem(struct kgd_dev *kgd, void *mem_obj)
++{
++	struct kgd_mem *mem = (struct kgd_mem *) mem_obj;
++
++	BUG_ON(mem == NULL);
++
++	amdgpu_bo_reserve(mem->bo, true);
++	amdgpu_bo_kunmap(mem->bo);
++	amdgpu_bo_unpin(mem->bo);
++	amdgpu_bo_unreserve(mem->bo);
++	amdgpu_bo_unref(&(mem->bo));
++	kfree(mem);
++}
++
++uint64_t get_vmem_size(struct kgd_dev *kgd)
++{
++	struct amdgpu_device *rdev =
++		(struct amdgpu_device *)kgd;
++
++	BUG_ON(kgd == NULL);
++
++	return rdev->mc.real_vram_size;
++}
++
++uint64_t get_gpu_clock_counter(struct kgd_dev *kgd)
++{
++	struct amdgpu_device *rdev = (struct amdgpu_device *)kgd;
++
++	if (rdev->asic_funcs->get_gpu_clock_counter)
++		return rdev->asic_funcs->get_gpu_clock_counter(rdev);
++	return 0;
++}
++
++uint32_t get_max_engine_clock_in_mhz(struct kgd_dev *kgd)
++{
++	struct amdgpu_device *rdev = (struct amdgpu_device *)kgd;
++
++	/* The sclk is in quantas of 10kHz */
++	return rdev->pm.dpm.dyn_state.max_clock_voltage_on_ac.sclk / 100;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+new file mode 100644
+index 0000000..c81242e
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -0,0 +1,64 @@
++/*
++ * Copyright 2014 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++/* amdgpu_amdkfd.h defines the private interface between amdgpu and amdkfd. */
++
++#ifndef AMDGPU_AMDKFD_H_INCLUDED
++#define AMDGPU_AMDKFD_H_INCLUDED
++
++#include <linux/types.h>
++#include <kgd_kfd_interface.h>
++
++struct amdgpu_device;
++
++struct kgd_mem {
++	struct amdgpu_bo *bo;
++	uint64_t gpu_addr;
++	void *cpu_ptr;
++};
++
++bool amdgpu_amdkfd_init(void);
++void amdgpu_amdkfd_fini(void);
++
++bool amdgpu_amdkfd_load_interface(struct amdgpu_device *rdev);
++
++void amdgpu_amdkfd_suspend(struct amdgpu_device *rdev);
++int amdgpu_amdkfd_resume(struct amdgpu_device *rdev);
++void amdgpu_amdkfd_interrupt(struct amdgpu_device *rdev,
++			const void *ih_ring_entry);
++void amdgpu_amdkfd_device_probe(struct amdgpu_device *rdev);
++void amdgpu_amdkfd_device_init(struct amdgpu_device *rdev);
++void amdgpu_amdkfd_device_fini(struct amdgpu_device *rdev);
++
++struct kfd2kgd_calls *amdgpu_amdkfd_gfx_7_get_functions(void);
++
++/* Shared API */
++int alloc_gtt_mem(struct kgd_dev *kgd, size_t size,
++			void **mem_obj, uint64_t *gpu_addr,
++			void **cpu_ptr);
++void free_gtt_mem(struct kgd_dev *kgd, void *mem_obj);
++uint64_t get_vmem_size(struct kgd_dev *kgd);
++uint64_t get_gpu_clock_counter(struct kgd_dev *kgd);
++
++uint32_t get_max_engine_clock_in_mhz(struct kgd_dev *kgd);
++
++#endif /* AMDGPU_AMDKFD_H_INCLUDED */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 56da962..115906f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -44,6 +44,8 @@
+ #include "amdgpu.h"
+ #include "amdgpu_irq.h"
+ 
++#include "amdgpu_amdkfd.h"
++
+ /*
+  * KMS wrapper.
+  * - 3.0.0 - initial driver
+@@ -527,12 +529,15 @@ static int __init amdgpu_init(void)
+ 	driver->num_ioctls = amdgpu_max_kms_ioctl;
+ 	amdgpu_register_atpx_handler();
+ 
++	amdgpu_amdkfd_init();
++
+ 	/* let modprobe override vga console setting */
+ 	return drm_pci_init(driver, pdriver);
+ }
+ 
+ static void __exit amdgpu_exit(void)
+ {
++	amdgpu_amdkfd_fini();
+ 	drm_pci_exit(driver, pdriver);
+ 	amdgpu_unregister_atpx_handler();
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
+index db5422e..fb44dd2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
+@@ -24,6 +24,7 @@
+ #include <drm/drmP.h>
+ #include "amdgpu.h"
+ #include "amdgpu_ih.h"
++#include "amdgpu_amdkfd.h"
+ 
+ /**
+  * amdgpu_ih_ring_alloc - allocate memory for the IH ring
+@@ -199,6 +200,12 @@ restart_ih:
+ 	rmb();
+ 
+ 	while (adev->irq.ih.rptr != wptr) {
++		u32 ring_index = adev->irq.ih.rptr >> 2;
++
++		/* Before dispatching irq to IP blocks, send it to amdkfd */
++		amdgpu_amdkfd_interrupt(adev,
++				(const void *) &adev->irq.ih.ring[ring_index]);
++
+ 		amdgpu_ih_decode_iv(adev, &entry);
+ 		adev->irq.ih.rptr &= adev->irq.ih.ptr_mask;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 5533434..8c40a96 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -34,6 +34,7 @@
+ #include <linux/vga_switcheroo.h>
+ #include <linux/slab.h>
+ #include <linux/pm_runtime.h>
++#include "amdgpu_amdkfd.h"
+ 
+ #if defined(CONFIG_VGA_SWITCHEROO)
+ bool amdgpu_has_atpx(void);
+@@ -61,6 +62,8 @@ int amdgpu_driver_unload_kms(struct drm_device *dev)
+ 
+ 	pm_runtime_get_sync(dev->dev);
+ 
++	amdgpu_amdkfd_device_fini(adev);
++
+ 	amdgpu_acpi_fini(adev);
+ 
+ 	amdgpu_device_fini(adev);
+@@ -118,6 +121,10 @@ int amdgpu_driver_load_kms(struct drm_device *dev, unsigned long flags)
+ 				"Error during ACPI methods call\n");
+ 	}
+ 
++	amdgpu_amdkfd_load_interface(adev);
++	amdgpu_amdkfd_device_probe(adev);
++	amdgpu_amdkfd_device_init(adev);
++
+ 	if (amdgpu_device_is_px(dev)) {
+ 		pm_runtime_use_autosuspend(dev->dev);
+ 		pm_runtime_set_autosuspend_delay(dev->dev, 5000);
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik.c b/drivers/gpu/drm/amd/amdgpu/cik.c
+index 341c566..b3b66a0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik.c
+@@ -64,6 +64,8 @@
+ #include "oss/oss_2_0_d.h"
+ #include "oss/oss_2_0_sh_mask.h"
+ 
++#include "amdgpu_amdkfd.h"
++
+ /*
+  * Indirect registers accessor
+  */
+@@ -2448,14 +2450,21 @@ static int cik_common_suspend(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
++	amdgpu_amdkfd_suspend(adev);
++
+ 	return cik_common_hw_fini(adev);
+ }
+ 
+ static int cik_common_resume(void *handle)
+ {
++	int r;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	return cik_common_hw_init(adev);
++	r = cik_common_hw_init(adev);
++	if (r)
++		return r;
++
++	return amdgpu_amdkfd_resume(adev);
+ }
+ 
+ static bool cik_common_is_idle(void *handle)
+-- 
+1.9.1
+

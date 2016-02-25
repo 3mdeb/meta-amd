@@ -1,0 +1,196 @@
+From c1b69ed0c62f9d86599600f4c1a3bd82db1b7362 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <david1.zhou@amd.com>
+Date: Tue, 21 Jul 2015 13:45:14 +0800
+Subject: [PATCH 0385/1050] drm/amdgpu: add backend implementation of gpu
+ scheduler (v2)
+
+v2: fix rebase breakage
+
+Signed-off-by: Chunming Zhou <david1.zhou@amd.com>
+Acked-by: Christian K?nig <christian.koenig@amd.com>
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile       |   3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |   8 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c |   3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c | 107 ++++++++++++++++++++++++++++++
+ 4 files changed, 119 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index 2800cf7..f1cb7d2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -85,7 +85,8 @@ amdgpu-y += amdgpu_cgs.o
+ 
+ # GPU scheduler
+ amdgpu-y += \
+-	../scheduler/gpu_scheduler.o
++	../scheduler/gpu_scheduler.o \
++	amdgpu_sched.o
+ 
+ amdgpu-$(CONFIG_COMPAT) += amdgpu_ioc32.o
+ amdgpu-$(CONFIG_VGA_SWITCHEROO) += amdgpu_atpx_handler.o
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 776339c..6bf16d9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -416,6 +416,7 @@ struct amdgpu_user_fence {
+ 	struct amdgpu_bo 	*bo;
+ 	/* write-back address offset to bo start */
+ 	uint32_t                offset;
++	uint64_t                sequence;
+ };
+ 
+ int amdgpu_fence_driver_init(struct amdgpu_device *adev);
+@@ -859,6 +860,8 @@ enum amdgpu_ring_type {
+ 	AMDGPU_RING_TYPE_VCE
+ };
+ 
++extern struct amd_sched_backend_ops amdgpu_sched_ops;
++
+ struct amdgpu_ring {
+ 	struct amdgpu_device		*adev;
+ 	const struct amdgpu_ring_funcs	*funcs;
+@@ -1232,6 +1235,11 @@ struct amdgpu_cs_parser {
+ 
+ 	/* user fence */
+ 	struct amdgpu_user_fence uf;
++
++	struct mutex job_lock;
++	struct work_struct job_work;
++	int (*prepare_job)(struct amdgpu_cs_parser *sched_job);
++	int (*run_job)(struct amdgpu_cs_parser *sched_job);
+ };
+ 
+ static inline u32 amdgpu_get_ib_value(struct amdgpu_cs_parser *p, uint32_t ib_idx, int idx)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index 4edeb90..be43ae4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -905,7 +905,8 @@ void amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring)
+ 
+ 	if (amdgpu_enable_scheduler) {
+ 		ring->scheduler = amd_sched_create((void *)ring->adev,
+-						   NULL, ring->idx, 5, 0);
++						   &amdgpu_sched_ops,
++						   ring->idx, 5, 0);
+ 		if (!ring->scheduler)
+ 			DRM_ERROR("Failed to create scheduler on ring %d.\n",
+ 				  ring->idx);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+new file mode 100644
+index 0000000..1f7bf31
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -0,0 +1,107 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ *
++ */
++#include <linux/kthread.h>
++#include <linux/wait.h>
++#include <linux/sched.h>
++#include <drm/drmP.h>
++#include "amdgpu.h"
++
++static int amdgpu_sched_prepare_job(struct amd_gpu_scheduler *sched,
++				    struct amd_context_entity *c_entity,
++				    void *job)
++{
++	int r = 0;
++	struct amdgpu_cs_parser *sched_job = (struct amdgpu_cs_parser *)job;
++	if (sched_job->prepare_job)
++		r = sched_job->prepare_job(sched_job);
++	if (r) {
++		DRM_ERROR("Prepare job error\n");
++		schedule_work(&sched_job->job_work);
++	}
++	return r;
++}
++
++static void amdgpu_sched_run_job(struct amd_gpu_scheduler *sched,
++				 struct amd_context_entity *c_entity,
++				 void *job)
++{
++	int r = 0;
++	struct amdgpu_cs_parser *sched_job = (struct amdgpu_cs_parser *)job;
++
++	mutex_lock(&sched_job->job_lock);
++	r = amdgpu_ib_schedule(sched_job->adev,
++			       sched_job->num_ibs,
++			       sched_job->ibs,
++			       sched_job->filp);
++	if (r)
++		goto err;
++
++	if (sched_job->run_job) {
++		r = sched_job->run_job(sched_job);
++		if (r)
++			goto err;
++	}
++	mutex_unlock(&sched_job->job_lock);
++	return;
++err:
++	DRM_ERROR("Run job error\n");
++	mutex_unlock(&sched_job->job_lock);
++	schedule_work(&sched_job->job_work);
++}
++
++static void amdgpu_sched_process_job(struct amd_gpu_scheduler *sched, void *job)
++{
++	struct amdgpu_cs_parser *sched_job = NULL;
++	struct amdgpu_fence *fence = NULL;
++	struct amdgpu_ring *ring = NULL;
++	struct amdgpu_device *adev = NULL;
++	struct amd_context_entity *c_entity = NULL;
++
++	if (!job)
++		return;
++	sched_job = (struct amdgpu_cs_parser *)job;
++	fence = sched_job->ibs[sched_job->num_ibs - 1].fence;
++	if (!fence)
++		return;
++	ring = fence->ring;
++	adev = ring->adev;
++
++	if (sched_job->ctx) {
++		c_entity = &sched_job->ctx->rings[ring->idx].c_entity;
++		atomic64_set(&c_entity->last_signaled_v_seq,
++			     sched_job->uf.sequence);
++	}
++
++	/* wake up users waiting for time stamp */
++	wake_up_all(&c_entity->wait_queue);
++
++	schedule_work(&sched_job->job_work);
++}
++
++struct amd_sched_backend_ops amdgpu_sched_ops = {
++	.prepare_job = amdgpu_sched_prepare_job,
++	.run_job = amdgpu_sched_run_job,
++	.process_job = amdgpu_sched_process_job
++};
++
+-- 
+1.9.1
+

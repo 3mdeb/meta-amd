@@ -1,0 +1,158 @@
+From e61235db62c5e68e56e59bea62b88f9f3d7a3cf5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 25 Aug 2015 11:05:36 +0200
+Subject: [PATCH 0508/1050] drm/amdgpu: add scheduler dependency callback v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This way the scheduler doesn't wait in it's work thread any more.
+
+v2: fix race conditions
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c     |  7 +++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c      | 22 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 22 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  3 +++
+ 5 files changed, 55 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index aa2dcf5..7195068 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -717,6 +717,7 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 		     void *owner);
+ int amdgpu_sync_rings(struct amdgpu_sync *sync,
+ 		      struct amdgpu_ring *ring);
++struct fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync);
+ int amdgpu_sync_wait(struct amdgpu_sync *sync);
+ void amdgpu_sync_free(struct amdgpu_device *adev, struct amdgpu_sync *sync,
+ 		      struct fence *fence);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index f93fb35..de98fbd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -27,6 +27,12 @@
+ #include <drm/drmP.h>
+ #include "amdgpu.h"
+ 
++static struct fence *amdgpu_sched_dependency(struct amd_sched_job *job)
++{
++	struct amdgpu_job *sched_job = (struct amdgpu_job *)job;
++	return amdgpu_sync_get_fence(&sched_job->ibs->sync);
++}
++
+ static struct fence *amdgpu_sched_run_job(struct amd_sched_job *job)
+ {
+ 	struct amdgpu_job *sched_job;
+@@ -75,6 +81,7 @@ static void amdgpu_sched_process_job(struct amd_sched_job *job)
+ }
+ 
+ struct amd_sched_backend_ops amdgpu_sched_ops = {
++	.dependency = amdgpu_sched_dependency,
+ 	.run_job = amdgpu_sched_run_job,
+ 	.process_job = amdgpu_sched_process_job
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+index 4fffb25..69b7d45 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+@@ -202,6 +202,28 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 	return r;
+ }
+ 
++struct fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync)
++{
++	struct amdgpu_sync_entry *e;
++	struct hlist_node *tmp;
++	struct fence *f;
++	int i;
++
++	hash_for_each_safe(sync->fences, i, tmp, e, node) {
++
++		f = e->fence;
++
++		hash_del(&e->node);
++		kfree(e);
++
++		if (!fence_is_signaled(f))
++			return f;
++
++		fence_put(f);
++	}
++	return NULL;
++}
++
+ int amdgpu_sync_wait(struct amdgpu_sync *sync)
+ {
+ 	struct amdgpu_sync_entry *e;
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index 205cb88..2f5d1f0 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -192,14 +192,36 @@ void amd_sched_entity_fini(struct amd_gpu_scheduler *sched,
+ 	kfifo_free(&entity->job_queue);
+ }
+ 
++static void amd_sched_entity_wakeup(struct fence *f, struct fence_cb *cb)
++{
++	struct amd_sched_entity *entity =
++		container_of(cb, struct amd_sched_entity, cb);
++	entity->dependency = NULL;
++	fence_put(f);
++	amd_sched_wakeup(entity->scheduler);
++}
++
+ static struct amd_sched_job *
+ amd_sched_entity_pop_job(struct amd_sched_entity *entity)
+ {
++	struct amd_gpu_scheduler *sched = entity->scheduler;
+ 	struct amd_sched_job *job;
+ 
++	if (ACCESS_ONCE(entity->dependency))
++		return NULL;
++
+ 	if (!kfifo_out_peek(&entity->job_queue, &job, sizeof(job)))
+ 		return NULL;
+ 
++	while ((entity->dependency = sched->ops->dependency(job))) {
++
++		if (fence_add_callback(entity->dependency, &entity->cb,
++				       amd_sched_entity_wakeup))
++			fence_put(entity->dependency);
++		else
++			return NULL;
++	}
++
+ 	return job;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index e797796..2af0e4d 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -45,6 +45,8 @@ struct amd_sched_entity {
+ 	spinlock_t			queue_lock;
+ 	struct amd_gpu_scheduler	*scheduler;
+ 	uint64_t                        fence_context;
++	struct fence			*dependency;
++	struct fence_cb			cb;
+ };
+ 
+ /**
+@@ -89,6 +91,7 @@ static inline struct amd_sched_fence *to_amd_sched_fence(struct fence *f)
+  * these functions should be implemented in driver side
+ */
+ struct amd_sched_backend_ops {
++	struct fence *(*dependency)(struct amd_sched_job *job);
+ 	struct fence *(*run_job)(struct amd_sched_job *job);
+ 	void (*process_job)(struct amd_sched_job *job);
+ };
+-- 
+1.9.1
+

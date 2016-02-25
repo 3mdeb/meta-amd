@@ -1,0 +1,145 @@
+From d94aed5a6c947b1fda346aff1fa316dacf4a1a5a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Tue, 5 May 2015 21:13:49 +0200
+Subject: [PATCH 0208/1050] drm/amdgpu: add and implement the GPU reset status
+ query
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Marek Olšák <marek.olsak@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  6 ++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c    | 36 +++++++++++++++++++-----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  1 +
+ 3 files changed, 27 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 66b5bd0..ebff89e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1040,7 +1040,7 @@ struct amdgpu_vm_manager {
+ 
+ struct amdgpu_ctx_state {
+ 	uint64_t flags;
+-	uint64_t hangs;
++	uint32_t hangs;
+ };
+ 
+ struct amdgpu_ctx {
+@@ -1049,6 +1049,7 @@ struct amdgpu_ctx {
+ 	struct amdgpu_fpriv *fpriv;
+ 	struct amdgpu_ctx_state state;
+ 	uint32_t id;
++	unsigned reset_counter;
+ };
+ 
+ struct amdgpu_ctx_mgr {
+@@ -1897,8 +1898,6 @@ int amdgpu_ctx_alloc(struct amdgpu_device *adev,struct amdgpu_fpriv *fpriv,
+ 							uint32_t *id,uint32_t flags);
+ int amdgpu_ctx_free(struct amdgpu_device *adev, struct amdgpu_fpriv *fpriv,
+ 						  uint32_t id);
+-int amdgpu_ctx_query(struct amdgpu_device *adev, struct amdgpu_fpriv *fpriv,
+-							uint32_t id,struct amdgpu_ctx_state *state);
+ 
+ void amdgpu_ctx_fini(struct amdgpu_fpriv *fpriv);
+ struct amdgpu_ctx *amdgpu_ctx_get(struct amdgpu_fpriv *fpriv, uint32_t id);
+@@ -2006,6 +2005,7 @@ struct amdgpu_device {
+ 	atomic64_t			vram_vis_usage;
+ 	atomic64_t			gtt_usage;
+ 	atomic64_t			num_bytes_moved;
++	atomic_t			gpu_reset_counter;
+ 
+ 	/* display */
+ 	struct amdgpu_mode_info		mode_info;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index bcd332e..6c66ac8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -81,21 +81,36 @@ int amdgpu_ctx_free(struct amdgpu_device *adev, struct amdgpu_fpriv *fpriv, uint
+ 	return -EINVAL;
+ }
+ 
+-int amdgpu_ctx_query(struct amdgpu_device *adev, struct amdgpu_fpriv *fpriv, uint32_t id, struct amdgpu_ctx_state *state)
++static int amdgpu_ctx_query(struct amdgpu_device *adev,
++			    struct amdgpu_fpriv *fpriv, uint32_t id,
++			    union drm_amdgpu_ctx_out *out)
+ {
+ 	struct amdgpu_ctx *ctx;
+ 	struct amdgpu_ctx_mgr *mgr = &fpriv->ctx_mgr;
++	unsigned reset_counter;
+ 
+ 	mutex_lock(&mgr->lock);
+ 	ctx = idr_find(&mgr->ctx_handles, id);
+-	if (ctx) {
+-		/* state should alter with CS activity */
+-		*state = ctx->state;
++	if (!ctx) {
+ 		mutex_unlock(&mgr->lock);
+-		return 0;
++		return -EINVAL;
+ 	}
++
++	/* TODO: these two are always zero */
++	out->state.flags = ctx->state.flags;
++	out->state.hangs = ctx->state.hangs;
++
++	/* determine if a GPU reset has occured since the last call */
++	reset_counter = atomic_read(&adev->gpu_reset_counter);
++	/* TODO: this should ideally return NO, GUILTY, or INNOCENT. */
++	if (ctx->reset_counter == reset_counter)
++		out->state.reset_status = AMDGPU_CTX_NO_RESET;
++	else
++		out->state.reset_status = AMDGPU_CTX_UNKNOWN_RESET;
++	ctx->reset_counter = reset_counter;
++
+ 	mutex_unlock(&mgr->lock);
+-	return -EINVAL;
++	return 0;
+ }
+ 
+ void amdgpu_ctx_fini(struct amdgpu_fpriv *fpriv)
+@@ -115,12 +130,11 @@ void amdgpu_ctx_fini(struct amdgpu_fpriv *fpriv)
+ }
+ 
+ int amdgpu_ctx_ioctl(struct drm_device *dev, void *data,
+-							struct drm_file *filp)
++		     struct drm_file *filp)
+ {
+ 	int r;
+ 	uint32_t id;
+ 	uint32_t flags;
+-	struct amdgpu_ctx_state state;
+ 
+ 	union drm_amdgpu_ctx *args = data;
+ 	struct amdgpu_device *adev = dev->dev_private;
+@@ -139,11 +153,7 @@ int amdgpu_ctx_ioctl(struct drm_device *dev, void *data,
+ 			r = amdgpu_ctx_free(adev, fpriv, id);
+ 			break;
+ 		case AMDGPU_CTX_OP_QUERY_STATE:
+-			r = amdgpu_ctx_query(adev, fpriv, id, &state);
+-			if (r == 0) {
+-				args->out.state.flags = state.flags;
+-				args->out.state.hangs = state.hangs;
+-			}
++			r = amdgpu_ctx_query(adev, fpriv, id, &args->out);
+ 			break;
+ 		default:
+ 			return -EINVAL;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 61cf5ad..3448d9f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1781,6 +1781,7 @@ int amdgpu_gpu_reset(struct amdgpu_device *adev)
+ 	}
+ 
+ 	adev->needs_reset = false;
++	atomic_inc(&adev->gpu_reset_counter);
+ 
+ 	/* block TTM */
+ 	resched = ttm_bo_lock_delayed_workqueue(&adev->mman.bdev);
+-- 
+1.9.1
+

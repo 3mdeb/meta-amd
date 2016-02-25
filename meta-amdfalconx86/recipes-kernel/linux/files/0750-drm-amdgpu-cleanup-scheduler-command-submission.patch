@@ -1,0 +1,151 @@
+From 89665ef940cfd7c74dd69be9d343c2f5c83be7cd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Sat, 14 Nov 2015 21:05:35 +0100
+Subject: [PATCH 0750/1050] drm/amdgpu: cleanup scheduler command submission
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Unify the two code path again, cause they do pretty much the same thing.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <davdi1.zhou@amd.com>
+Reviewed-by: Junwei Zhang <Jerry.Zhang@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c | 63 +++++++++++++---------------------
+ 2 files changed, 25 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index afc76d4..d1e46d0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1213,6 +1213,7 @@ struct amdgpu_cs_parser {
+ 	/* relocations */
+ 	struct amdgpu_bo_list_entry	*vm_bos;
+ 	struct list_head	validated;
++	struct fence		*fence;
+ 
+ 	struct amdgpu_ib	*ibs;
+ 	uint32_t		num_ibs;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index cb201be..9607c2a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -439,8 +439,18 @@ static int cmp_size_smaller_first(void *priv, struct list_head *a,
+ 	return (int)la->robj->tbo.num_pages - (int)lb->robj->tbo.num_pages;
+ }
+ 
+-static void amdgpu_cs_parser_fini_early(struct amdgpu_cs_parser *parser, int error, bool backoff)
++/**
++ * cs_parser_fini() - clean parser states
++ * @parser:	parser structure holding parsing context.
++ * @error:	error number
++ *
++ * If error is set than unvalidate buffer, otherwise just free memory
++ * used by parsing context.
++ **/
++static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser, int error, bool backoff)
+ {
++	unsigned i;
++
+ 	if (!error) {
+ 		/* Sort the buffer list from the smallest to largest buffer,
+ 		 * which affects the order of buffers in the LRU list.
+@@ -455,17 +465,13 @@ static void amdgpu_cs_parser_fini_early(struct amdgpu_cs_parser *parser, int err
+ 		list_sort(NULL, &parser->validated, cmp_size_smaller_first);
+ 
+ 		ttm_eu_fence_buffer_objects(&parser->ticket,
+-				&parser->validated,
+-				&parser->ibs[parser->num_ibs-1].fence->base);
++					    &parser->validated,
++					    parser->fence);
+ 	} else if (backoff) {
+ 		ttm_eu_backoff_reservation(&parser->ticket,
+ 					   &parser->validated);
+ 	}
+-}
+-
+-static void amdgpu_cs_parser_fini_late(struct amdgpu_cs_parser *parser)
+-{
+-	unsigned i;
++	fence_put(parser->fence);
+ 
+ 	if (parser->ctx)
+ 		amdgpu_ctx_put(parser->ctx);
+@@ -484,20 +490,6 @@ static void amdgpu_cs_parser_fini_late(struct amdgpu_cs_parser *parser)
+ 		drm_gem_object_unreference_unlocked(&parser->uf.bo->gem_base);
+ }
+ 
+-/**
+- * cs_parser_fini() - clean parser states
+- * @parser:	parser structure holding parsing context.
+- * @error:	error number
+- *
+- * If error is set than unvalidate buffer, otherwise just free memory
+- * used by parsing context.
+- **/
+-static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser, int error, bool backoff)
+-{
+-       amdgpu_cs_parser_fini_early(parser, error, backoff);
+-       amdgpu_cs_parser_fini_late(parser);
+-}
+-
+ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p,
+ 				   struct amdgpu_vm *vm)
+ {
+@@ -582,15 +574,9 @@ static int amdgpu_cs_ib_vm_chunk(struct amdgpu_device *adev,
+ 	}
+ 
+ 	r = amdgpu_bo_vm_update_pte(parser, vm);
+-	if (r) {
+-		goto out;
+-	}
+-	amdgpu_cs_sync_rings(parser);
+-	if (!amdgpu_enable_scheduler)
+-		r = amdgpu_ib_schedule(adev, parser->num_ibs, parser->ibs,
+-				       parser->filp);
++	if (!r)
++		amdgpu_cs_sync_rings(parser);
+ 
+-out:
+ 	return r;
+ }
+ 
+@@ -881,7 +867,7 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 			goto out;
+ 		}
+ 		job->base.s_fence = fence;
+-		fence_get(&fence->base);
++		parser.fence = fence_get(&fence->base);
+ 
+ 		cs->out.handle = amdgpu_ctx_add_fence(parser.ctx, ring,
+ 						      &fence->base);
+@@ -890,17 +876,16 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		trace_amdgpu_cs_ioctl(job);
+ 		amd_sched_entity_push_job(&job->base);
+ 
+-		list_sort(NULL, &parser.validated, cmp_size_smaller_first);
+-		ttm_eu_fence_buffer_objects(&parser.ticket, &parser.validated,
+-					    &fence->base);
+-		fence_put(&fence->base);
++	} else {
++		struct amdgpu_fence *fence;
+ 
+-		amdgpu_cs_parser_fini_late(&parser);
+-		mutex_unlock(&vm->mutex);
+-		return 0;
++		r = amdgpu_ib_schedule(adev, parser.num_ibs, parser.ibs,
++				       parser.filp);
++		fence = parser.ibs[parser.num_ibs - 1].fence;
++		parser.fence = fence_get(&fence->base);
++		cs->out.handle = parser.ibs[parser.num_ibs - 1].sequence;
+ 	}
+ 
+-	cs->out.handle = parser.ibs[parser.num_ibs - 1].sequence;
+ out:
+ 	amdgpu_cs_parser_fini(&parser, r, reserved_buffers);
+ 	mutex_unlock(&vm->mutex);
+-- 
+1.9.1
+

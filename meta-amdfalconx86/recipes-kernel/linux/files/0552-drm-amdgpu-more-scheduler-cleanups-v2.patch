@@ -1,0 +1,412 @@
+From 4f839a243d3b0d8b1a14f4778a87ec4d8ddbf15f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 8 Sep 2015 20:22:31 +0200
+Subject: [PATCH 0552/1050] drm/amdgpu: more scheduler cleanups v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Embed the scheduler into the ring structure instead of allocating it.
+Use the ring name directly instead of the id.
+
+v2: rebased, whitespace cleanup
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Junwei Zhang <Jerry.Zhang@amd.com>
+Reviewed-by: Chunming Zhou<david1.zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h             |  4 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c          |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c         | 10 +++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c       | 23 ++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c        |  4 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c          | 43 +++++++++++++++++--------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c       |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c        | 10 ++++--
+ drivers/gpu/drm/amd/scheduler/gpu_sched_trace.h |  8 ++---
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c   | 37 ++++++++-------------
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h   | 20 ++++++------
+ 11 files changed, 87 insertions(+), 76 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 9108b7c..57b427f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -433,7 +433,7 @@ int amdgpu_fence_driver_init(struct amdgpu_device *adev);
+ void amdgpu_fence_driver_fini(struct amdgpu_device *adev);
+ void amdgpu_fence_driver_force_completion(struct amdgpu_device *adev);
+ 
+-void amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring);
++int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring);
+ int amdgpu_fence_driver_start_ring(struct amdgpu_ring *ring,
+ 				   struct amdgpu_irq_src *irq_src,
+ 				   unsigned irq_type);
+@@ -891,7 +891,7 @@ struct amdgpu_ring {
+ 	struct amdgpu_device		*adev;
+ 	const struct amdgpu_ring_funcs	*funcs;
+ 	struct amdgpu_fence_driver	fence_drv;
+-	struct amd_gpu_scheduler 	*sched;
++	struct amd_gpu_scheduler 	sched;
+ 
+ 	spinlock_t              fence_lock;
+ 	struct mutex		*ring_lock;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 6f39b2d..b74b6a8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -848,7 +848,7 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		job = kzalloc(sizeof(struct amdgpu_job), GFP_KERNEL);
+ 		if (!job)
+ 			return -ENOMEM;
+-		job->base.sched = ring->sched;
++		job->base.sched = &ring->sched;
+ 		job->base.s_entity = &parser->ctx->rings[ring->idx].entity;
+ 		job->adev = parser->adev;
+ 		job->ibs = parser->ibs;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index 5494831..e0b80cc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -43,10 +43,10 @@ int amdgpu_ctx_init(struct amdgpu_device *adev, bool kernel,
+ 		for (i = 0; i < adev->num_rings; i++) {
+ 			struct amd_sched_rq *rq;
+ 			if (kernel)
+-				rq = &adev->rings[i]->sched->kernel_rq;
++				rq = &adev->rings[i]->sched.kernel_rq;
+ 			else
+-				rq = &adev->rings[i]->sched->sched_rq;
+-			r = amd_sched_entity_init(adev->rings[i]->sched,
++				rq = &adev->rings[i]->sched.sched_rq;
++			r = amd_sched_entity_init(&adev->rings[i]->sched,
+ 						  &ctx->rings[i].entity,
+ 						  rq, amdgpu_sched_jobs);
+ 			if (r)
+@@ -55,7 +55,7 @@ int amdgpu_ctx_init(struct amdgpu_device *adev, bool kernel,
+ 
+ 		if (i < adev->num_rings) {
+ 			for (j = 0; j < i; j++)
+-				amd_sched_entity_fini(adev->rings[j]->sched,
++				amd_sched_entity_fini(&adev->rings[j]->sched,
+ 						      &ctx->rings[j].entity);
+ 			kfree(ctx);
+ 			return r;
+@@ -75,7 +75,7 @@ void amdgpu_ctx_fini(struct amdgpu_ctx *ctx)
+ 
+ 	if (amdgpu_enable_scheduler) {
+ 		for (i = 0; i < adev->num_rings; i++)
+-			amd_sched_entity_fini(adev->rings[i]->sched,
++			amd_sched_entity_fini(&adev->rings[i]->sched,
+ 					      &ctx->rings[i].entity);
+ 	}
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index 7f2d85e..b3fc26c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -609,9 +609,9 @@ int amdgpu_fence_driver_start_ring(struct amdgpu_ring *ring,
+  * Init the fence driver for the requested ring (all asics).
+  * Helper function for amdgpu_fence_driver_init().
+  */
+-void amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring)
++int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring)
+ {
+-	int i;
++	int i, r;
+ 
+ 	ring->fence_drv.cpu_addr = NULL;
+ 	ring->fence_drv.gpu_addr = 0;
+@@ -628,14 +628,16 @@ void amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring)
+ 	init_waitqueue_head(&ring->fence_drv.fence_queue);
+ 
+ 	if (amdgpu_enable_scheduler) {
+-		ring->sched = amd_sched_create(&amdgpu_sched_ops,
+-					       ring->idx,
+-					       amdgpu_sched_hw_submission,
+-					       (void *)ring->adev);
+-		if (!ring->sched)
+-			DRM_ERROR("Failed to create scheduler on ring %d.\n",
+-				  ring->idx);
++		r = amd_sched_init(&ring->sched, &amdgpu_sched_ops,
++				   amdgpu_sched_hw_submission, ring->name);
++		if (r) {
++			DRM_ERROR("Failed to create scheduler on ring %s.\n",
++				  ring->name);
++			return r;
++		}
+ 	}
++
++	return 0;
+ }
+ 
+ /**
+@@ -683,8 +685,7 @@ void amdgpu_fence_driver_fini(struct amdgpu_device *adev)
+ 		wake_up_all(&ring->fence_drv.fence_queue);
+ 		amdgpu_irq_put(adev, ring->fence_drv.irq_src,
+ 			       ring->fence_drv.irq_type);
+-		if (ring->sched)
+-			amd_sched_destroy(ring->sched);
++		amd_sched_fini(&ring->sched);
+ 		ring->fence_drv.initialized = false;
+ 	}
+ 	mutex_unlock(&adev->ring_lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index 6e73543..30dce23 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -357,7 +357,9 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 		ring->adev = adev;
+ 		ring->idx = adev->num_rings++;
+ 		adev->rings[ring->idx] = ring;
+-		amdgpu_fence_driver_init_ring(ring);
++		r = amdgpu_fence_driver_init_ring(ring);
++		if (r)
++			return r;
+ 	}
+ 
+ 	r = amdgpu_wb_get(adev, &ring->rptr_offs);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
+index 7cf5405..e907124 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
+@@ -145,8 +145,13 @@ static uint32_t amdgpu_sa_get_ring_from_fence(struct fence *f)
+ 	struct amd_sched_fence *s_fence;
+ 
+ 	s_fence = to_amd_sched_fence(f);
+-	if (s_fence)
+-		return s_fence->sched->ring_id;
++	if (s_fence) {
++		struct amdgpu_ring *ring;
++
++		ring = container_of(s_fence->sched, struct amdgpu_ring, sched);
++		return ring->idx;
++	}
++
+ 	a_fence = to_amdgpu_fence(f);
+ 	if (a_fence)
+ 		return a_fence->ring->idx;
+@@ -412,6 +417,26 @@ void amdgpu_sa_bo_free(struct amdgpu_device *adev, struct amdgpu_sa_bo **sa_bo,
+ }
+ 
+ #if defined(CONFIG_DEBUG_FS)
++
++static void amdgpu_sa_bo_dump_fence(struct fence *fence, struct seq_file *m)
++{
++	struct amdgpu_fence *a_fence = to_amdgpu_fence(fence);
++	struct amd_sched_fence *s_fence = to_amd_sched_fence(fence);
++
++	if (a_fence)
++		seq_printf(m, " protected by 0x%016llx on ring %d",
++			   a_fence->seq, a_fence->ring->idx);
++
++	if (s_fence) {
++		struct amdgpu_ring *ring;
++
++
++		ring = container_of(s_fence->sched, struct amdgpu_ring, sched);
++		seq_printf(m, " protected by 0x%016x on ring %d",
++			   s_fence->base.seqno, ring->idx);
++	}
++}
++
+ void amdgpu_sa_bo_dump_debug_info(struct amdgpu_sa_manager *sa_manager,
+ 				  struct seq_file *m)
+ {
+@@ -428,18 +453,8 @@ void amdgpu_sa_bo_dump_debug_info(struct amdgpu_sa_manager *sa_manager,
+ 		}
+ 		seq_printf(m, "[0x%010llx 0x%010llx] size %8lld",
+ 			   soffset, eoffset, eoffset - soffset);
+-		if (i->fence) {
+-			struct amdgpu_fence *a_fence = to_amdgpu_fence(i->fence);
+-			struct amd_sched_fence *s_fence = to_amd_sched_fence(i->fence);
+-			if (a_fence)
+-				seq_printf(m, " protected by 0x%016llx on ring %d",
+-					   a_fence->seq, a_fence->ring->idx);
+-			if (s_fence)
+-				seq_printf(m, " protected by 0x%016x on ring %d",
+-					   s_fence->base.seqno,
+-					   s_fence->sched->ring_id);
+-
+-		}
++		if (i->fence)
++			amdgpu_sa_bo_dump_fence(i->fence, m);
+ 		seq_printf(m, "\n");
+ 	}
+ 	spin_unlock(&sa_manager->wq.lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index d1984fc..2e946b2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -85,7 +85,7 @@ int amdgpu_sched_ib_submit_kernel_helper(struct amdgpu_device *adev,
+ 			kzalloc(sizeof(struct amdgpu_job), GFP_KERNEL);
+ 		if (!job)
+ 			return -ENOMEM;
+-		job->base.sched = ring->sched;
++		job->base.sched = &ring->sched;
+ 		job->base.s_entity = &adev->kernel_ctx.rings[ring->idx].entity;
+ 		job->adev = adev;
+ 		job->ibs = ibs;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+index b57ca10..4921de1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+@@ -65,8 +65,14 @@ static bool amdgpu_sync_same_dev(struct amdgpu_device *adev, struct fence *f)
+ 
+ 	if (a_fence)
+ 		return a_fence->ring->adev == adev;
+-	if (s_fence)
+-		return (struct amdgpu_device *)s_fence->sched->priv == adev;
++
++	if (s_fence) {
++		struct amdgpu_ring *ring;
++
++		ring = container_of(s_fence->sched, struct amdgpu_ring, sched);
++		return ring->adev == adev;
++	}
++
+ 	return false;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_sched_trace.h b/drivers/gpu/drm/amd/scheduler/gpu_sched_trace.h
+index a1f4ece..144f50a 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_sched_trace.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_sched_trace.h
+@@ -16,21 +16,21 @@ TRACE_EVENT(amd_sched_job,
+ 	    TP_ARGS(sched_job),
+ 	    TP_STRUCT__entry(
+ 			     __field(struct amd_sched_entity *, entity)
+-			     __field(u32, ring_id)
++			     __field(const char *, name)
+ 			     __field(u32, job_count)
+ 			     __field(int, hw_job_count)
+ 			     ),
+ 
+ 	    TP_fast_assign(
+ 			   __entry->entity = sched_job->s_entity;
+-			   __entry->ring_id = sched_job->sched->ring_id;
++			   __entry->name = sched_job->sched->name;
+ 			   __entry->job_count = kfifo_len(
+ 				   &sched_job->s_entity->job_queue) / sizeof(sched_job);
+ 			   __entry->hw_job_count = atomic_read(
+ 				   &sched_job->sched->hw_rq_count);
+ 			   ),
+-	    TP_printk("entity=%p, ring=%u, job count:%u, hw job count:%d",
+-		      __entry->entity, __entry->ring_id, __entry->job_count,
++	    TP_printk("entity=%p, ring=%s, job count:%u, hw job count:%d",
++		      __entry->entity, __entry->name, __entry->job_count,
+ 		      __entry->hw_job_count)
+ );
+ #endif
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index ec4842e..3697eee 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -381,56 +381,45 @@ static int amd_sched_main(void *param)
+ }
+ 
+ /**
+- * Create a gpu scheduler
++ * Init a gpu scheduler instance
+  *
++ * @sched		The pointer to the scheduler
+  * @ops			The backend operations for this scheduler.
+- * @ring		The the ring id for the scheduler.
+  * @hw_submissions	Number of hw submissions to do.
++ * @name		Name used for debugging
+  *
+- * Return the pointer to scheduler for success, otherwise return NULL
++ * Return 0 on success, otherwise error code.
+ */
+-struct amd_gpu_scheduler *amd_sched_create(struct amd_sched_backend_ops *ops,
+-					   unsigned ring, unsigned hw_submission,
+-					   void *priv)
++int amd_sched_init(struct amd_gpu_scheduler *sched,
++		   struct amd_sched_backend_ops *ops,
++		   unsigned hw_submission, const char *name)
+ {
+-	struct amd_gpu_scheduler *sched;
+-
+-	sched = kzalloc(sizeof(struct amd_gpu_scheduler), GFP_KERNEL);
+-	if (!sched)
+-		return NULL;
+-
+ 	sched->ops = ops;
+-	sched->ring_id = ring;
+ 	sched->hw_submission_limit = hw_submission;
+-	sched->priv = priv;
+-	snprintf(sched->name, sizeof(sched->name), "amdgpu[%d]", ring);
++	sched->name = name;
+ 	amd_sched_rq_init(&sched->sched_rq);
+ 	amd_sched_rq_init(&sched->kernel_rq);
+ 
+ 	init_waitqueue_head(&sched->wake_up_worker);
+ 	init_waitqueue_head(&sched->job_scheduled);
+ 	atomic_set(&sched->hw_rq_count, 0);
++
+ 	/* Each scheduler will run on a seperate kernel thread */
+ 	sched->thread = kthread_run(amd_sched_main, sched, sched->name);
+ 	if (IS_ERR(sched->thread)) {
+-		DRM_ERROR("Failed to create scheduler for id %d.\n", ring);
+-		kfree(sched);
+-		return NULL;
++		DRM_ERROR("Failed to create scheduler for %s.\n", name);
++		return PTR_ERR(sched->thread);
+ 	}
+ 
+-	return sched;
++	return 0;
+ }
+ 
+ /**
+  * Destroy a gpu scheduler
+  *
+  * @sched	The pointer to the scheduler
+- *
+- * return 0 if succeed. -1 if failed.
+  */
+-int amd_sched_destroy(struct amd_gpu_scheduler *sched)
++void amd_sched_fini(struct amd_gpu_scheduler *sched)
+ {
+ 	kthread_stop(sched->thread);
+-	kfree(sched);
+-	return  0;
+ }
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index 89d977d..80b64dc 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -101,23 +101,21 @@ struct amd_sched_backend_ops {
+  * One scheduler is implemented for each hardware ring
+ */
+ struct amd_gpu_scheduler {
+-	struct task_struct		*thread;
++	struct amd_sched_backend_ops	*ops;
++	uint32_t			hw_submission_limit;
++	const char			*name;
+ 	struct amd_sched_rq		sched_rq;
+ 	struct amd_sched_rq		kernel_rq;
+-	atomic_t			hw_rq_count;
+-	struct amd_sched_backend_ops	*ops;
+-	uint32_t			ring_id;
+ 	wait_queue_head_t		wake_up_worker;
+ 	wait_queue_head_t		job_scheduled;
+-	uint32_t                        hw_submission_limit;
+-	char                            name[20];
+-	void                            *priv;
++	atomic_t			hw_rq_count;
++	struct task_struct		*thread;
+ };
+ 
+-struct amd_gpu_scheduler *
+-amd_sched_create(struct amd_sched_backend_ops *ops,
+-		 uint32_t ring, uint32_t hw_submission, void *priv);
+-int amd_sched_destroy(struct amd_gpu_scheduler *sched);
++int amd_sched_init(struct amd_gpu_scheduler *sched,
++		   struct amd_sched_backend_ops *ops,
++		   uint32_t hw_submission, const char *name);
++void amd_sched_fini(struct amd_gpu_scheduler *sched);
+ 
+ int amd_sched_entity_init(struct amd_gpu_scheduler *sched,
+ 			  struct amd_sched_entity *entity,
+-- 
+1.9.1
+
