@@ -30,3 +30,8 @@ python () {
 	src_uri = d.getVar('SRC_URI', True).split()
 	d.setVar('SRC_URI', ' '.join(s.rstrip(";") for s in src_uri))
 }
+
+do_validate_branches_append() {
+    # Drop a config generating spurious warnings
+    sed -i '/CONFIG_DRM_I915_PRELIMINARY_HW_SUPPORT/d' ${WORKDIR}/${KMETA}/features/i915/i915.cfg
+}
