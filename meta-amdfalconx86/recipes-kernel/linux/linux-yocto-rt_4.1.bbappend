@@ -1,5 +1,5 @@
 KBRANCH_amdfalconx86 = "standard/preempt-rt/base"
-SRCREV_machine_amdfalconx86 = "3188436876d5eaff8d48f82064367d4a65c3aa97"
+SRCREV_machine_amdfalconx86 = "73c76150065091f6cc1751a3c8ec2d8a8cf8b6af"
 
 SRC_URI_append_amdfalconx86 += "file://amdfalconx86-preempt-rt.scc \
 "
