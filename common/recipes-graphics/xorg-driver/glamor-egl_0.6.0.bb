@@ -2,6 +2,9 @@ require recipes-graphics/xorg-driver/xorg-driver-common.inc
 
 DEPENDS += "libdrm virtual/mesa virtual/libgles1 virtual/libgles2 virtual/egl"
 
+FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
+SRC_URI_append = " file://0001-Rework-pkgconfig-files-using-Requires.patch"
+
 LIC_FILES_CHKSUM = "file://COPYING;md5=c7f5e33031114ad132cb03949d73a8a8"
 
 SRC_URI[md5sum] = "b3668594675f71a75153ee52dbd35535"
