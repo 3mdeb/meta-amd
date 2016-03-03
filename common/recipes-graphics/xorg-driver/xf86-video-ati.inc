@@ -23,7 +23,8 @@ SRC_URI = " \
 
 S = "${WORKDIR}/git"
 
-RDEPENDS_${PN} += "mesa-driver-radeon \
+RDEPENDS_${PN} += "glamor-egl \
+		   mesa-driver-radeon \
 		   mesa-driver-radeonsi \
 		   mesa-driver-swrast \
 "
