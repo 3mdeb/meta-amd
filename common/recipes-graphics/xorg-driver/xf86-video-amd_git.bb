@@ -1,6 +1,6 @@
-SUMMARY = "X.Org X server -- ATI integrated graphics chipsets driver"
+SUMMARY = "X.Org X server -- AMD graphics chipsets driver"
 
-DESCRIPTION = "xf86-video-ati is an Xorg driver for Intel integrated	\
+DESCRIPTION = "xf86-video-amd is an Xorg driver for AMD integrated	\
 graphics chipsets. The driver supports depths 8, 15, 16 and 24. On	\
 some chipsets, the driver supports hardware accelerated 3D via the	\
 Direct Rendering Infrastructure (DRI)."
@@ -16,12 +16,13 @@ DEPENDS += "virtual/libx11 drm dri2proto glproto \
 
 EXTRA_OECONF += "--enable-udev --enable-glamor"
 
-SRC_URI = " \
-	   git://anongit.freedesktop.org/git/xorg/driver/xf86-video-ati \
-"
+SRC_URI_radeon = "git://anongit.freedesktop.org/git/xorg/driver/xf86-video-ati"
+SRCREV_radeon = "906a0ec9224146098bb4581486129d2934d36495"
 
-SRCREV = "906a0ec9224146098bb4581486129d2934d36495"
-PV = "7.4.0+git${SRCPV}"
+SRC_URI_amdgpu = "git://anongit.freedesktop.org/xorg/driver/xf86-video-amdgpu;branch=master"
+SRCREV_amdgpu = "755e6ff2337cf615e3ba0854ccd533baec7144db"
+
+PV = "git${SRCPV}"
 
 S = "${WORKDIR}/git"
 
