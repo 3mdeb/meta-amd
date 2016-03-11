@@ -2,10 +2,10 @@ FILESEXTRAPATHS_prepend := "${THISDIR}/files:"
 
 PR := "${INC_PR}.1"
 
-SRCREV_meta_amdfalconx86 = "b9023d4c8fbbb854c26f158a079a5f54dd61964d"
+SRCREV_meta_amdfalconx86 ?= "b9023d4c8fbbb854c26f158a079a5f54dd61964d"
 
-LINUX_VERSION_amdfalconx86 = "4.1.18"
-KMACHINE_amdfalconx86 = "common-pc-64"
+LINUX_VERSION_amdfalconx86 ?= "4.1.18"
+KMACHINE_amdfalconx86 ?= "common-pc-64"
 
 COMPATIBLE_MACHINE_amdfalconx86 = "amdfalconx86"
 KERNEL_FEATURES_append_amdfalconx86 += " cfg/smp.scc cfg/sound.scc"
