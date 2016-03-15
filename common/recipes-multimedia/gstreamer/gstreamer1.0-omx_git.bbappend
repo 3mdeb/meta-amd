@@ -26,13 +26,17 @@ SRC_URI_append_amd = " \
 	   file://0012-gstomxvideoenc-implement-capture-configuration-suppo.patch \
 	   file://0013-gstomxvideoenc-add-capture-geometry-support.patch \
 	   file://0014-gstomxvideoenc-reduce-shutdown-timeout-for-tunnellin.patch \
+	   ${@bb.utils.contains("RT_KERNEL_AMD", "yes", "", "file://0001-gstomxvideoenc-use-scaling-default-macro-s.patch", d)} \
+	   ${@bb.utils.contains("RT_KERNEL_AMD", "yes", "", "file://0002-gstomxvideoenc-fix-srcpad-caps-when-scaling-property.patch", d)} \
+	   ${@bb.utils.contains("RT_KERNEL_AMD", "yes", "", "file://0003-gstomxvideoenc-add-fix-timestamp-property.patch", d)} \
+	   ${@bb.utils.contains("RT_KERNEL_AMD", "yes", "", "file://0004-gstomxvideoenc-add-force-keyframe-period-property.patch", d)} \
 	  "
 
 SRCREV_gst-omx_amd = "c44cd849400b90f5f4b1f4f429278d9685b1daca"
 SRCREV_common_amd = "1a07da9a64c733842651ece62ddefebedd29c2da"
 
-SRC_URI_append_steppeeagle += " file://0001-Adjust-gstomx.conf-for-Radeon.patch"
-SRC_URI_append_baldeagle += " file://0001-Adjust-gstomx.conf-for-Radeon.patch"
+SRC_URI_append_radeon += " ${@bb.utils.contains("RT_KERNEL_AMD", "yes", "", "file://0001-adjust-gstomx.conf-for-radeon.patch", d)}"
+SRC_URI_append_amdgpu += " ${@bb.utils.contains("RT_KERNEL_AMD", "yes", "", "file://0001-adjust-gstomx.conf-for-amdgpu.patch", d)}"
 
 PV .= "+git${SRCPV}"
 
