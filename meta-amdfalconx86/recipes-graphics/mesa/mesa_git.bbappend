@@ -1,5 +1,3 @@
-FILESEXTRAPATHS_prepend_amdfalconx86 := "${THISDIR}/${PN}:"
-
 SRCREV_amdfalconx86 = "b9b19162ee3f8d68be76b71adf2a290cbb675660"
 LIC_FILES_CHKSUM_amdfalconx86 = "file://docs/license.html;md5=6a23445982a7a972ac198e93cc1cb3de"
 PV_amdfalconx86 = "11.0.8+git${SRCPV}"
