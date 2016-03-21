@@ -43,6 +43,6 @@ FILES_${PN}-kms = "${libdir}/libkms*.so.*"
 FILES_${PN}-freedreno = "${libdir}/libdrm_freedreno.so.*"
 FILES_${PN}-amdgpu = "${libdir}/libdrm_amdgpu.so.*"
 
-do_install_append_amdfalconx86() {
+do_install_append_amd() {
 	cp ${S}/include/drm/amdgpu_drm.h ${D}/usr/include/libdrm
 }
