@@ -11,23 +11,26 @@ LIC_FILES_CHKSUM = "file://COPYING;md5=aabff1606551f9461ccf567739af63dc"
 
 DEPENDS += "virtual/libx11 drm dri2proto glproto \
 	    virtual/libgl xineramaproto libpciaccess \
-	    udev glamor-egl \
 "
 
-EXTRA_OECONF += "--enable-udev --enable-glamor"
+PACKAGECONFIG[udev] = "--enable-udev,--disable-udev,udev"
+PACKAGECONFIG[glamor] = "--enable-glamor,--disable-glamor"
 
 SRC_URI_radeon = "git://anongit.freedesktop.org/git/xorg/driver/xf86-video-ati"
-SRCREV_radeon = "906a0ec9224146098bb4581486129d2934d36495"
+SRCREV_radeon = "xf86-video-ati-7.6.1"
+PV_radeon = "radeon-7.6.1"
+PACKAGECONFIG_append_radeon = " udev glamor"
 
-SRC_URI_amdgpu = "git://anongit.freedesktop.org/xorg/driver/xf86-video-amdgpu;branch=master"
-SRCREV_amdgpu = "755e6ff2337cf615e3ba0854ccd533baec7144db"
+SRC_URI_amdgpu = "git://anongit.freedesktop.org/xorg/driver/xf86-video-amdgpu;branch=1.0"
+SRCREV_amdgpu = "xf86-video-amdgpu-1.0.1"
+PV_amdgpu = "amdgpu-1.0.1"
+PACKAGECONFIG_append_amdgpu = " udev glamor"
 
 PV = "git${SRCPV}"
 
 S = "${WORKDIR}/git"
 
-RDEPENDS_${PN} += "glamor-egl \
-		   mesa-driver-radeon \
+RDEPENDS_${PN} += "mesa-driver-radeon \
 		   mesa-driver-radeonsi \
 		   mesa-driver-swrast \
 "

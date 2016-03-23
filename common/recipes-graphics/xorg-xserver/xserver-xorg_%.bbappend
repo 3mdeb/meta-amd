@@ -1,6 +1,3 @@
-PR_amd = "${INC_PR}.1"
-EXTRA_OECONF_append_amd = " \
-		 --enable-aiglx \
-		 --enable-xvmc \
-		 --enable-libdrm \
-		"
+PACKAGECONFIG[glamor] = "--enable-glamor,--disable-glamor,libepoxy"
+PACKAGECONFIG_append_amdgpu = "glamor xshmfence"
+PACKAGECONFIG_append_radeon = "glamor xshmfence"
