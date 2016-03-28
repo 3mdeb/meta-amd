@@ -1,15 +1,16 @@
-DEPENDS_append_amd = " libvdpau"
-PACKAGECONFIG_append_amd = " xvmc gallium r600"
-PACKAGECONFIG_append_amd = " gallium-llvm"
-MESA_LLVM_RELEASE_amd = "3.4"
+SRCREV_amd = "b9b19162ee3f8d68be76b71adf2a290cbb675660"
+LIC_FILES_CHKSUM_amd = "file://docs/license.html;md5=6a23445982a7a972ac198e93cc1cb3de"
+PV_amd = "11.0.8+git${SRCPV}"
+DEPENDS_append_amd = " libvdpau libomxil python-mako-native libdrm nettle"
+GALLIUMDRIVERS_append_amd = ",r300,r600,radeonsi"
+GALLIUMDRIVERS_LLVM_amd = "r300,svga${@',${GALLIUMDRIVERS_LLVM33}' if ${GALLIUMDRIVERS_LLVM33_ENABLED} else ',nouveau'}"
+PACKAGECONFIG_append_amd = " xvmc gallium r600 gallium-llvm"
+MESA_LLVM_RELEASE_amd = "3.7.1"
 
-# Set DRIDRIVERS with anonymous python so we can effectively
-# override the _append_x86-64 assignement from mesa.inc.
-python __anonymous () {
-    d.setVar("DRIDRIVERS_amd", "radeon")
-}
+SRC_URI_amd = "\
+			git://anongit.freedesktop.org/git/mesa/mesa;branch=11.0 \
+"
 
-DEPENDS_append_amd = " libomxil"
 EXTRA_OECONF_append_amd = " \
 		 --disable-dri3 \
 		 --enable-vdpau \
@@ -17,7 +18,14 @@ EXTRA_OECONF_append_amd = " \
 		 --enable-xa \
 		 --enable-glx \
 		 --enable-omx \
+		 --enable-r600-llvm-compiler \
+		 --enable-llvm-shared-libs \
 		 --with-omx-libdir=${libdir}/bellagio \
+		"
+
+EXTRA_OECONF_append_amdfalconx86 = " \
+		 --disable-xvmc \
+		 --enable-texture-float \
 		"
 
 # Package all the libXvMC gallium extensions together
@@ -52,3 +60,14 @@ PACKAGES =+ "libomx-${PN} libomx-${PN}-dev"
 FILES_libomx-${PN} = "${libdir}/bellagio/libomx_*.so"
 FILES_libomx-${PN}-dev = "${libdir}/bellagio/libomx_*.la"
 FILES_${PN}-dbg += "${libdir}/bellagio/.debug"
+
+# Set DRIDRIVERS with anonymous python so we can effectively
+# override the _append_x86-64 assignement from mesa.inc.
+python __anonymous () {
+    d.setVar("DRIDRIVERS_amd", "radeon")
+}
+
+# Install override from mesa.inc
+do_install_append_amd() {
+	cp ${S}/include/EGL/eglplatform.h ${D}${includedir}/EGL/eglplatform.h
+}
