@@ -5,6 +5,15 @@ DEPENDS_append_amd = " libvdpau libomxil python-mako-native libdrm nettle"
 GALLIUMDRIVERS_append_amd = ",r300,r600,radeonsi"
 GALLIUMDRIVERS_LLVM_amd = "r300,svga${@',${GALLIUMDRIVERS_LLVM33}' if ${GALLIUMDRIVERS_LLVM33_ENABLED} else ',nouveau'}"
 PACKAGECONFIG_append_amd = " xvmc gallium r600 gallium-llvm"
+
+PACKAGECONFIG_append_amdfalconx86 = " va"
+LIBVA_PLATFORMS  = "libva"
+LIBVA_PLATFORMS .= "${@bb.utils.contains('DISTRO_FEATURES', 'x11', ' libva-x11', '', d)}"
+LIBVA_PLATFORMS .= "${@bb.utils.contains('DISTRO_FEATURES', 'wayland', ' libva-wayland', '', d)}"
+LIBVA_PLATFORMS .= "${@bb.utils.contains('DISTRO_FEATURES', 'opengl', ' libva-gl', '', d)}"
+PACKAGECONFIG[va] = "--enable-va,--disable-va,libva"
+RDEPENDS_mesa-megadriver += "${@bb.utils.contains('PACKAGECONFIG', 'va', '${LIBVA_PLATFORMS}', '', d)}"
+
 MESA_LLVM_RELEASE_amd = "3.7.1"
 
 SRC_URI_amd = "\
@@ -67,7 +76,21 @@ python __anonymous () {
     d.setVar("DRIDRIVERS_amd", "radeon")
 }
 
+# We'll need to setup some symlinks for the va enabled
+# video driver to work properly in case va is enabled
+# so skip the .so symlink checks.
+INSANE_SKIP_${PN}-megadriver += "${@bb.utils.contains('PACKAGECONFIG', 'va', 'dev-so', '', d)}"
+
 # Install override from mesa.inc
 do_install_append_amd() {
 	cp ${S}/include/EGL/eglplatform.h ${D}${includedir}/EGL/eglplatform.h
+
+	# Create symlinks for the gallium drivers to be able to play
+	# through the va enabled driver by default.
+	if ${@bb.utils.contains('PACKAGECONFIG','va','true','false',d)}; then
+		gallium_drivers=$(echo ${GALLIUMDRIVERS} | sed 's/,/ /g')
+		for gdriver in ${gallium_drivers}; do
+			ln -sf ${libdir}/dri/gallium_drv_video.so ${D}${libdir}/dri/${gdriver}_drv_video.so
+		done
+	fi
 }
