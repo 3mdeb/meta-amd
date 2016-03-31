@@ -12,7 +12,8 @@ LIC_FILES_CHKSUM = "file://COPYING.LIB;md5=4fbd65380cdd255951079008b364516c"
 DEPENDS = "libva"
 
 SRC_URI = "http://www.freedesktop.org/software/vaapi/releases/${REALPN}/${REALPN}-${PV}.tar.bz2 \
-          "
+           file://install-tests.patch"
+
 S = "${WORKDIR}/${REALPN}-${PV}"
 
 inherit autotools pkgconfig gtk-doc
