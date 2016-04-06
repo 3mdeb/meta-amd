@@ -44,3 +44,13 @@ do_validate_branches_append() {
     # Drop a config generating spurious warnings
     sed -i '/CONFIG_DRM_I915_PRELIMINARY_HW_SUPPORT/d' ${WORKDIR}/${KMETA}/features/i915/i915.cfg
 }
+
+#
+# Work around race in linux-yocto recipe for archive files.
+# This is fixed properly in the master branch with:
+#     http://patchwork.openembedded.org/patch/107179/
+#
+python do_ar_patched_prepend() {
+    bb.utils.mkdirhier("${STAGING_KERNEL_BUILDDIR}")
+    bb.utils.mkdirhier("${STAGING_KERNEL_DIR}")
+}
