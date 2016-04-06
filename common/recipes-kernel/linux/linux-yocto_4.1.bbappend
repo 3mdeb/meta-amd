@@ -14,6 +14,7 @@ SRC_URI_append_amdx86 += " \
 	file://drm.cfg \
 	file://sound.cfg \
 	file://hid.cfg \
+	file://enable-imc.cfg \
 	file://efi-partition.cfg \
 	file://usb-serial.cfg \
 	file://wifi-drivers.cfg \
