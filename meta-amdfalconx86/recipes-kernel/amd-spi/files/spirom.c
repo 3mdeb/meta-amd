@@ -32,6 +32,7 @@
 #include <linux/spi/spi.h>
 #include <linux/pci.h>
 #include <linux/delay.h>
+#include <linux/amd_imc.h>
 
 #include <asm/uaccess.h>
 
@@ -316,6 +317,15 @@ static int spirom_open(struct inode *inode, struct file *filp)
 		pr_debug("spirom: nothing for minor %d\n", iminor(inode));
 
 	mutex_unlock(&device_list_lock);
+
+	/*
+	 * In case IMC is enabled, we need to inform IMC to stop
+	 * fetching code from the BIOS ROM. We will inform IMC when
+	 * it is safe to start fetching from ROM again once we are
+	 * done with our SPI transactions.
+	 */
+	amd_imc_enter_scratch_ram();
+
 	return status;
 }
 
@@ -342,6 +352,14 @@ static int spirom_release(struct inode *inode, struct file *filp)
 			kfree(spirom);
 	}
 	mutex_unlock(&device_list_lock);
+
+	/*
+	 * In case IMC is enabled, we would have instructed IMC to stop
+	 * fetching from ROM BIOS earlier in the code path. Now that we
+	 * are done, we can safely inform IMC to start fetching from ROM
+	 * again.
+	 */
+	amd_imc_exit_scratch_ram();
 
 	return status;
 }
