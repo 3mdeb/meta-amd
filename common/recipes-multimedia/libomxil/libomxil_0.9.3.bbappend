@@ -14,13 +14,13 @@ LICENSE_FLAGS_remove = "commercial"
 # issues.
 #
 do_install_append_amd () {
-    ln -sf ${D}${libdir}/libomxil-bellagio.a test/components/audio_effects/
-    ln -sf ${D}${libdir}/libomxil-bellagio.a test/components/resource_manager/
-    oe_runmake includedir=${D}${includedir} LDFLAGS="${LDFLAGS} -L." check
+    oe_runmake includedir=${D}${includedir} LDFLAGS="${LDFLAGS} -L${D}${libdir}" check
     install test/components/audio_effects/omxvolcontroltest ${D}${bindir}
     install test/components/audio_effects/omxaudiomixertest ${D}${bindir}
     install test/components/resource_manager/omxrmtest ${D}${bindir}
 }
+
+INSANE_SKIP_${PN}-test = "rpaths"
 
 PACKAGES_prepend_amd = "${PN}-test "
 FILES_${PN}-test_amd = "${bindir}/omxvolcontroltest ${bindir}/omxaudiomixertest ${bindir}/omxrmtest"
