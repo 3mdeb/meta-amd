@@ -33,7 +33,7 @@ S = "${WORKDIR}/libva-${PV}"
 
 EXTRA_OECONF = "--disable-dummy-driver --disable-x11 --disable-wayland --disable-drm"
 
-PACKAGECONFIG ??= "${@base_contains("DISTRO_FEATURES", "opengl", "egl glx", "", d)}"
+PACKAGECONFIG ??= "${@bb.utils.contains("DISTRO_FEATURES", "opengl", "egl glx", "", d)}"
 PACKAGECONFIG[egl] = "--enable-egl,--disable-egl,virtual/egl,libva-x11"
 PACKAGECONFIG[glx] = "--enable-glx,--disable-glx,virtual/libgl libx11,libva-x11"
 
