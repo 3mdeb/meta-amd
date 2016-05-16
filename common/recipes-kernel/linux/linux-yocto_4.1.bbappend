@@ -6,6 +6,7 @@ KBRANCH_amdx86 ?= "standard/base"
 KMACHINE_amdx86 ?= "common-pc-64"
 SRCREV_machine_amdx86 ?= "dd6492b44151164242718855d6c9eebbf0018eac"
 SRCREV_meta_amdx86 ?= "b9023d4c8fbbb854c26f158a079a5f54dd61964d"
+LINUX_VERSION_amdx86 ?= "4.1.18"
 
 SRC_URI_append_amdx86 += " \
 	file://linux-yocto-amd-patches.scc \
