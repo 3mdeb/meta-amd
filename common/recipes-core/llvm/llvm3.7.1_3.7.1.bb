@@ -12,6 +12,7 @@ EXTRA_OECONF += "--enable-targets=x86_64,amdgpu"
 SRC_URI = "\
 	   git://llvm.org/git/llvm.git;branch=release_37;protocol=http \
 	   file://0001-force-link-pass.o.patch \
+	   file://0002-AMDGPU-Add-stony-support.patch \
 	  "
 
 S = "${WORKDIR}/git"
