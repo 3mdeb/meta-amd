@@ -1,0 +1,101 @@
+From f5617f9dde5ae2466560f7cb008c741e2b88adab Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <David1.Zhou@amd.com>
+Date: Thu, 5 Nov 2015 11:41:50 +0800
+Subject: [PATCH 0674/1565] drm/amd: add kmem cache for sched fence
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Change-Id: I45bb8ff10ef05dc3b15e31a77fbcf31117705f11
+Signed-off-by: Chunming Zhou <David1.Zhou@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 12 ++++++++++++
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  3 +++
+ drivers/gpu/drm/amd/scheduler/sched_fence.c   | 10 ++++++++--
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index 89619a5..fe5b3c4 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -34,6 +34,9 @@ static struct amd_sched_job *
+ amd_sched_entity_pop_job(struct amd_sched_entity *entity);
+ static void amd_sched_wakeup(struct amd_gpu_scheduler *sched);
+ 
++struct kmem_cache *sched_fence_slab;
++atomic_t sched_fence_slab_ref = ATOMIC_INIT(0);
++
+ /* Initialize a given run queue struct */
+ static void amd_sched_rq_init(struct amd_sched_rq *rq)
+ {
+@@ -450,6 +453,13 @@ int amd_sched_init(struct amd_gpu_scheduler *sched,
+ 	init_waitqueue_head(&sched->wake_up_worker);
+ 	init_waitqueue_head(&sched->job_scheduled);
+ 	atomic_set(&sched->hw_rq_count, 0);
++	if (atomic_inc_return(&sched_fence_slab_ref) == 1) {
++		sched_fence_slab = kmem_cache_create(
++			"amd_sched_fence", sizeof(struct amd_sched_fence), 0,
++			SLAB_HWCACHE_ALIGN, NULL);
++		if (!sched_fence_slab)
++			return -ENOMEM;
++	}
+ 
+ 	/* Each scheduler will run on a seperate kernel thread */
+ 	sched->thread = kthread_run(amd_sched_main, sched, sched->name);
+@@ -470,4 +480,6 @@ void amd_sched_fini(struct amd_gpu_scheduler *sched)
+ {
+ 	if (sched->thread)
+ 		kthread_stop(sched->thread);
++	if (atomic_dec_and_test(&sched_fence_slab_ref))
++		kmem_cache_destroy(sched_fence_slab);
+ }
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index 929e9ac..4d05ca6 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -30,6 +30,9 @@
+ struct amd_gpu_scheduler;
+ struct amd_sched_rq;
+ 
++extern struct kmem_cache *sched_fence_slab;
++extern atomic_t sched_fence_slab_ref;
++
+ /**
+  * A scheduler entity is a wrapper around a job queue or a group
+  * of other entities. Entities take turns emitting jobs from their 
+diff --git a/drivers/gpu/drm/amd/scheduler/sched_fence.c b/drivers/gpu/drm/amd/scheduler/sched_fence.c
+index d802638..8d2130b 100644
+--- a/drivers/gpu/drm/amd/scheduler/sched_fence.c
++++ b/drivers/gpu/drm/amd/scheduler/sched_fence.c
+@@ -32,7 +32,7 @@ struct amd_sched_fence *amd_sched_fence_create(struct amd_sched_entity *s_entity
+ 	struct amd_sched_fence *fence = NULL;
+ 	unsigned seq;
+ 
+-	fence = kzalloc(sizeof(struct amd_sched_fence), GFP_KERNEL);
++	fence = kmem_cache_zalloc(sched_fence_slab, GFP_KERNEL);
+ 	if (fence == NULL)
+ 		return NULL;
+ 	fence->owner = owner;
+@@ -71,11 +71,17 @@ static bool amd_sched_fence_enable_signaling(struct fence *f)
+ 	return true;
+ }
+ 
++static void amd_sched_fence_release(struct fence *f)
++{
++	struct amd_sched_fence *fence = to_amd_sched_fence(f);
++	kmem_cache_free(sched_fence_slab, fence);
++}
++
+ const struct fence_ops amd_sched_fence_ops = {
+ 	.get_driver_name = amd_sched_fence_get_driver_name,
+ 	.get_timeline_name = amd_sched_fence_get_timeline_name,
+ 	.enable_signaling = amd_sched_fence_enable_signaling,
+ 	.signaled = NULL,
+ 	.wait = fence_default_wait,
+-	.release = NULL,
++	.release = amd_sched_fence_release,
+ };
+-- 
+1.9.1
+
