@@ -12,6 +12,8 @@ RDEPENDS_${PN}-test_append_amd = " bash"
 #
 LICENSE_FLAGS_remove = "commercial"
 
+SRC_URI_append_amd = " file://0001-Added-NULL-pointer-check-for-failure-scenario.patch"
+
 #
 # The upstream sources expect that "make check" is run
 # after "make install" and we have to jump through some
