@@ -12,6 +12,14 @@ SRC_URI = "file://carrizo_ce.bin \
 	   file://carrizo_sdma.bin \
 	   file://carrizo_uvd.bin \
 	   file://carrizo_vce.bin \
+	   file://stoney_ce.bin \
+	   file://stoney_me.bin \
+	   file://stoney_mec.bin \
+	   file://stoney_pfp.bin \
+	   file://stoney_rlc.bin \
+	   file://stoney_sdma.bin \
+	   file://stoney_uvd.bin \
+	   file://stoney_vce.bin \
 	   file://LICENSE \
 	  "
 
