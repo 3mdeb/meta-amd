@@ -3,6 +3,7 @@ FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 SRC_URI_append_amd = " file://0001-test-components-fix-linking-issue.patch"
 
 RDEPENDS_${PN}_append_amd = "libomx-mesa"
+RDEPENDS_${PN}-test_append_amd = " bash"
 
 #
 # This package should not have commercial license flags.
