@@ -1,4 +1,9 @@
-RDEPENDS_${PN}_append_amd = "libomx-mesa"
+FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
+
+SRC_URI_append_amd = " file://0001-test-components-fix-linking-issue.patch"
+
+RDEPENDS_${PN}_append_amd = " libomx-mesa"
+RDEPENDS_${PN}-test_append_amd = " bash"
 
 #
 # This package should not have commercial license flags.
@@ -14,13 +19,11 @@ LICENSE_FLAGS_remove = "commercial"
 # issues.
 #
 do_install_append_amd () {
-    oe_runmake includedir=${D}${includedir} LDFLAGS="${LDFLAGS} -L${D}${libdir}" check
+    oe_runmake includedir=${D}${includedir} LDFLAGS="${LDFLAGS}" check
     install test/components/audio_effects/omxvolcontroltest ${D}${bindir}
     install test/components/audio_effects/omxaudiomixertest ${D}${bindir}
     install test/components/resource_manager/omxrmtest ${D}${bindir}
 }
-
-INSANE_SKIP_${PN}-test = "rpaths"
 
 PACKAGES_prepend_amd = "${PN}-test "
 FILES_${PN}-test_amd = "${bindir}/omxvolcontroltest ${bindir}/omxaudiomixertest ${bindir}/omxrmtest"
