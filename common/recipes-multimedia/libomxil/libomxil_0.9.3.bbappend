@@ -1,5 +1,5 @@
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
-RDEPENDS_${PN}_append_amd = "libomx-mesa"
+RDEPENDS_${PN}_append_amd = " libomx-mesa"
 
 #
 # This package should not have commercial license flags.
