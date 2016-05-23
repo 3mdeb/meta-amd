@@ -19,7 +19,3 @@ do_install_append_radeon () {
 	        sed -i -e 's/^\tDriver      "fbdev"/\tDriver      "radeon"/' ${D}/${sysconfdir}/X11/xorg.conf
 	fi
 }
-
-do_install_append_amdx86 () {
-	sed -i '/.\"SWcursor\"./c\\tOption      "SWcursor"           \t"True"' ${D}/${sysconfdir}/X11/xorg.conf
-}
