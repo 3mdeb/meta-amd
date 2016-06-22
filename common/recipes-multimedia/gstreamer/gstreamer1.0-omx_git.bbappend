@@ -30,6 +30,8 @@ SRC_URI_append_amd = " \
 	   ${@bb.utils.contains("RT_KERNEL_AMD", "yes", "", "file://0002-gstomxvideoenc-fix-srcpad-caps-when-scaling-property.patch", d)} \
 	   ${@bb.utils.contains("RT_KERNEL_AMD", "yes", "", "file://0003-gstomxvideoenc-add-fix-timestamp-property.patch", d)} \
 	   ${@bb.utils.contains("RT_KERNEL_AMD", "yes", "", "file://0004-gstomxvideoenc-add-force-keyframe-period-property.patch", d)} \
+	   ${@bb.utils.contains("RT_KERNEL_AMD", "yes", "", "file://0005-gstomxvideoenc-Add-new-property-to-set-framerate.patch", d)} \
+	   ${@bb.utils.contains("RT_KERNEL_AMD", "yes", "", "file://0006-gstomxvideoenc-Update-GstBuffer-fields-on-FRC.patch", d)} \
 	  "
 
 SRCREV_gst-omx_amd = "c44cd849400b90f5f4b1f4f429278d9685b1daca"

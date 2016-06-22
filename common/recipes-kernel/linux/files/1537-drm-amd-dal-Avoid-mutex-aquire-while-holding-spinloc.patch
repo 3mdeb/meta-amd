@@ -1,0 +1,113 @@
+From 99e8d462d2e28a22b7874be8761513542921c42c Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Fri, 11 Mar 2016 22:47:54 -0500
+Subject: [PATCH 1537/1565] drm/amd/dal: Avoid mutex aquire while holding
+ spinlock.
+
+Change-Id: I2afac2cca988d5f695737671d301da77c847128a
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      | 43 +++++++++++++---------
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    | 16 +++-----
+ 2 files changed, 32 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index 6cea7e2..1564485 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -1073,31 +1073,40 @@ void amdgpu_dm_flip_cleanup(
+ 	struct amdgpu_crtc *acrtc)
+ {
+ 	int r;
+-	struct amdgpu_flip_work *works = acrtc->pflip_works;
++	unsigned long flags;
++	struct amdgpu_flip_work *works = NULL;
+ 
+-	acrtc->pflip_works = NULL;
+-	acrtc->pflip_status = AMDGPU_FLIP_NONE;
++	spin_lock_irqsave(&adev->ddev->event_lock, flags);
++	if (acrtc->pflip_status != AMDGPU_FLIP_NONE) {
++		works = acrtc->pflip_works;
++		acrtc->pflip_works = NULL;
++		acrtc->pflip_status = AMDGPU_FLIP_NONE;
+ 
+-	if (works) {
+-		if(works->event)
++		if (works && works->event) {
+ 			drm_send_vblank_event(
+ 				adev->ddev,
+ 				acrtc->crtc_id,
+ 				works->event);
++		}
++		spin_unlock_irqrestore(&adev->ddev->event_lock, flags);
+ 
+-		r = amdgpu_bo_reserve(works->old_rbo, false);
+-		if (likely(r == 0)) {
+-			r = amdgpu_bo_unpin(works->old_rbo);
+-			if (unlikely(r != 0)) {
+-				DRM_ERROR("failed to unpin buffer after flip\n");
+-			}
+-			amdgpu_bo_unreserve(works->old_rbo);
+-		} else
+-			DRM_ERROR("failed to reserve buffer after flip\n");
++		if (works) {
++			r = amdgpu_bo_reserve(works->old_rbo, false);
++			if (likely(r == 0)) {
++				r = amdgpu_bo_unpin(works->old_rbo);
++				if (unlikely(r != 0)) {
++					DRM_ERROR("failed to unpin buffer after flip\n");
++				}
++				amdgpu_bo_unreserve(works->old_rbo);
++			} else
++				DRM_ERROR("failed to reserve buffer after flip\n");
+ 
+-		amdgpu_bo_unref(&works->old_rbo);
+-		kfree(works->shared);
+-		kfree(works);
++			amdgpu_bo_unref(&works->old_rbo);
++			kfree(works->shared);
++			kfree(works);
++		}
++	} else {
++		spin_unlock_irqrestore(&adev->ddev->event_lock, flags);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index f6f6836..bbc3552 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -2075,7 +2075,6 @@ static void manage_dm_interrupts(
+ 			&adev->pageflip_irq,
+ 			irq_type);
+ 	} else {
+-		unsigned long flags;
+ 		amdgpu_irq_put(
+ 			adev,
+ 			&adev->pageflip_irq,
+@@ -2098,15 +2097,12 @@ static void manage_dm_interrupts(
+ 		 * lock and check to amdgpu_dm_flip_cleanup function
+ 		 */
+ 
+-		spin_lock_irqsave(&adev->ddev->event_lock, flags);
+-		if (acrtc->pflip_status != AMDGPU_FLIP_NONE) {
+-			/*
+-			 * this is the case when on reset, last pending pflip
+-			 * interrupt did not not occur. Clean-up
+-			 */
+-			amdgpu_dm_flip_cleanup(adev, acrtc);
+-		}
+-		spin_unlock_irqrestore(&adev->ddev->event_lock, flags);
++
++		/*
++		 * this is the case when on reset, last pending pflip
++		 * interrupt did not not occur. Clean-up
++		 */
++		amdgpu_dm_flip_cleanup(adev, acrtc);
+ 	}
+ }
+ 
+-- 
+1.9.1
+

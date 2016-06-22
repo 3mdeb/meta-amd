@@ -1,3 +1,4 @@
+FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 SRCREV_amd = "b9b19162ee3f8d68be76b71adf2a290cbb675660"
 LIC_FILES_CHKSUM_amd = "file://docs/license.html;md5=6a23445982a7a972ac198e93cc1cb3de"
 PV_amd = "11.0.8+git${SRCPV}"
@@ -19,6 +20,13 @@ MESA_LLVM_RELEASE_amd = "3.7.1"
 
 SRC_URI_amd = "\
 			git://anongit.freedesktop.org/git/mesa/mesa;branch=11.0 \
+			file://0001-st-omx-h264-fix-corruption-when-scaling-matrix-prese.patch \
+			file://0002-st-omx-Remove-trailing-spaces.patch \
+			file://0003-st-omx-dec-Correct-the-timestamping.patch \
+			file://0004-st-omx-Avoid-segfault-in-deconstructor-if-constructo.patch \
+			file://0005-st-omx-enc-Correct-the-timestamping.patch \
+			file://0006-st-omx-enc-Modularize-the-Encoding-task.patch \
+			file://0007-st-omx-enc-Support-framerate-conversion.patch \
 "
 
 EXTRA_OECONF_append_amd = " \

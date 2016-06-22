@@ -1,0 +1,210 @@
+From 1db2a1e764e7bc2e17c0ea92880096ee8a4b5a3c Mon Sep 17 00:00:00 2001
+From: Nishanth Peethambaran <nishanth.peethambaran@amd.com>
+Date: Fri, 11 Mar 2016 01:23:00 -0500
+Subject: [PATCH 2/2] st/omx/dec: Correct the timestamping
+
+Attach the timestamp to the dpb buffer and use that timestamp
+while pushing buffer from dpb list to the omx client.
+
+Signed-off-by: Nishanth Peethambaran <nishanth.peethambaran@amd.com>
+---
+ src/gallium/state_trackers/omx/vid_dec.c        | 11 +++++++++--
+ src/gallium/state_trackers/omx/vid_dec.h        |  7 ++++++-
+ src/gallium/state_trackers/omx/vid_dec_h264.c   | 18 +++++++++++++++---
+ src/gallium/state_trackers/omx/vid_dec_mpeg12.c |  8 ++++++--
+ 4 files changed, 36 insertions(+), 8 deletions(-)
+
+diff --git a/src/gallium/state_trackers/omx/vid_dec.c b/src/gallium/state_trackers/omx/vid_dec.c
+index 00334a8..4b140dc 100644
+--- a/src/gallium/state_trackers/omx/vid_dec.c
++++ b/src/gallium/state_trackers/omx/vid_dec.c
+@@ -419,6 +419,7 @@ static OMX_ERRORTYPE vid_dec_DecodeBuffer(omx_base_PortType *port, OMX_BUFFERHEA
+    priv->in_buffers[i] = buf;
+    priv->sizes[i] = buf->nFilledLen;
+    priv->inputs[i] = buf->pBuffer;
++   priv->timestamps[i] = buf->nTimeStamp;
+ 
+    while (priv->num_in_buffers > (!!(buf->nFlags & OMX_BUFFERFLAG_EOS) ? 0 : 1)) {
+       bool eos = !!(priv->in_buffers[0]->nFlags & OMX_BUFFERFLAG_EOS);
+@@ -469,6 +470,7 @@ static OMX_ERRORTYPE vid_dec_DecodeBuffer(omx_base_PortType *port, OMX_BUFFERHEA
+          priv->in_buffers[0] = priv->in_buffers[1];
+          priv->sizes[0] = priv->sizes[1] - delta;
+          priv->inputs[0] = priv->inputs[1] + delta;
++         priv->timestamps[0] = priv->timestamps[1];
+       }
+ 
+       if (r)
+@@ -526,9 +528,13 @@ static void vid_dec_FrameDecoded(OMX_COMPONENTTYPE *comp, OMX_BUFFERHEADERTYPE*
+ {
+    vid_dec_PrivateType *priv = comp->pComponentPrivate;
+    bool eos = !!(input->nFlags & OMX_BUFFERFLAG_EOS);
++   OMX_TICKS timestamp;
+ 
+-   if (!input->pInputPortPrivate)
+-      input->pInputPortPrivate = priv->Flush(priv);
++   if (!input->pInputPortPrivate) {
++      input->pInputPortPrivate = priv->Flush(priv, &timestamp);
++      if (timestamp != OMX_VID_DEC_TIMESTAMP_INVALID)
++	      input->nTimeStamp = timestamp;
++   }
+ 
+    if (input->pInputPortPrivate) {
+       if (output->pInputPortPrivate) {
+@@ -539,6 +545,7 @@ static void vid_dec_FrameDecoded(OMX_COMPONENTTYPE *comp, OMX_BUFFERHEADERTYPE*
+          vid_dec_FillOutput(priv, input->pInputPortPrivate, output);
+       }
+       output->nFilledLen = output->nAllocLen;
++      output->nTimeStamp = input->nTimeStamp;
+    }
+ 
+    if (eos && input->pInputPortPrivate)
+diff --git a/src/gallium/state_trackers/omx/vid_dec.h b/src/gallium/state_trackers/omx/vid_dec.h
+index 3b39826..649d745 100644
+--- a/src/gallium/state_trackers/omx/vid_dec.h
++++ b/src/gallium/state_trackers/omx/vid_dec.h
+@@ -59,6 +59,8 @@
+ #define OMX_VID_DEC_AVC_NAME "OMX.mesa.video_decoder.avc"
+ #define OMX_VID_DEC_AVC_ROLE "video_decoder.avc"
+ 
++#define OMX_VID_DEC_TIMESTAMP_INVALID ((OMX_TICKS) -1)
++
+ struct vl_vlc;
+ 
+ DERIVEDCLASS(vid_dec_PrivateType, omx_base_filter_PrivateType)
+@@ -69,7 +71,7 @@ DERIVEDCLASS(vid_dec_PrivateType, omx_base_filter_PrivateType)
+    struct pipe_video_codec *codec; \
+    void (*Decode)(vid_dec_PrivateType *priv, struct vl_vlc *vlc, unsigned min_bits_left); \
+    void (*EndFrame)(vid_dec_PrivateType *priv); \
+-   struct pipe_video_buffer *(*Flush)(vid_dec_PrivateType *priv); \
++   struct pipe_video_buffer *(*Flush)(vid_dec_PrivateType *priv, OMX_TICKS *timestamp); \
+    struct pipe_video_buffer *target, *shadow; \
+    union { \
+       struct { \
+@@ -100,6 +102,9 @@ DERIVEDCLASS(vid_dec_PrivateType, omx_base_filter_PrivateType)
+    OMX_BUFFERHEADERTYPE *in_buffers[2]; \
+    const void *inputs[2]; \
+    unsigned sizes[2]; \
++   OMX_TICKS timestamps[2]; \
++   OMX_TICKS timestamp; \
++   bool first_buf_in_frame; \
+    bool frame_finished; \
+    bool frame_started; \
+    unsigned bytes_left; \
+diff --git a/src/gallium/state_trackers/omx/vid_dec_h264.c b/src/gallium/state_trackers/omx/vid_dec_h264.c
+index c87395e..b52fe87 100644
+--- a/src/gallium/state_trackers/omx/vid_dec_h264.c
++++ b/src/gallium/state_trackers/omx/vid_dec_h264.c
+@@ -44,6 +44,7 @@
+ struct dpb_list {
+    struct list_head list;
+    struct pipe_video_buffer *buffer;
++   OMX_TICKS timestamp;
+    unsigned poc;
+ };
+ 
+@@ -97,7 +98,7 @@ static const uint8_t Zigzag_Scan8[64] = {
+ 
+ static void vid_dec_h264_Decode(vid_dec_PrivateType *priv, struct vl_vlc *vlc, unsigned min_bits_left);
+ static void vid_dec_h264_EndFrame(vid_dec_PrivateType *priv);
+-static struct pipe_video_buffer *vid_dec_h264_Flush(vid_dec_PrivateType *priv);
++static struct pipe_video_buffer *vid_dec_h264_Flush(vid_dec_PrivateType *priv, OMX_TICKS *timestamp);
+ 
+ void vid_dec_h264_Init(vid_dec_PrivateType *priv)
+ {
+@@ -109,6 +110,7 @@ void vid_dec_h264_Init(vid_dec_PrivateType *priv)
+ 
+    LIST_INITHEAD(&priv->codec_data.h264.dpb_list);
+    priv->picture.h264.field_order_cnt[0] = priv->picture.h264.field_order_cnt[1] = INT_MAX;
++   priv->first_buf_in_frame = true;
+ }
+ 
+ static void vid_dec_h264_BeginFrame(vid_dec_PrivateType *priv)
+@@ -119,6 +121,9 @@ static void vid_dec_h264_BeginFrame(vid_dec_PrivateType *priv)
+       return;
+ 
+    vid_dec_NeedTarget(priv);
++   if (priv->first_buf_in_frame)
++	   priv->timestamp = priv->timestamps[0];
++   priv->first_buf_in_frame = false;
+ 
+    priv->picture.h264.num_ref_frames = priv->picture.h264.pps->sps->max_num_ref_frames;
+ 
+@@ -142,7 +147,8 @@ static void vid_dec_h264_BeginFrame(vid_dec_PrivateType *priv)
+    priv->frame_started = true;
+ }
+ 
+-static struct pipe_video_buffer *vid_dec_h264_Flush(vid_dec_PrivateType *priv)
++static struct pipe_video_buffer *vid_dec_h264_Flush(vid_dec_PrivateType *priv,
++		OMX_TICKS *timestamp)
+ {
+    struct dpb_list *entry, *result = NULL;
+    struct pipe_video_buffer *buf;
+@@ -161,6 +167,8 @@ static struct pipe_video_buffer *vid_dec_h264_Flush(vid_dec_PrivateType *priv)
+       return NULL;
+ 
+    buf = result->buffer;
++   if (timestamp)
++	   *timestamp = result->timestamp;
+ 
+    --priv->codec_data.h264.dpb_num;
+    LIST_DEL(&result->list);
+@@ -174,6 +182,7 @@ static void vid_dec_h264_EndFrame(vid_dec_PrivateType *priv)
+    struct dpb_list *entry;
+    struct pipe_video_buffer *tmp;
+    bool top_field_first;
++   OMX_TICKS timestamp;
+ 
+    if (!priv->frame_started)
+       return;
+@@ -196,7 +205,9 @@ static void vid_dec_h264_EndFrame(vid_dec_PrivateType *priv)
+    if (!entry)
+       return;
+ 
++   priv->first_buf_in_frame = true;
+    entry->buffer = priv->target;
++   entry->timestamp = priv->timestamp;
+    entry->poc = MIN2(priv->picture.h264.field_order_cnt[0], priv->picture.h264.field_order_cnt[1]);
+    LIST_ADDTAIL(&entry->list, &priv->codec_data.h264.dpb_list);
+    ++priv->codec_data.h264.dpb_num;
+@@ -207,7 +218,8 @@ static void vid_dec_h264_EndFrame(vid_dec_PrivateType *priv)
+       return;
+ 
+    tmp = priv->in_buffers[0]->pInputPortPrivate;
+-   priv->in_buffers[0]->pInputPortPrivate = vid_dec_h264_Flush(priv);
++   priv->in_buffers[0]->pInputPortPrivate = vid_dec_h264_Flush(priv, &timestamp);
++   priv->in_buffers[0]->nTimeStamp = timestamp;
+    priv->target = tmp;
+    priv->frame_finished = priv->in_buffers[0]->pInputPortPrivate != NULL;
+ }
+diff --git a/src/gallium/state_trackers/omx/vid_dec_mpeg12.c b/src/gallium/state_trackers/omx/vid_dec_mpeg12.c
+index bef83ec..ade104a 100644
+--- a/src/gallium/state_trackers/omx/vid_dec_mpeg12.c
++++ b/src/gallium/state_trackers/omx/vid_dec_mpeg12.c
+@@ -61,7 +61,8 @@ static uint8_t default_non_intra_matrix[64] = {
+ 
+ static void vid_dec_mpeg12_Decode(vid_dec_PrivateType *priv, struct vl_vlc *vlc, unsigned min_bits_left);
+ static void vid_dec_mpeg12_EndFrame(vid_dec_PrivateType *priv);
+-static struct pipe_video_buffer *vid_dec_mpeg12_Flush(vid_dec_PrivateType *priv);
++static struct pipe_video_buffer *vid_dec_mpeg12_Flush(vid_dec_PrivateType *priv,
++		OMX_TICKS *timestamp);
+ 
+ void vid_dec_mpeg12_Init(vid_dec_PrivateType *priv)
+ {
+@@ -131,10 +132,13 @@ static void vid_dec_mpeg12_EndFrame(vid_dec_PrivateType *priv)
+    priv->in_buffers[0]->pInputPortPrivate = done;
+ }
+ 
+-static struct pipe_video_buffer *vid_dec_mpeg12_Flush(vid_dec_PrivateType *priv)
++static struct pipe_video_buffer *vid_dec_mpeg12_Flush(vid_dec_PrivateType *priv,
++		OMX_TICKS *timestamp)
+ {
+    struct pipe_video_buffer *result = priv->picture.mpeg12.ref[1];
+    priv->picture.mpeg12.ref[1] = NULL;
++   if (timestamp)
++	   *timestamp = OMX_VID_DEC_TIMESTAMP_INVALID;
+    return result;
+ }
+ 
+-- 
+2.1.4
+
