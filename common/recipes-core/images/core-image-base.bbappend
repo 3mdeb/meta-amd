@@ -1,1 +1,1 @@
-require conf/machine/include/amd-multimedia.inc
+require conf/machine/include/amd-common.inc
