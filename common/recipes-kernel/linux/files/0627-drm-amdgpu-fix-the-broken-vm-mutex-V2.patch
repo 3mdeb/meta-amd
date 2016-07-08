@@ -1,0 +1,311 @@
+From f48b2659f521301753f9b3b67e308a79c6110346 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <david1.zhou@amd.com>
+Date: Fri, 16 Oct 2015 14:06:19 +0800
+Subject: [PATCH 0627/1565] drm/amdgpu: fix the broken vm->mutex V2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+fix the vm->mutex and ww_mutex confilcts.
+vm->mutex is always token first, then ww_mutex.
+
+V2: remove unneccessary checking for pt bo.
+
+Change-Id: Iea56e183752c02831126d06d2f5b7a474a6e4743
+Signed-off-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  |  8 +++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c | 22 ++++++++++-----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c  | 35 +++------------------------------
+ 3 files changed, 19 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 5fdc039..8727c30 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -608,7 +608,6 @@ static int amdgpu_cs_ib_vm_chunk(struct amdgpu_device *adev,
+ 		}
+ 	}
+ 
+-	mutex_lock(&vm->mutex);
+ 	r = amdgpu_bo_vm_update_pte(parser, vm);
+ 	if (r) {
+ 		goto out;
+@@ -619,7 +618,6 @@ static int amdgpu_cs_ib_vm_chunk(struct amdgpu_device *adev,
+ 				       parser->filp);
+ 
+ out:
+-	mutex_unlock(&vm->mutex);
+ 	return r;
+ }
+ 
+@@ -827,6 +825,8 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ {
+ 	struct amdgpu_device *adev = dev->dev_private;
+ 	union drm_amdgpu_cs *cs = data;
++	struct amdgpu_fpriv *fpriv = filp->driver_priv;
++	struct amdgpu_vm *vm = &fpriv->vm;
+ 	struct amdgpu_cs_parser *parser;
+ 	bool reserved_buffers = false;
+ 	int i, r;
+@@ -844,7 +844,7 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		r = amdgpu_cs_handle_lockup(adev, r);
+ 		return r;
+ 	}
+-
++	mutex_lock(&vm->mutex);
+ 	r = amdgpu_cs_parser_relocs(parser);
+ 	if (r == -ENOMEM)
+ 		DRM_ERROR("Not enough memory for command submission!\n");
+@@ -911,12 +911,14 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 
+ 		mutex_unlock(&job->job_lock);
+ 		amdgpu_cs_parser_fini_late(parser);
++		mutex_unlock(&vm->mutex);
+ 		return 0;
+ 	}
+ 
+ 	cs->out.handle = parser->ibs[parser->num_ibs - 1].sequence;
+ out:
+ 	amdgpu_cs_parser_fini(parser, r, reserved_buffers);
++	mutex_unlock(&vm->mutex);
+ 	r = amdgpu_cs_handle_lockup(adev, r);
+ 	return r;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index d81ab78..0873328 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -115,9 +115,10 @@ int amdgpu_gem_object_open(struct drm_gem_object *obj, struct drm_file *file_pri
+ 	struct amdgpu_vm *vm = &fpriv->vm;
+ 	struct amdgpu_bo_va *bo_va;
+ 	int r;
+-
++	mutex_lock(&vm->mutex);
+ 	r = amdgpu_bo_reserve(rbo, false);
+ 	if (r) {
++		mutex_unlock(&vm->mutex);
+ 		return r;
+ 	}
+ 
+@@ -128,7 +129,7 @@ int amdgpu_gem_object_open(struct drm_gem_object *obj, struct drm_file *file_pri
+ 		++bo_va->ref_count;
+ 	}
+ 	amdgpu_bo_unreserve(rbo);
+-
++	mutex_unlock(&vm->mutex);
+ 	return 0;
+ }
+ 
+@@ -141,9 +142,10 @@ void amdgpu_gem_object_close(struct drm_gem_object *obj,
+ 	struct amdgpu_vm *vm = &fpriv->vm;
+ 	struct amdgpu_bo_va *bo_va;
+ 	int r;
+-
++	mutex_lock(&vm->mutex);
+ 	r = amdgpu_bo_reserve(rbo, true);
+ 	if (r) {
++		mutex_unlock(&vm->mutex);
+ 		dev_err(adev->dev, "leaking bo va because "
+ 			"we fail to reserve bo (%d)\n", r);
+ 		return;
+@@ -155,6 +157,7 @@ void amdgpu_gem_object_close(struct drm_gem_object *obj,
+ 		}
+ 	}
+ 	amdgpu_bo_unreserve(rbo);
++	mutex_unlock(&vm->mutex);
+ }
+ 
+ static int amdgpu_gem_handle_lockup(struct amdgpu_device *adev, int r)
+@@ -481,18 +484,13 @@ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
+ 			goto error_unreserve;
+ 	}
+ 
+-	mutex_lock(&bo_va->vm->mutex);
+ 	r = amdgpu_vm_clear_freed(adev, bo_va->vm);
+ 	if (r)
+-		goto error_unlock;
+-
++		goto error_unreserve;
+ 
+ 	if (operation == AMDGPU_VA_OP_MAP)
+ 		r = amdgpu_vm_bo_update(adev, bo_va, &bo_va->bo->tbo.mem);
+ 
+-error_unlock:
+-	mutex_unlock(&bo_va->vm->mutex);
+-
+ error_unreserve:
+ 	ttm_eu_backoff_reservation(&ticket, &list);
+ 
+@@ -549,10 +547,11 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 	gobj = drm_gem_object_lookup(dev, filp, args->handle);
+ 	if (gobj == NULL)
+ 		return -ENOENT;
+-
++	mutex_lock(&fpriv->vm.mutex);
+ 	rbo = gem_to_amdgpu_bo(gobj);
+ 	r = amdgpu_bo_reserve(rbo, false);
+ 	if (r) {
++		mutex_unlock(&fpriv->vm.mutex);
+ 		drm_gem_object_unreference_unlocked(gobj);
+ 		return r;
+ 	}
+@@ -560,6 +559,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 	bo_va = amdgpu_vm_bo_find(&fpriv->vm, rbo);
+ 	if (!bo_va) {
+ 		amdgpu_bo_unreserve(rbo);
++		mutex_unlock(&fpriv->vm.mutex);
+ 		return -ENOENT;
+ 	}
+ 
+@@ -584,7 +584,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 
+ 	if (!r && !(args->flags & AMDGPU_VM_DELAY_UPDATE))
+ 		amdgpu_gem_va_update_vm(adev, bo_va, args->operation);
+-
++	mutex_unlock(&fpriv->vm.mutex);
+ 	drm_gem_object_unreference_unlocked(gobj);
+ 	return r;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 0675524..06e207f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -90,11 +90,9 @@ struct amdgpu_bo_list_entry *amdgpu_vm_get_bos(struct amdgpu_device *adev,
+ 	struct amdgpu_bo_list_entry *list;
+ 	unsigned i, idx;
+ 
+-	mutex_lock(&vm->mutex);
+ 	list = drm_malloc_ab(vm->max_pde_used + 2,
+ 			     sizeof(struct amdgpu_bo_list_entry));
+ 	if (!list) {
+-		mutex_unlock(&vm->mutex);
+ 		return NULL;
+ 	}
+ 
+@@ -119,7 +117,6 @@ struct amdgpu_bo_list_entry *amdgpu_vm_get_bos(struct amdgpu_device *adev,
+ 		list[idx].tv.shared = true;
+ 		list_add(&list[idx++].tv.head, head);
+ 	}
+-	mutex_unlock(&vm->mutex);
+ 
+ 	return list;
+ }
+@@ -970,9 +967,7 @@ struct amdgpu_bo_va *amdgpu_vm_bo_add(struct amdgpu_device *adev,
+ 	INIT_LIST_HEAD(&bo_va->invalids);
+ 	INIT_LIST_HEAD(&bo_va->vm_status);
+ 
+-	mutex_lock(&vm->mutex);
+ 	list_add_tail(&bo_va->bo_list, &bo->va);
+-	mutex_unlock(&vm->mutex);
+ 
+ 	return bo_va;
+ }
+@@ -1025,8 +1020,6 @@ int amdgpu_vm_bo_map(struct amdgpu_device *adev,
+ 		return -EINVAL;
+ 	}
+ 
+-	mutex_lock(&vm->mutex);
+-
+ 	saddr /= AMDGPU_GPU_PAGE_SIZE;
+ 	eaddr /= AMDGPU_GPU_PAGE_SIZE;
+ 
+@@ -1040,14 +1033,14 @@ int amdgpu_vm_bo_map(struct amdgpu_device *adev,
+ 			tmp->it.start, tmp->it.last + 1);
+ 		amdgpu_bo_unreserve(bo_va->bo);
+ 		r = -EINVAL;
+-		goto error_unlock;
++		goto error;
+ 	}
+ 
+ 	mapping = kmalloc(sizeof(*mapping), GFP_KERNEL);
+ 	if (!mapping) {
+ 		amdgpu_bo_unreserve(bo_va->bo);
+ 		r = -ENOMEM;
+-		goto error_unlock;
++		goto error;
+ 	}
+ 
+ 	INIT_LIST_HEAD(&mapping->list);
+@@ -1079,9 +1072,6 @@ int amdgpu_vm_bo_map(struct amdgpu_device *adev,
+ 		if (vm->page_tables[pt_idx].bo)
+ 			continue;
+ 
+-		/* drop mutex to allocate and clear page table */
+-		mutex_unlock(&vm->mutex);
+-
+ 		ww_mutex_lock(&resv->lock, NULL);
+ 		r = amdgpu_bo_create(adev, AMDGPU_VM_PTE_COUNT * 8,
+ 				     AMDGPU_GPU_PAGE_SIZE, true,
+@@ -1098,32 +1088,19 @@ int amdgpu_vm_bo_map(struct amdgpu_device *adev,
+ 			goto error_free;
+ 		}
+ 
+-		/* aquire mutex again */
+-		mutex_lock(&vm->mutex);
+-		if (vm->page_tables[pt_idx].bo) {
+-			/* someone else allocated the pt in the meantime */
+-			mutex_unlock(&vm->mutex);
+-			amdgpu_bo_unref(&pt);
+-			mutex_lock(&vm->mutex);
+-			continue;
+-		}
+-
+ 		vm->page_tables[pt_idx].addr = 0;
+ 		vm->page_tables[pt_idx].bo = pt;
+ 	}
+ 
+-	mutex_unlock(&vm->mutex);
+ 	return 0;
+ 
+ error_free:
+-	mutex_lock(&vm->mutex);
+ 	list_del(&mapping->list);
+ 	interval_tree_remove(&mapping->it, &vm->va);
+ 	trace_amdgpu_vm_bo_unmap(bo_va, mapping);
+ 	kfree(mapping);
+ 
+-error_unlock:
+-	mutex_unlock(&vm->mutex);
++error:
+ 	return r;
+ }
+ 
+@@ -1168,7 +1145,6 @@ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
+ 		}
+ 	}
+ 
+-	mutex_lock(&vm->mutex);
+ 	list_del(&mapping->list);
+ 	interval_tree_remove(&mapping->it, &vm->va);
+ 	trace_amdgpu_vm_bo_unmap(bo_va, mapping);
+@@ -1177,7 +1153,6 @@ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
+ 		list_add(&mapping->list, &vm->freed);
+ 	else
+ 		kfree(mapping);
+-	mutex_unlock(&vm->mutex);
+ 	amdgpu_bo_unreserve(bo_va->bo);
+ 
+ 	return 0;
+@@ -1201,8 +1176,6 @@ void amdgpu_vm_bo_rmv(struct amdgpu_device *adev,
+ 
+ 	list_del(&bo_va->bo_list);
+ 
+-	mutex_lock(&vm->mutex);
+-
+ 	spin_lock(&vm->status_lock);
+ 	list_del(&bo_va->vm_status);
+ 	spin_unlock(&vm->status_lock);
+@@ -1221,8 +1194,6 @@ void amdgpu_vm_bo_rmv(struct amdgpu_device *adev,
+ 
+ 	fence_put(bo_va->last_pt_update);
+ 	kfree(bo_va);
+-
+-	mutex_unlock(&vm->mutex);
+ }
+ 
+ /**
+-- 
+1.9.1
+
