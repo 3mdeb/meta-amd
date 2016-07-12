@@ -1,0 +1,132 @@
+From b51ddeb2d44ea0c5732d7446f5a23601c0fd4b5e Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Mon, 7 Mar 2016 12:49:55 +0800
+Subject: [PATCH 1559/1565] drm/amdgpu: use sched_job_init to initialize
+ sched_job
+
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c        | 23 ++++++++++-------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c       | 15 +++++++++------
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 17 +++++++++++++++++
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  5 ++++-
+ 4 files changed, 40 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 9392e50..23266b4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -862,27 +862,24 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ 			    union drm_amdgpu_cs *cs)
+ {
+ 	struct amdgpu_ring *ring = p->job->ring;
+-	struct amd_sched_fence *fence;
++	struct fence *fence;
+ 	struct amdgpu_job *job;
++	int r;
+ 
+ 	job = p->job;
+ 	p->job = NULL;
+ 
+-	job->base.sched = &ring->sched;
+-	job->base.s_entity = &p->ctx->rings[ring->idx].entity;
+-	job->owner = p->filp;
+-
+-	fence = amd_sched_fence_create(job->base.s_entity, p->filp);
+-	if (!fence) {
++	r = amd_sched_job_init(&job->base, &ring->sched,
++						&p->ctx->rings[ring->idx].entity,
++						p->filp, &fence);
++	if (r) {
+ 		amdgpu_job_free(job);
+-		return -ENOMEM;
++		return r;
+ 	}
+ 
+-	job->base.s_fence = fence;
+-	p->fence = fence_get(&fence->base);
+-
+-	cs->out.handle = amdgpu_ctx_add_fence(p->ctx, ring,
+-					      &fence->base);
++	job->owner = p->filp;
++	p->fence = fence_get(fence);
++	cs->out.handle = amdgpu_ctx_add_fence(p->ctx, ring, fence);
+ 	job->ibs[job->num_ibs - 1].sequence = cs->out.handle;
+ 
+ 	trace_amdgpu_cs_ioctl(job);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index 9c9b19e..eb0f789 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -87,16 +87,19 @@ int amdgpu_job_submit(struct amdgpu_job *job, struct amdgpu_ring *ring,
+ 		      struct amd_sched_entity *entity, void *owner,
+ 		      struct fence **f)
+ {
++	struct fence *fence;
++	int r;
+ 	job->ring = ring;
+-	job->base.sched = &ring->sched;
+-	job->base.s_entity = entity;
+-	job->base.s_fence = amd_sched_fence_create(job->base.s_entity, owner);
+-	if (!job->base.s_fence)
+-		return -ENOMEM;
+ 
+-	*f = fence_get(&job->base.s_fence->base);
++	if (!f)
++		return -EINVAL;
++
++	r = amd_sched_job_init(&job->base, &ring->sched, entity, owner, &fence);
++	if (r)
++		return r;
+ 
+ 	job->owner = owner;
++	*f = fence_get(fence);
+ 	amd_sched_entity_push_job(&job->base);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index a5ff945..b9d5822 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -335,6 +335,23 @@ void amd_sched_entity_push_job(struct amd_sched_job *sched_job)
+ 		   amd_sched_entity_in(sched_job));
+ }
+ 
++/* init a sched_job with basic field */
++int amd_sched_job_init(struct amd_sched_job *job,
++						struct amd_gpu_scheduler *sched,
++						struct amd_sched_entity *entity,
++						void *owner, struct fence **fence)
++{
++	job->sched = sched;
++	job->s_entity = entity;
++	job->s_fence = amd_sched_fence_create(entity, owner);
++	if (!job->s_fence)
++		return -ENOMEM;
++
++	if (fence)
++		*fence = &job->s_fence->base;
++	return 0;
++}
++
+ /**
+  * Return ture if we can push more jobs to the hw.
+  */
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index 9403145..74bbec8 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -144,5 +144,8 @@ struct amd_sched_fence *amd_sched_fence_create(
+ 	struct amd_sched_entity *s_entity, void *owner);
+ void amd_sched_fence_scheduled(struct amd_sched_fence *fence);
+ void amd_sched_fence_signal(struct amd_sched_fence *fence);
+-
++int amd_sched_job_init(struct amd_sched_job *job,
++					struct amd_gpu_scheduler *sched,
++					struct amd_sched_entity *entity,
++					void *owner, struct fence **fence);
+ #endif
+-- 
+1.9.1
+

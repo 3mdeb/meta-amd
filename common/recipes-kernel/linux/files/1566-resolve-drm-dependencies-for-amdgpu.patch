@@ -1,0 +1,1850 @@
+From 0fa77fad44d7084484ed28dc7237cc82d777e42d Mon Sep 17 00:00:00 2001
+From: Sanjay R Mehta <sanju.mehta@amd.com>
+Date: Sat, 23 Apr 2016 15:11:26 +0530
+Subject: [PATCH 03/12] resolve drm dependencies for amdgpu
+
+---
+ drivers/dma-buf/fence.c                            | 107 ++++
+ drivers/gpu/drm/Kconfig                            |  25 +
+ drivers/gpu/drm/Makefile                           |   1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h                |   8 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_atpx_handler.c   |   2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_display.c        |  35 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c             |   9 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c            |  13 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h           |   5 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c             |   2 +-
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c  |  16 +-
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    |   2 +
+ .../gpu/drm/amd/dal/dc/dce110/dce110_ipp_cursor.c  |  41 +-
+ drivers/gpu/drm/amd/dal/dc/dm_services.h           |  34 --
+ drivers/gpu/drm/drm_atomic_helper.c                |  99 ++-
+ drivers/gpu/drm/drm_fb_helper.c                    |  80 +++
+ drivers/gpu/drm/drm_pci.c                          |  20 +
+ drivers/gpu/drm/ttm/ttm_bo.c                       |  20 +
+ include/drm/drmP.h                                 |   7 +
+ include/drm/drm_atomic.h                           |  22 +
+ include/drm/drm_atomic_helper.h                    |   4 +
+ include/drm/drm_crtc.h                             |   2 +
+ include/drm/drm_dp_mst_helper.h                    |   1 +
+ include/drm/drm_fb_helper.h                        |   4 +
+ include/drm/ttm/ttm_bo_api.h                       |  10 +
+ include/linux/fence.h                              |  18 +
+ include/uapi/drm/amdgpu_drm.h                      | 673 +++++++++++++++++++++
+ 27 files changed, 1170 insertions(+), 90 deletions(-)
+ create mode 100644 include/uapi/drm/amdgpu_drm.h
+
+diff --git a/drivers/dma-buf/fence.c b/drivers/dma-buf/fence.c
+index 50ef8bd..192f99b 100644
+--- a/drivers/dma-buf/fence.c
++++ b/drivers/dma-buf/fence.c
+@@ -397,6 +397,113 @@ out:
+ }
+ EXPORT_SYMBOL(fence_default_wait);
+ 
++static bool
++fence_test_signaled_any(struct fence **fences, uint32_t count, uint32_t *idx)
++{
++	int i;
++
++	for (i = 0; i < count; ++i) {
++		struct fence *fence = fences[i];
++		if (test_bit(FENCE_FLAG_SIGNALED_BIT, &fence->flags)) {
++			if (idx)
++				*idx = i;
++			return true;
++		}
++	}
++	return false;
++}
++
++/**
++ * fence_wait_any_timeout - sleep until any fence gets signaled
++ * or until timeout elapses
++ * @fences:	[in]	array of fences to wait on
++ * @count:	[in]	number of fences to wait on
++ * @intr:	[in]	if true, do an interruptible wait
++ * @timeout:	[in]	timeout value in jiffies, or MAX_SCHEDULE_TIMEOUT
++ * @idx:	[out]	the first signaled fence index, meaninful only on Returns positive
++ *
++ * Returns -EINVAL on custom fence wait implementation, -ERESTARTSYS if
++ * interrupted, 0 if the wait timed out, or the remaining timeout in jiffies
++ * on success.
++ *
++ * Synchronous waits for the first fence in the array to be signaled. The
++ * caller needs to hold a reference to all fences in the array, otherwise a
++ * fence might be freed before return, resulting in undefined behavior.
++ */
++signed long
++fence_wait_any_timeout(struct fence **fences, uint32_t count,
++		       bool intr, signed long timeout, uint32_t *idx)
++{
++	struct default_wait_cb *cb;
++	signed long ret = timeout;
++	unsigned i;
++
++	if (WARN_ON(!fences || !count || timeout < 0))
++		return -EINVAL;
++
++	if (timeout == 0) {
++		for (i = 0; i < count; ++i)
++			if (fence_is_signaled(fences[i])) {
++				if (idx)
++					*idx = i;
++				return 1;
++			}
++
++		return 0;
++	}
++
++	cb = kcalloc(count, sizeof(struct default_wait_cb), GFP_KERNEL);
++	if (cb == NULL) {
++		ret = -ENOMEM;
++		goto err_free_cb;
++	}
++
++	for (i = 0; i < count; ++i) {
++		struct fence *fence = fences[i];
++
++		if (fence->ops->wait != fence_default_wait) {
++			ret = -EINVAL;
++			goto fence_rm_cb;
++		}
++
++		cb[i].task = current;
++		if (fence_add_callback(fence, &cb[i].base,
++				       fence_default_wait_cb)) {
++			/* This fence is already signaled */
++			if (idx)
++				*idx = i;
++			goto fence_rm_cb;
++		}
++	}
++
++	while (ret > 0) {
++		if (intr)
++			set_current_state(TASK_INTERRUPTIBLE);
++		else
++			set_current_state(TASK_UNINTERRUPTIBLE);
++
++		if (fence_test_signaled_any(fences, count, idx))
++			break;
++
++		ret = schedule_timeout(ret);
++
++		if (ret > 0 && intr && signal_pending(current))
++			ret = -ERESTARTSYS;
++	}
++
++	__set_current_state(TASK_RUNNING);
++
++fence_rm_cb:
++	while (i-- > 0)
++		fence_remove_callback(fences[i], &cb[i].base);
++
++err_free_cb:
++	kfree(cb);
++
++	return ret;
++}
++EXPORT_SYMBOL(fence_wait_any_timeout);
++
+ /**
+  * fence_init - Initialize a custom fence.
+  * @fence:	[in]	the fence to initialize
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+index 47f2ce8..98724d8 100644
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -120,6 +120,31 @@ config DRM_RADEON
+ 
+ source "drivers/gpu/drm/radeon/Kconfig"
+ 
++config DRM_AMDGPU
++        tristate "AMD GPU"
++        depends on DRM && PCI
++        select FB_CFB_FILLRECT
++        select FB_CFB_COPYAREA
++        select FB_CFB_IMAGEBLIT
++        select FW_LOADER
++        select DRM_KMS_HELPER
++        select DRM_KMS_FB_HELPER
++        select DRM_TTM
++        select POWER_SUPPLY
++        select HWMON
++        select BACKLIGHT_CLASS_DEVICE
++        select BACKLIGHT_LCD_SUPPORT
++        select INTERVAL_TREE
++        help
++          Choose this option if you have a recent AMD Radeon graphics card.
++
++          If M is selected, the module will be called amdgpu.
++
++source "drivers/gpu/drm/amd/amdgpu/Kconfig"
++source "drivers/gpu/drm/amd/powerplay/Kconfig"
++
++source "drivers/gpu/drm/amd/acp/Kconfig"
++
+ source "drivers/gpu/drm/nouveau/Kconfig"
+ 
+ config DRM_I810
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index 7d4944e..ca5cf1a 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -39,6 +39,7 @@ obj-$(CONFIG_DRM_TDFX)	+= tdfx/
+ obj-$(CONFIG_DRM_R128)	+= r128/
+ obj-$(CONFIG_HSA_AMD) += amd/amdkfd/
+ obj-$(CONFIG_DRM_RADEON)+= radeon/
++obj-$(CONFIG_DRM_AMDGPU)+= amd/amdgpu/
+ obj-$(CONFIG_DRM_MGA)	+= mga/
+ obj-$(CONFIG_DRM_I810)	+= i810/
+ obj-$(CONFIG_DRM_I915)  += i915/
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index d792c3c..baa2586 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -2364,10 +2364,10 @@ void amdgpu_driver_preclose_kms(struct drm_device *dev,
+ 				struct drm_file *file_priv);
+ int amdgpu_suspend_kms(struct drm_device *dev, bool suspend, bool fbcon);
+ int amdgpu_resume_kms(struct drm_device *dev, bool resume, bool fbcon);
+-u32 amdgpu_get_vblank_counter_kms(struct drm_device *dev, unsigned int pipe);
+-int amdgpu_enable_vblank_kms(struct drm_device *dev, unsigned int pipe);
+-void amdgpu_disable_vblank_kms(struct drm_device *dev, unsigned int pipe);
+-int amdgpu_get_vblank_timestamp_kms(struct drm_device *dev, unsigned int pipe,
++u32 amdgpu_get_vblank_counter_kms(struct drm_device *dev, int pipe);
++int amdgpu_enable_vblank_kms(struct drm_device *dev, int pipe);
++void amdgpu_disable_vblank_kms(struct drm_device *dev, int pipe);
++int amdgpu_get_vblank_timestamp_kms(struct drm_device *dev, int pipe,
+ 				    int *max_error,
+ 				    struct timeval *vblank_time,
+ 				    unsigned flags);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_atpx_handler.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_atpx_handler.c
+index 81dc6b6..338810b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_atpx_handler.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_atpx_handler.c
+@@ -501,7 +501,7 @@ static int amdgpu_atpx_get_client_id(struct pci_dev *pdev)
+ 		return VGA_SWITCHEROO_DIS;
+ }
+ 
+-static const struct vga_switcheroo_handler amdgpu_atpx_handler = {
++static struct vga_switcheroo_handler amdgpu_atpx_handler = {
+ 	.switchto = amdgpu_atpx_switchto,
+ 	.power_state = amdgpu_atpx_power_state,
+ 	.init = amdgpu_atpx_init,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+index 68a2398..074a2ad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+@@ -71,8 +71,7 @@ static void amdgpu_flip_work_func(struct work_struct *__work)
+ 	struct drm_crtc *crtc = &amdgpuCrtc->base;
+ 	unsigned long flags;
+ 	unsigned i, repcnt = 4;
+-	int vpos, hpos, stat, min_udelay = 0;
+-	struct drm_vblank_crtc *vblank = &crtc->dev->vblank[work->crtc_id];
++	int vpos, hpos, stat;
+ 
+ 	if (amdgpu_flip_handle_fence(work, &work->excl))
+ 		return;
+@@ -104,8 +103,7 @@ static void amdgpu_flip_work_func(struct work_struct *__work)
+ 		 */
+ 		stat = amdgpu_get_crtc_scanoutpos(adev->ddev, work->crtc_id,
+ 						  GET_DISTANCE_TO_VBLANKSTART,
+-						  &vpos, &hpos, NULL, NULL,
+-						  &crtc->hwmode);
++						  &vpos, &hpos, NULL, NULL);
+ 
+ 		if ((stat & (DRM_SCANOUTPOS_VALID | DRM_SCANOUTPOS_ACCURATE)) !=
+ 		    (DRM_SCANOUTPOS_VALID | DRM_SCANOUTPOS_ACCURATE) ||
+@@ -113,24 +111,24 @@ static void amdgpu_flip_work_func(struct work_struct *__work)
+ 			break;
+ 
+ 		/* Sleep at least until estimated real start of hw vblank */
+-		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+-		min_udelay = (-hpos + 1) * max(vblank->linedur_ns / 1000, 5);
+-		if (min_udelay > vblank->framedur_ns / 2000) {
++	//	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++	//	min_udelay = (-hpos + 1) * max(vblank->linedur_ns / 1000, 5);
++	//	if (min_udelay > vblank->framedur_ns / 2000) {
+ 			/* Don't wait ridiculously long - something is wrong */
+-			repcnt = 0;
+-			break;
+-		}
+-		usleep_range(min_udelay, 2 * min_udelay);
+-		spin_lock_irqsave(&crtc->dev->event_lock, flags);
++	//		repcnt = 0;
++	//		break;
++	//	}
++	//	usleep_range(min_udelay, 2 * min_udelay);
++	//	spin_lock_irqsave(&crtc->dev->event_lock, flags);
+ 	};
+ 
+-	if (!repcnt)
++/*	if (!repcnt)
+ 		DRM_DEBUG_DRIVER("Delay problem on crtc %d: min_udelay %d, "
+ 				 "framedur %d, linedur %d, stat %d, vpos %d, "
+ 				 "hpos %d\n", work->crtc_id, min_udelay,
+ 				 vblank->framedur_ns / 1000,
+ 				 vblank->linedur_ns / 1000, stat, vpos, hpos);
+-
++*/
+ 	/* set the flip status */
+ 	amdgpuCrtc->pflip_status = AMDGPU_FLIP_SUBMITTED;
+ 	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+@@ -792,10 +790,9 @@ bool amdgpu_crtc_scaling_mode_fixup(struct drm_crtc *crtc,
+  * unknown small number of scanlines wrt. real scanout position.
+  *
+  */
+-int amdgpu_get_crtc_scanoutpos(struct drm_device *dev, unsigned int pipe,
++int amdgpu_get_crtc_scanoutpos(struct drm_device *dev, int pipe,
+ 			       unsigned int flags, int *vpos, int *hpos,
+-			       ktime_t *stime, ktime_t *etime,
+-			       const struct drm_display_mode *mode)
++			       ktime_t *stime, ktime_t *etime)
+ {
+ 	u32 vbl = 0, position = 0;
+ 	int vbl_start, vbl_end, vtotal, ret = 0;
+@@ -831,7 +828,7 @@ int amdgpu_get_crtc_scanoutpos(struct drm_device *dev, unsigned int pipe,
+ 	}
+ 	else {
+ 		/* No: Fake something reasonable which gives at least ok results. */
+-		vbl_start = mode->crtc_vdisplay;
++		vbl_start = adev->mode_info.crtcs[pipe]->base.hwmode.crtc_vdisplay;
+ 		vbl_end = 0;
+ 	}
+ 
+@@ -877,7 +874,7 @@ int amdgpu_get_crtc_scanoutpos(struct drm_device *dev, unsigned int pipe,
+ 
+ 	/* Inside "upper part" of vblank area? Apply corrective offset if so: */
+ 	if (in_vbl && (*vpos >= vbl_start)) {
+-		vtotal = mode->crtc_vtotal;
++		vtotal = adev->mode_info.crtcs[pipe]->base.hwmode.crtc_vtotal;
+ 		*vpos = *vpos - vtotal;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c
+index e694c99..aa1ecaa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c
+@@ -47,9 +47,9 @@ static struct fb_ops amdgpufb_ops = {
+ 	.owner = THIS_MODULE,
+ 	.fb_check_var = drm_fb_helper_check_var,
+ 	.fb_set_par = drm_fb_helper_set_par,
+-	.fb_fillrect = drm_fb_helper_cfb_fillrect,
+-	.fb_copyarea = drm_fb_helper_cfb_copyarea,
+-	.fb_imageblit = drm_fb_helper_cfb_imageblit,
++	.fb_fillrect = cfb_fillrect,
++	.fb_copyarea = cfb_copyarea,
++	.fb_imageblit = cfb_imageblit,
+ 	.fb_pan_display = drm_fb_helper_pan_display,
+ 	.fb_blank = drm_fb_helper_blank,
+ 	.fb_setcmap = drm_fb_helper_setcmap,
+@@ -376,8 +376,7 @@ void amdgpu_fbdev_fini(struct amdgpu_device *adev)
+ void amdgpu_fbdev_set_suspend(struct amdgpu_device *adev, int state)
+ {
+ 	if (adev->mode_info.rfbdev)
+-		drm_fb_helper_set_suspend(&adev->mode_info.rfbdev->helper,
+-			state);
++		fb_set_suspend(adev->mode_info.rfbdev->helper.fbdev, state);
+ }
+ 
+ int amdgpu_fbdev_total_size(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 7805a87..20a4695 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -607,7 +607,7 @@ void amdgpu_driver_preclose_kms(struct drm_device *dev,
+  * Gets the frame count on the requested crtc (all asics).
+  * Returns frame count on success, -EINVAL on failure.
+  */
+-u32 amdgpu_get_vblank_counter_kms(struct drm_device *dev, unsigned int pipe)
++u32 amdgpu_get_vblank_counter_kms(struct drm_device *dev, int pipe)
+ {
+ 	struct amdgpu_device *adev = dev->dev_private;
+ 	int vpos, hpos, stat;
+@@ -638,8 +638,7 @@ u32 amdgpu_get_vblank_counter_kms(struct drm_device *dev, unsigned int pipe)
+ 			 */
+ 			stat = amdgpu_get_crtc_scanoutpos(
+ 				dev, pipe, GET_DISTANCE_TO_VBLANKSTART,
+-				&vpos, &hpos, NULL, NULL,
+-				&adev->mode_info.crtcs[pipe]->base.hwmode);
++				&vpos, &hpos, NULL, NULL);
+ 		} while (count != amdgpu_display_vblank_get_counter(adev, pipe));
+ 
+ 		if (((stat & (DRM_SCANOUTPOS_VALID | DRM_SCANOUTPOS_ACCURATE)) !=
+@@ -674,7 +673,7 @@ u32 amdgpu_get_vblank_counter_kms(struct drm_device *dev, unsigned int pipe)
+  * Enable the interrupt on the requested crtc (all asics).
+  * Returns 0 on success, -EINVAL on failure.
+  */
+-int amdgpu_enable_vblank_kms(struct drm_device *dev, unsigned int pipe)
++int amdgpu_enable_vblank_kms(struct drm_device *dev, int pipe)
+ {
+ 	struct amdgpu_device *adev = dev->dev_private;
+ 	int idx = amdgpu_crtc_idx_to_irq_type(adev, pipe);
+@@ -690,7 +689,7 @@ int amdgpu_enable_vblank_kms(struct drm_device *dev, unsigned int pipe)
+  *
+  * Disable the interrupt on the requested crtc (all asics).
+  */
+-void amdgpu_disable_vblank_kms(struct drm_device *dev, unsigned int pipe)
++void amdgpu_disable_vblank_kms(struct drm_device *dev, int pipe)
+ {
+ 	struct amdgpu_device *adev = dev->dev_private;
+ 	int idx = amdgpu_crtc_idx_to_irq_type(adev, pipe);
+@@ -711,7 +710,7 @@ void amdgpu_disable_vblank_kms(struct drm_device *dev, unsigned int pipe)
+  * scanout position.  (all asics).
+  * Returns postive status flags on success, negative error on failure.
+  */
+-int amdgpu_get_vblank_timestamp_kms(struct drm_device *dev, unsigned int pipe,
++int amdgpu_get_vblank_timestamp_kms(struct drm_device *dev, int pipe,
+ 				    int *max_error,
+ 				    struct timeval *vblank_time,
+ 				    unsigned flags)
+@@ -736,7 +735,7 @@ int amdgpu_get_vblank_timestamp_kms(struct drm_device *dev, unsigned int pipe,
+ 	/* Helper routine in DRM core does all the work: */
+ 	return drm_calc_vbltimestamp_from_scanoutpos(dev, pipe, max_error,
+ 						     vblank_time, flags,
+-						     &crtc->hwmode);
++						     crtc,&crtc->hwmode);
+ }
+ 
+ const struct drm_ioctl_desc amdgpu_ioctls_kms[] = {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+index e13afcc..3bdeb65 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+@@ -603,10 +603,9 @@ bool amdgpu_ddc_probe(struct amdgpu_connector *amdgpu_connector, bool use_aux);
+ 
+ void amdgpu_encoder_set_active_device(struct drm_encoder *encoder);
+ 
+-int amdgpu_get_crtc_scanoutpos(struct drm_device *dev, unsigned int pipe,
++int amdgpu_get_crtc_scanoutpos(struct drm_device *dev, int pipe,
+ 			       unsigned int flags, int *vpos, int *hpos,
+-			       ktime_t *stime, ktime_t *etime,
+-			       const struct drm_display_mode *mode);
++			       ktime_t *stime, ktime_t *etime);
+ 
+ int amdgpu_framebuffer_init(struct drm_device *dev,
+ 			     struct amdgpu_framebuffer *rfb,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
+index 8bf84ef..a23b96f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c
+@@ -360,7 +360,7 @@ int amdgpu_sa_bo_new(struct amdgpu_sa_manager *sa_manager,
+ 		if (count) {
+ 			spin_unlock(&sa_manager->wq.lock);
+ 			t = fence_wait_any_timeout(fences, count, false,
+-						   MAX_SCHEDULE_TIMEOUT);
++						   MAX_SCHEDULE_TIMEOUT,NULL);
+ 			for (i = 0; i < count; ++i)
+ 				fence_put(fences[i]);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c
+index e442318..5eebdce 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c
+@@ -130,7 +130,7 @@ enum dc_edid_status dm_helpers_parse_edid_caps(
+ 	return result;
+ }
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+ static struct amdgpu_connector *get_connector_for_sink(
+ 	struct drm_device *dev,
+ 	const struct dc_sink *sink)
+@@ -164,7 +164,7 @@ static struct amdgpu_connector *get_connector_for_link(
+ 	return aconnector;
+ }
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+ static void get_payload_table(
+ 		struct amdgpu_connector *aconnector,
+ 		struct dp_mst_stream_allocation_table *proposed_table)
+@@ -212,7 +212,7 @@ bool dm_helpers_dp_mst_write_payload_allocation_table(
+ 		struct dp_mst_stream_allocation_table *proposed_table,
+ 		bool enable)
+ {
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+ 	struct amdgpu_device *adev = ctx->driver_context;
+ 	struct drm_device *dev = adev->ddev;
+ 	struct amdgpu_connector *aconnector;
+@@ -305,7 +305,7 @@ bool dm_helpers_dp_mst_poll_for_allocation_change_trigger(
+ 		struct dc_context *ctx,
+ 		const struct dc_stream *stream)
+ {
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+ 	struct amdgpu_device *adev = ctx->driver_context;
+ 	struct drm_device *dev = adev->ddev;
+ 	struct amdgpu_connector *aconnector;
+@@ -338,7 +338,7 @@ bool dm_helpers_dp_mst_send_payload_allocation(
+ 		const struct dc_stream *stream,
+ 		bool enable)
+ {
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+ 	struct amdgpu_device *adev = ctx->driver_context;
+ 	struct drm_device *dev = adev->ddev;
+ 	struct amdgpu_connector *aconnector;
+@@ -374,7 +374,7 @@ bool dm_helpers_dp_mst_send_payload_allocation(
+ 
+ void dm_helpers_dp_mst_handle_mst_hpd_rx_irq(void *param)
+ {
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+ 	uint8_t esi[8] = { 0 };
+ 	uint8_t dret;
+ 	bool new_irq_handled = true;
+@@ -423,7 +423,7 @@ bool dm_helpers_dp_mst_start_top_mgr(
+ 		const struct dc_link *link,
+ 		bool boot)
+ {
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+ 	struct amdgpu_device *adev = ctx->driver_context;
+ 	struct drm_device *dev = adev->ddev;
+ 	struct amdgpu_connector *aconnector = get_connector_for_link(dev, link);
+@@ -447,7 +447,7 @@ void dm_helpers_dp_mst_stop_top_mgr(
+ 		struct dc_context *ctx,
+ 		const struct dc_link *link)
+ {
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+ 	struct amdgpu_device *adev = ctx->driver_context;
+ 	struct drm_device *dev = adev->ddev;
+ 	struct amdgpu_connector *aconnector = get_connector_for_link(dev, link);
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index 14611e57..5a49f7d 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -1405,6 +1405,7 @@ static bool page_flip_needed(
+ 
+ static int dm_plane_helper_prepare_fb(
+ 	struct drm_plane *plane,
++	struct drm_framebuffer *fb,
+ 	const struct drm_plane_state *new_state)
+ {
+ 	struct amdgpu_framebuffer *afb;
+@@ -1439,6 +1440,7 @@ static int dm_plane_helper_prepare_fb(
+ 
+ static void dm_plane_helper_cleanup_fb(
+ 	struct drm_plane *plane,
++	struct drm_framebuffer *fb,
+ 	const struct drm_plane_state *old_state)
+ {
+ 	struct amdgpu_bo *rbo;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp_cursor.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp_cursor.c
+index 1737317..de5b7e2 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp_cursor.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp_cursor.c
+@@ -31,6 +31,9 @@
+ 
+ #include "dce110_ipp.h"
+ 
++static void generic_reg_update_ex(const struct dc_context *ctx,
++		uint32_t addr, uint32_t reg_val, int n, ...);
++
+ #define CURSOR_COLOR_BLACK 0x00000000
+ #define CURSOR_COLOR_WHITE 0xFFFFFFFF
+ 
+@@ -39,7 +42,6 @@
+ 
+ #define  DCP_REG_UPDATE_N(reg_name, n, ...)	\
+ 		generic_reg_update(ipp110->base.ctx, ipp110->offsets.dcp_offset, reg_name, n, __VA_ARGS__)
+-
+ #define  DCP_REG_SET_N(reg_name, n, ...)	\
+ 		generic_reg_set(ipp110->base.ctx, ipp110->offsets.dcp_offset, reg_name, n, __VA_ARGS__)
+ 
+@@ -49,6 +51,17 @@
+ #define DCP_REG_SET_2(reg, field1, val1, field2, val2)	\
+ 		DCP_REG_SET_N(reg, 2, FD(reg##__##field1), val1, FD(reg##__##field2), val2)
+ 
++
++#define generic_reg_update(ctx, inst_offset, reg_name, n, ...)\
++		generic_reg_update_ex(ctx, \
++		mm##reg_name + inst_offset, dm_read_reg(ctx, mm##reg_name + inst_offset), n, \
++		__VA_ARGS__)
++
++#define generic_reg_set(ctx, inst_offset, reg_name, n, ...)\
++		generic_reg_update_ex(ctx, \
++		mm##reg_name + inst_offset, 0, n, \
++		__VA_ARGS__)
++
+ static void enable(
+ 	struct dce110_ipp *ipp110,
+ 	bool enable);
+@@ -82,6 +95,32 @@ static void program_address(
+ 	struct dce110_ipp *ipp110,
+ 	PHYSICAL_ADDRESS_LOC address);
+ 
++
++static void generic_reg_update_ex(const struct dc_context *ctx,
++		uint32_t addr, uint32_t reg_val, int n, ...)
++{
++	int shift, mask, field_value;
++	int i = 0;
++
++	va_list ap;
++	va_start(ap, n);
++
++	 while (i < n) {
++		shift = va_arg(ap, int);
++		mask = va_arg(ap, int);
++		field_value = va_arg(ap, int);
++
++		reg_val = set_reg_field_value_ex(reg_val, field_value, mask, shift);
++		i++;
++	  }
++
++	 dm_write_reg(ctx, addr, reg_val);
++	 va_end(ap);
++
++
++}
++
++
+ void dce110_ipp_cursor_set_position(
+ 	struct input_pixel_processor *ipp,
+ 	const struct dc_cursor_position *position)
+diff --git a/drivers/gpu/drm/amd/dal/dc/dm_services.h b/drivers/gpu/drm/amd/dal/dc/dm_services.h
+index 15417e4..20f37dc 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dm_services.h
++++ b/drivers/gpu/drm/amd/dal/dc/dm_services.h
+@@ -145,40 +145,6 @@ static inline uint32_t set_reg_field_value_ex(
+ 		reg_name ## __ ## reg_field ## __SHIFT)
+ 
+ 
+-static inline void generic_reg_update_ex(const struct dc_context *ctx,
+-		uint32_t addr, uint32_t reg_val, int n, ...)
+-{
+-	int shift, mask, field_value;
+-	int i = 0;
+-
+-	va_list ap;
+-	va_start(ap, n);
+-
+-	 while (i < n) {
+-		shift = va_arg(ap, int);
+-		mask = va_arg(ap, int);
+-		field_value = va_arg(ap, int);
+-
+-		reg_val = set_reg_field_value_ex(reg_val, field_value, mask, shift);
+-		i++;
+-	  }
+-
+-	 dm_write_reg(ctx, addr, reg_val);
+-	 va_end(ap);
+-
+-
+-}
+-
+-#define generic_reg_update(ctx, inst_offset, reg_name, n, ...)\
+-		generic_reg_update_ex(ctx, \
+-		mm##reg_name + inst_offset, dm_read_reg(ctx, mm##reg_name + inst_offset), n, \
+-		__VA_ARGS__)
+-
+-#define generic_reg_set(ctx, inst_offset, reg_name, n, ...)\
+-		generic_reg_update_ex(ctx, \
+-		mm##reg_name + inst_offset, 0, n, \
+-		__VA_ARGS__)
+-
+ 
+ 
+ #define FD(reg_field)	reg_field ## __SHIFT, \
+diff --git a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_helper.c
+index 1d2ca52..d630c7f 100644
+--- a/drivers/gpu/drm/drm_atomic_helper.c
++++ b/drivers/gpu/drm/drm_atomic_helper.c
+@@ -124,7 +124,7 @@ steal_encoder(struct drm_atomic_state *state,
+ 	if (IS_ERR(crtc_state))
+ 		return PTR_ERR(crtc_state);
+ 
+-	crtc_state->mode_changed = true;
++	crtc_state->connectors_changed = true;
+ 
+ 	list_for_each_entry(connector, &config->connector_list, head) {
+ 		if (connector->state->best_encoder != encoder)
+@@ -174,14 +174,14 @@ update_connector_routing(struct drm_atomic_state *state, int conn_idx)
+ 			idx = drm_crtc_index(connector->state->crtc);
+ 
+ 			crtc_state = state->crtc_states[idx];
+-			crtc_state->mode_changed = true;
++			crtc_state->connectors_changed = true;
+ 		}
+ 
+ 		if (connector_state->crtc) {
+ 			idx = drm_crtc_index(connector_state->crtc);
+ 
+ 			crtc_state = state->crtc_states[idx];
+-			crtc_state->mode_changed = true;
++			crtc_state->connectors_changed = true;
+ 		}
+ 	}
+ 
+@@ -233,7 +233,7 @@ update_connector_routing(struct drm_atomic_state *state, int conn_idx)
+ 	idx = drm_crtc_index(connector_state->crtc);
+ 
+ 	crtc_state = state->crtc_states[idx];
+-	crtc_state->mode_changed = true;
++	crtc_state->connectors_changed = true;
+ 
+ 	DRM_DEBUG_ATOMIC("[CONNECTOR:%d:%s] using [ENCODER:%d:%s] on [CRTC:%d]\n",
+ 			 connector->base.id,
+@@ -256,7 +256,8 @@ mode_fixup(struct drm_atomic_state *state)
+ 	bool ret;
+ 
+ 	for_each_crtc_in_state(state, crtc, crtc_state, i) {
+-		if (!crtc_state->mode_changed)
++		if (!crtc_state->mode_changed &&
++		    !crtc_state->connectors_changed)
+ 			continue;
+ 
+ 		drm_mode_copy(&crtc_state->adjusted_mode, &crtc_state->mode);
+@@ -313,7 +314,8 @@ mode_fixup(struct drm_atomic_state *state)
+ 	for_each_crtc_in_state(state, crtc, crtc_state, i) {
+ 		const struct drm_crtc_helper_funcs *funcs;
+ 
+-		if (!crtc_state->mode_changed)
++		if (!crtc_state->mode_changed &&
++		    !crtc_state->connectors_changed)
+ 			continue;
+ 
+ 		funcs = crtc->helper_private;
+@@ -332,7 +334,8 @@ mode_fixup(struct drm_atomic_state *state)
+ static bool
+ needs_modeset(struct drm_crtc_state *state)
+ {
+-	return state->mode_changed || state->active_changed;
++	return state->mode_changed || state->active_changed ||
++	       state->connectors_changed;
+ }
+ 
+ /**
+@@ -378,6 +381,7 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
+ 			DRM_DEBUG_ATOMIC("[CRTC:%d] enable changed\n",
+ 					 crtc->base.id);
+ 			crtc_state->mode_changed = true;
++			crtc_state->connectors_changed = true;
+ 		}
+ 	}
+ 
+@@ -619,6 +623,86 @@ disable_outputs(struct drm_device *dev, struct drm_atomic_state *old_state)
+ 	}
+ }
+ 
++/**
++ * drm_atomic_helper_update_legacy_modeset_state - update legacy modeset state
++ * @dev: DRM device
++ * @old_state: atomic state object with old state structures
++ *
++ * This function updates all the various legacy modeset state pointers in
++ * connectors, encoders and crtcs. It also updates the timestamping constants
++ * used for precise vblank timestamps by calling
++ * drm_calc_timestamping_constants().
++ *
++ * Drivers can use this for building their own atomic commit if they don't have
++ * a pure helper-based modeset implementation.
++ */
++void
++drm_atomic_helper_update_legacy_modeset_state(struct drm_device *dev,
++					      struct drm_atomic_state *old_state)
++{
++	struct drm_connector *connector;
++	struct drm_connector_state *old_conn_state;
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *old_crtc_state;
++	int i;
++
++	/* clear out existing links and update dpms */
++	for_each_connector_in_state(old_state, connector, old_conn_state, i) {
++		if (connector->encoder) {
++			WARN_ON(!connector->encoder->crtc);
++
++			connector->encoder->crtc = NULL;
++			connector->encoder = NULL;
++		}
++
++		crtc = connector->state->crtc;
++		if ((!crtc && old_conn_state->crtc) ||
++		    (crtc && drm_atomic_crtc_needs_modeset(crtc->state))) {
++			struct drm_property *dpms_prop =
++				dev->mode_config.dpms_property;
++			int mode = DRM_MODE_DPMS_OFF;
++
++			if (crtc && crtc->state->active)
++				mode = DRM_MODE_DPMS_ON;
++
++			connector->dpms = mode;
++			drm_object_property_set_value(&connector->base,
++						      dpms_prop, mode);
++		}
++	}
++
++	/* set new links */
++	for_each_connector_in_state(old_state, connector, old_conn_state, i) {
++		if (!connector->state->crtc)
++			continue;
++
++		if (WARN_ON(!connector->state->best_encoder))
++			continue;
++
++		connector->encoder = connector->state->best_encoder;
++		connector->encoder->crtc = connector->state->crtc;
++	}
++
++	/* set legacy state in the crtc structure */
++	for_each_crtc_in_state(old_state, crtc, old_crtc_state, i) {
++		struct drm_plane *primary = crtc->primary;
++
++		crtc->mode = crtc->state->mode;
++		crtc->enabled = crtc->state->enable;
++
++		if (drm_atomic_get_existing_plane_state(old_state, primary) &&
++		    primary->state->crtc == crtc) {
++			crtc->x = primary->state->src_x >> 16;
++			crtc->y = primary->state->src_y >> 16;
++		}
++
++		if (crtc->state->enable)
++			drm_calc_timestamping_constants(crtc,
++							&crtc->state->adjusted_mode);
++	}
++}
++EXPORT_SYMBOL(drm_atomic_helper_update_legacy_modeset_state);
++
+ static void
+ set_routing_links(struct drm_device *dev, struct drm_atomic_state *old_state)
+ {
+@@ -1981,6 +2065,7 @@ void __drm_atomic_helper_crtc_duplicate_state(struct drm_crtc *crtc,
+ 	state->mode_changed = false;
+ 	state->active_changed = false;
+ 	state->planes_changed = false;
++	state->connectors_changed = false;
+ 	state->event = NULL;
+ }
+ EXPORT_SYMBOL(__drm_atomic_helper_crtc_duplicate_state);
+diff --git a/drivers/gpu/drm/drm_fb_helper.c b/drivers/gpu/drm/drm_fb_helper.c
+index cac4229..a5ae64a 100644
+--- a/drivers/gpu/drm/drm_fb_helper.c
++++ b/drivers/gpu/drm/drm_fb_helper.c
+@@ -667,6 +667,86 @@ out_free:
+ }
+ EXPORT_SYMBOL(drm_fb_helper_init);
+ 
++/**
++ * drm_fb_helper_alloc_fbi - allocate fb_info and some of its members
++ * @fb_helper: driver-allocated fbdev helper
++ *
++ * A helper to alloc fb_info and the members cmap and apertures. Called
++ * by the driver within the fb_probe fb_helper callback function.
++ *
++ * RETURNS:
++ * fb_info pointer if things went okay, pointer containing error code
++ * otherwise
++ */
++struct fb_info *drm_fb_helper_alloc_fbi(struct drm_fb_helper *fb_helper)
++{
++	struct device *dev = fb_helper->dev->dev;
++	struct fb_info *info;
++	int ret;
++
++	info = framebuffer_alloc(0, dev);
++	if (!info)
++		return ERR_PTR(-ENOMEM);
++
++	ret = fb_alloc_cmap(&info->cmap, 256, 0);
++	if (ret)
++		goto err_release;
++
++	info->apertures = alloc_apertures(1);
++	if (!info->apertures) {
++		ret = -ENOMEM;
++		goto err_free_cmap;
++	}
++
++	fb_helper->fbdev = info;
++
++	return info;
++
++err_free_cmap:
++	fb_dealloc_cmap(&info->cmap);
++err_release:
++	framebuffer_release(info);
++	return ERR_PTR(ret);
++}
++EXPORT_SYMBOL(drm_fb_helper_alloc_fbi);
++
++/**
++ * drm_fb_helper_unregister_fbi - unregister fb_info framebuffer device
++ * @fb_helper: driver-allocated fbdev helper
++ *
++ * A wrapper around unregister_framebuffer, to release the fb_info
++ * framebuffer device
++ */
++void drm_fb_helper_unregister_fbi(struct drm_fb_helper *fb_helper)
++{
++	if (fb_helper && fb_helper->fbdev)
++		unregister_framebuffer(fb_helper->fbdev);
++}
++EXPORT_SYMBOL(drm_fb_helper_unregister_fbi);
++
++/**
++ * drm_fb_helper_release_fbi - dealloc fb_info and its members
++ * @fb_helper: driver-allocated fbdev helper
++ *
++ * A helper to free memory taken by fb_info and the members cmap and
++ * apertures
++ */
++void drm_fb_helper_release_fbi(struct drm_fb_helper *fb_helper)
++{
++	if (fb_helper) {
++		struct fb_info *info = fb_helper->fbdev;
++
++		if (info) {
++			if (info->cmap.len)
++				fb_dealloc_cmap(&info->cmap);
++			framebuffer_release(info);
++		}
++
++		fb_helper->fbdev = NULL;
++	}
++}
++EXPORT_SYMBOL(drm_fb_helper_release_fbi);
++
+ void drm_fb_helper_fini(struct drm_fb_helper *fb_helper)
+ {
+ 	if (!list_empty(&fb_helper->kernel_fb_list)) {
+diff --git a/drivers/gpu/drm/drm_pci.c b/drivers/gpu/drm/drm_pci.c
+index 1b1bd42..0d2c1ef 100644
+--- a/drivers/gpu/drm/drm_pci.c
++++ b/drivers/gpu/drm/drm_pci.c
+@@ -403,6 +403,26 @@ int drm_pcie_get_speed_cap_mask(struct drm_device *dev, u32 *mask)
+ }
+ EXPORT_SYMBOL(drm_pcie_get_speed_cap_mask);
+ 
++int drm_pcie_get_max_link_width(struct drm_device *dev, u32 *mlw)
++{
++	struct pci_dev *root;
++	u32 lnkcap;
++
++	*mlw = 0;
++	if (!dev->pdev)
++		return -EINVAL;
++
++	root = dev->pdev->bus->self;
++
++	pcie_capability_read_dword(root, PCI_EXP_LNKCAP, &lnkcap);
++
++	*mlw = (lnkcap & PCI_EXP_LNKCAP_MLW) >> 4;
++
++	DRM_INFO("probing mlw for device %x:%x = %x\n", root->vendor, root->device, lnkcap);
++	return 0;
++}
++EXPORT_SYMBOL(drm_pcie_get_max_link_width);
++
+ #else
+ 
+ int drm_pci_init(struct drm_driver *driver, struct pci_driver *pdriver)
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index 8d9b7de..aa41b54 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -228,6 +228,26 @@ void ttm_bo_del_sub_from_lru(struct ttm_buffer_object *bo)
+ }
+ EXPORT_SYMBOL(ttm_bo_del_sub_from_lru);
+ 
++void ttm_bo_move_to_lru_tail(struct ttm_buffer_object *bo)
++{
++	struct ttm_bo_device *bdev = bo->bdev;
++	struct ttm_mem_type_manager *man;
++
++	lockdep_assert_held(&bo->resv->lock.base);
++
++	if (!list_empty(&bo->swap)) {
++		list_del(&bo->swap);
++		list_add_tail(&bo->swap, &bo->glob->swap_lru);
++	}
++
++	if (!list_empty(&bo->lru)) {
++		man = &bdev->man[bo->mem.mem_type];
++		list_del(&bo->lru);
++		list_add_tail(&bo->lru, &man->lru);
++	}
++}
++EXPORT_SYMBOL(ttm_bo_move_to_lru_tail);
++
+ /*
+  * Call bo->mutex locked.
+  */
+diff --git a/include/drm/drmP.h b/include/drm/drmP.h
+index 62c40777..0d88593 100644
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -125,6 +125,7 @@ struct dma_buf_attachment;
+ #define DRM_UT_KMS		0x04
+ #define DRM_UT_PRIME		0x08
+ #define DRM_UT_ATOMIC		0x10
++#define DRM_UT_VBL		0x20
+ 
+ extern __printf(2, 3)
+ void drm_ut_debug_printk(const char *function_name,
+@@ -216,6 +217,11 @@ void drm_err(const char *format, ...);
+ 		if (unlikely(drm_debug & DRM_UT_ATOMIC))		\
+ 			drm_ut_debug_printk(__func__, fmt, ##args);	\
+ 	} while (0)
++#define DRM_DEBUG_VBL(fmt, args...)					\
++	do {								\
++		if (unlikely(drm_debug & DRM_UT_VBL))			\
++			drm_ut_debug_printk(__func__, fmt, ##args);	\
++	} while (0)
+ 
+ /*@}*/
+ 
+@@ -1075,6 +1081,7 @@ static inline int drm_pci_set_busid(struct drm_device *dev,
+ #define DRM_PCIE_SPEED_80 4
+ 
+ extern int drm_pcie_get_speed_cap_mask(struct drm_device *dev, u32 *speed_mask);
++extern int drm_pcie_get_max_link_width(struct drm_device *dev, u32 *mlw);
+ 
+ /* platform section */
+ extern int drm_platform_init(struct drm_driver *driver, struct platform_device *platform_device);
+diff --git a/include/drm/drm_atomic.h b/include/drm/drm_atomic.h
+index 3f13b91..d01840c 100644
+--- a/include/drm/drm_atomic.h
++++ b/include/drm/drm_atomic.h
+@@ -54,6 +54,21 @@ int drm_atomic_connector_set_property(struct drm_connector *connector,
+ 		struct drm_connector_state *state, struct drm_property *property,
+ 		uint64_t val);
+ 
++/**
++ * drm_atomic_get_existing_plane_state - get plane state, if it exists
++ * @state: global atomic state object
++ * @plane: plane to grab
++ *
++ * This function returns the plane state for the given plane, or NULL
++ * if the plane is not part of the global atomic state.
++ */
++static inline struct drm_plane_state *
++drm_atomic_get_existing_plane_state(struct drm_atomic_state *state,
++				    struct drm_plane *plane)
++{
++	return state->plane_states[drm_plane_index(plane)];
++}
++
+ int __must_check
+ drm_atomic_set_crtc_for_plane(struct drm_plane_state *plane_state,
+ 			      struct drm_crtc *crtc);
+@@ -99,4 +114,11 @@ int __must_check drm_atomic_async_commit(struct drm_atomic_state *state);
+ 	     (__i)++)							\
+ 		if (plane_state)
+ 
++static inline bool
++drm_atomic_crtc_needs_modeset(struct drm_crtc_state *state)
++{
++	return state->mode_changed || state->active_changed ||
++	       state->connectors_changed;
++}
++
+ #endif /* DRM_ATOMIC_H_ */
+diff --git a/include/drm/drm_atomic_helper.h b/include/drm/drm_atomic_helper.h
+index d665781..6ee0ee5 100644
+--- a/include/drm/drm_atomic_helper.h
++++ b/include/drm/drm_atomic_helper.h
+@@ -43,6 +43,10 @@ int drm_atomic_helper_commit(struct drm_device *dev,
+ void drm_atomic_helper_wait_for_vblanks(struct drm_device *dev,
+ 					struct drm_atomic_state *old_state);
+ 
++void
++drm_atomic_helper_update_legacy_modeset_state(struct drm_device *dev,
++					      struct drm_atomic_state *old_state);
++
+ void drm_atomic_helper_commit_modeset_disables(struct drm_device *dev,
+ 					       struct drm_atomic_state *state);
+ void drm_atomic_helper_commit_modeset_enables(struct drm_device *dev,
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index ca71c03..6f3b6c1 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -254,6 +254,7 @@ struct drm_atomic_state;
+  * @active: whether the CRTC is actively displaying (used for DPMS)
+  * @mode_changed: for use by helpers and drivers when computing state updates
+  * @active_changed: for use by helpers and drivers when computing state updates
++ * @connectors_changed: connectors to this crtc have been updated
+  * @plane_mask: bitmask of (1 << drm_plane_index(plane)) of attached planes
+  * @last_vblank_count: for helpers and drivers to capture the vblank of the
+  * 	update to ensure framebuffer cleanup isn't done too early
+@@ -280,6 +281,7 @@ struct drm_crtc_state {
+ 	bool planes_changed : 1;
+ 	bool mode_changed : 1;
+ 	bool active_changed : 1;
++	bool connectors_changed : 1;
+ 
+ 	/* attached planes bitmask:
+ 	 * WARNING: transitional helpers do not maintain plane_mask so
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index c7f01d1..006062a 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -375,6 +375,7 @@ struct drm_dp_mst_topology_mgr;
+ struct drm_dp_mst_topology_cbs {
+ 	/* create a connector for a port */
+ 	struct drm_connector *(*add_connector)(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port, const char *path);
++	void (*register_connector)(struct drm_connector *connector);
+ 	void (*destroy_connector)(struct drm_dp_mst_topology_mgr *mgr,
+ 				  struct drm_connector *connector);
+ 	void (*hotplug)(struct drm_dp_mst_topology_mgr *mgr);
+diff --git a/include/drm/drm_fb_helper.h b/include/drm/drm_fb_helper.h
+index 0dfd94def..2ee4ec5 100644
+--- a/include/drm/drm_fb_helper.h
++++ b/include/drm/drm_fb_helper.h
+@@ -136,6 +136,10 @@ int drm_fb_helper_check_var(struct fb_var_screeninfo *var,
+ 			    struct fb_info *info);
+ 
+ bool drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper);
++
++struct fb_info *drm_fb_helper_alloc_fbi(struct drm_fb_helper *fb_helper);
++void drm_fb_helper_unregister_fbi(struct drm_fb_helper *fb_helper);
++void drm_fb_helper_release_fbi(struct drm_fb_helper *fb_helper);
+ void drm_fb_helper_fill_var(struct fb_info *info, struct drm_fb_helper *fb_helper,
+ 			    uint32_t fb_width, uint32_t fb_height);
+ void drm_fb_helper_fill_fix(struct fb_info *info, uint32_t pitch,
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index c768ddf..afae231 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -383,6 +383,16 @@ extern void ttm_bo_add_to_lru(struct ttm_buffer_object *bo);
+  */
+ extern int ttm_bo_del_from_lru(struct ttm_buffer_object *bo);
+ 
++/**
++ * ttm_bo_move_to_lru_tail
++ *
++ * @bo: The buffer object.
++ *
++ * Move this BO to the tail of all lru lists used to lookup and reserve an
++ * object. This function must be called with struct ttm_bo_global::lru_lock
++ * held, and is used to make a BO less likely to be considered for eviction.
++ */
++extern void ttm_bo_move_to_lru_tail(struct ttm_buffer_object *bo);
+ 
+ /**
+  * ttm_bo_lock_delayed_workqueue
+diff --git a/include/linux/fence.h b/include/linux/fence.h
+index 39efee1..c476540 100644
+--- a/include/linux/fence.h
++++ b/include/linux/fence.h
+@@ -280,6 +280,22 @@ fence_is_signaled(struct fence *fence)
+ }
+ 
+ /**
++ * fence_is_later - return if f1 is chronologically later than f2
++ * @f1: [in]    the first fence from the same context
++ * @f2: [in]    the second fence from the same context
++ *
++ * Returns true if f1 is chronologically later than f2. Both fences must be
++ * from the same context, since a seqno is not re-used across contexts.
++ */
++static inline bool fence_is_later(struct fence *f1, struct fence *f2)
++{
++	if (WARN_ON(f1->context != f2->context))
++		return false;
++
++	return f1->seqno - f2->seqno < INT_MAX;
++}
++
++/**
+  * fence_later - return the chronologically later fence
+  * @f1:	[in]	the first fence from the same context
+  * @f2:	[in]	the second fence from the same context
+@@ -305,6 +321,8 @@ static inline struct fence *fence_later(struct fence *f1, struct fence *f2)
+ }
+ 
+ signed long fence_wait_timeout(struct fence *, bool intr, signed long timeout);
++signed long fence_wait_any_timeout(struct fence **fences, uint32_t count,
++				   bool intr, signed long timeout, uint32_t *idx);
+ 
+ 
+ /**
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+new file mode 100644
+index 0000000..6dcaa79
+--- /dev/null
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -0,0 +1,673 @@
++/* amdgpu_drm.h -- Public header for the amdgpu driver -*- linux-c -*-
++ *
++ * Copyright 2000 Precision Insight, Inc., Cedar Park, Texas.
++ * Copyright 2000 VA Linux Systems, Inc., Fremont, California.
++ * Copyright 2002 Tungsten Graphics, Inc., Cedar Park, Texas.
++ * Copyright 2014 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors:
++ *    Kevin E. Martin <martin@valinux.com>
++ *    Gareth Hughes <gareth@valinux.com>
++ *    Keith Whitwell <keith@tungstengraphics.com>
++ */
++
++#ifndef __AMDGPU_DRM_H__
++#define __AMDGPU_DRM_H__
++
++#include "drm.h"
++
++#define DRM_AMDGPU_GEM_CREATE		0x00
++#define DRM_AMDGPU_GEM_MMAP		0x01
++#define DRM_AMDGPU_CTX			0x02
++#define DRM_AMDGPU_BO_LIST		0x03
++#define DRM_AMDGPU_CS			0x04
++#define DRM_AMDGPU_INFO			0x05
++#define DRM_AMDGPU_GEM_METADATA		0x06
++#define DRM_AMDGPU_GEM_WAIT_IDLE	0x07
++#define DRM_AMDGPU_GEM_VA		0x08
++#define DRM_AMDGPU_WAIT_CS		0x09
++#define DRM_AMDGPU_GEM_OP		0x10
++#define DRM_AMDGPU_GEM_USERPTR		0x11
++#define DRM_AMDGPU_WAIT_FENCES		0x12
++
++#define DRM_IOCTL_AMDGPU_GEM_CREATE	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_CREATE, union drm_amdgpu_gem_create)
++#define DRM_IOCTL_AMDGPU_GEM_MMAP	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_MMAP, union drm_amdgpu_gem_mmap)
++#define DRM_IOCTL_AMDGPU_CTX		DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_CTX, union drm_amdgpu_ctx)
++#define DRM_IOCTL_AMDGPU_BO_LIST	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_BO_LIST, union drm_amdgpu_bo_list)
++#define DRM_IOCTL_AMDGPU_CS		DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_CS, union drm_amdgpu_cs)
++#define DRM_IOCTL_AMDGPU_INFO		DRM_IOW(DRM_COMMAND_BASE + DRM_AMDGPU_INFO, struct drm_amdgpu_info)
++#define DRM_IOCTL_AMDGPU_GEM_METADATA	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_METADATA, struct drm_amdgpu_gem_metadata)
++#define DRM_IOCTL_AMDGPU_GEM_WAIT_IDLE	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_WAIT_IDLE, union drm_amdgpu_gem_wait_idle)
++#define DRM_IOCTL_AMDGPU_GEM_VA		DRM_IOW(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_VA, struct drm_amdgpu_gem_va)
++#define DRM_IOCTL_AMDGPU_WAIT_CS	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_WAIT_CS, union drm_amdgpu_wait_cs)
++#define DRM_IOCTL_AMDGPU_GEM_OP		DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_OP, struct drm_amdgpu_gem_op)
++#define DRM_IOCTL_AMDGPU_GEM_USERPTR	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_USERPTR, struct drm_amdgpu_gem_userptr)
++#define DRM_IOCTL_AMDGPU_WAIT_FENCES	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_WAIT_FENCES, union drm_amdgpu_wait_fences)
++
++#define AMDGPU_GEM_DOMAIN_CPU		0x1
++#define AMDGPU_GEM_DOMAIN_GTT		0x2
++#define AMDGPU_GEM_DOMAIN_VRAM		0x4
++#define AMDGPU_GEM_DOMAIN_GDS		0x8
++#define AMDGPU_GEM_DOMAIN_GWS		0x10
++#define AMDGPU_GEM_DOMAIN_OA		0x20
++
++/* Flag that CPU access will be required for the case of VRAM domain */
++#define AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED	(1 << 0)
++/* Flag that CPU access will not work, this VRAM domain is invisible */
++#define AMDGPU_GEM_CREATE_NO_CPU_ACCESS		(1 << 1)
++/* Flag that USWC attributes should be used for GTT */
++#define AMDGPU_GEM_CREATE_CPU_GTT_USWC		(1 << 2)
++
++struct drm_amdgpu_gem_create_in  {
++	/** the requested memory size */
++	uint64_t bo_size;
++	/** physical start_addr alignment in bytes for some HW requirements */
++	uint64_t alignment;
++	/** the requested memory domains */
++	uint64_t domains;
++	/** allocation flags */
++	uint64_t domain_flags;
++};
++
++struct drm_amdgpu_gem_create_out  {
++	/** returned GEM object handle */
++	uint32_t handle;
++	uint32_t _pad;
++};
++
++union drm_amdgpu_gem_create {
++	struct drm_amdgpu_gem_create_in		in;
++	struct drm_amdgpu_gem_create_out	out;
++};
++
++/** Opcode to create new residency list.  */
++#define AMDGPU_BO_LIST_OP_CREATE	0
++/** Opcode to destroy previously created residency list */
++#define AMDGPU_BO_LIST_OP_DESTROY	1
++/** Opcode to update resource information in the list */
++#define AMDGPU_BO_LIST_OP_UPDATE	2
++
++struct drm_amdgpu_bo_list_in {
++	/** Type of operation */
++	uint32_t operation;
++	/** Handle of list or 0 if we want to create one */
++	uint32_t list_handle;
++	/** Number of BOs in list  */
++	uint32_t bo_number;
++	/** Size of each element describing BO */
++	uint32_t bo_info_size;
++	/** Pointer to array describing BOs */
++	uint64_t bo_info_ptr;
++};
++
++struct drm_amdgpu_bo_list_entry {
++	/** Handle of BO */
++	uint32_t bo_handle;
++	/** New (if specified) BO priority to be used during migration */
++	uint32_t bo_priority;
++};
++
++struct drm_amdgpu_bo_list_out {
++	/** Handle of resource list  */
++	uint32_t list_handle;
++	uint32_t _pad;
++};
++
++union drm_amdgpu_bo_list {
++	struct drm_amdgpu_bo_list_in in;
++	struct drm_amdgpu_bo_list_out out;
++};
++
++/* context related */
++#define AMDGPU_CTX_OP_ALLOC_CTX	1
++#define AMDGPU_CTX_OP_FREE_CTX	2
++#define AMDGPU_CTX_OP_QUERY_STATE	3
++
++/* GPU reset status */
++#define AMDGPU_CTX_NO_RESET		0
++/* this the context caused it */
++#define AMDGPU_CTX_GUILTY_RESET		1
++/* some other context caused it */
++#define AMDGPU_CTX_INNOCENT_RESET	2
++/* unknown cause */
++#define AMDGPU_CTX_UNKNOWN_RESET	3
++
++struct drm_amdgpu_ctx_in {
++	/** AMDGPU_CTX_OP_* */
++	uint32_t	op;
++	/** For future use, no flags defined so far */
++	uint32_t	flags;
++	uint32_t	ctx_id;
++	uint32_t	_pad;
++};
++
++union drm_amdgpu_ctx_out {
++		struct {
++			uint32_t	ctx_id;
++			uint32_t	_pad;
++		} alloc;
++
++		struct {
++			/** For future use, no flags defined so far */
++			uint64_t	flags;
++			/** Number of resets caused by this context so far. */
++			uint32_t	hangs;
++			/** Reset status since the last call of the ioctl. */
++			uint32_t	reset_status;
++		} state;
++};
++
++union drm_amdgpu_ctx {
++	struct drm_amdgpu_ctx_in in;
++	union drm_amdgpu_ctx_out out;
++};
++
++/*
++ * This is not a reliable API and you should expect it to fail for any
++ * number of reasons and have fallback path that do not use userptr to
++ * perform any operation.
++ */
++#define AMDGPU_GEM_USERPTR_READONLY	(1 << 0)
++#define AMDGPU_GEM_USERPTR_ANONONLY	(1 << 1)
++#define AMDGPU_GEM_USERPTR_VALIDATE	(1 << 2)
++#define AMDGPU_GEM_USERPTR_REGISTER	(1 << 3)
++
++struct drm_amdgpu_gem_userptr {
++	uint64_t		addr;
++	uint64_t		size;
++	/* AMDGPU_GEM_USERPTR_* */
++	uint32_t		flags;
++	/* Resulting GEM handle */
++	uint32_t		handle;
++};
++
++/* same meaning as the GB_TILE_MODE and GL_MACRO_TILE_MODE fields */
++#define AMDGPU_TILING_ARRAY_MODE_SHIFT			0
++#define AMDGPU_TILING_ARRAY_MODE_MASK			0xf
++#define AMDGPU_TILING_PIPE_CONFIG_SHIFT			4
++#define AMDGPU_TILING_PIPE_CONFIG_MASK			0x1f
++#define AMDGPU_TILING_TILE_SPLIT_SHIFT			9
++#define AMDGPU_TILING_TILE_SPLIT_MASK			0x7
++#define AMDGPU_TILING_MICRO_TILE_MODE_SHIFT		12
++#define AMDGPU_TILING_MICRO_TILE_MODE_MASK		0x7
++#define AMDGPU_TILING_BANK_WIDTH_SHIFT			15
++#define AMDGPU_TILING_BANK_WIDTH_MASK			0x3
++#define AMDGPU_TILING_BANK_HEIGHT_SHIFT			17
++#define AMDGPU_TILING_BANK_HEIGHT_MASK			0x3
++#define AMDGPU_TILING_MACRO_TILE_ASPECT_SHIFT		19
++#define AMDGPU_TILING_MACRO_TILE_ASPECT_MASK		0x3
++#define AMDGPU_TILING_NUM_BANKS_SHIFT			21
++#define AMDGPU_TILING_NUM_BANKS_MASK			0x3
++
++#define AMDGPU_TILING_SET(field, value) \
++	(((value) & AMDGPU_TILING_##field##_MASK) << AMDGPU_TILING_##field##_SHIFT)
++#define AMDGPU_TILING_GET(value, field) \
++	(((value) >> AMDGPU_TILING_##field##_SHIFT) & AMDGPU_TILING_##field##_MASK)
++
++#define AMDGPU_GEM_METADATA_OP_SET_METADATA                  1
++#define AMDGPU_GEM_METADATA_OP_GET_METADATA                  2
++
++/** The same structure is shared for input/output */
++struct drm_amdgpu_gem_metadata {
++	/** GEM Object handle */
++	uint32_t	handle;
++	/** Do we want get or set metadata */
++	uint32_t	op;
++	struct {
++		/** For future use, no flags defined so far */
++		uint64_t	flags;
++		/** family specific tiling info */
++		uint64_t	tiling_info;
++		uint32_t	data_size_bytes;
++		uint32_t	data[64];
++	} data;
++};
++
++struct drm_amdgpu_gem_mmap_in {
++	/** the GEM object handle */
++	uint32_t handle;
++	uint32_t _pad;
++};
++
++struct drm_amdgpu_gem_mmap_out {
++	/** mmap offset from the vma offset manager */
++	uint64_t addr_ptr;
++};
++
++union drm_amdgpu_gem_mmap {
++	struct drm_amdgpu_gem_mmap_in   in;
++	struct drm_amdgpu_gem_mmap_out out;
++};
++
++struct drm_amdgpu_gem_wait_idle_in {
++	/** GEM object handle */
++	uint32_t handle;
++	/** For future use, no flags defined so far */
++	uint32_t flags;
++	/** Absolute timeout to wait */
++	uint64_t timeout;
++};
++
++struct drm_amdgpu_gem_wait_idle_out {
++	/** BO status:  0 - BO is idle, 1 - BO is busy */
++	uint32_t status;
++	/** Returned current memory domain */
++	uint32_t domain;
++};
++
++union drm_amdgpu_gem_wait_idle {
++	struct drm_amdgpu_gem_wait_idle_in  in;
++	struct drm_amdgpu_gem_wait_idle_out out;
++};
++
++struct drm_amdgpu_wait_cs_in {
++	/** Command submission handle */
++	uint64_t handle;
++	/** Absolute timeout to wait */
++	uint64_t timeout;
++	uint32_t ip_type;
++	uint32_t ip_instance;
++	uint32_t ring;
++	uint32_t ctx_id;
++};
++
++struct drm_amdgpu_wait_cs_out {
++	/** CS status:  0 - CS completed, 1 - CS still busy */
++	uint64_t status;
++};
++
++union drm_amdgpu_wait_cs {
++	struct drm_amdgpu_wait_cs_in in;
++	struct drm_amdgpu_wait_cs_out out;
++};
++
++struct drm_amdgpu_fence {
++	uint32_t ctx_id;
++	uint32_t ip_type;
++	uint32_t ip_instance;
++	uint32_t ring;
++	uint64_t seq_no;
++};
++
++struct drm_amdgpu_wait_fences_in {
++	/** This points to uint64_t * which points to fences */
++	uint64_t fences;
++	uint32_t fence_count;
++	uint32_t wait_all;
++	uint64_t timeout_ns;
++};
++
++struct drm_amdgpu_wait_fences_out {
++	uint32_t status;
++	uint32_t first_signaled;
++};
++
++union drm_amdgpu_wait_fences {
++	struct drm_amdgpu_wait_fences_in in;
++	struct drm_amdgpu_wait_fences_out out;
++};
++
++#define AMDGPU_GEM_OP_GET_GEM_CREATE_INFO	0
++#define AMDGPU_GEM_OP_SET_PLACEMENT		1
++
++/* Sets or returns a value associated with a buffer. */
++struct drm_amdgpu_gem_op {
++	/** GEM object handle */
++	uint32_t	handle;
++	/** AMDGPU_GEM_OP_* */
++	uint32_t	op;
++	/** Input or return value */
++	uint64_t	value;
++};
++
++#define AMDGPU_VA_OP_MAP			1
++#define AMDGPU_VA_OP_UNMAP			2
++
++/* Delay the page table update till the next CS */
++#define AMDGPU_VM_DELAY_UPDATE		(1 << 0)
++
++/* Mapping flags */
++/* readable mapping */
++#define AMDGPU_VM_PAGE_READABLE		(1 << 1)
++/* writable mapping */
++#define AMDGPU_VM_PAGE_WRITEABLE	(1 << 2)
++/* executable mapping, new for VI */
++#define AMDGPU_VM_PAGE_EXECUTABLE	(1 << 3)
++
++struct drm_amdgpu_gem_va {
++	/** GEM object handle */
++	uint32_t handle;
++	uint32_t _pad;
++	/** AMDGPU_VA_OP_* */
++	uint32_t operation;
++	/** AMDGPU_VM_PAGE_* */
++	uint32_t flags;
++	/** va address to assign . Must be correctly aligned.*/
++	uint64_t va_address;
++	/** Specify offset inside of BO to assign. Must be correctly aligned.*/
++	uint64_t offset_in_bo;
++	/** Specify mapping size. Must be correctly aligned. */
++	uint64_t map_size;
++};
++
++#define AMDGPU_HW_IP_GFX          0
++#define AMDGPU_HW_IP_COMPUTE      1
++#define AMDGPU_HW_IP_DMA          2
++#define AMDGPU_HW_IP_UVD          3
++#define AMDGPU_HW_IP_VCE          4
++#define AMDGPU_HW_IP_NUM          5
++
++#define AMDGPU_HW_IP_INSTANCE_MAX_COUNT 1
++
++#define AMDGPU_CHUNK_ID_IB		0x01
++#define AMDGPU_CHUNK_ID_FENCE		0x02
++#define AMDGPU_CHUNK_ID_DEPENDENCIES	0x03
++
++struct drm_amdgpu_cs_chunk {
++	uint32_t		chunk_id;
++	uint32_t		length_dw;
++	uint64_t		chunk_data;
++};
++
++struct drm_amdgpu_cs_in {
++	/** Rendering context id */
++	uint32_t		ctx_id;
++	/**  Handle of resource list associated with CS */
++	uint32_t		bo_list_handle;
++	uint32_t		num_chunks;
++	uint32_t		_pad;
++	/** this points to uint64_t * which point to cs chunks */
++	uint64_t		chunks;
++};
++
++struct drm_amdgpu_cs_out {
++	uint64_t handle;
++};
++
++union drm_amdgpu_cs {
++	struct drm_amdgpu_cs_in in;
++	struct drm_amdgpu_cs_out out;
++};
++
++/* Specify flags to be used for IB */
++
++/* This IB should be submitted to CE */
++#define AMDGPU_IB_FLAG_CE	(1<<0)
++
++/* CE Preamble */
++#define AMDGPU_IB_FLAG_PREAMBLE (1<<1)
++
++struct drm_amdgpu_cs_chunk_ib {
++	uint32_t _pad;
++	/** AMDGPU_IB_FLAG_* */
++	uint32_t flags;
++	/** Virtual address to begin IB execution */
++	uint64_t va_start;
++	/** Size of submission */
++	uint32_t ib_bytes;
++	/** HW IP to submit to */
++	uint32_t ip_type;
++	/** HW IP index of the same type to submit to  */
++	uint32_t ip_instance;
++	/** Ring index to submit to */
++	uint32_t ring;
++};
++
++struct drm_amdgpu_cs_chunk_dep {
++	uint32_t ip_type;
++	uint32_t ip_instance;
++	uint32_t ring;
++	uint32_t ctx_id;
++	uint64_t handle;
++};
++
++struct drm_amdgpu_cs_chunk_fence {
++	uint32_t handle;
++	uint32_t offset;
++};
++
++struct drm_amdgpu_cs_chunk_data {
++	union {
++		struct drm_amdgpu_cs_chunk_ib		ib_data;
++		struct drm_amdgpu_cs_chunk_fence	fence_data;
++	};
++};
++
++/**
++ *  Query h/w info: Flag that this is integrated (a.h.a. fusion) GPU
++ *
++ */
++#define AMDGPU_IDS_FLAGS_FUSION         0x1
++
++/* indicate if acceleration can be working */
++#define AMDGPU_INFO_ACCEL_WORKING		0x00
++/* get the crtc_id from the mode object id? */
++#define AMDGPU_INFO_CRTC_FROM_ID		0x01
++/* query hw IP info */
++#define AMDGPU_INFO_HW_IP_INFO			0x02
++/* query hw IP instance count for the specified type */
++#define AMDGPU_INFO_HW_IP_COUNT			0x03
++/* timestamp for GL_ARB_timer_query */
++#define AMDGPU_INFO_TIMESTAMP			0x05
++/* Query the firmware version */
++#define AMDGPU_INFO_FW_VERSION			0x0e
++	/* Subquery id: Query VCE firmware version */
++	#define AMDGPU_INFO_FW_VCE		0x1
++	/* Subquery id: Query UVD firmware version */
++	#define AMDGPU_INFO_FW_UVD		0x2
++	/* Subquery id: Query GMC firmware version */
++	#define AMDGPU_INFO_FW_GMC		0x03
++	/* Subquery id: Query GFX ME firmware version */
++	#define AMDGPU_INFO_FW_GFX_ME		0x04
++	/* Subquery id: Query GFX PFP firmware version */
++	#define AMDGPU_INFO_FW_GFX_PFP		0x05
++	/* Subquery id: Query GFX CE firmware version */
++	#define AMDGPU_INFO_FW_GFX_CE		0x06
++	/* Subquery id: Query GFX RLC firmware version */
++	#define AMDGPU_INFO_FW_GFX_RLC		0x07
++	/* Subquery id: Query GFX MEC firmware version */
++	#define AMDGPU_INFO_FW_GFX_MEC		0x08
++	/* Subquery id: Query SMC firmware version */
++	#define AMDGPU_INFO_FW_SMC		0x0a
++	/* Subquery id: Query SDMA firmware version */
++	#define AMDGPU_INFO_FW_SDMA		0x0b
++/* number of bytes moved for TTM migration */
++#define AMDGPU_INFO_NUM_BYTES_MOVED		0x0f
++/* the used VRAM size */
++#define AMDGPU_INFO_VRAM_USAGE			0x10
++/* the used GTT size */
++#define AMDGPU_INFO_GTT_USAGE			0x11
++/* Information about GDS, etc. resource configuration */
++#define AMDGPU_INFO_GDS_CONFIG			0x13
++/* Query information about VRAM and GTT domains */
++#define AMDGPU_INFO_VRAM_GTT			0x14
++/* Query information about register in MMR address space*/
++#define AMDGPU_INFO_READ_MMR_REG		0x15
++/* Query information about device: rev id, family, etc. */
++#define AMDGPU_INFO_DEV_INFO			0x16
++/* visible vram usage */
++#define AMDGPU_INFO_VIS_VRAM_USAGE		0x17
++
++#define AMDGPU_INFO_MMR_SE_INDEX_SHIFT	0
++#define AMDGPU_INFO_MMR_SE_INDEX_MASK	0xff
++#define AMDGPU_INFO_MMR_SH_INDEX_SHIFT	8
++#define AMDGPU_INFO_MMR_SH_INDEX_MASK	0xff
++
++/* Input structure for the INFO ioctl */
++struct drm_amdgpu_info {
++	/* Where the return value will be stored */
++	uint64_t return_pointer;
++	/* The size of the return value. Just like "size" in "snprintf",
++	 * it limits how many bytes the kernel can write. */
++	uint32_t return_size;
++	/* The query request id. */
++	uint32_t query;
++
++	union {
++		struct {
++			uint32_t id;
++			uint32_t _pad;
++		} mode_crtc;
++
++		struct {
++			/** AMDGPU_HW_IP_* */
++			uint32_t type;
++			/**
++			 * Index of the IP if there are more IPs of the same
++			 * type. Ignored by AMDGPU_INFO_HW_IP_COUNT.
++			 */
++			uint32_t ip_instance;
++		} query_hw_ip;
++
++		struct {
++			uint32_t dword_offset;
++			/** number of registers to read */
++			uint32_t count;
++			uint32_t instance;
++			/** For future use, no flags defined so far */
++			uint32_t flags;
++		} read_mmr_reg;
++
++		struct {
++			/** AMDGPU_INFO_FW_* */
++			uint32_t fw_type;
++			/**
++			 * Index of the IP if there are more IPs of
++			 * the same type.
++			 */
++			uint32_t ip_instance;
++			/**
++			 * Index of the engine. Whether this is used depends
++			 * on the firmware type. (e.g. MEC, SDMA)
++			 */
++			uint32_t index;
++			uint32_t _pad;
++		} query_fw;
++	};
++};
++
++struct drm_amdgpu_info_gds {
++	/** GDS GFX partition size */
++	uint32_t gds_gfx_partition_size;
++	/** GDS compute partition size */
++	uint32_t compute_partition_size;
++	/** total GDS memory size */
++	uint32_t gds_total_size;
++	/** GWS size per GFX partition */
++	uint32_t gws_per_gfx_partition;
++	/** GSW size per compute partition */
++	uint32_t gws_per_compute_partition;
++	/** OA size per GFX partition */
++	uint32_t oa_per_gfx_partition;
++	/** OA size per compute partition */
++	uint32_t oa_per_compute_partition;
++	uint32_t _pad;
++};
++
++struct drm_amdgpu_info_vram_gtt {
++	uint64_t vram_size;
++	uint64_t vram_cpu_accessible_size;
++	uint64_t gtt_size;
++};
++
++struct drm_amdgpu_info_firmware {
++	uint32_t ver;
++	uint32_t feature;
++};
++
++#define AMDGPU_VRAM_TYPE_UNKNOWN 0
++#define AMDGPU_VRAM_TYPE_GDDR1 1
++#define AMDGPU_VRAM_TYPE_DDR2  2
++#define AMDGPU_VRAM_TYPE_GDDR3 3
++#define AMDGPU_VRAM_TYPE_GDDR4 4
++#define AMDGPU_VRAM_TYPE_GDDR5 5
++#define AMDGPU_VRAM_TYPE_HBM   6
++#define AMDGPU_VRAM_TYPE_DDR3  7
++
++struct drm_amdgpu_info_device {
++	/** PCI Device ID */
++	uint32_t device_id;
++	/** Internal chip revision: A0, A1, etc.) */
++	uint32_t chip_rev;
++	uint32_t external_rev;
++	/** Revision id in PCI Config space */
++	uint32_t pci_rev;
++	uint32_t family;
++	uint32_t num_shader_engines;
++	uint32_t num_shader_arrays_per_engine;
++	/* in KHz */
++	uint32_t gpu_counter_freq;
++	uint64_t max_engine_clock;
++	uint64_t max_memory_clock;
++	/* cu information */
++	uint32_t cu_active_number;
++	uint32_t cu_ao_mask;
++	uint32_t cu_bitmap[4][4];
++	/** Render backend pipe mask. One render backend is CB+DB. */
++	uint32_t enabled_rb_pipes_mask;
++	uint32_t num_rb_pipes;
++	uint32_t num_hw_gfx_contexts;
++	uint32_t _pad;
++	uint64_t ids_flags;
++	/** Starting virtual address for UMDs. */
++	uint64_t virtual_address_offset;
++	/** The maximum virtual address */
++	uint64_t virtual_address_max;
++	/** Required alignment of virtual addresses. */
++	uint32_t virtual_address_alignment;
++	/** Page table entry - fragment size */
++	uint32_t pte_fragment_size;
++	uint32_t gart_page_size;
++	/** constant engine ram size*/
++	uint32_t ce_ram_size;
++	/** video memory type info*/
++	uint32_t vram_type;
++	/** video memory bit width*/
++	uint32_t vram_bit_width;
++	/* vce harvesting instance */
++	uint32_t vce_harvest_config;
++};
++
++struct drm_amdgpu_info_hw_ip {
++	/** Version of h/w IP */
++	uint32_t  hw_ip_version_major;
++	uint32_t  hw_ip_version_minor;
++	/** Capabilities */
++	uint64_t  capabilities_flags;
++	/** command buffer address start alignment*/
++	uint32_t  ib_start_alignment;
++	/** command buffer size alignment*/
++	uint32_t  ib_size_alignment;
++	/** Bitmask of available rings. Bit 0 means ring 0, etc. */
++	uint32_t  available_rings;
++	uint32_t  _pad;
++};
++
++/*
++ * Supported GPU families
++ */
++#define AMDGPU_FAMILY_UNKNOWN			0
++#define AMDGPU_FAMILY_CI			120 /* Bonaire, Hawaii */
++#define AMDGPU_FAMILY_KV			125 /* Kaveri, Kabini, Mullins */
++#define AMDGPU_FAMILY_VI			130 /* Iceland, Tonga */
++#define AMDGPU_FAMILY_CZ			135 /* Carrizo, Stoney */
++
++#endif
+-- 
+1.9.1
+

@@ -1,0 +1,785 @@
+From f82d70354c6c925e6a9d9286fae643d84ad91a38 Mon Sep 17 00:00:00 2001
+From: Sanjay R Mehta <sanju.mehta@amd.com>
+Date: Mon, 25 Apr 2016 11:23:11 +0530
+Subject: [PATCH 11/12] 4-1-0 kernel's  drivers I2C directory
+
+---
+ drivers/i2c/busses/i2c-at91.c               |  70 +++--------
+ drivers/i2c/busses/i2c-designware-platdrv.c |  33 +----
+ drivers/i2c/busses/i2c-mv64xxx.c            |   2 +
+ drivers/i2c/busses/i2c-piix4.c              |   4 +-
+ drivers/i2c/busses/i2c-rcar.c               |   7 +-
+ drivers/i2c/busses/i2c-s3c2410.c            |   8 +-
+ drivers/i2c/i2c-core.c                      | 179 +++++++++-------------------
+ drivers/i2c/i2c-mux.c                       |   3 +-
+ drivers/i2c/muxes/i2c-mux-pca9541.c         |   4 +-
+ drivers/i2c/muxes/i2c-mux-pca954x.c         |   2 +-
+ include/linux/pci_ids.h                     |   1 +
+ 11 files changed, 94 insertions(+), 219 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-at91.c b/drivers/i2c/busses/i2c-at91.c
+index 9bd10a9..ff23d1b 100644
+--- a/drivers/i2c/busses/i2c-at91.c
++++ b/drivers/i2c/busses/i2c-at91.c
+@@ -65,9 +65,6 @@
+ #define	AT91_TWI_UNRE		0x0080	/* Underrun Error */
+ #define	AT91_TWI_NACK		0x0100	/* Not Acknowledged */
+ 
+-#define	AT91_TWI_INT_MASK \
+-	(AT91_TWI_TXCOMP | AT91_TWI_RXRDY | AT91_TWI_TXRDY | AT91_TWI_NACK)
+-
+ #define	AT91_TWI_IER		0x0024	/* Interrupt Enable Register */
+ #define	AT91_TWI_IDR		0x0028	/* Interrupt Disable Register */
+ #define	AT91_TWI_IMR		0x002c	/* Interrupt Mask Register */
+@@ -122,12 +119,13 @@ static void at91_twi_write(struct at91_twi_dev *dev, unsigned reg, unsigned val)
+ 
+ static void at91_disable_twi_interrupts(struct at91_twi_dev *dev)
+ {
+-	at91_twi_write(dev, AT91_TWI_IDR, AT91_TWI_INT_MASK);
++	at91_twi_write(dev, AT91_TWI_IDR,
++		       AT91_TWI_TXCOMP | AT91_TWI_RXRDY | AT91_TWI_TXRDY);
+ }
+ 
+ static void at91_twi_irq_save(struct at91_twi_dev *dev)
+ {
+-	dev->imr = at91_twi_read(dev, AT91_TWI_IMR) & AT91_TWI_INT_MASK;
++	dev->imr = at91_twi_read(dev, AT91_TWI_IMR) & 0x7;
+ 	at91_disable_twi_interrupts(dev);
+ }
+ 
+@@ -217,14 +215,6 @@ static void at91_twi_write_data_dma_callback(void *data)
+ 	dma_unmap_single(dev->dev, sg_dma_address(&dev->dma.sg),
+ 			 dev->buf_len, DMA_TO_DEVICE);
+ 
+-	/*
+-	 * When this callback is called, THR/TX FIFO is likely not to be empty
+-	 * yet. So we have to wait for TXCOMP or NACK bits to be set into the
+-	 * Status Register to be sure that the STOP bit has been sent and the
+-	 * transfer is completed. The NACK interrupt has already been enabled,
+-	 * we just have to enable TXCOMP one.
+-	 */
+-	at91_twi_write(dev, AT91_TWI_IER, AT91_TWI_TXCOMP);
+ 	at91_twi_write(dev, AT91_TWI_CR, AT91_TWI_STOP);
+ }
+ 
+@@ -319,7 +309,7 @@ static void at91_twi_read_data_dma_callback(void *data)
+ 	/* The last two bytes have to be read without using dma */
+ 	dev->buf += dev->buf_len - 2;
+ 	dev->buf_len = 2;
+-	at91_twi_write(dev, AT91_TWI_IER, AT91_TWI_RXRDY | AT91_TWI_TXCOMP);
++	at91_twi_write(dev, AT91_TWI_IER, AT91_TWI_RXRDY);
+ }
+ 
+ static void at91_twi_read_data_dma(struct at91_twi_dev *dev)
+@@ -380,7 +370,7 @@ static irqreturn_t atmel_twi_interrupt(int irq, void *dev_id)
+ 	/* catch error flags */
+ 	dev->transfer_status |= status;
+ 
+-	if (irqstatus & (AT91_TWI_TXCOMP | AT91_TWI_NACK)) {
++	if (irqstatus & AT91_TWI_TXCOMP) {
+ 		at91_disable_twi_interrupts(dev);
+ 		complete(&dev->cmd_complete);
+ 	}
+@@ -394,34 +384,6 @@ static int at91_do_twi_transfer(struct at91_twi_dev *dev)
+ 	unsigned long time_left;
+ 	bool has_unre_flag = dev->pdata->has_unre_flag;
+ 
+-	/*
+-	 * WARNING: the TXCOMP bit in the Status Register is NOT a clear on
+-	 * read flag but shows the state of the transmission at the time the
+-	 * Status Register is read. According to the programmer datasheet,
+-	 * TXCOMP is set when both holding register and internal shifter are
+-	 * empty and STOP condition has been sent.
+-	 * Consequently, we should enable NACK interrupt rather than TXCOMP to
+-	 * detect transmission failure.
+-	 *
+-	 * Besides, the TXCOMP bit is already set before the i2c transaction
+-	 * has been started. For read transactions, this bit is cleared when
+-	 * writing the START bit into the Control Register. So the
+-	 * corresponding interrupt can safely be enabled just after.
+-	 * However for write transactions managed by the CPU, we first write
+-	 * into THR, so TXCOMP is cleared. Then we can safely enable TXCOMP
+-	 * interrupt. If TXCOMP interrupt were enabled before writing into THR,
+-	 * the interrupt handler would be called immediately and the i2c command
+-	 * would be reported as completed.
+-	 * Also when a write transaction is managed by the DMA controller,
+-	 * enabling the TXCOMP interrupt in this function may lead to a race
+-	 * condition since we don't know whether the TXCOMP interrupt is enabled
+-	 * before or after the DMA has started to write into THR. So the TXCOMP
+-	 * interrupt is enabled later by at91_twi_write_data_dma_callback().
+-	 * Immediately after in that DMA callback, we still need to send the
+-	 * STOP condition manually writing the corresponding bit into the
+-	 * Control Register.
+-	 */
+-
+ 	dev_dbg(dev->dev, "transfer: %s %d bytes.\n",
+ 		(dev->msg->flags & I2C_M_RD) ? "read" : "write", dev->buf_len);
+ 
+@@ -452,24 +414,26 @@ static int at91_do_twi_transfer(struct at91_twi_dev *dev)
+ 		 * seems to be the best solution.
+ 		 */
+ 		if (dev->use_dma && (dev->buf_len > AT91_I2C_DMA_THRESHOLD)) {
+-			at91_twi_write(dev, AT91_TWI_IER, AT91_TWI_NACK);
+ 			at91_twi_read_data_dma(dev);
+-		} else {
++			/*
++			 * It is important to enable TXCOMP irq here because
++			 * doing it only when transferring the last two bytes
++			 * will mask NACK errors since TXCOMP is set when a
++			 * NACK occurs.
++			 */
+ 			at91_twi_write(dev, AT91_TWI_IER,
+-				       AT91_TWI_TXCOMP |
+-				       AT91_TWI_NACK |
+-				       AT91_TWI_RXRDY);
+-		}
++			       AT91_TWI_TXCOMP);
++		} else
++			at91_twi_write(dev, AT91_TWI_IER,
++			       AT91_TWI_TXCOMP | AT91_TWI_RXRDY);
+ 	} else {
+ 		if (dev->use_dma && (dev->buf_len > AT91_I2C_DMA_THRESHOLD)) {
+-			at91_twi_write(dev, AT91_TWI_IER, AT91_TWI_NACK);
+ 			at91_twi_write_data_dma(dev);
++			at91_twi_write(dev, AT91_TWI_IER, AT91_TWI_TXCOMP);
+ 		} else {
+ 			at91_twi_write_next_byte(dev);
+ 			at91_twi_write(dev, AT91_TWI_IER,
+-				       AT91_TWI_TXCOMP |
+-				       AT91_TWI_NACK |
+-				       AT91_TWI_TXRDY);
++				AT91_TWI_TXCOMP | AT91_TWI_TXRDY);
+ 		}
+ 	}
+ 
+diff --git a/drivers/i2c/busses/i2c-designware-platdrv.c b/drivers/i2c/busses/i2c-designware-platdrv.c
+index 3f7d487..0a80e4a 100644
+--- a/drivers/i2c/busses/i2c-designware-platdrv.c
++++ b/drivers/i2c/busses/i2c-designware-platdrv.c
+@@ -24,7 +24,6 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/delay.h>
+-#include <linux/dmi.h>
+ #include <linux/i2c.h>
+ #include <linux/clk.h>
+ #include <linux/clk-provider.h>
+@@ -52,22 +51,6 @@ static u32 i2c_dw_get_clk_rate_khz(struct dw_i2c_dev *dev)
+ }
+ 
+ #ifdef CONFIG_ACPI
+-/*
+- * The HCNT/LCNT information coming from ACPI should be the most accurate
+- * for given platform. However, some systems get it wrong. On such systems
+- * we get better results by calculating those based on the input clock.
+- */
+-static const struct dmi_system_id dw_i2c_no_acpi_params[] = {
+-	{
+-		.ident = "Dell Inspiron 7348",
+-		.matches = {
+-			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+-			DMI_MATCH(DMI_PRODUCT_NAME, "Inspiron 7348"),
+-		},
+-	},
+-	{ }
+-};
+-
+ static void dw_i2c_acpi_params(struct platform_device *pdev, char method[],
+ 			       u16 *hcnt, u16 *lcnt, u32 *sda_hold)
+ {
+@@ -75,9 +58,6 @@ static void dw_i2c_acpi_params(struct platform_device *pdev, char method[],
+ 	acpi_handle handle = ACPI_HANDLE(&pdev->dev);
+ 	union acpi_object *obj;
+ 
+-	if (dmi_check_system(dw_i2c_no_acpi_params))
+-		return;
+-
+ 	if (ACPI_FAILURE(acpi_evaluate_object(handle, method, NULL, &buf)))
+ 		return;
+ 
+@@ -273,6 +253,12 @@ static int dw_i2c_probe(struct platform_device *pdev)
+ 	adap->dev.parent = &pdev->dev;
+ 	adap->dev.of_node = pdev->dev.of_node;
+ 
++	r = i2c_add_numbered_adapter(adap);
++	if (r) {
++		dev_err(&pdev->dev, "failure adding adapter\n");
++		return r;
++	}
++
+ 	if (dev->pm_runtime_disabled) {
+ 		pm_runtime_forbid(&pdev->dev);
+ 	} else {
+@@ -282,13 +268,6 @@ static int dw_i2c_probe(struct platform_device *pdev)
+ 		pm_runtime_enable(&pdev->dev);
+ 	}
+ 
+-	r = i2c_add_numbered_adapter(adap);
+-	if (r) {
+-		dev_err(&pdev->dev, "failure adding adapter\n");
+-		pm_runtime_disable(&pdev->dev);
+-		return r;
+-	}
+-
+ 	return 0;
+ }
+ 
+diff --git a/drivers/i2c/busses/i2c-mv64xxx.c b/drivers/i2c/busses/i2c-mv64xxx.c
+index 5801227..30059c1 100644
+--- a/drivers/i2c/busses/i2c-mv64xxx.c
++++ b/drivers/i2c/busses/i2c-mv64xxx.c
+@@ -669,6 +669,8 @@ mv64xxx_i2c_can_offload(struct mv64xxx_i2c_data *drv_data)
+ 	struct i2c_msg *msgs = drv_data->msgs;
+ 	int num = drv_data->num_msgs;
+ 
++	return false;
++
+ 	if (!drv_data->offload_enabled)
+ 		return false;
+ 
+diff --git a/drivers/i2c/busses/i2c-piix4.c b/drivers/i2c/busses/i2c-piix4.c
+index 67cbec6..630bce6 100644
+--- a/drivers/i2c/busses/i2c-piix4.c
++++ b/drivers/i2c/busses/i2c-piix4.c
+@@ -245,7 +245,7 @@ static int piix4_setup_sb800(struct pci_dev *PIIX4_dev,
+ 	     PIIX4_dev->device == PCI_DEVICE_ID_AMD_HUDSON2_SMBUS &&
+ 	     PIIX4_dev->revision >= 0x41) ||
+ 	    (PIIX4_dev->vendor == PCI_VENDOR_ID_AMD &&
+-	     PIIX4_dev->device == 0x790b &&
++	     PIIX4_dev->device == PCI_DEVICE_ID_AMD_KERNCZ_SMBUS &&
+ 	     PIIX4_dev->revision >= 0x49))
+ 		smb_en = 0x00;
+ 	else
+@@ -545,7 +545,7 @@ static const struct pci_device_id piix4_ids[] = {
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_ATI, PCI_DEVICE_ID_ATI_IXP400_SMBUS) },
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_ATI, PCI_DEVICE_ID_ATI_SBX00_SMBUS) },
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_HUDSON2_SMBUS) },
+-	{ PCI_DEVICE(PCI_VENDOR_ID_AMD, 0x790b) },
++	{ PCI_DEVICE(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_KERNCZ_SMBUS) },
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_SERVERWORKS,
+ 		     PCI_DEVICE_ID_SERVERWORKS_OSB4) },
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_SERVERWORKS,
+diff --git a/drivers/i2c/busses/i2c-rcar.c b/drivers/i2c/busses/i2c-rcar.c
+index d9d022c..5a84bea 100644
+--- a/drivers/i2c/busses/i2c-rcar.c
++++ b/drivers/i2c/busses/i2c-rcar.c
+@@ -688,16 +688,15 @@ static int rcar_i2c_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	pm_runtime_enable(dev);
+-	platform_set_drvdata(pdev, priv);
+-
+ 	ret = i2c_add_numbered_adapter(adap);
+ 	if (ret < 0) {
+ 		dev_err(dev, "reg adap failed: %d\n", ret);
+-		pm_runtime_disable(dev);
+ 		return ret;
+ 	}
+ 
++	pm_runtime_enable(dev);
++	platform_set_drvdata(pdev, priv);
++
+ 	dev_info(dev, "probed\n");
+ 
+ 	return 0;
+diff --git a/drivers/i2c/busses/i2c-s3c2410.c b/drivers/i2c/busses/i2c-s3c2410.c
+index 4247942..297e9c9 100644
+--- a/drivers/i2c/busses/i2c-s3c2410.c
++++ b/drivers/i2c/busses/i2c-s3c2410.c
+@@ -1243,19 +1243,17 @@ static int s3c24xx_i2c_probe(struct platform_device *pdev)
+ 	i2c->adap.nr = i2c->pdata->bus_num;
+ 	i2c->adap.dev.of_node = pdev->dev.of_node;
+ 
+-	platform_set_drvdata(pdev, i2c);
+-
+-	pm_runtime_enable(&pdev->dev);
+-
+ 	ret = i2c_add_numbered_adapter(&i2c->adap);
+ 	if (ret < 0) {
+ 		dev_err(&pdev->dev, "failed to add bus to i2c core\n");
+-		pm_runtime_disable(&pdev->dev);
+ 		s3c24xx_i2c_deregister_cpufreq(i2c);
+ 		clk_unprepare(i2c->clk);
+ 		return ret;
+ 	}
+ 
++	platform_set_drvdata(pdev, i2c);
++
++	pm_runtime_enable(&pdev->dev);
+ 	pm_runtime_enable(&i2c->adap.dev);
+ 
+ 	dev_info(&pdev->dev, "%s: S3C I2C adapter\n", dev_name(&i2c->adap.dev));
+diff --git a/drivers/i2c/i2c-core.c b/drivers/i2c/i2c-core.c
+index 372da32..987c124 100644
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@ -94,40 +94,27 @@ struct gsb_buffer {
+ 	};
+ } __packed;
+ 
+-struct acpi_i2c_lookup {
+-	struct i2c_board_info *info;
+-	acpi_handle adapter_handle;
+-	acpi_handle device_handle;
+-};
+-
+-static int acpi_i2c_find_address(struct acpi_resource *ares, void *data)
++static int acpi_i2c_add_resource(struct acpi_resource *ares, void *data)
+ {
+-	struct acpi_i2c_lookup *lookup = data;
+-	struct i2c_board_info *info = lookup->info;
+-	struct acpi_resource_i2c_serialbus *sb;
+-	acpi_handle adapter_handle;
+-	acpi_status status;
++	struct i2c_board_info *info = data;
+ 
+-	if (info->addr || ares->type != ACPI_RESOURCE_TYPE_SERIAL_BUS)
+-		return 1;
++	if (ares->type == ACPI_RESOURCE_TYPE_SERIAL_BUS) {
++		struct acpi_resource_i2c_serialbus *sb;
+ 
+-	sb = &ares->data.i2c_serial_bus;
+-	if (sb->type != ACPI_RESOURCE_SERIAL_TYPE_I2C)
+-		return 1;
++		sb = &ares->data.i2c_serial_bus;
++		if (!info->addr && sb->type == ACPI_RESOURCE_SERIAL_TYPE_I2C) {
++			info->addr = sb->slave_address;
++			if (sb->access_mode == ACPI_I2C_10BIT_MODE)
++				info->flags |= I2C_CLIENT_TEN;
++		}
++	} else if (info->irq < 0) {
++		struct resource r;
+ 
+-	/*
+-	 * Extract the ResourceSource and make sure that the handle matches
+-	 * with the I2C adapter handle.
+-	 */
+-	status = acpi_get_handle(lookup->device_handle,
+-				 sb->resource_source.string_ptr,
+-				 &adapter_handle);
+-	if (ACPI_SUCCESS(status) && adapter_handle == lookup->adapter_handle) {
+-		info->addr = sb->slave_address;
+-		if (sb->access_mode == ACPI_I2C_10BIT_MODE)
+-			info->flags |= I2C_CLIENT_TEN;
++		if (acpi_dev_resource_interrupt(ares, 0, &r))
++			info->irq = r.start;
+ 	}
+ 
++	/* Tell the ACPI core to skip this resource */
+ 	return 1;
+ }
+ 
+@@ -136,8 +123,6 @@ static acpi_status acpi_i2c_add_device(acpi_handle handle, u32 level,
+ {
+ 	struct i2c_adapter *adapter = data;
+ 	struct list_head resource_list;
+-	struct acpi_i2c_lookup lookup;
+-	struct resource_entry *entry;
+ 	struct i2c_board_info info;
+ 	struct acpi_device *adev;
+ 	int ret;
+@@ -149,38 +134,16 @@ static acpi_status acpi_i2c_add_device(acpi_handle handle, u32 level,
+ 
+ 	memset(&info, 0, sizeof(info));
+ 	info.fwnode = acpi_fwnode_handle(adev);
++	info.irq = -1;
+ 
+-	memset(&lookup, 0, sizeof(lookup));
+-	lookup.adapter_handle = ACPI_HANDLE(adapter->dev.parent);
+-	lookup.device_handle = handle;
+-	lookup.info = &info;
+-
+-	/*
+-	 * Look up for I2cSerialBus resource with ResourceSource that
+-	 * matches with this adapter.
+-	 */
+ 	INIT_LIST_HEAD(&resource_list);
+ 	ret = acpi_dev_get_resources(adev, &resource_list,
+-				     acpi_i2c_find_address, &lookup);
++				     acpi_i2c_add_resource, &info);
+ 	acpi_dev_free_resource_list(&resource_list);
+ 
+ 	if (ret < 0 || !info.addr)
+ 		return AE_OK;
+ 
+-	/* Then fill IRQ number if any */
+-	ret = acpi_dev_get_resources(adev, &resource_list, NULL, NULL);
+-	if (ret < 0)
+-		return AE_OK;
+-
+-	resource_list_for_each_entry(entry, &resource_list) {
+-		if (resource_type(entry->res) == IORESOURCE_IRQ) {
+-			info.irq = entry->res->start;
+-			break;
+-		}
+-	}
+-
+-	acpi_dev_free_resource_list(&resource_list);
+-
+ 	adev->power.flags.ignore_parent = true;
+ 	strlcpy(info.type, dev_name(&adev->dev), sizeof(info.type));
+ 	if (!i2c_new_device(adapter, &info)) {
+@@ -193,8 +156,6 @@ static acpi_status acpi_i2c_add_device(acpi_handle handle, u32 level,
+ 	return AE_OK;
+ }
+ 
+-#define ACPI_I2C_MAX_SCAN_DEPTH 32
+-
+ /**
+  * acpi_i2c_register_devices - enumerate I2C slave devices behind adapter
+  * @adap: pointer to adapter
+@@ -205,13 +166,17 @@ static acpi_status acpi_i2c_add_device(acpi_handle handle, u32 level,
+  */
+ static void acpi_i2c_register_devices(struct i2c_adapter *adap)
+ {
++	acpi_handle handle;
+ 	acpi_status status;
+ 
+-	if (!adap->dev.parent || !has_acpi_companion(adap->dev.parent))
++	if (!adap->dev.parent)
+ 		return;
+ 
+-	status = acpi_walk_namespace(ACPI_TYPE_DEVICE, ACPI_ROOT_OBJECT,
+-				     ACPI_I2C_MAX_SCAN_DEPTH,
++	handle = ACPI_HANDLE(adap->dev.parent);
++	if (!handle)
++		return;
++
++	status = acpi_walk_namespace(ACPI_TYPE_DEVICE, handle, 1,
+ 				     acpi_i2c_add_device, NULL,
+ 				     adap, NULL);
+ 	if (ACPI_FAILURE(status))
+@@ -293,7 +258,7 @@ acpi_i2c_space_handler(u32 function, acpi_physical_address command,
+ 	struct acpi_connection_info *info = &data->info;
+ 	struct acpi_resource_i2c_serialbus *sb;
+ 	struct i2c_adapter *adapter = data->adapter;
+-	struct i2c_client *client;
++	struct i2c_client client;
+ 	struct acpi_resource *ares;
+ 	u32 accessor_type = function >> 16;
+ 	u8 action = function & ACPI_IO_MASK;
+@@ -304,12 +269,6 @@ acpi_i2c_space_handler(u32 function, acpi_physical_address command,
+ 	if (ACPI_FAILURE(ret))
+ 		return ret;
+ 
+-	client = kzalloc(sizeof(*client), GFP_KERNEL);
+-	if (!client) {
+-		ret = AE_NO_MEMORY;
+-		goto err;
+-	}
+-
+ 	if (!value64 || ares->type != ACPI_RESOURCE_TYPE_SERIAL_BUS) {
+ 		ret = AE_BAD_PARAMETER;
+ 		goto err;
+@@ -321,73 +280,75 @@ acpi_i2c_space_handler(u32 function, acpi_physical_address command,
+ 		goto err;
+ 	}
+ 
+-	client->adapter = adapter;
+-	client->addr = sb->slave_address;
++	memset(&client, 0, sizeof(client));
++	client.adapter = adapter;
++	client.addr = sb->slave_address;
++	client.flags = 0;
+ 
+ 	if (sb->access_mode == ACPI_I2C_10BIT_MODE)
+-		client->flags |= I2C_CLIENT_TEN;
++		client.flags |= I2C_CLIENT_TEN;
+ 
+ 	switch (accessor_type) {
+ 	case ACPI_GSB_ACCESS_ATTRIB_SEND_RCV:
+ 		if (action == ACPI_READ) {
+-			status = i2c_smbus_read_byte(client);
++			status = i2c_smbus_read_byte(&client);
+ 			if (status >= 0) {
+ 				gsb->bdata = status;
+ 				status = 0;
+ 			}
+ 		} else {
+-			status = i2c_smbus_write_byte(client, gsb->bdata);
++			status = i2c_smbus_write_byte(&client, gsb->bdata);
+ 		}
+ 		break;
+ 
+ 	case ACPI_GSB_ACCESS_ATTRIB_BYTE:
+ 		if (action == ACPI_READ) {
+-			status = i2c_smbus_read_byte_data(client, command);
++			status = i2c_smbus_read_byte_data(&client, command);
+ 			if (status >= 0) {
+ 				gsb->bdata = status;
+ 				status = 0;
+ 			}
+ 		} else {
+-			status = i2c_smbus_write_byte_data(client, command,
++			status = i2c_smbus_write_byte_data(&client, command,
+ 					gsb->bdata);
+ 		}
+ 		break;
+ 
+ 	case ACPI_GSB_ACCESS_ATTRIB_WORD:
+ 		if (action == ACPI_READ) {
+-			status = i2c_smbus_read_word_data(client, command);
++			status = i2c_smbus_read_word_data(&client, command);
+ 			if (status >= 0) {
+ 				gsb->wdata = status;
+ 				status = 0;
+ 			}
+ 		} else {
+-			status = i2c_smbus_write_word_data(client, command,
++			status = i2c_smbus_write_word_data(&client, command,
+ 					gsb->wdata);
+ 		}
+ 		break;
+ 
+ 	case ACPI_GSB_ACCESS_ATTRIB_BLOCK:
+ 		if (action == ACPI_READ) {
+-			status = i2c_smbus_read_block_data(client, command,
++			status = i2c_smbus_read_block_data(&client, command,
+ 					gsb->data);
+ 			if (status >= 0) {
+ 				gsb->len = status;
+ 				status = 0;
+ 			}
+ 		} else {
+-			status = i2c_smbus_write_block_data(client, command,
++			status = i2c_smbus_write_block_data(&client, command,
+ 					gsb->len, gsb->data);
+ 		}
+ 		break;
+ 
+ 	case ACPI_GSB_ACCESS_ATTRIB_MULTIBYTE:
+ 		if (action == ACPI_READ) {
+-			status = acpi_gsb_i2c_read_bytes(client, command,
++			status = acpi_gsb_i2c_read_bytes(&client, command,
+ 					gsb->data, info->access_length);
+ 			if (status > 0)
+ 				status = 0;
+ 		} else {
+-			status = acpi_gsb_i2c_write_bytes(client, command,
++			status = acpi_gsb_i2c_write_bytes(&client, command,
+ 					gsb->data, info->access_length);
+ 		}
+ 		break;
+@@ -401,7 +362,6 @@ acpi_i2c_space_handler(u32 function, acpi_physical_address command,
+ 	gsb->status = status;
+ 
+  err:
+-	kfree(client);
+ 	ACPI_FREE(ares);
+ 	return ret;
+ }
+@@ -603,9 +563,6 @@ static int i2c_generic_recovery(struct i2c_adapter *adap)
+ 	if (bri->prepare_recovery)
+ 		bri->prepare_recovery(adap);
+ 
+-	bri->set_scl(adap, val);
+-	ndelay(RECOVERY_NDELAY);
+-
+ 	/*
+ 	 * By this time SCL is high, as we need to give 9 falling-rising edges
+ 	 */
+@@ -636,6 +593,7 @@ static int i2c_generic_recovery(struct i2c_adapter *adap)
+ 
+ int i2c_generic_scl_recovery(struct i2c_adapter *adap)
+ {
++	adap->bus_recovery_info->set_scl(adap, 1);
+ 	return i2c_generic_recovery(adap);
+ }
+ EXPORT_SYMBOL_GPL(i2c_generic_scl_recovery);
+@@ -674,13 +632,8 @@ static int i2c_device_probe(struct device *dev)
+ 	if (!client)
+ 		return 0;
+ 
+-	if (!client->irq) {
+-		int irq = -ENOENT;
+-
+-		if (dev->of_node)
+-			irq = of_irq_get(dev->of_node, 0);
+-		else if (ACPI_COMPANION(dev))
+-			irq = acpi_dev_gpio_irq_get(ACPI_COMPANION(dev), 0);
++	if (!client->irq && dev->of_node) {
++		int irq = of_irq_get(dev->of_node, 0);
+ 
+ 		if (irq == -EPROBE_DEFER)
+ 			return irq;
+@@ -1319,7 +1272,7 @@ static struct i2c_client *of_i2c_register_device(struct i2c_adapter *adap,
+ 	}
+ 
+ 	addr = of_get_property(node, "reg", &len);
+-	if (!addr || (len < sizeof(*addr))) {
++	if (!addr || (len < sizeof(int))) {
+ 		dev_err(&adap->dev, "of_i2c: invalid reg on %s\n",
+ 			node->full_name);
+ 		return ERR_PTR(-EINVAL);
+@@ -1371,17 +1324,13 @@ static int of_dev_node_match(struct device *dev, void *data)
+ struct i2c_client *of_find_i2c_device_by_node(struct device_node *node)
+ {
+ 	struct device *dev;
+-	struct i2c_client *client;
+ 
+-	dev = bus_find_device(&i2c_bus_type, NULL, node, of_dev_node_match);
++	dev = bus_find_device(&i2c_bus_type, NULL, node,
++					 of_dev_node_match);
+ 	if (!dev)
+ 		return NULL;
+ 
+-	client = i2c_verify_client(dev);
+-	if (!client)
+-		put_device(dev);
+-
+-	return client;
++	return i2c_verify_client(dev);
+ }
+ EXPORT_SYMBOL(of_find_i2c_device_by_node);
+ 
+@@ -1389,17 +1338,13 @@ EXPORT_SYMBOL(of_find_i2c_device_by_node);
+ struct i2c_adapter *of_find_i2c_adapter_by_node(struct device_node *node)
+ {
+ 	struct device *dev;
+-	struct i2c_adapter *adapter;
+ 
+-	dev = bus_find_device(&i2c_bus_type, NULL, node, of_dev_node_match);
++	dev = bus_find_device(&i2c_bus_type, NULL, node,
++					 of_dev_node_match);
+ 	if (!dev)
+ 		return NULL;
+ 
+-	adapter = i2c_verify_adapter(dev);
+-	if (!adapter)
+-		put_device(dev);
+-
+-	return adapter;
++	return i2c_verify_adapter(dev);
+ }
+ EXPORT_SYMBOL(of_find_i2c_adapter_by_node);
+ #else
+@@ -1728,7 +1673,7 @@ void i2c_del_adapter(struct i2c_adapter *adap)
+ 	 * FIXME: This is old code and should ideally be replaced by an
+ 	 * alternative which results in decoupling the lifetime of the struct
+ 	 * device from the i2c_adapter, like spi or netdev do. Any solution
+-	 * should be thoroughly tested with DEBUG_KOBJECT_RELEASE enabled!
++	 * should be throughly tested with DEBUG_KOBJECT_RELEASE enabled!
+ 	 */
+ 	init_completion(&adap->dev_released);
+ 	device_unregister(&adap->dev);
+@@ -2969,24 +2914,18 @@ int i2c_slave_register(struct i2c_client *client, i2c_slave_cb_t slave_cb)
+ {
+ 	int ret;
+ 
+-	if (!client || !slave_cb) {
+-		WARN(1, "insufficent data\n");
++	if (!client || !slave_cb)
+ 		return -EINVAL;
+-	}
+ 
+ 	if (!(client->flags & I2C_CLIENT_TEN)) {
+ 		/* Enforce stricter address checking */
+ 		ret = i2c_check_addr_validity(client->addr);
+-		if (ret) {
+-			dev_err(&client->dev, "%s: invalid address\n", __func__);
++		if (ret)
+ 			return ret;
+-		}
+ 	}
+ 
+-	if (!client->adapter->algo->reg_slave) {
+-		dev_err(&client->dev, "%s: not supported by adapter\n", __func__);
++	if (!client->adapter->algo->reg_slave)
+ 		return -EOPNOTSUPP;
+-	}
+ 
+ 	client->slave_cb = slave_cb;
+ 
+@@ -2994,10 +2933,8 @@ int i2c_slave_register(struct i2c_client *client, i2c_slave_cb_t slave_cb)
+ 	ret = client->adapter->algo->reg_slave(client);
+ 	i2c_unlock_adapter(client->adapter);
+ 
+-	if (ret) {
++	if (ret)
+ 		client->slave_cb = NULL;
+-		dev_err(&client->dev, "%s: adapter returned error %d\n", __func__, ret);
+-	}
+ 
+ 	return ret;
+ }
+@@ -3007,10 +2944,8 @@ int i2c_slave_unregister(struct i2c_client *client)
+ {
+ 	int ret;
+ 
+-	if (!client->adapter->algo->unreg_slave) {
+-		dev_err(&client->dev, "%s: not supported by adapter\n", __func__);
++	if (!client->adapter->algo->unreg_slave)
+ 		return -EOPNOTSUPP;
+-	}
+ 
+ 	i2c_lock_adapter(client->adapter);
+ 	ret = client->adapter->algo->unreg_slave(client);
+@@ -3018,8 +2953,6 @@ int i2c_slave_unregister(struct i2c_client *client)
+ 
+ 	if (ret == 0)
+ 		client->slave_cb = NULL;
+-	else
+-		dev_err(&client->dev, "%s: adapter returned error %d\n", __func__, ret);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/i2c/i2c-mux.c b/drivers/i2c/i2c-mux.c
+index 2ba7c0f..06cc1ff 100644
+--- a/drivers/i2c/i2c-mux.c
++++ b/drivers/i2c/i2c-mux.c
+@@ -51,7 +51,7 @@ static int i2c_mux_master_xfer(struct i2c_adapter *adap,
+ 
+ 	ret = priv->select(parent, priv->mux_priv, priv->chan_id);
+ 	if (ret >= 0)
+-		ret = __i2c_transfer(parent, msgs, num);
++		ret = parent->algo->master_xfer(parent, msgs, num);
+ 	if (priv->deselect)
+ 		priv->deselect(parent, priv->mux_priv, priv->chan_id);
+ 
+@@ -144,7 +144,6 @@ struct i2c_adapter *i2c_add_mux_adapter(struct i2c_adapter *parent,
+ 	priv->adap.dev.parent = &parent->dev;
+ 	priv->adap.retries = parent->retries;
+ 	priv->adap.timeout = parent->timeout;
+-	priv->adap.quirks = parent->quirks;
+ 
+ 	/* Sanity check on class */
+ 	if (i2c_mux_parent_classes(parent) & class)
+diff --git a/drivers/i2c/muxes/i2c-mux-pca9541.c b/drivers/i2c/muxes/i2c-mux-pca9541.c
+index 0c8d4d2..cb77277 100644
+--- a/drivers/i2c/muxes/i2c-mux-pca9541.c
++++ b/drivers/i2c/muxes/i2c-mux-pca9541.c
+@@ -104,7 +104,7 @@ static int pca9541_reg_write(struct i2c_client *client, u8 command, u8 val)
+ 		buf[0] = command;
+ 		buf[1] = val;
+ 		msg.buf = buf;
+-		ret = __i2c_transfer(adap, &msg, 1);
++		ret = adap->algo->master_xfer(adap, &msg, 1);
+ 	} else {
+ 		union i2c_smbus_data data;
+ 
+@@ -144,7 +144,7 @@ static int pca9541_reg_read(struct i2c_client *client, u8 command)
+ 				.buf = &val
+ 			}
+ 		};
+-		ret = __i2c_transfer(adap, msg, 2);
++		ret = adap->algo->master_xfer(adap, msg, 2);
+ 		if (ret == 2)
+ 			ret = val;
+ 		else if (ret >= 0)
+diff --git a/drivers/i2c/muxes/i2c-mux-pca954x.c b/drivers/i2c/muxes/i2c-mux-pca954x.c
+index ea4aa9d..bea0d2d 100644
+--- a/drivers/i2c/muxes/i2c-mux-pca954x.c
++++ b/drivers/i2c/muxes/i2c-mux-pca954x.c
+@@ -134,7 +134,7 @@ static int pca954x_reg_write(struct i2c_adapter *adap,
+ 		msg.len = 1;
+ 		buf[0] = val;
+ 		msg.buf = buf;
+-		ret = __i2c_transfer(adap, &msg, 1);
++		ret = adap->algo->master_xfer(adap, &msg, 1);
+ 	} else {
+ 		union i2c_smbus_data data;
+ 		ret = adap->algo->smbus_xfer(adap, client->addr,
+-- 
+1.9.1
+
