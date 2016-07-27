@@ -9,7 +9,6 @@ inherit packagegroup
 RDEPENDS_${PN} += "\
     libfaad \
     libid3tag \
-    libmad \
     gstreamer1.0-plugins-bad-meta \
     gstreamer1.0-plugins-ugly-meta \
     gstreamer1.0-libav \
