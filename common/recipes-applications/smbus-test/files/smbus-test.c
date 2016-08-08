@@ -122,7 +122,13 @@ void parse_cmd(const char *cmdline)
 	union i2c_smbus_data smbus_data;
 	unsigned long funcs;
 
-	if (strncmp(cmdline, "enumerate", 9) == 0) {
+	if ((cmdline == NULL) || (strncmp(cmdline, "exit", 4) == 0)) {
+		printf("\nExiting...\n");
+		if((fd != -1) && (close(fd) < 0))
+			printf("Error closing device\n\n");
+
+		exit(EXIT_SUCCESS);
+	} else if (strncmp(cmdline, "enumerate", 9) == 0) {
 		DIR *dir;
 		struct dirent *dir_entry;
 		int adapter_found = 0;
@@ -593,12 +599,6 @@ void parse_cmd(const char *cmdline)
 		fclose(file);
 	} else if (strncmp(cmdline, "license", 7) == 0) {
 		show_license();
-	} else if (strncmp(cmdline, "exit", 4) == 0) {
-		printf("\nExiting...\n");
-		if((fd != -1) && (close(fd) < 0))
-			printf("Error closing device\n\n");
-
-		exit(EXIT_SUCCESS);
 	} else if (strncmp(cmdline, "help", 4) == 0) {
 		print_usage();
 	} else {

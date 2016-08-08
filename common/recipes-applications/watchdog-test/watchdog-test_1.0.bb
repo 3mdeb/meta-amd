@@ -2,7 +2,7 @@ DESCRIPTION = "Sample application for AMD Watchdog driver"
 SECTION = "applications"
 LICENSE = "BSD"
 DEPENDS = "readline"
-LIC_FILES_CHKSUM = "file://watchdog-test.c;md5=47ff70acbf47e0bf894330dee1143414"
+LIC_FILES_CHKSUM = "file://watchdog-test.c;md5=1d81025de7376754875ee74378f07d7a"
 
 PR = "r1"
 PV = "1.0"

@@ -111,7 +111,15 @@ void print_usage()
 
 void parse_cmd(const char *cmdline)
 {
-	if (strncmp(cmdline, "help", 4) == 0)
+	if ((cmdline == NULL) || (strncmp(cmdline, "exit", 4) == 0)) {
+		printf("\nExiting...\n");
+		printf("\nIf the Watchdog Timer was not disabled, and you did not send the magic character,\n"
+			"Watchdog Timer is still ticking, and your system will reboot soon\n");
+
+		if(close(fd) < 0)
+			perror("Error closing /dev/watchdog");
+		exit(EXIT_SUCCESS);
+	} else if (strncmp(cmdline, "help", 4) == 0)
 		print_usage();
 	else if (strncmp(cmdline, "disablewatchdog", 7) == 0) {
 		int flags;
@@ -243,14 +251,6 @@ void parse_cmd(const char *cmdline)
 		printf("Watchdog Timer will start counting down with the new timeout value\n");
 	} else if (strncmp(cmdline, "license", 7) == 0) {
 		show_license();
-	} else if (strncmp(cmdline, "exit", 4) == 0) {
-		printf("\nExiting...\n");
-		printf("\nIf the Watchdog Timer was not disabled, and you did not send the magic character,\n"
-			"Watchdog Timer is still ticking, and your system will reboot soon\n");
-
-		if(close(fd) < 0)
-			perror("Error closing /dev/watchdog");
-		exit(EXIT_SUCCESS);
 	} else {
 		printf("\nUnknown command\n");
 		print_usage();

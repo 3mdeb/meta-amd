@@ -3,7 +3,7 @@ SECTION = "applications"
 LICENSE = "BSD"
 DEPENDS = "readline"
 LIC_FILES_CHKSUM = "\
-		    file://gpio-test.c;md5=e6e905de01cc60d7d588d095010cc904 \
+		    file://gpio-test.c;md5=35bd4f849bf7b97ea60ecf724ff7d228 \
 		    file://gpio-test.h;md5=c7aaa743b172cf584032f9bfc5e85044 \
 		   "
 

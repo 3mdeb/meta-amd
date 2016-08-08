@@ -2,7 +2,7 @@ DESCRIPTION = "Sample application for AMD GPIO driver"
 SECTION = "applications"
 LICENSE = "BSD"
 DEPENDS = "readline"
-LIC_FILES_CHKSUM = "file://gpio-test.c;md5=cd7d02789bf5b4795b385ad4f2938469 \
+LIC_FILES_CHKSUM = "file://gpio-test.c;md5=c07e1063c9d11d0bafd9efb931ad6119 \
                     file://gpio-test.h;md5=c7aaa743b172cf584032f9bfc5e85044 \
                    "
 

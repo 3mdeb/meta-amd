@@ -182,7 +182,11 @@ void parse_cmd(const char *cmdline)
 	struct rtc_time rtc_time;
 	struct rtc_wkalrm rtc_wakealarm;
 
-	if (strncmp(cmdline, "help", 4) == 0)
+	if ((cmdline == NULL) || (strncmp(cmdline, "exit", 4) == 0)) {
+		close(rtc_fd);
+		printf("\nExiting...\n");
+		exit(EXIT_SUCCESS);
+	} else if (strncmp(cmdline, "help", 4) == 0)
 		print_usage();
 	else if (strncmp(cmdline, "updateinton", 11) == 0) {
 		int i;
@@ -453,10 +457,6 @@ void parse_cmd(const char *cmdline)
 			perror("RTC_PIE_OFF ioctl");
 	} else if (strncmp(cmdline, "license", 7) == 0) {
 		show_license();
-	} else if (strncmp(cmdline, "exit", 4) == 0) {
-		close(rtc_fd);
-		printf("\nExiting...\n");
-		exit(EXIT_SUCCESS);
 	} else {
 		printf("\nUnknown command\n");
 		print_usage();
