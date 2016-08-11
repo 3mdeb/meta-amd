@@ -125,7 +125,11 @@ void parse_cmd(const char *cmdline)
 	int addr;
 	int ret;
 
-	if (strncmp(cmdline, "enumerate", 9) == 0) {
+	if ((cmdline == NULL) || (strncmp(cmdline, "exit", 4) == 0)) {
+		printf("\nExiting...\n");
+		close(fd);
+		exit(EXIT_SUCCESS);
+	} else if (strncmp(cmdline, "enumerate", 9) == 0) {
 		DIR *dir;
 		struct dirent *dir_entry;
 		int device_found = 0;
@@ -758,10 +762,6 @@ void parse_cmd(const char *cmdline)
 		close(infile_fd);
 	} else if (strncmp(cmdline, "license", 7) == 0) {
 		show_license();
-	} else if (strncmp(cmdline, "exit", 4) == 0) {
-		printf("\nExiting...\n");
-		close(fd);
-		exit(EXIT_SUCCESS);
 	} else if (strncmp(cmdline, "help", 4) == 0) {
 		print_usage();
 	} else {

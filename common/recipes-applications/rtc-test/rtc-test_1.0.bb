@@ -2,7 +2,7 @@ DESCRIPTION = "Sample application for AMD RTC driver"
 SECTION = "applications"
 LICENSE = "BSD"
 DEPENDS = "readline"
-LIC_FILES_CHKSUM = "file://rtc-test.c;md5=cdf9bfd59714d20025056dbfaaf31134"
+LIC_FILES_CHKSUM = "file://rtc-test.c;md5=ab350f4f921bfc19f7b7938a07f5688a"
 
 PR = "r1"
 PV = "1.0"

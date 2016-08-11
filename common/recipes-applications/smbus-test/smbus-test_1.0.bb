@@ -2,7 +2,7 @@ DESCRIPTION = "Sample application for AMD SMBUS driver"
 SECTION = "applications"
 LICENSE = "BSD | GPLv2"
 DEPENDS = "readline"
-LIC_FILES_CHKSUM = "file://smbus-test.c;md5=51840771157718d4d562329e476d6917 \
+LIC_FILES_CHKSUM = "file://smbus-test.c;md5=6e93b58b38eb7ba04529bb2b6c66ef70 \
                     file://i2c-dev.h;md5=11afa8583cd78137a63feb1a8b24cc51 \
                    "
 

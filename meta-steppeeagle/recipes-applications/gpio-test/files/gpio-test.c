@@ -109,7 +109,34 @@ void parse_cmd(const char *cmdline)
 {
 	int fd;
 
-	if (strncmp(cmdline, "help", 4) == 0)
+	if ((cmdline == NULL) || (strncmp(cmdline, "exit", 4) == 0)) {
+		int i;
+		int ret;
+		char gpio[3 + 1];
+
+		printf("\nExiting...\n");
+
+		/* We need to unexport all the GPIO pins exported earlier */
+		for (i = 0; i < AMD_GPIO_NUM_PINS; i++) {
+			if (gpio_in_use[i]) {
+				int fd;
+
+				fd = open("/sys/class/gpio/unexport", O_WRONLY);
+				if (fd < 0) {
+					printf("\nPlease make sure AMD GPIO driver is loaded\n");
+					exit(EXIT_FAILURE);
+				}
+				memset(gpio, '\0', (3 + 1));
+				snprintf(gpio, 4, "%d", i);
+
+				ret = write(fd, gpio, strlen(gpio));
+				if (ret < 0)
+					perror("Error writing to /sys/class/gpio/unexport");
+			}
+		}
+
+		exit(EXIT_SUCCESS);
+	} else if (strncmp(cmdline, "help", 4) == 0)
 		print_usage();
 	else if (strncmp(cmdline, "getnumgpio", 10) == 0) {
 		int fd;
@@ -517,33 +544,6 @@ out:
 			perror("Error executing \'dmesg | grep GPIO\'");
 	} else if (strncmp(cmdline, "license", 7) == 0) {
 		show_license();
-	} else if (strncmp(cmdline, "exit", 4) == 0) {
-		int i;
-		int ret;
-		char gpio[3 + 1];
-
-		printf("\nExiting...\n");
-
-		/* We need to unexport all the GPIO pins exported earlier */
-		for (i = 0; i < AMD_GPIO_NUM_PINS; i++) {
-			if (gpio_in_use[i]) {
-				int fd;
-
-				fd = open("/sys/class/gpio/unexport", O_WRONLY);
-				if (fd < 0) {
-					printf("\nPlease make sure AMD GPIO driver is loaded\n");
-					exit(EXIT_FAILURE);
-				}
-				memset(gpio, '\0', (3 + 1));
-				snprintf(gpio, 4, "%d", i);
-
-				ret = write(fd, gpio, strlen(gpio));
-				if (ret < 0)
-					perror("Error writing to /sys/class/gpio/unexport");
-			}
-		}
-
-		exit(EXIT_SUCCESS);
 	} else {
 		printf("\nUnknown command\n");
 		print_usage();
