@@ -1,6 +1,6 @@
 DESCRIPTION = "This kernel module provides support for AMD GPIO driver"
 LICENSE = "BSD | GPLv2"
-LIC_FILES_CHKSUM = "file://gpio-amd.c;md5=510b5351a8ac0bf7d5db80ba8405b62d \
+LIC_FILES_CHKSUM = "file://gpio-amd.c;md5=737a1d848eb024813d53a91c16227f3b \
 		    file://gpio-amd.h;md5=33c3b088228b74a9728fb39279d8c20a \
 		    file://Makefile;md5=1cf995f5213fae50197541e5992b0d4e \
 		   "

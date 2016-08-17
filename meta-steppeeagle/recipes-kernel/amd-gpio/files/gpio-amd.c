@@ -651,14 +651,7 @@ exit:
 
 static int amd_gpio_remove(struct platform_device *pdev)
 {
-	int err;
-
-	err = gpiochip_remove(&amd_gpio_chip.gpio);
-	if (err) {
-		dev_err(&pdev->dev, "Unable to remove gpio chip\n");
-		return err;
-	}
-
+	gpiochip_remove(&amd_gpio_chip.gpio);
 	iounmap(amd_gpio_chip.iomuxbase);
 	release_mem_region(iomuxbase_phys, AMD_IOMUX_MEM_MAP_SIZE);
 	iounmap(amd_gpio_chip.gpiobase);
