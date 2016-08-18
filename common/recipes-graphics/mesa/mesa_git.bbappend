@@ -90,6 +90,11 @@ python __anonymous () {
 # so skip the .so symlink checks.
 INSANE_SKIP_${PN}-megadriver += "${@bb.utils.contains('PACKAGECONFIG', 'va', 'dev-so', '', d)}"
 
+# Mesa 11.1 onwards provides options for crypto functions
+# this is not supported in the version we are using currently
+# and generates warnings so disable it.
+MESA_CRYPTO = ""
+
 # Install override from mesa.inc
 do_install_append_amd() {
 	cp ${S}/include/EGL/eglplatform.h ${D}${includedir}/EGL/eglplatform.h
