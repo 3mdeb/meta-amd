@@ -1,59 +1,27 @@
-meta-seattle
-============
+# meta-seattle
 
-This is the location for AMD Seattle maintained BSP.
+This is the location for AMD Seattle BSP.
 
-
-Overview of AMD 64-bit ARM-based processor
-------------------------------------------
+## Overview of AMD 64-bit ARM-based processor
 
 The AMD Opteron A1100-Series features AMDs first 64-bit ARM-based processor, codenamed "Seattle".
 
-
-Yocto Project Compatible
-========================
+## Yocto Project Compatible
 
 This BSP is compatible with the Yocto Project as per the requirements
 listed here:
 
   https://www.yoctoproject.org/webform/yocto-project-compatible-registration
 
-Dependencies
-============
+## Dependencies
 
 This layer depends on:
 
-  URI: git://git.openembedded.org/bitbake
-  branch: master
+[bitbake](https://github.com/openembedded/bitbake) layer,
+[oe-core](https://github.com/openembedded/openembedded-core) layer,
+meta-amd/common layer
 
-  URI: git://git.openembedded.org/openembedded-core
-  layers: meta
-  branch: master
-
-  URI: git://git.yoctoproject.org/meta-amd
-  layers: common
-  branch: master
-
-Patches
-=======
-
-Please submit any patches against this BSP to the maintainer and cc
-the meta-amd mailing list (meta-amd@yoctoproject.org):
-
-Maintainer: Adrian Calianu <adrian.calianu@enea.com>
-
-
-Table of Contents
-=================
-
-  I. Building the meta-seattle BSP layer
- II. Booting the images
-III. How to Run 32-bit Applications on aarch64
- IV. Limitations
-
-
-I. Building the meta-seattle BSP layer
-=======================================
+## Building the meta-seattle BSP layer
 
 The following instructions require a Poky installation (or equivalent).
 
@@ -83,8 +51,7 @@ Once complete the images for the target machine will be available in the output
 directory 'tmp/deploy/images'.
 
 
-II. Booting the images
-=====================================
+## Booting the images
 
 Booting the images using UEFI firmware
 
@@ -119,8 +86,7 @@ References:
 1) https://www.kernel.org/doc/Documentation/efi-stub.txt
 2) http://www.uefi.org/specifications
 
-III. How to Run 32-bit Applications on aarch64
-==============================================
+## How to Run 32-bit Applications on aarch64
 
 Since multilib is not yet available for aarch64, this BSP offers some alternatives
 in order to run 32-bit legacy applications on an aarch64.
@@ -132,8 +98,7 @@ chroot and another one qemu installation.
 meta-seattle BSP includes two scripts that help you to setup environment for 32bit
 applications that can be found under following path meta-seattle/recipes-support/32b-env/
 
-III.1 Using chroot tool to run 32-bit applications on aarch64
-=============================================================
+### Using chroot tool to run 32-bit applications on aarch64
 
 This solution requires the chroot tool on the target, a 32b-built rootfs, and
 a build for the seattle machine.
@@ -144,15 +109,14 @@ root@seattle:~# tar -zxf rootfs32.tar.gz
 
 root@seattle:~# set_32b_env_chroot.sh -r ./rootfs32
 
-# 32b environment started
+- 32b environment started
 @seattle:~# ./hello32d
 
 Starting from this point, any 32-bit application can be executed, but not 64-bit
 applications which will fail due to wrong path to 32-bit libraries. To run a 64-bit
 application, chroot mode must be quit by using the "exit" command.
 
-III.2 Using qemu to run 32-bit applications on aarch64
-======================================================
+### Using qemu to run 32-bit applications on aarch64
 
 This example requires an existing 32b-built rootfs and a build for the seattle machine.
 It is also expected that qemu-arm is already installed!!!
@@ -163,8 +127,8 @@ root@seattle:~# source /usr/bin/set_32b_env_qemu.sh -r ./rootfs32
 
 Starting from this point, any 32-bit or 64-bit application can be executed.
 
-IV. Limitations
-===============
+## Limitations
+
 In order to enable 32-bit support in the aarch64 kernel, COMPAT mode is enabled
 (CONFIG_COMPAT=y), page size set to 4K, and VirtualAddress set to 48-bit.
 
