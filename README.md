@@ -1,16 +1,15 @@
-meta-amd
-==========
+# meta-amd
 
 This is the location for AMD BSPs.
 
 Please see the README files contained in the individual BSP layers for
-BSP-specific information.
+BSP-specific information like dependencies etc.
 
 If you have problems with or questions about a particular BSP, please
-contact the maintainer listed in the MAINTAINERS file directly (cc:ing
-the Yocto mailing list puts it in the archive and helps other people
-who might have the same questions in the future), but please try to do
-the following first:
+contact the maintainer of the particular layer as listed in the
+MAINTAINERS section below directly (cc:ing the Yocto mailing list
+puts it in the archive and helps other people who might have the same
+questions in the future), but please try to do the following first:
 
   - look in the Yocto Project Bugzilla
     (http://bugzilla.yoctoproject.org/) to see if a problem has
@@ -31,8 +30,7 @@ submit the bug against the most likely category for the problem - if
 you're wrong, it's not a big deal and the bug will be recategorized
 upon triage.
 
-Guidelines for submitting patches
-=================================
+## Contributing
 
 Please submit any patches against meta-amd BSPs to the meta-amd
 mailing list (meta-amd@yoctoproject.org).  Also, if your patches are
@@ -82,3 +80,13 @@ The meta-amd maintainers will do their best to review and/or pull in
 a patch or patchset within 24 hours of the time it was posted.  For
 larger and/or more involved patches and patchsets, the review process
 may take longer.
+
+## Maintainers
+
+The per layer gatekeepers are the following.
+
+- amdfalconx86: Drew Moseley, drew_moseley@mentor.com
+- baldeagle: Drew Moseley, drew_moseley@mentor.com
+- common: Drew Moseley, drew_moseley@mentor.com
+- steppeeagle: Drew Moseley, drew_moseley@mentor.com
+- seattle: Adrian Calianu, adrian.calianu@enea.com

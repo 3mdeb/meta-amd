@@ -1,5 +1,4 @@
-meta-amd/common
-===============
+# meta-amd/common
 
 This layer contains metadata that is appropriate for all
 AMD-based platforms.
