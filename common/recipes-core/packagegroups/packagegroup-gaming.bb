@@ -7,7 +7,9 @@ PR = "r0"
 inherit packagegroup
 
 LUNARG_SDK_COMPONENTS = "glslang spirv-tools vulkan-loader-layers vulkan-tools vulkan-samples"
+CODEXL_COMPONENTS = "codexl codexl-examples"
 
 RDEPENDS_${PN} += "\
     ${LUNARG_SDK_COMPONENTS} \
+    ${CODEXL_COMPONENTS} \
 "
