@@ -1,0 +1,236 @@
+From 930261e14dcdc6f224fe8f4336eacb3b80533d21 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Mon, 7 Dec 2015 13:27:26 -0500
+Subject: [PATCH 0582/1110] drm/amd/dal: Add callback to DM for aux access
+
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c  | 41 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      |  9 ++---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 19 +++++++---
+ drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c     | 12 +++----
+ drivers/gpu/drm/amd/dal/dc/dc_helpers.h            | 14 ++++++++
+ drivers/gpu/drm/amd/dal/dc/dcs/ddc_service.c       |  2 ++
+ drivers/gpu/drm/amd/dal/dc/dcs/ddc_service.h       | 11 ++++++
+ 7 files changed, 91 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
+index 2554e1a..7d3b2d3 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
+@@ -457,3 +457,44 @@ void dc_helpers_dp_mst_stop_top_mgr(
+ 
+ 	aconnector->is_mst_connector = false;
+ }
++
++bool dc_helper_dp_read_dpcd(
++		struct dc_context *ctx,
++		const struct dc_link *link,
++		uint32_t address,
++		uint8_t *data,
++		uint32_t size) {
++
++
++	struct amdgpu_device *adev = ctx->driver_context;
++	struct drm_device *dev = adev->ddev;
++	struct amdgpu_connector *aconnector = get_connector_for_link(dev, link);
++
++	if (!aconnector) {
++		DRM_ERROR("Failed to found connector for link!");
++		return false;
++	}
++
++	return drm_dp_dpcd_read(&aconnector->dm_dp_aux.aux, address,
++			data, size) > 0;
++}
++
++bool dc_helper_dp_write_dpcd(
++		struct dc_context *ctx,
++		const struct dc_link *link,
++		uint32_t address,
++		const uint8_t *data,
++		uint32_t size) {
++
++	struct amdgpu_device *adev = ctx->driver_context;
++	struct drm_device *dev = adev->ddev;
++	struct amdgpu_connector *aconnector = get_connector_for_link(dev, link);
++
++	if (!aconnector) {
++		DRM_ERROR("Failed to found connector for link!");
++		return false;
++	}
++
++	return drm_dp_dpcd_write(&aconnector->dm_dp_aux.aux, address,
++			(uint8_t *)data, size) > 0;
++}
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index ab546a7..9bb8165 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -795,20 +795,15 @@ static void handle_hpd_rx_irq(void *param)
+ 	struct drm_connector *connector = &aconnector->base;
+ 	struct drm_device *dev = connector->dev;
+ 
+-	if (aconnector->mst_mgr.mst_state) {
+-		mutex_lock(&aconnector->mst_mgr.aux->hw_mutex);
+-	}
+-
+ 	if (dc_link_handle_hpd_rx_irq(aconnector->dc_link) &&
+-			!aconnector->mst_mgr.mst_state) {
++			!aconnector->is_mst_connector) {
+ 		/* Downstream Port status changed. */
+ 		dc_link_detect(aconnector->dc_link);
+ 		amdgpu_dm_update_connector_after_detect(aconnector);
+ 		drm_helper_hpd_irq_event(dev);
+ 	}
+ 
+-	if (aconnector->mst_mgr.mst_state) {
+-		mutex_unlock(&aconnector->mst_mgr.aux->hw_mutex);
++	if (aconnector->is_mst_connector) {
+ 		dc_helpers_dp_mst_handle_mst_hpd_rx_irq(param);
+ 	}
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 7fc9f17..d8c0799 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -43,6 +43,8 @@
+ #include "opp.h"
+ #include "link_encoder.h"
+ 
++#include "dcs/ddc_service.h"
++
+ /*******************************************************************************
+  * Private structures
+  ******************************************************************************/
+@@ -912,6 +914,7 @@ void dc_print_sync_report(
+ 	 * data from Step 1). */
+ }
+ 
++/*AG TODO Create callbacks for WIN DM */
+ bool dc_read_dpcd(
+ 		struct dc *dc,
+ 		uint32_t link_index,
+@@ -921,9 +924,13 @@ bool dc_read_dpcd(
+ {
+ 	struct core_link *link =
+ 			DC_LINK_TO_LINK(dc_get_link_at_index(dc, link_index));
+-	enum dc_status r = core_link_read_dpcd(link, address, data, size);
+ 
+-	return r == DC_OK;
++	enum ddc_result r = dal_ddc_service_read_dpcd_data(
++			link->ddc,
++			address,
++			data,
++			size);
++	return r == DDC_RESULT_SUCESSFULL;
+ }
+ 
+ bool dc_write_dpcd(
+@@ -935,9 +942,13 @@ bool dc_write_dpcd(
+ {
+ 	struct core_link *link =
+ 			DC_LINK_TO_LINK(dc_get_link_at_index(dc, link_index));
+-	enum dc_status r = core_link_write_dpcd(link, address, data, size);
+ 
+-	return r == DC_OK;
++	enum ddc_result r = dal_ddc_service_write_dpcd_data(
++			link->ddc,
++			address,
++			data,
++			size);
++	return r == DDC_RESULT_SUCESSFULL;
+ }
+ 
+ bool dc_link_add_sink(
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
+index 4c9eae4..3a80a10 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
+@@ -20,9 +20,9 @@ enum dc_status core_link_read_dpcd(
+ 	uint8_t *data,
+ 	uint32_t size)
+ {
+-	if (dal_ddc_service_read_dpcd_data(link->ddc, address, data, size)
+-			!= DDC_RESULT_SUCESSFULL)
+-		return DC_ERROR_UNEXPECTED;
++	if (!dc_helper_dp_read_dpcd(link->ctx,
++			&link->public, address, data, size))
++			return DC_ERROR_UNEXPECTED;
+ 
+ 	return DC_OK;
+ }
+@@ -33,9 +33,9 @@ enum dc_status core_link_write_dpcd(
+ 	const uint8_t *data,
+ 	uint32_t size)
+ {
+-	if (dal_ddc_service_write_dpcd_data(link->ddc, address, data, size)
+-			!= DDC_RESULT_SUCESSFULL)
+-		return DC_ERROR_UNEXPECTED;
++	if (!dc_helper_dp_write_dpcd(link->ctx,
++			&link->public, address, data, size))
++				return DC_ERROR_UNEXPECTED;
+ 
+ 	return DC_OK;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_helpers.h b/drivers/gpu/drm/amd/dal/dc/dc_helpers.h
+index c0fbb65..66f4d2d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc_helpers.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc_helpers.h
+@@ -72,4 +72,18 @@ void dc_helpers_dp_mst_stop_top_mgr(
+ 		struct dc_context *ctx,
+ 		const struct dc_link *link);
+ 
++bool dc_helper_dp_read_dpcd(
++		struct dc_context *ctx,
++		const struct dc_link *link,
++		uint32_t address,
++		uint8_t *data,
++		uint32_t size);
++
++bool dc_helper_dp_write_dpcd(
++		struct dc_context *ctx,
++		const struct dc_link *link,
++		uint32_t address,
++		const uint8_t *data,
++		uint32_t size);
++
+ #endif /* __DC_HELPERS__ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dcs/ddc_service.c b/drivers/gpu/drm/amd/dal/dc/dcs/ddc_service.c
+index 5436704..854ff3f 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dcs/ddc_service.c
++++ b/drivers/gpu/drm/amd/dal/dc/dcs/ddc_service.c
+@@ -564,6 +564,8 @@ static uint32_t query_edid_block(
+ #define DDC_DPCD_EDID_TEST_MASK 0x04
+ #define DDC_DPCD_TEST_REQUEST_ADDRESS 0x218
+ 
++/* AG TODO GO throug DM callback here like for DPCD */
++
+ static void write_dp_edid_checksum(
+ 	struct ddc_service *ddc,
+ 	uint8_t checksum)
+diff --git a/drivers/gpu/drm/amd/dal/dc/dcs/ddc_service.h b/drivers/gpu/drm/amd/dal/dc/dcs/ddc_service.h
+index e5217b7..3bf2a9e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dcs/ddc_service.h
++++ b/drivers/gpu/drm/amd/dal/dc/dcs/ddc_service.h
+@@ -35,4 +35,15 @@ void dal_ddc_service_set_ddc_pin(
+ struct ddc *dal_ddc_service_get_ddc_pin(struct ddc_service *ddc_service);
+ void dal_ddc_service_reset_dp_receiver_id_info(struct ddc_service *ddc_service);
+ 
++enum ddc_result dal_ddc_service_read_dpcd_data(
++	struct ddc_service *ddc,
++	uint32_t address,
++	uint8_t *data,
++	uint32_t len);
++enum ddc_result dal_ddc_service_write_dpcd_data(
++	struct ddc_service *ddc,
++	uint32_t address,
++	const uint8_t *data,
++	uint32_t len);
++
+ #endif /* __DAL_DDC_SERVICE_H__ */
+-- 
+2.7.4
+

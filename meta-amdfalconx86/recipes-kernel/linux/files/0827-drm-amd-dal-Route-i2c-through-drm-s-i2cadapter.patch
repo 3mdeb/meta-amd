@@ -1,0 +1,682 @@
+From c0da0066c05d0e388a3e6a632ae61fab62f46ff5 Mon Sep 17 00:00:00 2001
+From: Harry Wentland <harry.wentland@amd.com>
+Date: Thu, 18 Feb 2016 15:45:33 -0500
+Subject: [PATCH 0827/1110] drm/amd/dal: Route i2c through drm's i2cadapter
+
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c  |  31 +++++
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    |  74 +++++++++++-
+ drivers/gpu/drm/amd/dal/dc/bios/bios_parser.c      |   1 +
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |  15 +++
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          |   1 +
+ drivers/gpu/drm/amd/dal/dc/core/dc_link_ddc.c      |  72 ++++--------
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |   4 +
+ drivers/gpu/drm/amd/dal/dc/dc_ddc_types.h          | 129 +++++++++++++++++++++
+ drivers/gpu/drm/amd/dal/dc/dc_types.h              |   3 +
+ drivers/gpu/drm/amd/dal/dc/dm_helpers.h            |   5 +
+ drivers/gpu/drm/amd/dal/dc/gpio/ddc.h              |   7 --
+ drivers/gpu/drm/amd/dal/dc/inc/dc_link_ddc.h       |   1 +
+ .../gpu/drm/amd/dal/include/ddc_service_types.h    |  30 -----
+ drivers/gpu/drm/amd/dal/include/gpio_types.h       |   4 -
+ drivers/gpu/drm/amd/dal/include/i2caux_interface.h |  23 ----
+ 15 files changed, 282 insertions(+), 118 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/dc_ddc_types.h
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c
+index bbc60a6..97a3206 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c
+@@ -26,6 +26,7 @@
+ #include <linux/string.h>
+ #include <linux/acpi.h>
+ #include <linux/version.h>
++#include <linux/i2c.h>
+ 
+ #include <drm/drmP.h>
+ #include <drm/drm_crtc_helper.h>
+@@ -498,3 +499,33 @@ bool dm_helper_dp_write_dpcd(
+ 	return drm_dp_dpcd_write(&aconnector->dm_dp_aux.aux,
+ 			address, (uint8_t *)data, size) > 0;
+ }
++
++bool dm_helpers_submit_i2c(
++		struct dc_context *ctx,
++		const struct dc_link *link,
++		struct i2c_command *cmd)
++{
++	struct amdgpu_device *adev = ctx->driver_context;
++	struct drm_device *dev = adev->ddev;
++	struct amdgpu_connector *aconnector = get_connector_for_link(dev, link);
++	struct i2c_msg *msgs;
++	int i = 0;
++	int num = cmd->number_of_payloads;
++
++	if (!aconnector) {
++		DRM_ERROR("Failed to found connector for link!");
++		return false;
++	}
++
++	msgs = kzalloc(num * sizeof(struct i2c_msg), GFP_KERNEL);
++
++	for (i = 0; i < num; i++) {
++		msgs[i].flags = cmd->payloads[i].write ? I2C_M_RD : 0;
++		msgs[i].addr = cmd->payloads[i].address;
++		msgs[i].len = cmd->payloads[i].length;
++		msgs[i].buf = cmd->payloads[i].data;
++	}
++
++	return i2c_transfer(&aconnector->i2c->base, msgs, num) == num;
++}
++
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index df7afc9..84ce0bb 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -1808,6 +1808,58 @@ void amdgpu_dm_connector_init_helper(
+ 				0);
+ }
+ 
++int amdgpu_dm_i2c_xfer(struct i2c_adapter *i2c_adap,
++		      struct i2c_msg *msgs, int num)
++{
++	struct amdgpu_i2c_adapter *i2c = i2c_get_adapdata(i2c_adap);
++	struct i2c_command cmd;
++	int i;
++
++	cmd.payloads = kzalloc(num * sizeof(struct i2c_payload), GFP_KERNEL);
++	cmd.number_of_payloads = num;
++	cmd.engine = I2C_COMMAND_ENGINE_DEFAULT;
++	cmd.speed = 100;
++
++	for (i = 0; i < num; i++) {
++		cmd.payloads[i].write = (msgs[i].flags & I2C_M_RD);
++		cmd.payloads[i].address = msgs[i].addr;
++		cmd.payloads[i].length = msgs[i].len;
++		cmd.payloads[i].data = msgs[i].buf;
++	}
++
++	if (dc_submit_i2c(i2c->dm->dc, i2c->link_index, &cmd))
++		return num;
++	else
++		return -EIO;
++}
++
++u32 amdgpu_dm_i2c_func(struct i2c_adapter *adap)
++{
++	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
++}
++
++static const struct i2c_algorithm amdgpu_dm_i2c_algo = {
++	.master_xfer = amdgpu_dm_i2c_xfer,
++	.functionality = amdgpu_dm_i2c_func,
++};
++
++struct amdgpu_i2c_adapter *create_i2c(unsigned int link_index, struct amdgpu_display_manager *dm, int *res)
++{
++	struct amdgpu_i2c_adapter *i2c;
++
++	i2c = kzalloc(sizeof (struct amdgpu_i2c_adapter), GFP_KERNEL);
++	i2c->dm = dm;
++	i2c->base.owner = THIS_MODULE;
++	i2c->base.class = I2C_CLASS_DDC;
++	i2c->base.dev.parent = &dm->adev->pdev->dev;
++	i2c->base.algo = &amdgpu_dm_i2c_algo;
++	snprintf(i2c->base.name, sizeof (i2c->base.name), "AMDGPU DM i2c hw bus %d", link_index);
++	i2c->link_index = link_index;
++	i2c_set_adapdata(&i2c->base, i2c);
++
++	return i2c;
++}
++
+ /* Note: this function assumes that dc_link_detect() was called for the
+  * dc_link which will be represented by this aconnector. */
+ int amdgpu_dm_connector_init(
+@@ -1816,12 +1868,23 @@ int amdgpu_dm_connector_init(
+ 	uint32_t link_index,
+ 	struct amdgpu_encoder *aencoder)
+ {
+-	int res, connector_type;
++	int res = 0;
++	int connector_type;
+ 	struct dc *dc = dm->dc;
+ 	const struct dc_link *link = dc_get_link_at_index(dc, link_index);
++	struct amdgpu_i2c_adapter *i2c;
+ 
+ 	DRM_DEBUG_KMS("%s()\n", __func__);
+ 
++	i2c = create_i2c(link->link_index, dm, &res);
++	aconnector->i2c = i2c;
++	res = i2c_add_adapter(&i2c->base);
++
++	if (res) {
++		DRM_ERROR("Failed to register hw i2c %d\n", link->link_index);
++		goto out_free;
++	}
++
+ 	connector_type = to_drm_connector_type(link->connector_signal);
+ 
+ 	res = drm_connector_init(
+@@ -1833,7 +1896,7 @@ int amdgpu_dm_connector_init(
+ 	if (res) {
+ 		DRM_ERROR("connector_init failed\n");
+ 		aconnector->connector_id = -1;
+-		return res;
++		goto out_free;
+ 	}
+ 
+ 	drm_connector_helper_add(
+@@ -1877,7 +1940,12 @@ int amdgpu_dm_connector_init(
+ 	}
+ #endif
+ 
+-	return 0;
++out_free:
++	if (res) {
++		kfree(i2c);
++		aconnector->i2c = NULL;
++	}
++	return res;
+ }
+ 
+ int amdgpu_dm_get_encoder_crtc_mask(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.c b/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.c
+index 4ce5f9f..586a5ee 100644
+--- a/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.c
++++ b/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.c
+@@ -3432,6 +3432,7 @@ static bool i2c_read(
+ 		cmd.payloads = payloads;
+ 		cmd.number_of_payloads = ARRAY_SIZE(payloads);
+ 
++		/* TODO route this through drm i2c_adapter */
+ 		result = dal_i2caux_submit_i2c_command(
+ 				dal_adapter_service_get_i2caux(bp->as),
+ 				ddc,
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 666e248..8ca8121 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -817,6 +817,21 @@ bool dc_write_dpcd(
+ 	return r == DDC_RESULT_SUCESSFULL;
+ }
+ 
++bool dc_submit_i2c(
++		struct dc *dc,
++		uint32_t link_index,
++		struct i2c_command *cmd)
++{
++	struct core_link *link =
++			DC_LINK_TO_LINK(dc_get_link_at_index(dc, link_index));
++	struct ddc_service *ddc = link->ddc;
++
++	return dal_i2caux_submit_i2c_command(
++		dal_adapter_service_get_i2caux(ddc->as),
++		ddc->ddc_pin,
++		cmd);
++}
++
+ bool dc_link_add_remote_sink(const struct dc_link *link, struct dc_sink *sink)
+ {
+ 	struct core_link *core_link = DC_LINK_TO_LINK(link);
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 8203432..054216c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -971,6 +971,7 @@ static bool construct(
+ 	ddc_service_init_data.as = as;
+ 	ddc_service_init_data.ctx = link->ctx;
+ 	ddc_service_init_data.id = link->link_id;
++	ddc_service_init_data.link = link;
+ 	link->ddc = dal_ddc_service_create(&ddc_service_init_data);
+ 
+ 	link->public.ddc_hw_inst =
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link_ddc.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link_ddc.c
+index 62b8c26..f725da7 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link_ddc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link_ddc.c
+@@ -24,14 +24,14 @@
+  */
+ 
+ #include "dm_services.h"
+-
++#include "dm_helpers.h"
+ #include "include/adapter_service_interface.h"
+ #include "include/ddc_service_types.h"
+ #include "include/grph_object_id.h"
+ #include "include/dpcd_defs.h"
+ #include "include/logger_interface.h"
+ #include "include/vector.h"
+-
++#include "core_types.h"
+ #include "dc_link_ddc.h"
+ 
+ #define AUX_POWER_UP_WA_DELAY 500
+@@ -145,37 +145,6 @@ union hdmi_scdc_test_config_Data {
+ 
+ 
+ 
+-union ddc_wa {
+-	struct {
+-		uint32_t DP_SKIP_POWER_OFF:1;
+-		uint32_t DP_AUX_POWER_UP_WA_DELAY:1;
+-	} bits;
+-	uint32_t raw;
+-};
+-
+-struct ddc_flags {
+-	uint8_t EDID_QUERY_DONE_ONCE:1;
+-	uint8_t IS_INTERNAL_DISPLAY:1;
+-	uint8_t FORCE_READ_REPEATED_START:1;
+-	uint8_t EDID_STRESS_READ:1;
+-
+-};
+-
+-struct ddc_service {
+-	struct ddc *ddc_pin;
+-	struct ddc_flags flags;
+-	union ddc_wa wa;
+-	enum ddc_transaction_type transaction_type;
+-	enum display_dongle_type dongle_type;
+-	struct dp_receiver_id_info dp_receiver_id_info;
+-	struct adapter_service *as;
+-	struct dc_context *ctx;
+-
+-	uint32_t address;
+-	uint32_t edid_buf_len;
+-	uint8_t edid_buf[MAX_EDID_BUFFER_SIZE];
+-};
+-
+ struct i2c_payloads {
+ 	struct vector payloads;
+ };
+@@ -312,6 +281,7 @@ static bool construct(
+ 	enum connector_id connector_id =
+ 		dal_graphics_object_id_get_connector_id(init_data->id);
+ 
++	ddc_service->link = init_data->link;
+ 	ddc_service->ctx = init_data->ctx;
+ 	ddc_service->as = init_data->as;
+ 	ddc_service->ddc_pin = dal_adapter_service_obtain_ddc(
+@@ -474,10 +444,10 @@ static bool i2c_read(
+ 		.engine = DDC_I2C_COMMAND_ENGINE,
+ 		.speed = dal_adapter_service_get_sw_i2c_speed(ddc->as) };
+ 
+-	return dal_i2caux_submit_i2c_command(
+-		dal_adapter_service_get_i2caux(ddc->as),
+-		ddc->ddc_pin,
+-		&command);
++	return dm_helpers_submit_i2c(
++			ddc->ctx,
++			&ddc->link->public,
++			&command);
+ }
+ 
+ static uint8_t aux_read_edid_block(
+@@ -614,18 +584,18 @@ static uint8_t i2c_read_edid_block(
+ 		cmd.payloads = &payloads[1];
+ 		cmd.number_of_payloads = 1;
+ 
+-		if (dal_i2caux_submit_i2c_command(
+-			dal_adapter_service_get_i2caux(ddc->as),
+-			ddc->ddc_pin,
++		if (dm_helpers_submit_i2c(
++			ddc->ctx,
++			&ddc->link->public,
+ 			&cmd)) {
+ 
+ 			cmd.payloads = &payloads[2];
+ 			cmd.number_of_payloads = 1;
+ 
+-			ret = dal_i2caux_submit_i2c_command(
+-				dal_adapter_service_get_i2caux(ddc->as),
+-				ddc->ddc_pin,
+-				&cmd);
++			ret = dm_helpers_submit_i2c(
++					ddc->ctx,
++					&ddc->link->public,
++					&cmd);
+ 		}
+ 
+ 	} else {
+@@ -644,10 +614,10 @@ static uint8_t i2c_read_edid_block(
+ 			cmd.number_of_payloads = 2;
+ 		}
+ 
+-		ret = dal_i2caux_submit_i2c_command(
+-			dal_adapter_service_get_i2caux(ddc->as),
+-			ddc->ddc_pin,
+-			&cmd);
++		ret = dm_helpers_submit_i2c(
++				ddc->ctx,
++				&ddc->link->public,
++				&cmd);
+ 	}
+ 
+ 	return ret ? DDC_EDID_BLOCK_SIZE : 0;
+@@ -982,9 +952,9 @@ bool dal_ddc_service_query_ddc_data(
+ 		command.number_of_payloads =
+ 			dal_ddc_i2c_payloads_get_count(payloads);
+ 
+-		ret = dal_i2caux_submit_i2c_command(
+-				dal_adapter_service_get_i2caux(ddc->as),
+-				ddc->ddc_pin,
++		ret = dm_helpers_submit_i2c(
++				ddc->ctx,
++				&ddc->link->public,
+ 				&command);
+ 
+ 		dal_ddc_i2c_payloads_destroy(&payloads);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index 9cd239c..40e5883 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -511,5 +511,9 @@ bool dc_write_dpcd(
+ 		const uint8_t *data,
+ 	uint32_t size);
+ 
++bool dc_submit_i2c(
++		struct dc *dc,
++		uint32_t link_index,
++		struct i2c_command *cmd);
+ 
+ #endif /* DC_INTERFACE_H_ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_ddc_types.h b/drivers/gpu/drm/amd/dal/dc/dc_ddc_types.h
+new file mode 100644
+index 0000000..c74d99c
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/dc_ddc_types.h
+@@ -0,0 +1,129 @@
++/*
++ * Copyright 2012-15 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++#ifndef DC_DDC_TYPES_H_
++#define DC_DDC_TYPES_H_
++
++struct i2c_payload {
++	bool write;
++	uint8_t address;
++	uint8_t length;
++	uint8_t *data;
++};
++
++enum i2c_command_engine {
++	I2C_COMMAND_ENGINE_DEFAULT,
++	I2C_COMMAND_ENGINE_SW,
++	I2C_COMMAND_ENGINE_HW
++};
++
++struct i2c_command {
++	struct i2c_payload *payloads;
++	uint8_t number_of_payloads;
++
++	enum i2c_command_engine engine;
++
++	/* expressed in KHz
++	 * zero means "use default value" */
++	uint32_t speed;
++};
++
++struct gpio_ddc_hw_info {
++	bool hw_supported;
++	uint32_t ddc_channel;
++};
++
++struct ddc {
++	struct gpio *pin_data;
++	struct gpio *pin_clock;
++	struct gpio_ddc_hw_info hw_info;
++	struct dc_context *ctx;
++};
++
++
++union ddc_wa {
++	struct {
++		uint32_t DP_SKIP_POWER_OFF:1;
++		uint32_t DP_AUX_POWER_UP_WA_DELAY:1;
++	} bits;
++	uint32_t raw;
++};
++
++struct ddc_flags {
++	uint8_t EDID_QUERY_DONE_ONCE:1;
++	uint8_t IS_INTERNAL_DISPLAY:1;
++	uint8_t FORCE_READ_REPEATED_START:1;
++	uint8_t EDID_STRESS_READ:1;
++
++};
++
++enum ddc_transaction_type {
++	DDC_TRANSACTION_TYPE_NONE = 0,
++	DDC_TRANSACTION_TYPE_I2C,
++	DDC_TRANSACTION_TYPE_I2C_OVER_AUX,
++	DDC_TRANSACTION_TYPE_I2C_OVER_AUX_WITH_DEFER,
++	DDC_TRANSACTION_TYPE_I2C_OVER_AUX_RETRY_DEFER
++};
++
++enum display_dongle_type {
++	DISPLAY_DONGLE_NONE = 0,
++	/* Active converter types*/
++	DISPLAY_DONGLE_DP_VGA_CONVERTER,
++	DISPLAY_DONGLE_DP_DVI_CONVERTER,
++	DISPLAY_DONGLE_DP_HDMI_CONVERTER,
++	/* DP-HDMI/DVI passive dongles (Type 1 and Type 2)*/
++	DISPLAY_DONGLE_DP_DVI_DONGLE,
++	DISPLAY_DONGLE_DP_HDMI_DONGLE,
++	/* Other types of dongle*/
++	DISPLAY_DONGLE_DP_HDMI_MISMATCHED_DONGLE,
++};
++
++struct dp_receiver_id_info {
++	uint32_t dpcd_rev;
++	uint32_t sink_id;
++	int8_t sink_id_str[6];
++	int8_t sink_hw_revision;
++	int8_t sink_fw_revision[2];
++	uint32_t branch_id;
++	int8_t branch_name[6];
++	enum display_dongle_type dongle_type;
++};
++
++struct ddc_service {
++	struct ddc *ddc_pin;
++	struct ddc_flags flags;
++	union ddc_wa wa;
++	enum ddc_transaction_type transaction_type;
++	enum display_dongle_type dongle_type;
++	struct dp_receiver_id_info dp_receiver_id_info;
++	struct adapter_service *as;
++	struct dc_context *ctx;
++	struct core_link *link;
++
++	uint32_t address;
++	uint32_t edid_buf_len;
++	uint8_t edid_buf[MAX_EDID_BUFFER_SIZE];
++};
++
++#endif /* DC_DDC_TYPES_H_ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_types.h b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+index 219fe77..8d81d08 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+@@ -67,6 +67,8 @@ enum dce_environment {
+ #define MAX_SURFACE_NUM 2
+ #define NUM_PIXEL_FORMATS 10
+ 
++#include "dc_ddc_types.h"
++
+ enum tiling_mode {
+ 	TILING_MODE_INVALID,
+ 	TILING_MODE_LINEAR,
+@@ -102,6 +104,7 @@ enum plane_stereo_format {
+ 	PLANE_STEREO_FORMAT_CHECKER_BOARD = 7
+ };
+ 
++
+ /* TODO: Find way to calculate number of bits
+  *  Please increase if pixel_format enum increases
+  * num  from  PIXEL_FORMAT_INDEX8 to PIXEL_FORMAT_444BPP32
+diff --git a/drivers/gpu/drm/amd/dal/dc/dm_helpers.h b/drivers/gpu/drm/amd/dal/dc/dm_helpers.h
+index b6ce510..faffc16 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dm_helpers.h
++++ b/drivers/gpu/drm/amd/dal/dc/dm_helpers.h
+@@ -95,4 +95,9 @@ bool dm_helper_dp_write_dpcd(
+ 		const uint8_t *data,
+ 		uint32_t size);
+ 
++bool dm_helpers_submit_i2c(
++		struct dc_context *ctx,
++		const struct dc_link *link,
++		struct i2c_command *cmd);
++
+ #endif /* __DM_HELPERS__ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/gpio/ddc.h b/drivers/gpu/drm/amd/dal/dc/gpio/ddc.h
+index 2631571..500c3cd 100644
+--- a/drivers/gpu/drm/amd/dal/dc/gpio/ddc.h
++++ b/drivers/gpu/drm/amd/dal/dc/gpio/ddc.h
+@@ -26,13 +26,6 @@
+ #ifndef __DAL_DDC_H__
+ #define __DAL_DDC_H__
+ 
+-struct ddc {
+-	struct gpio *pin_data;
+-	struct gpio *pin_clock;
+-	struct gpio_ddc_hw_info hw_info;
+-	struct dc_context *ctx;
+-};
+-
+ struct ddc *dal_gpio_create_ddc(
+ 	struct gpio_service *service,
+ 	uint32_t offset,
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/dc_link_ddc.h b/drivers/gpu/drm/amd/dal/dc/inc/dc_link_ddc.h
+index 18104d6..088afce 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/dc_link_ddc.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/dc_link_ddc.h
+@@ -69,6 +69,7 @@ struct ddc_service_init_data {
+ 	struct adapter_service *as;
+ 	struct graphics_object_id id;
+ 	struct dc_context *ctx;
++	struct core_link *link;
+ };
+ 
+ struct ddc_service *dal_ddc_service_create(
+diff --git a/drivers/gpu/drm/amd/dal/include/ddc_service_types.h b/drivers/gpu/drm/amd/dal/include/ddc_service_types.h
+index cbdb6df..63dbbc5 100644
+--- a/drivers/gpu/drm/amd/dal/include/ddc_service_types.h
++++ b/drivers/gpu/drm/amd/dal/include/ddc_service_types.h
+@@ -52,26 +52,6 @@ enum ddc_service_type {
+ 	DDC_SERVICE_TYPE_DISPLAY_PORT_MST,
+ };
+ 
+-enum ddc_transaction_type {
+-	DDC_TRANSACTION_TYPE_NONE = 0,
+-	DDC_TRANSACTION_TYPE_I2C,
+-	DDC_TRANSACTION_TYPE_I2C_OVER_AUX,
+-	DDC_TRANSACTION_TYPE_I2C_OVER_AUX_WITH_DEFER,
+-	DDC_TRANSACTION_TYPE_I2C_OVER_AUX_RETRY_DEFER
+-};
+-
+-enum display_dongle_type {
+-	DISPLAY_DONGLE_NONE = 0,
+-	/* Active converter types*/
+-	DISPLAY_DONGLE_DP_VGA_CONVERTER,
+-	DISPLAY_DONGLE_DP_DVI_CONVERTER,
+-	DISPLAY_DONGLE_DP_HDMI_CONVERTER,
+-	/* DP-HDMI/DVI passive dongles (Type 1 and Type 2)*/
+-	DISPLAY_DONGLE_DP_DVI_DONGLE,
+-	DISPLAY_DONGLE_DP_HDMI_DONGLE,
+-	/* Other types of dongle*/
+-	DISPLAY_DONGLE_DP_HDMI_MISMATCHED_DONGLE,
+-};
+ 
+ enum dcs_dpcd_revision {
+ 	DCS_DPCD_REV_10 = 0x10,
+@@ -130,16 +110,6 @@ struct display_sink_capability {
+ 	enum signal_type signal;
+ };
+ 
+-struct dp_receiver_id_info {
+-	uint32_t dpcd_rev;
+-	uint32_t sink_id;
+-	int8_t sink_id_str[6];
+-	int8_t sink_hw_revision;
+-	int8_t sink_fw_revision[2];
+-	uint32_t branch_id;
+-	int8_t branch_name[6];
+-	enum display_dongle_type dongle_type;
+-};
+ 
+ struct av_sync_data {
+ 	uint8_t av_granularity;/* DPCD 00023h */
+diff --git a/drivers/gpu/drm/amd/dal/include/gpio_types.h b/drivers/gpu/drm/amd/dal/include/gpio_types.h
+index 6d3214b..62548d6 100644
+--- a/drivers/gpu/drm/amd/dal/include/gpio_types.h
++++ b/drivers/gpu/drm/amd/dal/include/gpio_types.h
+@@ -329,10 +329,6 @@ struct gpio_config_data {
+ 	} config;
+ };
+ 
+-struct gpio_ddc_hw_info {
+-	bool hw_supported;
+-	uint32_t ddc_channel;
+-};
+ 
+ struct gpio_ddc_open_options {
+ 	bool en_bit_present;
+diff --git a/drivers/gpu/drm/amd/dal/include/i2caux_interface.h b/drivers/gpu/drm/amd/dal/include/i2caux_interface.h
+index b961d24..ac16fa0 100644
+--- a/drivers/gpu/drm/amd/dal/include/i2caux_interface.h
++++ b/drivers/gpu/drm/amd/dal/include/i2caux_interface.h
+@@ -29,29 +29,6 @@
+ #include "ddc_interface.h"
+ #include "adapter_service_interface.h"
+ 
+-struct i2c_payload {
+-	bool write;
+-	uint8_t address;
+-	uint8_t length;
+-	uint8_t *data;
+-};
+-
+-enum i2c_command_engine {
+-	I2C_COMMAND_ENGINE_DEFAULT,
+-	I2C_COMMAND_ENGINE_SW,
+-	I2C_COMMAND_ENGINE_HW
+-};
+-
+-struct i2c_command {
+-	struct i2c_payload *payloads;
+-	uint8_t number_of_payloads;
+-
+-	enum i2c_command_engine engine;
+-
+-	/* expressed in KHz
+-	 * zero means "use default value" */
+-	uint32_t speed;
+-};
+ 
+ #define DEFAULT_AUX_MAX_DATA_SIZE 16
+ #define AUX_MAX_DEFER_WRITE_RETRY 20
+-- 
+2.7.4
+

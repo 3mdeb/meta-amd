@@ -1,0 +1,108 @@
+From 8cd08f288a7b536c23bdd618506d223f3bbf35d7 Mon Sep 17 00:00:00 2001
+From: Monk Liu <monk.liu@amd.com>
+Date: Thu, 14 Jan 2016 19:07:38 +0800
+Subject: [PATCH 0444/1110] drm/amdgpu: patch cond exec for SDMA
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Monk Liu <monk.liu@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c |  9 +++++++--
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c | 25 +++++++++++++++++++++++++
+ 3 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index c0b7731..ddcd836 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -302,6 +302,8 @@ struct amdgpu_ring_funcs {
+ 	void (*insert_nop)(struct amdgpu_ring *ring, uint32_t count);
+ 	/* pad the indirect buffer to the necessary number of dw */
+ 	void (*pad_ib)(struct amdgpu_ring *ring, struct amdgpu_ib *ib);
++	unsigned (*init_cond_exec)(struct amdgpu_ring *ring);
++	void (*patch_cond_exec)(struct amdgpu_ring *ring, unsigned offset);
+ };
+ 
+ /*
+@@ -2188,6 +2190,8 @@ amdgpu_get_sdma_instance(struct amdgpu_ring *ring)
+ #define amdgpu_ring_emit_hdp_flush(r) (r)->funcs->emit_hdp_flush((r))
+ #define amdgpu_ring_emit_hdp_invalidate(r) (r)->funcs->emit_hdp_invalidate((r))
+ #define amdgpu_ring_pad_ib(r, ib) ((r)->funcs->pad_ib((r), (ib)))
++#define amdgpu_ring_init_cond_exec(r) (r)->funcs->init_cond_exec((r))
++#define amdgpu_ring_patch_cond_exec(r,o) (r)->funcs->patch_cond_exec((r),(o))
+ #define amdgpu_ih_get_wptr(adev) (adev)->irq.ih_funcs->get_wptr((adev))
+ #define amdgpu_ih_decode_iv(adev, iv) (adev)->irq.ih_funcs->decode_iv((adev), (iv))
+ #define amdgpu_ih_set_rptr(adev) (adev)->irq.ih_funcs->set_rptr((adev))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 52b63e3..964914b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -123,7 +123,8 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 	struct amdgpu_ctx *ctx, *old_ctx;
+ 	struct amdgpu_vm *vm;
+ 	struct fence *hwf;
+-	unsigned i;
++        unsigned i, patch_offset = ~0;
++
+ 	int r = 0;
+ 
+ 	if (num_ibs == 0)
+@@ -199,9 +200,13 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 		amdgpu_ring_emit_fence(ring, addr, ib->sequence,
+ 				       AMDGPU_FENCE_FLAG_64BIT);
+ 	}
+-
++	
++	if(f)
+         *f = fence_get(hwf);
+ 
++        if (patch_offset != ~0 && ring->funcs->patch_cond_exec)
++                amdgpu_ring_patch_cond_exec(ring, patch_offset);
++
+ 	amdgpu_ring_commit(ring);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index 5845dde..aebf4b7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -452,6 +452,31 @@ static void sdma_v3_0_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 se
+ 	amdgpu_ring_write(ring, SDMA_PKT_TRAP_INT_CONTEXT_INT_CONTEXT(0));
+ }
+ 
++unsigned init_cond_exec(struct amdgpu_ring *ring)
++{
++	unsigned ret;
++	amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_COND_EXE));
++	amdgpu_ring_write(ring, lower_32_bits(ring->cond_exe_gpu_addr));
++	amdgpu_ring_write(ring, upper_32_bits(ring->cond_exe_gpu_addr));
++	amdgpu_ring_write(ring, 1);
++	ret = ring->wptr;/* this is the offset we need patch later */
++	amdgpu_ring_write(ring, 0x55aa55aa);/* insert dummy here and patch it later */
++	return ret;
++}
++
++void patch_cond_exec(struct amdgpu_ring *ring, unsigned offset)
++{
++	unsigned cur;
++	BUG_ON(ring->ring[offset] != 0x55aa55aa);
++
++	cur = ring->wptr - 1;
++	if (likely(cur > offset))
++		ring->ring[offset] = cur - offset;
++	else
++		ring->ring[offset] = (ring->ring_size>>2) - offset + cur;
++}
++
++
+ /**
+  * sdma_v3_0_gfx_stop - stop the gfx async dma engines
+  *
+-- 
+2.7.4
+

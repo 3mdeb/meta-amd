@@ -1,0 +1,193 @@
+From 8b19f17d2f345718701054ebe6ef1cf21c8a64a0 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Sat, 9 Jan 2016 23:59:18 -0500
+Subject: [PATCH 0686/1110] drm/amd/dal: Skip notification for MST connectors
+
+Skip connector status update and notification for MST connectors
+and for detection failures.
+
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Acked-by: Jordan Lazare <Jordan.Lazare@amd.com>
+---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      | 27 +++++++++++-----------
+ .../drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c    |  4 +++-
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          | 16 ++++++-------
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |  8 +++++--
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    |  2 +-
+ 5 files changed, 32 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index 118821d..cee507c 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -762,12 +762,13 @@ static void handle_hpd_irq(void *param)
+ 	struct drm_connector *connector = &aconnector->base;
+ 	struct drm_device *dev = connector->dev;
+ 
+-	dc_link_detect(aconnector->dc_link);
+-	if (aconnector->dc_link->type == dc_connection_mst_branch)
+-		return;
+-
+-	amdgpu_dm_update_connector_after_detect(aconnector);
+-	drm_kms_helper_hotplug_event(dev);
++	/* In case of failure or MST no need to update connector status or notify the OS
++	 * since (for MST case) MST does this in it's own context.
++	 */
++	if (dc_link_detect(aconnector->dc_link)) {
++		amdgpu_dm_update_connector_after_detect(aconnector);
++		drm_kms_helper_hotplug_event(dev);
++	}
+ }
+ 
+ static void handle_hpd_rx_irq(void *param)
+@@ -780,9 +781,10 @@ static void handle_hpd_rx_irq(void *param)
+ 	if (dc_link_handle_hpd_rx_irq(aconnector->dc_link) &&
+ 			!is_mst_root_connector) {
+ 		/* Downstream Port status changed. */
+-		dc_link_detect(aconnector->dc_link);
+-		amdgpu_dm_update_connector_after_detect(aconnector);
+-		drm_kms_helper_hotplug_event(dev);
++		if (dc_link_detect(aconnector->dc_link)) {
++			amdgpu_dm_update_connector_after_detect(aconnector);
++			drm_kms_helper_hotplug_event(dev);
++		}
+ 	}
+ 
+ 	if (is_mst_root_connector)
+@@ -1055,10 +1057,9 @@ int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
+ 			goto fail_free_connector;
+ 		}
+ 
+-		dc_link_detect(dc_get_link_at_index(dm->dc, i));
+-
+-		amdgpu_dm_update_connector_after_detect(
+-			aconnector);
++		if (dc_link_detect(dc_get_link_at_index(dm->dc, i)))
++			amdgpu_dm_update_connector_after_detect(
++				aconnector);
+ 	}
+ 
+ 	/* Software is initialized. Now we can register interrupt handlers. */
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+index 88b9730..aeab396 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -353,8 +353,10 @@ static void dm_dp_destroy_mst_connector(
+ 				aconnector, connector->base.id, aconnector->mst_port);
+ 
+ 	aconnector->port = NULL;
+-	if (aconnector->dc_sink)
++	if (aconnector->dc_sink) {
+ 		dc_link_remove_remote_sink(aconnector->dc_link, aconnector->dc_sink);
++		aconnector->dc_sink = NULL;
++	}
+ }
+ 
+ static void dm_dp_mst_hotplug(struct drm_dp_mst_topology_mgr *mgr)
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index e9e36c8..a634a44 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -540,7 +540,7 @@ static void detect_dp(
+ 	}
+ }
+ 
+-void dc_link_detect(const struct dc_link *dc_link)
++bool dc_link_detect(const struct dc_link *dc_link)
+ {
+ 	struct core_link *link = DC_LINK_TO_LINK(dc_link);
+ 	struct dc_sink_init_data sink_init_data = { 0 };
+@@ -557,11 +557,11 @@ void dc_link_detect(const struct dc_link *dc_link)
+ 	enum dc_connection_type new_connection_type = dc_connection_none;
+ 
+ 	if (link->public.connector_signal == SIGNAL_TYPE_VIRTUAL)
+-		return;
++		return false;
+ 
+ 	if (false == detect_sink(link, &new_connection_type)) {
+ 		BREAK_TO_DEBUGGER();
+-		return;
++		return false;
+ 	}
+ 
+ 	link_disconnect_sink(link);
+@@ -608,7 +608,7 @@ void dc_link_detect(const struct dc_link *dc_link)
+ 				&audio_support);
+ 
+ 			if (link->public.type == dc_connection_mst_branch)
+-				return;
++				return false;
+ 
+ 			break;
+ 		}
+@@ -616,7 +616,7 @@ void dc_link_detect(const struct dc_link *dc_link)
+ 		default:
+ 			DC_ERROR("Invalid connector type! signal:%d\n",
+ 				link->public.connector_signal);
+-			return;
++			return false;
+ 		} /* switch() */
+ 
+ 		if (link->dpcd_caps.sink_count.bits.SINK_COUNT)
+@@ -640,7 +640,7 @@ void dc_link_detect(const struct dc_link *dc_link)
+ 		dc_sink = dc_sink_create(&sink_init_data);
+ 		if (!dc_sink) {
+ 			DC_ERROR("Failed to create sink!\n");
+-			return;
++			return false;
+ 		}
+ 
+ 		sink = DC_SINK_TO_CORE(dc_sink);
+@@ -660,7 +660,7 @@ void dc_link_detect(const struct dc_link *dc_link)
+ 				LOG_MAJOR_ERROR,
+ 				LOG_MINOR_DETECTION_EDID_PARSER,
+ 				"No EDID read.\n");
+-			return;
++			return false;
+ 
+ 		default:
+ 			break;
+@@ -719,7 +719,7 @@ void dc_link_detect(const struct dc_link *dc_link)
+ 		(sink_caps.signal == SIGNAL_TYPE_NONE ?
+ 			"Disconnected":"Connected"));
+ 
+-	return;
++	return true;
+ }
+ 
+ static enum hpd_source_id get_hpd_line(
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index df7e34b..a2f26cb 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -296,8 +296,12 @@ const struct graphics_object_id dc_get_link_id_at_index(
+ /* Set backlight level of an embedded panel (eDP, LVDS). */
+ bool dc_link_set_backlight_level(const struct dc_link *dc_link, uint32_t level);
+ 
+-/* Request DC to detect if there is a Panel connected. */
+-void dc_link_detect(const struct dc_link *dc_link);
++/* Request DC to detect if there is a Panel connected.
++ * Return false for any type of detection failure or MST detection
++ * true otherwise. True meaning further action is required (status update
++ * and OS notification).
++ */
++bool dc_link_detect(const struct dc_link *dc_link);
+ 
+ /* Notify DC about DP RX Interrupt (aka Short Pulse Interrupt).
+  * Return:
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index f3610b4..80d3f8a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -661,7 +661,7 @@ enum dc_status dce110_validate_bandwidth(
+ 		dc->ctx->logger,
+ 		LOG_MAJOR_BWM,
+ 		LOG_MINOR_BWM_REQUIRED_BANDWIDTH_CALCS,
+-		"%s: start",
++		"%s: start\n",
+ 		__func__);
+ 
+ 	if (!bw_calcs(
+-- 
+2.7.4
+

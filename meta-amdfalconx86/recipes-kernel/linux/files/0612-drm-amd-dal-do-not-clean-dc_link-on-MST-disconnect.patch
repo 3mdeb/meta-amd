@@ -1,0 +1,119 @@
+From 7cc988ac024ed34c946722e036eec93f117069bd Mon Sep 17 00:00:00 2001
+From: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Date: Fri, 11 Dec 2015 20:28:48 +0800
+Subject: [PATCH 0612/1110] drm/amd/dal: do not clean dc_link on MST disconnect
+
+This change restores previous behaviour, because mapping between
+stream and connector is needed till reset mode, where it is accessed
+for payload allocation.
+
+We currently have the following references to dc_sink:
+
+1. Hard reference in stream. Cleaned-up when target destroyed on reset mode;
+2. Hard reference in link. Clean-up on HPD disconnect event;
+3. Weak reference in aconnector. Weak means it does not controlled by counter.
+
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland<harry.wentland@amd.com>
+---
+ .../drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c    | 37 ++++++++++++----------
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          | 19 ++---------
+ 2 files changed, 23 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+index 3246dcd..f2926ff 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -75,8 +75,7 @@ dm_dp_mst_detect(struct drm_connector *connector, bool force)
+ 			aconnector->port);
+ 
+ 	if (status == connector_status_disconnected && aconnector->dc_sink) {
+-		dc_link_remove_sink(aconnector->dc_link, aconnector->dc_sink);
+-		aconnector->dc_sink = NULL;
++		aconnector->edid = NULL;
+ 	}
+ 
+ 	return status;
+@@ -170,25 +169,31 @@ static int dm_dp_mst_get_modes(struct drm_connector *connector)
+ 
+ 	flush_work(&master->mst_mgr.work);
+ 
+-	edid = drm_dp_mst_get_edid(connector, &master->mst_mgr, aconnector->port);
++	if (!aconnector->edid) {
++		edid = drm_dp_mst_get_edid(connector, &master->mst_mgr, aconnector->port);
+ 
+-	if (!edid) {
+-		drm_mode_connector_update_edid_property(
+-			&aconnector->base,
+-			NULL);
++		if (!edid) {
++			drm_mode_connector_update_edid_property(
++				&aconnector->base,
++				NULL);
+ 
+-		return ret;
+-	}
++			return ret;
++		}
+ 
+-	aconnector->edid = edid;
++		aconnector->edid = edid;
+ 
+-	if (!aconnector->dc_sink) {
+-			sink = dm_dp_mst_add_mst_sink(
++		if (aconnector->dc_sink)
++			dc_link_remove_sink(
+ 				aconnector->dc_link,
+-				(uint8_t *)edid,
+-				(edid->extensions + 1) * EDID_LENGTH);
+-				aconnector->dc_sink = sink;
+-	}
++				aconnector->dc_sink);
++
++		sink = dm_dp_mst_add_mst_sink(
++			aconnector->dc_link,
++			(uint8_t *)edid,
++			(edid->extensions + 1) * EDID_LENGTH);
++		aconnector->dc_sink = sink;
++	} else
++		edid = aconnector->edid;
+ 
+ 	DRM_DEBUG_KMS("edid retrieved %p\n", edid);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 5890555..add76ca 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -639,27 +639,12 @@ void dc_link_detect(const struct dc_link *dc_link)
+ 		switch (link->public.connector_signal) {
+ 		case SIGNAL_TYPE_DISPLAY_PORT:
+ 			dc_helpers_dp_mst_stop_top_mgr(link->ctx, &link->public);
+-			/*
+-			 * in this case sinks would be removed in outer level
+-			 */
+-
+-			/*
+-			 * TODO: this is the only way to understand that link
+-			 * was in mst mode. Proposal for future to add
+-			 * additional field to link that will show actual state.
+-			 *
+-			 * For the change: for mst we create sink outside, and
+-			 * should remove them in the same place
+-			 */
+-			if (link->public.sink_count == 1 &&
+-				link->public.sink[0]->sink_signal !=
+-					SIGNAL_TYPE_DISPLAY_PORT_MST)
+-				link_disconnect_all_sinks(link);
+ 			break;
+ 		default:
+-			link_disconnect_all_sinks(link);
+ 			break;
+ 		}
++
++		link_disconnect_all_sinks(link);
+ 	}
+ 
+ 	LINK_INFO("link=%d, dc_sink_in=%p is now %s\n",
+-- 
+2.7.4
+

@@ -1,0 +1,357 @@
+From de44dc45fda1f3399c6b20646221fe6fdab5b672 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Fri, 8 Jul 2016 12:49:13 +0530
+Subject: [PATCH 1085/1110] drm/amdgpu/gfx8: add powergating support for CZ/ST
+
+This implements powergating support for CZ/ST asics.
+
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Tom St Denis <tom.stdenis@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h   |   5 +
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c | 266 +++++++++++++++++++++++-----------
+ 2 files changed, 190 insertions(+), 81 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 8127e81..3a3815c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -131,9 +131,14 @@ extern unsigned amdgpu_pcie_lane_cap;
+ #define AMDGPU_RESET_VCE			(1 << 13)
+ #define AMDGPU_RESET_VCE1			(1 << 14)
+ 
++#define AMDGPU_PG_SUPPORT_GFX_QUICK_MG         (1 << 11)
++#define AMDGPU_PG_SUPPORT_GFX_PIPELINE         (1 << 12)
++
+ #define AMDGPU_PG_SUPPORT_GFX_PG                (1 << 0)
+ #define AMDGPU_PG_SUPPORT_GFX_SMG               (1 << 1)
+ #define AMDGPU_PG_SUPPORT_GFX_DMG               (1 << 2)
++#define AMDGPU_PG_SUPPORT_CP                    (1 << 5)
++#define AMDGPU_PG_SUPPORT_RLC_SMU_HS            (1 << 7)
+ 
+ /* GFX current status */
+ #define AMDGPU_GFX_NORMAL_MODE			0x00000000L
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 951381c..5705436 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -834,6 +834,25 @@ err1:
+ 	return r;
+ }
+ 
++static void gfx_v8_0_free_microcode(struct amdgpu_device *adev) {
++	release_firmware(adev->gfx.pfp_fw);
++	adev->gfx.pfp_fw = NULL;
++	release_firmware(adev->gfx.me_fw);
++	adev->gfx.me_fw = NULL;
++	release_firmware(adev->gfx.ce_fw);
++	adev->gfx.ce_fw = NULL;
++	release_firmware(adev->gfx.rlc_fw);
++	adev->gfx.rlc_fw = NULL;
++	release_firmware(adev->gfx.mec_fw);
++	adev->gfx.mec_fw = NULL;
++	if ((adev->asic_type != CHIP_STONEY) &&
++	    (adev->asic_type != CHIP_TOPAZ))
++		release_firmware(adev->gfx.mec2_fw);
++	adev->gfx.mec2_fw = NULL;
++
++	kfree(adev->gfx.rlc.register_list_format);
++}
++
+ static int gfx_v8_0_init_microcode(struct amdgpu_device *adev)
+ {
+ 	const char *chip_name;
+@@ -2097,7 +2116,7 @@ static int gfx_v8_0_sw_fini(void *handle)
+ 
+ 	gfx_v8_0_rlc_fini(adev);
+ 
+-	kfree(adev->gfx.rlc.register_list_format);
++	gfx_v8_0_free_microcode(adev);
+ 
+ 	return 0;
+ }
+@@ -3806,6 +3825,53 @@ static void gfx_v8_0_init_power_gating(struct amdgpu_device *adev)
+         }
+  }
+ 
++static void cz_enable_sck_slow_down_on_power_up(struct amdgpu_device *adev,
++                                               bool enable)
++{
++        u32 data, orig;
++ 
++        orig = data = RREG32(mmRLC_PG_CNTL);
++ 
++        if (enable)
++                data |= RLC_PG_CNTL__SMU_CLK_SLOWDOWN_ON_PU_ENABLE_MASK;
++        else
++                data &= ~RLC_PG_CNTL__SMU_CLK_SLOWDOWN_ON_PU_ENABLE_MASK;
++ 
++        if (orig != data)
++                WREG32(mmRLC_PG_CNTL, data);
++}
++
++static void cz_enable_sck_slow_down_on_power_down(struct amdgpu_device *adev,
++                                                 bool enable)
++{
++        u32 data, orig;
++ 
++        orig = data = RREG32(mmRLC_PG_CNTL);
++ 
++        if (enable)
++                data |= RLC_PG_CNTL__SMU_CLK_SLOWDOWN_ON_PD_ENABLE_MASK;
++        else
++                data &= ~RLC_PG_CNTL__SMU_CLK_SLOWDOWN_ON_PD_ENABLE_MASK;
++ 
++        if (orig != data)
++                WREG32(mmRLC_PG_CNTL, data);
++}
++
++static void cz_enable_cp_power_gating(struct amdgpu_device *adev, bool enable)
++{
++        u32 data, orig;
++ 
++        orig = data = RREG32(mmRLC_PG_CNTL);
++ 
++        if (enable)
++                data &= ~RLC_PG_CNTL__CP_PG_DISABLE_MASK;
++        else
++                data |= RLC_PG_CNTL__CP_PG_DISABLE_MASK;
++ 
++        if (orig != data)
++                WREG32(mmRLC_PG_CNTL, data);
++ }
++
+ static void polaris11_init_power_gating(struct amdgpu_device *adev)
+ {
+ 	uint32_t data;
+@@ -3858,10 +3924,20 @@ static void gfx_v8_0_init_pg(struct amdgpu_device *adev)
+                         WREG32(mmRLC_JUMP_TABLE_RESTORE, adev->gfx.rlc.cp_table_gpu_addr >> 8);
+                         gfx_v8_0_init_power_gating(adev);
+                         WREG32(mmRLC_PG_ALWAYS_ON_CU_MASK, cu_info.ao_cu_mask);
+-                }
+-
+-		if (adev->asic_type == CHIP_POLARIS11)
++ 			if (adev->pg_flags & AMDGPU_PG_SUPPORT_RLC_SMU_HS) {
++                                cz_enable_sck_slow_down_on_power_up(adev, true);
++                                cz_enable_sck_slow_down_on_power_down(adev, true);
++                        } else {
++                                cz_enable_sck_slow_down_on_power_up(adev, false);
++                                cz_enable_sck_slow_down_on_power_down(adev, false);
++                        }
++                        if (adev->pg_flags & AMDGPU_PG_SUPPORT_CP)
++                                cz_enable_cp_power_gating(adev, true);
++                        else
++                                cz_enable_cp_power_gating(adev, false);
++                } else if (adev->asic_type == CHIP_POLARIS11) {
+ 			polaris11_init_power_gating(adev);
++		}
+ 	}
+ }
+ 
+@@ -5194,97 +5270,125 @@ static int gfx_v8_0_late_init(void *handle)
+ 	return 0;
+ }
+ 
+-static void polaris11_enable_gfx_static_mg_power_gating(struct amdgpu_device *adev,
+-		bool enable)
++static void gfx_v8_0_enable_gfx_static_mg_power_gating(struct amdgpu_device *adev,
++                                                       bool enable)
+ {
+-	uint32_t data, temp;
+-
+-	/* Send msg to SMU via Powerplay */
+-	amdgpu_set_powergating_state(adev,
+-			AMD_IP_BLOCK_TYPE_SMC,
+-			enable ? AMD_PG_STATE_GATE : AMD_PG_STATE_UNGATE);
+-
+-	if (enable) {
+-		/* Enable static MGPG */
+-		temp = data = RREG32(mmRLC_PG_CNTL);
+-		data |= RLC_PG_CNTL__STATIC_PER_CU_PG_ENABLE_MASK;
+-
+-		if (temp != data)
+-			WREG32(mmRLC_PG_CNTL, data);
+-	} else {
+-		temp = data = RREG32(mmRLC_PG_CNTL);
+-		data &= ~RLC_PG_CNTL__STATIC_PER_CU_PG_ENABLE_MASK;
+-
+-		if (temp != data)
+-			WREG32(mmRLC_PG_CNTL, data);
+-	}
++         uint32_t data, temp;
++ 
++         if (enable) {
++                 /* Enable static MGPG */
++                 temp = data = RREG32(mmRLC_PG_CNTL);
++                 data |= RLC_PG_CNTL__STATIC_PER_CU_PG_ENABLE_MASK;
++ 
++                 if (temp != data)
++                         WREG32(mmRLC_PG_CNTL, data);
++         } else {
++                 temp = data = RREG32(mmRLC_PG_CNTL);
++                 data &= ~RLC_PG_CNTL__STATIC_PER_CU_PG_ENABLE_MASK;
++ 
++                 if (temp != data)
++                         WREG32(mmRLC_PG_CNTL, data);
++         }
+ }
+ 
+-static void polaris11_enable_gfx_dynamic_mg_power_gating(struct amdgpu_device *adev,
+-		bool enable)
++static void gfx_v8_0_enable_gfx_dynamic_mg_power_gating(struct amdgpu_device *adev,
++                                                        bool enable)
+ {
+-	uint32_t data, temp;
+-
+-	if (enable) {
+-		/* Enable dynamic MGPG */
+-		temp = data = RREG32(mmRLC_PG_CNTL);
+-		data |= RLC_PG_CNTL__DYN_PER_CU_PG_ENABLE_MASK;
+-
+-		if (temp != data)
+-			WREG32(mmRLC_PG_CNTL, data);
+-	} else {
+-		temp = data = RREG32(mmRLC_PG_CNTL);
+-		data &= ~RLC_PG_CNTL__DYN_PER_CU_PG_ENABLE_MASK;
+-
+-		if (temp != data)
+-			WREG32(mmRLC_PG_CNTL, data);
+-	}
++         uint32_t data, temp;
++ 
++         if (enable) {
++                 /* Enable dynamic MGPG */
++                 temp = data = RREG32(mmRLC_PG_CNTL);
++                 data |= RLC_PG_CNTL__DYN_PER_CU_PG_ENABLE_MASK;
++ 
++                 if (temp != data)
++                         WREG32(mmRLC_PG_CNTL, data);
++         } else {
++                 temp = data = RREG32(mmRLC_PG_CNTL);
++                 data &= ~RLC_PG_CNTL__DYN_PER_CU_PG_ENABLE_MASK;
++ 
++                 if (temp != data)
++                         WREG32(mmRLC_PG_CNTL, data);
++         }
+ }
+ 
+-static void polaris11_enable_gfx_quick_mg_power_gating(struct amdgpu_device *adev,
+-		bool enable)
++static void cz_enable_gfx_cg_power_gating(struct amdgpu_device *adev,
++                                         bool enable)
+ {
+-	uint32_t data, temp;
+-
+-	if (enable) {
+-		/* Enable quick PG */
+-		temp = data = RREG32(mmRLC_PG_CNTL);
+-		data |= 0x100000;
++       u32 data, orig;
++ 
++        orig = data = RREG32(mmRLC_PG_CNTL);
++ 
++        if (enable)
++                data |= RLC_PG_CNTL__GFX_POWER_GATING_ENABLE_MASK;
++        else
++                data &= ~RLC_PG_CNTL__GFX_POWER_GATING_ENABLE_MASK;
++ 
++        if (orig != data)
++                WREG32(mmRLC_PG_CNTL, data);
++}
+ 
+-		if (temp != data)
+-			WREG32(mmRLC_PG_CNTL, data);
+-	} else {
+-		temp = data = RREG32(mmRLC_PG_CNTL);
+-		data &= ~0x100000;
++static void cz_enable_gfx_pipeline_power_gating(struct amdgpu_device *adev,
++                                               bool enable)
++{
++       u32 data, orig;
++ 
++        orig = data = RREG32(mmRLC_PG_CNTL);
++ 
++        if (enable)
++                data |= RLC_PG_CNTL__GFX_PIPELINE_PG_ENABLE_MASK;
++        else
++                data &= ~RLC_PG_CNTL__GFX_PIPELINE_PG_ENABLE_MASK;
++ 
++        if (orig != data)
++                WREG32(mmRLC_PG_CNTL, data);
++ 
++        /* Read any GFX register to wake up GFX. */
++        if (!enable)
++                data = RREG32(mmDB_RENDER_CONTROL);
++}
+ 
+-		if (temp != data)
+-			WREG32(mmRLC_PG_CNTL, data);
+-	}
++static void cz_update_gfx_cg_power_gating(struct amdgpu_device *adev,
++                                         bool enable)
++{
++       if ((adev->pg_flags & AMDGPU_PG_SUPPORT_GFX_PG) && enable) {
++                cz_enable_gfx_cg_power_gating(adev, true);
++                if (adev->pg_flags & AMDGPU_PG_SUPPORT_GFX_PIPELINE)
++                        cz_enable_gfx_pipeline_power_gating(adev, true);
++        } else {
++                cz_enable_gfx_cg_power_gating(adev, false);
++                cz_enable_gfx_pipeline_power_gating(adev, false);
++        }
+ }
+ 
+ static int gfx_v8_0_set_powergating_state(void *handle,
+ 					  enum amd_powergating_state state)
+ {
+-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+-
+-	if (!(adev->pg_flags & AMD_PG_SUPPORT_GFX_PG))
+-		return 0;
+-
+-	switch (adev->asic_type) {
+-	case CHIP_POLARIS11:
+-		if (adev->pg_flags & AMD_PG_SUPPORT_GFX_SMG)
+-			polaris11_enable_gfx_static_mg_power_gating(adev,
+-					state == AMD_PG_STATE_GATE ? true : false);
+-		else if (adev->pg_flags & AMD_PG_SUPPORT_GFX_DMG)
+-			polaris11_enable_gfx_dynamic_mg_power_gating(adev,
+-					state == AMD_PG_STATE_GATE ? true : false);
+-		else
+-			polaris11_enable_gfx_quick_mg_power_gating(adev,
+-					state == AMD_PG_STATE_GATE ? true : false);
+-		break;
+-	default:
+-		break;
+-	}
++        struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++        bool enable = (state == AMD_PG_STATE_GATE) ? true : false;
++ 
++        if (!(adev->pg_flags & AMDGPU_PG_SUPPORT_GFX_PG))
++                return 0;
++ 
++        switch (adev->asic_type) {
++        case CHIP_CARRIZO:
++        case CHIP_STONEY:
++                if (adev->pg_flags & AMDGPU_PG_SUPPORT_GFX_PG)
++                        cz_update_gfx_cg_power_gating(adev, enable);
++ 
++                if ((adev->pg_flags & AMDGPU_PG_SUPPORT_GFX_SMG) && enable)
++                        gfx_v8_0_enable_gfx_static_mg_power_gating(adev, true);
++                else
++                        gfx_v8_0_enable_gfx_static_mg_power_gating(adev, false);
++ 
++                if ((adev->pg_flags & AMDGPU_PG_SUPPORT_GFX_DMG) && enable)
++                       gfx_v8_0_enable_gfx_dynamic_mg_power_gating(adev, true);
++                else
++                       gfx_v8_0_enable_gfx_dynamic_mg_power_gating(adev, false);
++                break;
++        default:
++                break;
++        }
+ 
+ 	return 0;
+ }
+-- 
+2.7.4
+

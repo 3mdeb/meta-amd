@@ -1,0 +1,667 @@
+From d2375cf918a6a0fe2d6dce2b480e8e094ab2d074 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Thu, 7 Jan 2016 18:09:48 -0500
+Subject: [PATCH 0681/1110] drm/amd/dal: virtual link and sink support
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Jordan Lazare <Jordan.Lazare@amd.com>
+---
+ .../drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c    |  4 +-
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    |  2 +
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 44 +++++++++-------
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          | 16 +++---
+ drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c       | 10 ++--
+ drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c     |  2 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      |  5 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_sink.c          | 12 ++---
+ drivers/gpu/drm/amd/dal/dc/core/dc_target.c        |  4 +-
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |  6 ++-
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 58 +++++++++++-----------
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    | 14 ++++--
+ .../drm/amd/dal/dc/dce_base/dce_base_resource.c    | 26 ++++++----
+ drivers/gpu/drm/amd/dal/dc/inc/core_dc.h           |  2 +-
+ drivers/gpu/drm/amd/dal/dc/inc/core_types.h        |  7 +--
+ drivers/gpu/drm/amd/dal/include/dal_types.h        |  1 +
+ drivers/gpu/drm/amd/dal/include/signal_types.h     |  3 +-
+ 17 files changed, 124 insertions(+), 92 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+index 80bd0c6..61e12ad 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -119,7 +119,7 @@ static struct dc_sink *dm_dp_mst_add_mst_sink(
+ 		uint16_t len)
+ {
+ 	struct dc_sink *dc_sink;
+-	struct sink_init_data init_params = {
++	struct dc_sink_init_data init_params = {
+ 			.link = dc_link,
+ 			.sink_signal = SIGNAL_TYPE_DISPLAY_PORT_MST};
+ 	enum dc_edid_status edid_status;
+@@ -139,7 +139,7 @@ static struct dc_sink *dm_dp_mst_add_mst_sink(
+ 	 * dc_link->connector_signal;
+ 	 */
+ 
+-	dc_sink = sink_create(&init_params);
++	dc_sink = dc_sink_create(&init_params);
+ 
+ 	if (!dc_sink)
+ 		return NULL;
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index 00a0139..7df2d28 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -1605,6 +1605,8 @@ static int to_drm_connector_type(enum signal_type st)
+ 	case SIGNAL_TYPE_DVI_DUAL_LINK:
+ 	case SIGNAL_TYPE_DVI_SINGLE_LINK:
+ 		return DRM_MODE_CONNECTOR_DVID;
++	case SIGNAL_TYPE_VIRTUAL:
++		return DRM_MODE_CONNECTOR_VIRTUAL;
+ 
+ 	default:
+ 		return DRM_MODE_CONNECTOR_Unknown;
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 96ec35f..397b664 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -92,14 +92,6 @@ static bool create_links(struct dc *dc, const struct dc_init_data *init_params)
+ 	dal_output_to_console("%s: connectors_num:%d\n", __func__,
+ 			connectors_num);
+ 
+-	dc->links = dc_service_alloc(
+-		init_params->ctx, connectors_num * sizeof(struct core_link *));
+-
+-	if (NULL == dc->links) {
+-		dal_error("DC: failed to allocate 'links' storage!\n");
+-		goto allocate_dc_links_storage_fail;
+-	}
+-
+ 	for (i = 0; i < connectors_num; i++) {
+ 		struct link_init_data link_init_params = {0};
+ 		struct core_link *link;
+@@ -121,14 +113,28 @@ static bool create_links(struct dc *dc, const struct dc_init_data *init_params)
+ 		}
+ 	}
+ 
+-	if (!dc->link_count) {
+-		dal_error("DC: no 'links' were created!\n");
+-		goto allocate_dc_links_storage_fail;
++	for (i = 0; i < init_params->num_virtual_links; i++) {
++		struct core_link *link =
++			dc_service_alloc(dc->ctx, sizeof(*link));
++
++		if (link == NULL) {
++			BREAK_TO_DEBUGGER();
++			goto failed_alloc;
++		}
++
++		link->adapter_srv = init_params->adapter_srv;
++		link->ctx = init_params->ctx;
++		link->dc = dc;
++		link->public.connector_signal = SIGNAL_TYPE_VIRTUAL;
++
++		link->public.link_index = dc->link_count;
++		dc->links[dc->link_count] = link;
++		dc->link_count++;
+ 	}
+ 
+ 	return true;
+ 
+-allocate_dc_links_storage_fail:
++failed_alloc:
+ 	return false;
+ }
+ 
+@@ -165,7 +171,8 @@ static void init_hw(struct dc *dc)
+ 		 * required signal (which may be different from the
+ 		 * default signal on connector). */
+ 		struct core_link *link = dc->links[i];
+-		dc->hwss.encoder_hw_init(link->link_enc);
++		if (link->public.connector_signal != SIGNAL_TYPE_VIRTUAL)
++			dc->hwss.encoder_hw_init(link->link_enc);
+ 	}
+ 
+ 	for(i = 0; i < dc->res_pool.controller_count; i++) {
+@@ -291,6 +298,7 @@ static bool construct(struct dc *dc, const struct dal_init_data *init_params)
+ 	}
+ 	dc_init_data.ctx->driver_context = init_params->driver;
+ 	dc_init_data.ctx->cgs_device = init_params->cgs_device;
++	dc_init_data.num_virtual_links = init_params->num_virtual_links;
+ 	dc_init_data.ctx->dc = dc;
+ 
+ 	/* Create logger */
+@@ -359,7 +367,6 @@ ctx_fail:
+ static void destruct(struct dc *dc)
+ {
+ 	destroy_links(dc);
+-	dc_service_free(dc->ctx, dc->links);
+ 	dc->hwss.destruct_resource_pool(&dc->res_pool);
+ 	dal_logger_destroy(&dc->ctx->logger);
+ 	dc_service_free(dc->ctx, dc->ctx);
+@@ -623,9 +630,9 @@ const struct audio **dc_get_audios(struct dc *dc)
+ 
+ void dc_get_caps(const struct dc *dc, struct dc_caps *caps)
+ {
+-    caps->max_targets = dc->res_pool.controller_count;
+-    caps->max_links = dc->link_count;
+-    caps->max_audios = dc->res_pool.audio_count;
++	caps->max_targets = dc->res_pool.controller_count;
++	caps->max_links = dc->link_count;
++	caps->max_audios = dc->res_pool.audio_count;
+ }
+ 
+ void dc_flip_surface_addrs(struct dc* dc,
+@@ -843,6 +850,9 @@ bool dc_link_add_sink(const struct dc_link *link, struct dc_sink *sink)
+ 
+ 	dc_link->sink[link->sink_count] = sink;
+ 	dc_link->sink_count++;
++	if (sink->sink_signal == SIGNAL_TYPE_VIRTUAL
++		&& link->connector_signal == SIGNAL_TYPE_VIRTUAL)
++		dc_link->type = dc_connection_single;
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 794465e..2ef0451 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -553,7 +553,7 @@ static void dc_link_detect_dp(
+ void dc_link_detect(const struct dc_link *dc_link)
+ {
+ 	struct core_link *link = DC_LINK_TO_LINK(dc_link);
+-	struct sink_init_data sink_init_data = { 0 };
++	struct dc_sink_init_data sink_init_data = { 0 };
+ 	struct display_sink_capability sink_caps = { 0 };
+ 	uint8_t i;
+ 	bool converter_disable_audio = false;
+@@ -566,6 +566,9 @@ void dc_link_detect(const struct dc_link *dc_link)
+ 	struct core_sink *sink = NULL;
+ 	enum dc_connection_type new_connection_type = dc_connection_none;
+ 
++	if (link->public.connector_signal == SIGNAL_TYPE_VIRTUAL)
++		return;
++
+ 	if (false == detect_sink(link, &new_connection_type)) {
+ 		BREAK_TO_DEBUGGER();
+ 		return;
+@@ -647,7 +650,7 @@ void dc_link_detect(const struct dc_link *dc_link)
+ 		sink_init_data.converter_disable_audio =
+ 			converter_disable_audio;
+ 
+-		dc_sink = sink_create(&sink_init_data);
++		dc_sink = dc_sink_create(&sink_init_data);
+ 		if (!dc_sink) {
+ 			DC_ERROR("Failed to create sink!\n");
+ 			return;
+@@ -835,7 +838,6 @@ static bool construct(
+ 
+ 	link->dc = init_params->dc;
+ 	link->adapter_srv = as;
+-	link->connector_index = init_params->connector_index;
+ 	link->ctx = dc_ctx;
+ 	link->public.link_index = init_params->link_index;
+ 
+@@ -994,7 +996,6 @@ struct core_link *link_create(const struct link_init_data *init_params)
+ {
+ 	struct core_link *link =
+ 			dc_service_alloc(init_params->ctx, sizeof(*link));
+-	link->ctx = init_params->ctx;
+ 
+ 	if (NULL == link)
+ 		goto alloc_fail;
+@@ -1063,9 +1064,9 @@ static void dpcd_configure_panel_mode(
+ 	}
+ 	dal_logger_write(link->ctx->logger, LOG_MAJOR_DETECTION,
+ 			LOG_MINOR_DETECTION_DP_CAPS,
+-			"Connector: %d eDP panel mode supported: %d "
++			"Link: %d eDP panel mode supported: %d "
+ 			"eDP panel mode enabled: %d \n",
+-			link->connector_index,
++			link->public.link_index,
+ 			link->dpcd_caps.panel_mode_edp,
+ 			panel_mode_edp);
+ }
+@@ -1268,7 +1269,8 @@ bool dc_link_set_backlight_level(const struct dc_link *public, uint32_t level)
+ 
+ void core_link_resume(struct core_link *link)
+ {
+-	program_hpd_filter(link);
++	if (link->public.connector_signal != SIGNAL_TYPE_VIRTUAL)
++		program_hpd_filter(link);
+ }
+ 
+ static struct fixed31_32 get_pbn_per_slot(struct core_stream *stream)
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
+index 787091f..4c17ff1 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
+@@ -1404,8 +1404,8 @@ bool dc_link_handle_hpd_rx_irq(const struct dc_link *dc_link)
+ 	dal_logger_write(link->ctx->logger,
+ 		LOG_MAJOR_HW_TRACE,
+ 		LOG_MINOR_HW_TRACE_HPD_IRQ,
+-		"%s: Got short pulse HPD on connector %d\n",
+-		__func__, link->connector_index);
++		"%s: Got short pulse HPD on link %d\n",
++		__func__, link->public.link_index);
+ 
+ 	 /* All the "handle_hpd_irq_xxx()" methods
+ 	 * should be called only after
+@@ -1582,16 +1582,16 @@ static void dp_wa_power_up_0010FA(struct core_link *link, uint8_t *dpcd_data,
+ 		 * keep receiver powered all the time.*/
+ 		case DP_BRANCH_DEVICE_ID_1:
+ 		case DP_BRANCH_DEVICE_ID_4:
+-			link->dp_wa.bits.KEEP_RECEIVER_POWERED = 1;
++			link->wa_flags.dp_keep_receiver_powered = true;
+ 			break;
+ 
+ 		/* TODO: May need work around for other dongles. */
+ 		default:
+-			link->dp_wa.bits.KEEP_RECEIVER_POWERED = 0;
++			link->wa_flags.dp_keep_receiver_powered = false;
+ 			break;
+ 		}
+ 	} else
+-		link->dp_wa.bits.KEEP_RECEIVER_POWERED = 0;
++		link->wa_flags.dp_keep_receiver_powered = false;
+ }
+ 
+ static void retrieve_link_cap(struct core_link *link)
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
+index 27acac8..e9ae9e1 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
+@@ -72,7 +72,7 @@ void dp_enable_link_phy(
+ 
+ void dp_disable_link_phy(struct core_link *link, enum signal_type signal)
+ {
+-	if (!link->dp_wa.bits.KEEP_RECEIVER_POWERED)
++	if (!link->wa_flags.dp_keep_receiver_powered)
+ 		dp_receiver_power_ctrl(link, false);
+ 
+ 	link->dc->hwss.encoder_disable_output(link->link_enc, signal);
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index 1ad317a..557f918 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -457,8 +457,11 @@ static void fill_display_configs(
+ 			cfg->src_width = stream->public.src.width;
+ 			cfg->ddi_channel_mapping =
+ 				stream->sink->link->ddi_channel_mapping.raw;
+-			cfg->transmitter =
++			if (stream->signal != SIGNAL_TYPE_VIRTUAL)
++				cfg->transmitter =
+ 				stream->sink->link->link_enc->transmitter;
++			else
++				cfg->transmitter = TRANSMITTER_UNKNOWN;
+ 			cfg->link_settings =
+ 					stream->sink->link->cur_link_settings;
+ 			cfg->sym_clock = stream->public.timing.pix_clk_khz;
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_sink.c b/drivers/gpu/drm/amd/dal/dc/core/dc_sink.c
+index 3d537d5..608fb99 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_sink.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_sink.c
+@@ -48,7 +48,7 @@ static void destruct(struct sink *sink)
+ 
+ }
+ 
+-static bool construct(struct sink *sink, const struct sink_init_data *init_params)
++static bool construct(struct sink *sink, const struct dc_sink_init_data *init_params)
+ {
+ 
+ 	struct core_link *core_link = DC_LINK_TO_LINK(init_params->link);
+@@ -87,12 +87,7 @@ void dc_sink_release(const struct dc_sink *dc_sink)
+ 	}
+ }
+ 
+-
+-/*******************************************************************************
+- * Protected functions - visible only inside of DC (not visible in DM)
+- ******************************************************************************/
+-
+-struct dc_sink *sink_create(const struct sink_init_data *init_params)
++struct dc_sink *dc_sink_create(const struct dc_sink_init_data *init_params)
+ {
+ 	struct core_link *core_link = DC_LINK_TO_LINK(init_params->link);
+ 
+@@ -116,3 +111,6 @@ alloc_fail:
+ 	return NULL;
+ }
+ 
++/*******************************************************************************
++ * Protected functions - visible only inside of DC (not visible in DM)
++ ******************************************************************************/
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+index 31374ab..b8420bf 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+@@ -497,7 +497,7 @@ void dc_target_log(
+ 		dal_logger_write(dal_logger,
+ 			log_major,
+ 			log_minor,
+-			"\tconnector: %d",
+-			core_stream->sink->link->connector_index);
++			"\tlink: %d",
++			core_stream->sink->link->public.link_index);
+ 	}
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index 007fdc4..bcfd96d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -40,6 +40,7 @@
+ struct dc_init_data {
+ 	struct dc_context *ctx;
+ 	struct adapter_service *adapter_srv;
++	uint8_t num_virtual_links;
+ };
+ 
+ struct dc_caps {
+@@ -311,6 +312,7 @@ void dc_link_remove_sink(
+ 	const struct dc_link *link,
+ 	const struct dc_sink *sink);
+ 
++
+ /*******************************************************************************
+  * Sink Interfaces - A sink corresponds to a display output device
+  ******************************************************************************/
+@@ -329,14 +331,14 @@ void dc_sink_release(const struct dc_sink *sink);
+ 
+ const struct audio **dc_get_audios(struct dc *dc);
+ 
+-struct sink_init_data {
++struct dc_sink_init_data {
+ 	enum signal_type sink_signal;
+ 	const struct dc_link *link;
+ 	uint32_t dongle_max_pix_clk;
+ 	bool converter_disable_audio;
+ };
+ 
+-struct dc_sink *sink_create(const struct sink_init_data *init_params);
++struct dc_sink *dc_sink_create(const struct dc_sink_init_data *init_params);
+ 
+ 
+ /*******************************************************************************
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 0d8b050..4f37282 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -802,8 +802,8 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 		 */
+ 		stream->tg->funcs->set_blank(stream->tg, true);
+ 
+-		core_link_disable_stream(
+-				stream->sink->link, stream);
++		if (stream->signal != SIGNAL_TYPE_VIRTUAL)
++			core_link_disable_stream(stream->sink->link, stream);
+ 
+ 		/*TODO: AUTO check if timing changed*/
+ 		if (false == dal_clock_source_program_pix_clk(
+@@ -822,9 +822,10 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 	}
+ 
+ 	/*TODO: mst support - use total stream count*/
+-	dce110_mem_input_allocate_dmif_buffer(stream->mi,
+-			&stream->public.timing,
+-			context->target_count);
++	dce110_mem_input_allocate_dmif_buffer(
++					stream->mi,
++					&stream->public.timing,
++					context->target_count);
+ 
+ 	if (timing_changed) {
+ 		if (false == stream->tg->funcs->enable_crtc(
+@@ -834,10 +835,11 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 		}
+ 	}
+ 
+-	if (DC_OK != bios_parser_crtc_source_select(stream)) {
+-		BREAK_TO_DEBUGGER();
+-		return DC_ERROR_UNEXPECTED;
+-	}
++	if (stream->signal != SIGNAL_TYPE_VIRTUAL)
++		if (DC_OK != bios_parser_crtc_source_select(stream)) {
++			BREAK_TO_DEBUGGER();
++			return DC_ERROR_UNEXPECTED;
++		}
+ 
+ 	dce110_opp_set_dyn_expansion(
+ 			opp,
+@@ -845,14 +847,12 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 			stream->public.timing.display_color_depth,
+ 			stream->sink->public.sink_signal);
+ 
+-	program_fmt(
+-			opp,
+-			&stream->fmt_bit_depth,
+-			&stream->clamping);
++	program_fmt(opp, &stream->fmt_bit_depth, &stream->clamping);
+ 
+-	dce110_link_encoder_setup(
+-		stream->sink->link->link_enc,
+-		stream->signal);
++	if (stream->signal != SIGNAL_TYPE_VIRTUAL)
++		dce110_link_encoder_setup(
++			stream->sink->link->link_enc,
++			stream->signal);
+ 
+ 	if (dc_is_dp_signal(stream->signal))
+ 		stream->stream_enc->funcs->dp_set_stream_attribute(
+@@ -861,16 +861,16 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 
+ 	if (dc_is_hdmi_signal(stream->signal))
+ 		stream->stream_enc->funcs->hdmi_set_stream_attribute(
+-		stream->stream_enc,
+-		&stream->public.timing,
+-		stream->audio != NULL);
++			stream->stream_enc,
++			&stream->public.timing,
++			stream->audio != NULL);
+ 
+ 	if (dc_is_dvi_signal(stream->signal))
+ 		stream->stream_enc->funcs->dvi_set_stream_attribute(
+-		stream->stream_enc,
+-		&stream->public.timing,
+-		(stream->signal == SIGNAL_TYPE_DVI_DUAL_LINK) ?
+-		true : false);
++			stream->stream_enc,
++			&stream->public.timing,
++			(stream->signal == SIGNAL_TYPE_DVI_DUAL_LINK) ?
++			true : false);
+ 
+ 	if (stream->audio != NULL) {
+ 		if (AUDIO_RESULT_OK != dal_audio_setup(
+@@ -891,14 +891,12 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 				&stream->audio_output.pll_info);
+ 
+ 	/* program blank color */
+-	color_space = get_output_color_space(
+-			&stream->public.timing);
+-
++	color_space = get_output_color_space(&stream->public.timing);
+ 	stream->tg->funcs->set_blank_color(
+ 			context->res_ctx.pool.timing_generators[controller_idx],
+ 			color_space);
+ 
+-	if (timing_changed) {
++	if (timing_changed && stream->signal != SIGNAL_TYPE_VIRTUAL) {
+ 		core_link_enable_stream(stream->sink->link, stream);
+ 	} else {
+ 		core_link_update_stream(stream->sink->link, stream);
+@@ -918,7 +916,8 @@ static void power_down_encoders(struct dc *dc)
+ 	int i;
+ 
+ 	for (i = 0; i < dc->link_count; i++) {
+-		dce110_link_encoder_disable_output(
++		if (dc->links[i]->public.connector_signal != SIGNAL_TYPE_VIRTUAL)
++			dce110_link_encoder_disable_output(
+ 				dc->links[i]->link_enc, SIGNAL_TYPE_NONE);
+ 	}
+ }
+@@ -1571,7 +1570,8 @@ static void reset_single_stream_hw_ctx(struct core_stream *stream,
+ 		stream->audio = NULL;
+ 	}
+ 
+-	core_link_disable_stream(stream->sink->link, stream);
++	if (stream->signal != SIGNAL_TYPE_VIRTUAL)
++		core_link_disable_stream(stream->sink->link, stream);
+ 
+ 	stream->tg->funcs->set_blank(stream->tg, true);
+ 	stream->tg->funcs->disable_crtc(stream->tg);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index 266b761..f3610b4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -528,14 +528,17 @@ static enum dc_status validate_mapped_resource(
+ 				DC_STREAM_TO_CORE(target->public.streams[j]);
+ 			struct core_link *link = stream->sink->link;
+ 
+-			status = build_stream_hw_param(stream);
++			if (!stream->tg->funcs->validate_timing(
++					stream->tg, &stream->public.timing))
++				return DC_FAIL_CONTROLLER_VALIDATE;
+ 
+-			if (status != DC_OK)
++			if (stream->signal == SIGNAL_TYPE_VIRTUAL)
+ 				return status;
+ 
+-			if (!stream->tg->funcs->validate_timing(stream->tg, &stream->public.timing))
+-				return DC_FAIL_CONTROLLER_VALIDATE;
++			status = build_stream_hw_param(stream);
+ 
++			if (status != DC_OK)
++				return status;
+ 
+ 			if (!dce110_link_encoder_validate_output_with_stream(
+ 					link->link_enc,
+@@ -781,7 +784,8 @@ static enum dc_status map_clock_resources(
+ 			struct core_stream *stream =
+ 				DC_STREAM_TO_CORE(target->public.streams[j]);
+ 
+-			if (dc_is_dp_signal(stream->signal))
++			if (dc_is_dp_signal(stream->signal)
++				|| stream->signal == SIGNAL_TYPE_VIRTUAL)
+ 				stream->clock_source = context->res_ctx.
+ 					pool.clock_sources[DCE110_CLK_SRC_EXT];
+ 			else
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce_base/dce_base_resource.c b/drivers/gpu/drm/amd/dal/dc/dce_base/dce_base_resource.c
+index 1b091be..85cff3b 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce_base/dce_base_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce_base/dce_base_resource.c
+@@ -227,6 +227,23 @@ enum dc_status dce_base_map_resources(
+ 
+ 			attach_stream_to_controller(&context->res_ctx, stream);
+ 
++			set_stream_signal(stream);
++
++			curr_stream =
++				dc->current_context.res_ctx.controller_ctx
++				[stream->controller_idx].stream;
++			context->res_ctx.controller_ctx[stream->controller_idx]
++			.flags.timing_changed =
++				check_timing_change(curr_stream, stream);
++
++			/*
++			 * we do not need stream encoder or audio resources
++			 * when connecting to virtual link
++			 */
++			if (stream->sink->link->public.connector_signal ==
++							SIGNAL_TYPE_VIRTUAL)
++				continue;
++
+ 			stream->stream_enc =
+ 				find_first_free_match_stream_enc_for_link(
+ 					&context->res_ctx,
+@@ -239,8 +256,6 @@ enum dc_status dce_base_map_resources(
+ 					&context->res_ctx,
+ 					stream->stream_enc);
+ 
+-			set_stream_signal(stream);
+-
+ 			/* TODO: Add check if ASIC support and EDID audio */
+ 			if (!stream->sink->converter_disable_audio &&
+ 						dc_is_audio_capable_signal(
+@@ -254,13 +269,6 @@ enum dc_status dce_base_map_resources(
+ 				set_audio_in_use(&context->res_ctx,
+ 						stream->audio);
+ 			}
+-			curr_stream =
+-				dc->current_context.res_ctx.controller_ctx
+-				[stream->controller_idx].stream;
+-			context->res_ctx.controller_ctx[stream->controller_idx]
+-			.flags.timing_changed =
+-				check_timing_change(curr_stream, stream);
+-
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h b/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h
+index 66f7544..9d62a24 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h
+@@ -17,7 +17,7 @@ struct dc {
+ 
+ 	/** link-related data - begin **/
+ 	uint8_t link_count;
+-	struct core_link **links;
++	struct core_link *links[MAX_PIPES * 2];
+ 	/** link-related data - end **/
+ 
+ 	/* TODO: determine max number of targets*/
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+index 5f918c1..192399b 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+@@ -202,8 +202,6 @@ struct core_link {
+ 
+ 	struct dc_context *ctx; /* TODO: AUTO remove 'dal' when DC is complete*/
+ 
+-	uint8_t connector_index; /* this will be mapped to the HPD pins */
+-
+ 	struct adapter_service *adapter_srv;
+ 	struct link_encoder *link_enc;
+ 	struct ddc_service *ddc;
+@@ -221,10 +219,13 @@ struct core_link {
+ 	unsigned int dpcd_sink_count;
+ 
+ 	enum edp_revision edp_revision;
+-	union dp_wa dp_wa;
+ 
+ 	/* MST record stream using this link */
+ 	struct dp_mst_stream_allocation_table stream_alloc_table;
++
++	struct link_flags {
++		bool dp_keep_receiver_powered;
++	} wa_flags;
+ };
+ 
+ #define DC_LINK_TO_LINK(dc_link) container_of(dc_link, struct core_link, public)
+diff --git a/drivers/gpu/drm/amd/dal/include/dal_types.h b/drivers/gpu/drm/amd/dal/include/dal_types.h
+index 5539c19..5ec4784 100644
+--- a/drivers/gpu/drm/amd/dal/include/dal_types.h
++++ b/drivers/gpu/drm/amd/dal/include/dal_types.h
+@@ -136,6 +136,7 @@ struct dal_init_data {
+ 	struct dal_override_parameters display_param;
+ 	void *driver; /* ctx */
+ 	void *cgs_device;
++	uint8_t num_virtual_links;
+ };
+ 
+ struct dal_dc_init_data {
+diff --git a/drivers/gpu/drm/amd/dal/include/signal_types.h b/drivers/gpu/drm/amd/dal/include/signal_types.h
+index e95e821..a50f7ed 100644
+--- a/drivers/gpu/drm/amd/dal/include/signal_types.h
++++ b/drivers/gpu/drm/amd/dal/include/signal_types.h
+@@ -37,8 +37,9 @@ enum signal_type {
+ 	SIGNAL_TYPE_DISPLAY_PORT_MST	= (1 << 6),
+ 	SIGNAL_TYPE_EDP			= (1 << 7),
+ 	SIGNAL_TYPE_WIRELESS		= (1 << 8),	/* Wireless Display */
++	SIGNAL_TYPE_VIRTUAL		= (1 << 9),	/* Virtual Display */
+ 
+-	SIGNAL_TYPE_COUNT		= 9,
++	SIGNAL_TYPE_COUNT		= 10,
+ 	SIGNAL_TYPE_ALL			= (1 << SIGNAL_TYPE_COUNT) - 1
+ };
+ 
+-- 
+2.7.4
+

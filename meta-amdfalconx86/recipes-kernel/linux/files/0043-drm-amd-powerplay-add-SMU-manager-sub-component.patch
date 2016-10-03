@@ -1,0 +1,670 @@
+From a84259401d5f43c9a4ad5ad62619c5c6341b7fd6 Mon Sep 17 00:00:00 2001
+From: Jammy Zhou <Jammy.Zhou@amd.com>
+Date: Tue, 21 Jul 2015 17:43:02 +0800
+Subject: [PATCH 0043/1110] drm/amd/powerplay: add SMU manager sub-component
+
+The SMUMGR is one sub-component of powerplay for SMU firmware support.
+The SMU handles firmware loading for other IP blocks (GFX, SDMA, etc.)
+on VI parts.  The adds the core powerplay infrastructure to handle that.
+
+v3: direct use printk in powerplay module.
+v2: direct use cgs_read/write_register functions in smu-modules
+
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+Signed-off-by: Jammy Zhou <Jammy.Zhou@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/powerplay/Makefile          |   4 +
+ drivers/gpu/drm/amd/powerplay/amd_powerplay.c   |  81 ++++++++
+ drivers/gpu/drm/amd/powerplay/inc/pp_instance.h |  33 ++++
+ drivers/gpu/drm/amd/powerplay/inc/smumgr.h      | 182 +++++++++++++++++
+ drivers/gpu/drm/amd/powerplay/smumgr/Makefile   |   9 +
+ drivers/gpu/drm/amd/powerplay/smumgr/smumgr.c   | 251 ++++++++++++++++++++++++
+ 6 files changed, 560 insertions(+)
+ create mode 100644 drivers/gpu/drm/amd/powerplay/inc/pp_instance.h
+ create mode 100644 drivers/gpu/drm/amd/powerplay/inc/smumgr.h
+ create mode 100644 drivers/gpu/drm/amd/powerplay/smumgr/Makefile
+ create mode 100644 drivers/gpu/drm/amd/powerplay/smumgr/smumgr.c
+
+diff --git a/drivers/gpu/drm/amd/powerplay/Makefile b/drivers/gpu/drm/amd/powerplay/Makefile
+index e7428a1..60c6654 100644
+--- a/drivers/gpu/drm/amd/powerplay/Makefile
++++ b/drivers/gpu/drm/amd/powerplay/Makefile
+@@ -6,6 +6,10 @@ subdir-ccflags-y += -Iinclude/drm  \
+ 
+ AMD_PP_PATH = ../powerplay
+ 
++PP_LIBS = smumgr
++
++AMD_POWERPLAY = $(addsuffix /Makefile,$(addprefix drivers/gpu/drm/amd/powerplay/,$(PP_LIBS)))
++
+ include $(AMD_POWERPLAY)
+ 
+ POWER_MGR = amd_powerplay.o
+diff --git a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+index 39ffc5d..ea78525 100644
+--- a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
++++ b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+@@ -23,8 +23,10 @@
+ #include <linux/types.h>
+ #include <linux/kernel.h>
+ #include <linux/gfp.h>
++#include <linux/slab.h>
+ #include "amd_shared.h"
+ #include "amd_powerplay.h"
++#include "pp_instance.h"
+ 
+ static int pp_early_init(void *handle)
+ {
+@@ -43,11 +45,51 @@ static int pp_sw_fini(void *handle)
+ 
+ static int pp_hw_init(void *handle)
+ {
++	struct pp_instance *pp_handle;
++	struct pp_smumgr *smumgr;
++	int ret = 0;
++
++	if (handle == NULL)
++		return -EINVAL;
++
++	pp_handle = (struct pp_instance *)handle;
++	smumgr = pp_handle->smu_mgr;
++
++	if (smumgr == NULL || smumgr->smumgr_funcs == NULL ||
++		smumgr->smumgr_funcs->smu_init == NULL ||
++		smumgr->smumgr_funcs->start_smu == NULL)
++		return -EINVAL;
++
++	ret = smumgr->smumgr_funcs->smu_init(smumgr);
++	if (ret) {
++		printk(KERN_ERR "[ powerplay ] smc initialization failed\n");
++		return ret;
++	}
++
++	ret = smumgr->smumgr_funcs->start_smu(smumgr);
++	if (ret) {
++		printk(KERN_ERR "[ powerplay ] smc start failed\n");
++		smumgr->smumgr_funcs->smu_fini(smumgr);
++		return ret;
++	}
+ 	return 0;
+ }
+ 
+ static int pp_hw_fini(void *handle)
+ {
++	struct pp_instance *pp_handle;
++	struct pp_smumgr *smumgr;
++
++	if (handle == NULL)
++		return -EINVAL;
++
++	pp_handle = (struct pp_instance *)handle;
++	smumgr = pp_handle->smu_mgr;
++
++	if (smumgr != NULL || smumgr->smumgr_funcs != NULL ||
++		smumgr->smumgr_funcs->smu_fini != NULL)
++		smumgr->smumgr_funcs->smu_fini(smumgr);
++
+ 	return 0;
+ }
+ 
+@@ -176,12 +218,49 @@ const struct amd_powerplay_funcs pp_dpm_funcs = {
+ 	.print_current_performance_level = pp_debugfs_print_current_performance_level,
+ };
+ 
++static int amd_pp_instance_init(struct amd_pp_init *pp_init,
++				struct amd_powerplay *amd_pp)
++{
++	int ret;
++	struct pp_instance *handle;
++
++	handle = kzalloc(sizeof(struct pp_instance), GFP_KERNEL);
++	if (handle == NULL)
++		return -ENOMEM;
++
++	ret = smum_init(pp_init, handle);
++	if (ret)
++		return ret;
++
++	amd_pp->pp_handle = handle;
++	return 0;
++}
++
++static int amd_pp_instance_fini(void *handle)
++{
++	struct pp_instance *instance = (struct pp_instance *)handle;
++	if (instance == NULL)
++		return -EINVAL;
++
++	smum_fini(instance->smu_mgr);
++
++	kfree(handle);
++	return 0;
++}
++
+ int amd_powerplay_init(struct amd_pp_init *pp_init,
+ 		       struct amd_powerplay *amd_pp)
+ {
++	int ret;
++
+ 	if (pp_init == NULL || amd_pp == NULL)
+ 		return -EINVAL;
+ 
++	ret = amd_pp_instance_init(pp_init, amd_pp);
++
++	if (ret)
++		return ret;
++
+ 	amd_pp->ip_funcs = &pp_ip_funcs;
+ 	amd_pp->pp_funcs = &pp_dpm_funcs;
+ 
+@@ -190,5 +269,7 @@ int amd_powerplay_init(struct amd_pp_init *pp_init,
+ 
+ int amd_powerplay_fini(void *handle)
+ {
++	amd_pp_instance_fini(handle);
++
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/pp_instance.h b/drivers/gpu/drm/amd/powerplay/inc/pp_instance.h
+new file mode 100644
+index 0000000..318f827
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/inc/pp_instance.h
+@@ -0,0 +1,33 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#ifndef _PP_INSTANCE_H_
++#define _PP_INSTANCE_H_
++
++#include "smumgr.h"
++
++
++struct pp_instance {
++	struct pp_smumgr *smu_mgr;
++};
++
++#endif
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/smumgr.h b/drivers/gpu/drm/amd/powerplay/inc/smumgr.h
+new file mode 100644
+index 0000000..504f035
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/inc/smumgr.h
+@@ -0,0 +1,182 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#ifndef _SMUMGR_H_
++#define _SMUMGR_H_
++#include <linux/types.h>
++#include "pp_instance.h"
++#include "amd_powerplay.h"
++
++struct pp_smumgr;
++struct pp_instance;
++
++#define smu_lower_32_bits(n) ((uint32_t)(n))
++#define smu_upper_32_bits(n) ((uint32_t)(((n)>>16)>>16))
++
++struct pp_smumgr_func {
++	int (*smu_init)(struct pp_smumgr *smumgr);
++	int (*smu_fini)(struct pp_smumgr *smumgr);
++	int (*start_smu)(struct pp_smumgr *smumgr);
++	int (*check_fw_load_finish)(struct pp_smumgr *smumgr,
++				    uint32_t firmware);
++	int (*request_smu_load_fw)(struct pp_smumgr *smumgr);
++	int (*request_smu_load_specific_fw)(struct pp_smumgr *smumgr,
++					    uint32_t firmware);
++	int (*get_argument)(struct pp_smumgr *smumgr);
++	int (*send_msg_to_smc)(struct pp_smumgr *smumgr, uint16_t msg);
++	int (*send_msg_to_smc_with_parameter)(struct pp_smumgr *smumgr,
++					  uint16_t msg, uint32_t parameter);
++	int (*download_pptable_settings)(struct pp_smumgr *smumgr,
++					 void **table);
++	int (*upload_pptable_settings)(struct pp_smumgr *smumgr);
++};
++
++struct pp_smumgr {
++	uint32_t chip_family;
++	uint32_t chip_id;
++	uint32_t hw_revision;
++	void *device;
++	void *backend;
++	uint32_t usec_timeout;
++	bool reload_fw;
++	const struct pp_smumgr_func *smumgr_funcs;
++};
++
++
++extern int smum_init(struct amd_pp_init *pp_init,
++		     struct pp_instance *handle);
++
++extern int smum_fini(struct pp_smumgr *smumgr);
++
++extern int smum_get_argument(struct pp_smumgr *smumgr);
++
++extern int smum_download_powerplay_table(struct pp_smumgr *smumgr, void **table);
++
++extern int smum_upload_powerplay_table(struct pp_smumgr *smumgr);
++
++extern int smum_send_msg_to_smc(struct pp_smumgr *smumgr, uint16_t msg);
++
++extern int smum_send_msg_to_smc_with_parameter(struct pp_smumgr *smumgr,
++					uint16_t msg, uint32_t parameter);
++
++extern int smum_wait_on_register(struct pp_smumgr *smumgr,
++				uint32_t index, uint32_t value, uint32_t mask);
++
++extern int smum_wait_for_register_unequal(struct pp_smumgr *smumgr,
++				uint32_t index, uint32_t value, uint32_t mask);
++
++extern int smum_wait_on_indirect_register(struct pp_smumgr *smumgr,
++				uint32_t indirect_port, uint32_t index,
++				uint32_t value, uint32_t mask);
++
++
++extern void smum_wait_for_indirect_register_unequal(
++				struct pp_smumgr *smumgr,
++				uint32_t indirect_port, uint32_t index,
++				uint32_t value, uint32_t mask);
++
++extern int smu_allocate_memory(void *device, uint32_t size,
++			 enum cgs_gpu_mem_type type,
++			 uint32_t byte_align, uint64_t *mc_addr,
++			 void **kptr, void *handle);
++
++extern int smu_free_memory(void *device, void *handle);
++
++#define SMUM_FIELD_SHIFT(reg, field) reg##__##field##__SHIFT
++
++#define SMUM_FIELD_MASK(reg, field) reg##__##field##_MASK
++
++#define SMUM_WAIT_INDIRECT_REGISTER_GIVEN_INDEX(smumgr,			\
++					port, index, value, mask)	\
++	smum_wait_on_indirect_register(smumgr,				\
++				mm##port##_INDEX, index, value, mask)
++
++
++#define SMUM_WAIT_REGISTER_UNEQUAL_GIVEN_INDEX(smumgr,         \
++							index, value, mask) \
++		smum_wait_for_register_unequal(smumgr,            \
++					index, value, mask)
++
++#define SMUM_WAIT_REGISTER_UNEQUAL(smumgr, reg, value, mask)		\
++	SMUM_WAIT_REGISTER_UNEQUAL_GIVEN_INDEX(smumgr,			\
++				mm##reg, value, mask)
++
++#define SMUM_WAIT_FIELD_UNEQUAL(smumgr, reg, field, fieldval)		\
++	SMUM_WAIT_REGISTER_UNEQUAL(smumgr, reg,				\
++		(fieldval) << SMUM_FIELD_SHIFT(reg, field),		\
++		SMUM_FIELD_MASK(reg, field))
++
++#define SMUM_GET_FIELD(value, reg, field)				\
++		(((value) & SMUM_FIELD_MASK(reg, field))		\
++		>> SMUM_FIELD_SHIFT(reg, field))
++
++#define SMUM_READ_FIELD(device, reg, field)                           \
++		SMUM_GET_FIELD(cgs_read_register(device, mm##reg), reg, field)
++
++#define SMUM_SET_FIELD(value, reg, field, field_val)                  \
++		(((value) & ~SMUM_FIELD_MASK(reg, field)) |                    \
++		(SMUM_FIELD_MASK(reg, field) & ((field_val) <<                 \
++			SMUM_FIELD_SHIFT(reg, field))))
++
++#define SMUM_WAIT_VFPF_INDIRECT_REGISTER_GIVEN_INDEX(smumgr,		\
++				port, index, value, mask)		\
++	smum_wait_on_indirect_register(smumgr,				\
++		mm##port##_INDEX_0, index, value, mask)
++
++#define SMUM_WAIT_VFPF_INDIRECT_REGISTER_UNEQUAL_GIVEN_INDEX(smumgr,	\
++				port, index, value, mask)		\
++	smum_wait_for_indirect_register_unequal(smumgr,			\
++		mm##port##_INDEX_0, index, value, mask)
++
++
++#define SMUM_WAIT_VFPF_INDIRECT_REGISTER(smumgr, port, reg, value, mask) \
++	SMUM_WAIT_VFPF_INDIRECT_REGISTER_GIVEN_INDEX(smumgr, port, ix##reg, value, mask)
++
++#define SMUM_WAIT_VFPF_INDIRECT_REGISTER_UNEQUAL(smumgr, port, reg, value, mask)     \
++		SMUM_WAIT_VFPF_INDIRECT_REGISTER_UNEQUAL_GIVEN_INDEX(smumgr, port, ix##reg, value, mask)
++
++
++/*Operations on named fields.*/
++
++#define SMUM_READ_VFPF_INDIRECT_FIELD(device, port, reg, field) \
++		SMUM_GET_FIELD(cgs_read_ind_register(device, port, ix##reg), \
++			reg, field)
++
++#define SMUM_WRITE_FIELD(device, reg, field, fieldval)            \
++		cgs_write_register(device, mm##reg, \
++		SMUM_SET_FIELD(cgs_read_register(device, mm##reg), reg, field, fieldval))
++
++#define SMUM_WRITE_VFPF_INDIRECT_FIELD(device, port, reg, field, fieldval)    \
++		cgs_write_ind_register(device, port, ix##reg, \
++			SMUM_SET_FIELD(cgs_read_ind_register(device, port, ix##reg), \
++			reg, field, fieldval))
++
++#define SMUM_WAIT_VFPF_INDIRECT_FIELD(smumgr, port, reg, field, fieldval) \
++	SMUM_WAIT_VFPF_INDIRECT_REGISTER(smumgr, port, reg,		\
++		(fieldval) << SMUM_FIELD_SHIFT(reg, field),		\
++		SMUM_FIELD_MASK(reg, field))
++
++#define SMUM_WAIT_VFPF_INDIRECT_FIELD_UNEQUAL(smumgr, port, reg, field, fieldval) \
++	SMUM_WAIT_VFPF_INDIRECT_REGISTER_UNEQUAL(smumgr, port, reg,	\
++		(fieldval) << SMUM_FIELD_SHIFT(reg, field),		\
++		SMUM_FIELD_MASK(reg, field))
++#endif
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/Makefile b/drivers/gpu/drm/amd/powerplay/smumgr/Makefile
+new file mode 100644
+index 0000000..61bfb2a
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/Makefile
+@@ -0,0 +1,9 @@
++#
++# Makefile for the 'smu manager' sub-component of powerplay.
++# It provides the smu management services for the driver.
++
++SMU_MGR = smumgr.o
++
++AMD_PP_SMUMGR = $(addprefix $(AMD_PP_PATH)/smumgr/,$(SMU_MGR))
++
++AMD_POWERPLAY_FILES += $(AMD_PP_SMUMGR)
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/smumgr.c b/drivers/gpu/drm/amd/powerplay/smumgr/smumgr.c
+new file mode 100644
+index 0000000..1a11714
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/smumgr.c
+@@ -0,0 +1,251 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include "pp_instance.h"
++#include "smumgr.h"
++#include "cgs_common.h"
++#include "linux/delay.h"
++
++int smum_init(struct amd_pp_init *pp_init, struct pp_instance *handle)
++{
++	struct pp_smumgr *smumgr;
++
++	if ((handle == NULL) || (pp_init == NULL))
++		return -EINVAL;
++
++	smumgr = kzalloc(sizeof(struct pp_smumgr), GFP_KERNEL);
++	if (smumgr == NULL)
++		return -ENOMEM;
++
++	smumgr->device = pp_init->device;
++	smumgr->chip_family = pp_init->chip_family;
++	smumgr->chip_id = pp_init->chip_id;
++	smumgr->hw_revision = pp_init->rev_id;
++	smumgr->usec_timeout = AMD_MAX_USEC_TIMEOUT;
++	smumgr->reload_fw = 1;
++	handle->smu_mgr = smumgr;
++
++	switch (smumgr->chip_family) {
++	case AMD_FAMILY_CZ:
++		/* TODO */
++		break;
++	case AMD_FAMILY_VI:
++		/* TODO */
++		break;
++	default:
++		kfree(smumgr);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++int smum_fini(struct pp_smumgr *smumgr)
++{
++	kfree(smumgr);
++	return 0;
++}
++
++int smum_get_argument(struct pp_smumgr *smumgr)
++{
++	if (NULL != smumgr->smumgr_funcs->get_argument)
++		return smumgr->smumgr_funcs->get_argument(smumgr);
++
++	return 0;
++}
++
++int smum_download_powerplay_table(struct pp_smumgr *smumgr,
++								void **table)
++{
++	if (NULL != smumgr->smumgr_funcs->download_pptable_settings)
++		return smumgr->smumgr_funcs->download_pptable_settings(smumgr,
++									table);
++
++	return 0;
++}
++
++int smum_upload_powerplay_table(struct pp_smumgr *smumgr)
++{
++	if (NULL != smumgr->smumgr_funcs->upload_pptable_settings)
++		return smumgr->smumgr_funcs->upload_pptable_settings(smumgr);
++
++	return 0;
++}
++
++int smum_send_msg_to_smc(struct pp_smumgr *smumgr, uint16_t msg)
++{
++	if (smumgr == NULL || smumgr->smumgr_funcs->send_msg_to_smc == NULL)
++		return -EINVAL;
++
++	return smumgr->smumgr_funcs->send_msg_to_smc(smumgr, msg);
++}
++
++int smum_send_msg_to_smc_with_parameter(struct pp_smumgr *smumgr,
++					uint16_t msg, uint32_t parameter)
++{
++	if (smumgr == NULL ||
++		smumgr->smumgr_funcs->send_msg_to_smc_with_parameter == NULL)
++		return -EINVAL;
++	return smumgr->smumgr_funcs->send_msg_to_smc_with_parameter(
++						smumgr, msg, parameter);
++}
++
++/*
++ * Returns once the part of the register indicated by the mask has
++ * reached the given value.
++ */
++int smum_wait_on_register(struct pp_smumgr *smumgr,
++				uint32_t index,
++				uint32_t value, uint32_t mask)
++{
++	uint32_t i;
++	uint32_t cur_value;
++
++	if (smumgr == NULL || smumgr->device == NULL)
++		return -EINVAL;
++
++	for (i = 0; i < smumgr->usec_timeout; i++) {
++		cur_value = cgs_read_register(smumgr->device, index);
++		if ((cur_value & mask) == (value & mask))
++			break;
++		udelay(1);
++	}
++
++	/* timeout means wrong logic*/
++	if (i == smumgr->usec_timeout)
++		return -1;
++
++	return 0;
++}
++
++int smum_wait_for_register_unequal(struct pp_smumgr *smumgr,
++					uint32_t index,
++					uint32_t value, uint32_t mask)
++{
++	uint32_t i;
++	uint32_t cur_value;
++
++	if (smumgr == NULL)
++		return -EINVAL;
++
++	for (i = 0; i < smumgr->usec_timeout; i++) {
++		cur_value = cgs_read_register(smumgr->device,
++									index);
++		if ((cur_value & mask) != (value & mask))
++			break;
++		udelay(1);
++	}
++
++	/* timeout means wrong logic */
++	if (i == smumgr->usec_timeout)
++		return -1;
++
++	return 0;
++}
++
++
++/*
++ * Returns once the part of the register indicated by the mask
++ * has reached the given value.The indirect space is described by
++ * giving the memory-mapped index of the indirect index register.
++ */
++int smum_wait_on_indirect_register(struct pp_smumgr *smumgr,
++					uint32_t indirect_port,
++					uint32_t index,
++					uint32_t value,
++					uint32_t mask)
++{
++	if (smumgr == NULL || smumgr->device == NULL)
++		return -EINVAL;
++
++	cgs_write_register(smumgr->device, indirect_port, index);
++	return smum_wait_on_register(smumgr, indirect_port + 1,
++						mask, value);
++}
++
++void smum_wait_for_indirect_register_unequal(
++						struct pp_smumgr *smumgr,
++						uint32_t indirect_port,
++						uint32_t index,
++						uint32_t value,
++						uint32_t mask)
++{
++	if (smumgr == NULL || smumgr->device == NULL)
++		return;
++	cgs_write_register(smumgr->device, indirect_port, index);
++	smum_wait_for_register_unequal(smumgr, indirect_port + 1,
++						value, mask);
++}
++
++int smu_allocate_memory(void *device, uint32_t size,
++			 enum cgs_gpu_mem_type type,
++			 uint32_t byte_align, uint64_t *mc_addr,
++			 void **kptr, void *handle)
++{
++	int ret = 0;
++	cgs_handle_t cgs_handle;
++
++	if (device == NULL || handle == NULL ||
++	    mc_addr == NULL || kptr == NULL)
++		return -EINVAL;
++
++	ret = cgs_alloc_gpu_mem(device, type, size, byte_align,
++				0, 0, (cgs_handle_t *)handle);
++	if (ret)
++		return -ENOMEM;
++
++	cgs_handle = *(cgs_handle_t *)handle;
++
++	ret = cgs_gmap_gpu_mem(device, cgs_handle, mc_addr);
++	if (ret)
++		goto error_gmap;
++
++	ret = cgs_kmap_gpu_mem(device, cgs_handle, kptr);
++	if (ret)
++		goto error_kmap;
++
++	return 0;
++
++error_kmap:
++	cgs_gunmap_gpu_mem(device, cgs_handle);
++
++error_gmap:
++	cgs_free_gpu_mem(device, cgs_handle);
++	return ret;
++}
++
++int smu_free_memory(void *device, void *handle)
++{
++	cgs_handle_t cgs_handle = (cgs_handle_t)handle;
++
++	if (device == NULL || handle == NULL)
++		return -EINVAL;
++
++	cgs_kunmap_gpu_mem(device, cgs_handle);
++	cgs_gunmap_gpu_mem(device, cgs_handle);
++	cgs_free_gpu_mem(device, cgs_handle);
++
++	return 0;
++}
+-- 
+2.7.4
+

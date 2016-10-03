@@ -1,0 +1,122 @@
+From 99daa73a701cf97a5beed053619755447ded430b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 26 Jan 2016 11:40:46 +0100
+Subject: [PATCH 0253/1110] drm/amdgpu: optimize VM fencing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No need to fence every page table, just the page directory is enough.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 51 +++++++++++++++-------------------
+ 1 file changed, 23 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index ae1d20a..6bf839f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -631,36 +631,25 @@ static void amdgpu_vm_frag_ptes(struct amdgpu_device *adev,
+  *
+  * Global and local mutex must be locked!
+  */
+-static int amdgpu_vm_update_ptes(struct amdgpu_device *adev,
+-				 struct amdgpu_gart *gtt,
+-				 uint32_t gtt_flags,
+-				 struct amdgpu_vm *vm,
+-				 struct amdgpu_ib *ib,
+-				 uint64_t start, uint64_t end,
+-				 uint64_t dst, uint32_t flags)
++static void amdgpu_vm_update_ptes(struct amdgpu_device *adev,
++                                  struct amdgpu_gart *gtt,
++                                  uint32_t gtt_flags,
++                                  struct amdgpu_vm *vm,
++                                  struct amdgpu_ib *ib,
++                                  uint64_t start, uint64_t end,
++                                  uint64_t dst, uint32_t flags)
+ {
+ 	uint64_t mask = AMDGPU_VM_PTE_COUNT - 1;
+ 	uint64_t last_pte = ~0, last_dst = ~0;
+-	void *owner = AMDGPU_FENCE_OWNER_VM;
+ 	unsigned count = 0;
+ 	uint64_t addr;
+ 
+-	/* sync to everything on unmapping */
+-	if (!(flags & AMDGPU_PTE_VALID))
+-		owner = AMDGPU_FENCE_OWNER_UNDEFINED;
+-
+ 	/* walk over the address space and update the page tables */
+ 	for (addr = start; addr < end; ) {
+ 		uint64_t pt_idx = addr >> amdgpu_vm_block_size;
+                 struct amdgpu_bo *pt = vm->page_tables[pt_idx].entry.robj;
+ 		unsigned nptes;
+ 		uint64_t pte;
+-		int r;
+-
+-		amdgpu_sync_resv(adev, &ib->sync, pt->tbo.resv, owner);
+-		r = reservation_object_reserve_shared(pt->tbo.resv);
+-		if (r)
+-			return r;
+ 
+ 		if ((addr & ~mask) == (end & ~mask))
+ 			nptes = end - addr;
+@@ -694,8 +683,6 @@ static int amdgpu_vm_update_ptes(struct amdgpu_device *adev,
+ 				    last_pte, last_pte + 8 * count,
+ 				    last_dst, flags);
+ 	}
+-
+-	return 0;
+ }
+ 
+ /**
+@@ -723,11 +710,16 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 				       struct fence **fence)
+ {
+ 	struct amdgpu_ring *ring = adev->vm_manager.vm_pte_funcs_ring;
++        void *owner = AMDGPU_FENCE_OWNER_VM;
+ 	unsigned nptes, ncmds, ndw;
+ 	struct amdgpu_ib *ib;
+ 	struct fence *f = NULL;
+ 	int r;
+ 
++        /* sync to everything on unmapping */
++        if (!(flags & AMDGPU_PTE_VALID))
++                owner = AMDGPU_FENCE_OWNER_UNDEFINED;
++ 
+ 	nptes = last - start + 1;
+ 
+ 	/*
+@@ -769,14 +761,17 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 	}
+ 
+ 	ib->length_dw = 0;
+-
+-	r = amdgpu_vm_update_ptes(adev, gtt, gtt_flags, vm, ib, start,
+-				  last + 1, addr, flags);
+-	if (r) {
+-		amdgpu_ib_free(adev, ib);
+-		kfree(ib);
+-		return r;
+-	}
++        r = amdgpu_sync_resv(adev, &ib->sync, vm->page_directory->tbo.resv,
++                             owner);
++        if (r)
++                goto error_free;
++
++        r = reservation_object_reserve_shared(vm->page_directory->tbo.resv);
++        if (r)
++                goto error_free;
++ 
++        amdgpu_vm_update_ptes(adev, gtt, gtt_flags, vm, ib, start, last + 1,
++                              addr, flags);
+ 
+ 	amdgpu_vm_pad_ib(adev, ib);
+ 	WARN_ON(ib->length_dw > ndw);
+-- 
+2.7.4
+

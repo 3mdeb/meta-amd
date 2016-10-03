@@ -1,0 +1,622 @@
+From 9c05026f1eca2f9a6d1aeb97c6130f9848cdfa97 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Thu, 3 Dec 2015 14:13:20 -0500
+Subject: [PATCH 0573/1110] drm/amd/dal: add single display infor to notify
+ pplib with
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ .../drm/amd/dal/amdgpu_dm/amdgpu_dal_services.c    |  6 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 94 ++++++++++++++++------
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          | 76 +++++++++++++----
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |  3 +-
+ drivers/gpu/drm/amd/dal/dc/dc_services.h           | 30 +++++--
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.c     |  4 +-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c   |  4 +-
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c     |  4 +-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    | 20 ++---
+ .../gpu/drm/amd/dal/dc/dce110/dce110_transform.c   |  4 +-
+ drivers/gpu/drm/amd/dal/dc/inc/core_types.h        |  2 +
+ 11 files changed, 170 insertions(+), 77 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dal_services.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dal_services.c
+index b2886d2..fd54703 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dal_services.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dal_services.c
+@@ -158,7 +158,7 @@ bool dc_service_pp_pre_dce_clock_change(
+ }
+ 
+ bool dc_service_pp_apply_display_requirements(
+-		struct dc_context *ctx,
++		const struct dc_context *ctx,
+ 		const struct dc_pp_display_configuration *pp_display_cfg)
+ {
+ #ifdef CONFIG_DRM_AMD_POWERPLAY
+@@ -201,7 +201,7 @@ bool dc_service_pp_apply_display_requirements(
+ }
+ 
+ bool dc_service_get_system_clocks_range(
+-		struct dc_context *ctx,
++		const struct dc_context *ctx,
+ 		struct dal_system_clock_range *sys_clks)
+ {
+ #ifdef CONFIG_DRM_AMD_POWERPLAY
+@@ -230,7 +230,7 @@ bool dc_service_get_system_clocks_range(
+ 
+ 
+ bool dc_service_pp_get_clock_levels_by_type(
+-		struct dc_context *ctx,
++		const struct dc_context *ctx,
+ 		enum dc_pp_clock_type clk_type,
+ 		struct dc_pp_clock_levels *clks)
+ {
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 0b7c252..57277ed 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -40,6 +40,8 @@
+ #include "include/irq_service_interface.h"
+ 
+ #include "link_hwss.h"
++#include "opp.h"
++#include "link_encoder.h"
+ 
+ /*******************************************************************************
+  * Private structures
+@@ -462,40 +464,81 @@ static bool targets_changed(
+ 	return false;
+ }
+ 
+-
+-static uint32_t get_min_vblank_time_us(const struct validate_context *context)
++static uint32_t get_min_vblank_time_us(const struct validate_context* context)
+ {
+ 	uint8_t i, j;
+ 	uint32_t min_vertical_blank_time = -1;
+ 	for (i = 0; i < context->target_count; i++) {
+-		const struct core_target *target = context->targets[i];
++		const struct core_target* target = context->targets[i];
+ 		for (j = 0; j < target->public.stream_count; j++) {
+-			const struct dc_stream *stream =
++			const struct dc_stream* stream =
+ 						target->public.streams[j];
+ 			uint32_t vertical_blank_in_pixels = 0;
+ 			uint32_t vertical_blank_time = 0;
+-
+ 			vertical_blank_in_pixels = stream->timing.h_total *
+ 				(stream->timing.v_total
+-				- stream->timing.v_addressable);
+-			/*TODO: - vertical timing overscan if we still support*/
+-			vertical_blank_time = vertical_blank_in_pixels * 1000
+-				/ stream->timing.pix_clk_khz;
+-			/*TODO: doublescan doubles, pixel repetition mults*/
+-
++					- stream->timing.v_addressable);
++			vertical_blank_time = vertical_blank_in_pixels
++				* 1000 / stream->timing.pix_clk_khz;
+ 			if (min_vertical_blank_time > vertical_blank_time)
+ 				min_vertical_blank_time = vertical_blank_time;
+ 		}
+ 	}
+-
+ 	return min_vertical_blank_time;
+ }
+ 
+-static void pplib_post_set_mode(
+-	struct dc *dc,
++static void fill_display_configs(
++	const struct validate_context* context,
++	struct dc_pp_display_configuration *pp_display_cfg)
++{
++	uint8_t i, j;
++	uint8_t num_cfgs = 0;
++
++	for (i = 0; i < context->target_count; i++) {
++		const struct core_target* target = context->targets[i];
++
++		for (j = 0; j < target->public.stream_count; j++) {
++			const struct core_stream *stream =
++			DC_STREAM_TO_CORE(target->public.streams[j]);
++			struct dc_pp_single_disp_config *cfg =
++					&pp_display_cfg->disp_configs[num_cfgs];
++
++			num_cfgs++;
++			cfg->signal = stream->signal;
++			cfg->pipe_idx = stream->opp->inst;
++			cfg->src_height = stream->public.src.height;
++			cfg->src_width = stream->public.src.width;
++			cfg->ddi_channel_mapping =
++				stream->sink->link->ddi_channel_mapping.raw;
++			cfg->transmitter =
++				stream->sink->link->link_enc->transmitter;
++			cfg->link_settings =
++					stream->sink->link->cur_link_settings;
++			cfg->sym_clock = stream->public.timing.pix_clk_khz;
++			switch (stream->public.timing.display_color_depth) {
++			case COLOR_DEPTH_101010:
++				cfg->sym_clock = (cfg->sym_clock * 30) / 24;
++				break;
++			case COLOR_DEPTH_121212:
++				cfg->sym_clock = (cfg->sym_clock * 36) / 24;
++				break;
++			case COLOR_DEPTH_161616:
++				cfg->sym_clock = (cfg->sym_clock * 48) / 24;
++				break;
++			default:
++				break;
++			}
++			/* TODO: unhardcode*/
++			cfg->v_refresh = 60;
++		}
++	}
++	pp_display_cfg->display_count = num_cfgs;
++}
++
++static void pplib_apply_display_requirements(
++	const struct dc *dc,
+ 	const struct validate_context *context)
+ {
+-	uint8_t i;
+ 	struct dc_pp_display_configuration pp_display_cfg = { 0 };
+ 
+ 	pp_display_cfg.nb_pstate_switch_disable =
+@@ -507,11 +550,6 @@ static void pplib_post_set_mode(
+ 	pp_display_cfg.cpu_pstate_separation_time =
+ 			context->bw_results.blackout_recovery_time_us;
+ 
+-	pp_display_cfg.max_displays = dc->link_count;
+-	for (i = 0; i < context->target_count; i++)
+-		pp_display_cfg.active_displays +=
+-				context->targets[i]->public.stream_count;
+-
+ 	pp_display_cfg.min_memory_clock_khz = context->bw_results.required_yclk;
+ 	pp_display_cfg.min_engine_clock_khz = context->bw_results.required_sclk;
+ 	pp_display_cfg.min_engine_clock_deep_sleep_khz
+@@ -524,9 +562,17 @@ static void pplib_post_set_mode(
+ 
+ 	pp_display_cfg.disp_clk_khz = context->bw_results.dispclk_khz;
+ 
+-	/* TODO: unhardcode, is this still applicable?*/
+-	pp_display_cfg.crtc_index = 0;
+-	pp_display_cfg.line_time_in_us = 0;
++	fill_display_configs(context, &pp_display_cfg);
++
++	/* TODO: is this still applicable?*/
++	if (pp_display_cfg.display_count == 1) {
++		const struct dc_crtc_timing *timing =
++			&context->targets[0]->public.streams[0]->timing;
++		pp_display_cfg.crtc_index =
++			pp_display_cfg.disp_configs[0].pipe_idx;
++		pp_display_cfg.line_time_in_us = timing->h_total * 1000
++							/ timing->pix_clk_khz;
++	}
+ 
+ 	dc_service_pp_apply_display_requirements(dc->ctx, &pp_display_cfg);
+ }
+@@ -613,7 +659,7 @@ bool dc_commit_targets(
+ 
+ 	program_timing_sync(dc->ctx, context);
+ 
+-	pplib_post_set_mode(dc, context);
++	pplib_apply_display_requirements(dc, context);
+ 
+ 	/* TODO: disable unused plls*/
+ fail:
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 8dc3af2..ac39dff 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -654,20 +654,23 @@ static bool construct(
+ 	struct core_link *link,
+ 	const struct link_init_data *init_params)
+ {
++	uint8_t i;
++	struct adapter_service *as = init_params->adapter_srv;
+ 	struct irq *hpd_gpio = NULL;
+ 	struct ddc_service_init_data ddc_service_init_data = { 0 };
+ 	struct dc_context *dc_ctx = init_params->ctx;
+ 	struct encoder_init_data enc_init_data = { 0 };
+ 	struct connector_feature_support cfs = { 0 };
++	struct integrated_info info = {{{ 0 }}};
+ 
+ 	link->dc = init_params->dc;
+-	link->adapter_srv = init_params->adapter_srv;
++	link->adapter_srv = as;
+ 	link->connector_index = init_params->connector_index;
+ 	link->ctx = dc_ctx;
+ 	link->link_index = init_params->link_index;
+ 
+ 	link->link_id = dal_adapter_service_get_connector_obj_id(
+-			init_params->adapter_srv,
++			as,
+ 			init_params->connector_index);
+ 
+ 	if (link->link_id.type != OBJECT_TYPE_CONNECTOR) {
+@@ -691,28 +694,28 @@ static bool construct(
+ 	case CONNECTOR_ID_DISPLAY_PORT:
+ 		link->public.connector_signal =	SIGNAL_TYPE_DISPLAY_PORT;
+ 		hpd_gpio = dal_adapter_service_obtain_hpd_irq(
+-					init_params->adapter_srv,
++					as,
+ 					link->link_id);
+ 
+ 		if (hpd_gpio != NULL) {
+ 			link->public.irq_source_hpd_rx =
+ 					dal_irq_get_rx_source(hpd_gpio);
+ 			dal_adapter_service_release_irq(
+-					init_params->adapter_srv, hpd_gpio);
++					as, hpd_gpio);
+ 		}
+ 
+ 		break;
+ 	case CONNECTOR_ID_EDP:
+ 		link->public.connector_signal = SIGNAL_TYPE_EDP;
+ 		hpd_gpio = dal_adapter_service_obtain_hpd_irq(
+-					init_params->adapter_srv,
++					as,
+ 					link->link_id);
+ 
+ 		if (hpd_gpio != NULL) {
+ 			link->public.irq_source_hpd_rx =
+ 					dal_irq_get_rx_source(hpd_gpio);
+ 			dal_adapter_service_release_irq(
+-					init_params->adapter_srv, hpd_gpio);
++					as, hpd_gpio);
+ 		}
+ 		break;
+ 	default:
+@@ -726,26 +729,21 @@ static bool construct(
+ 	LINK_INFO("Connector[%d] description:\n",
+ 			init_params->connector_index);
+ 
+-	link->connector = dal_connector_create(dc_ctx,
+-			init_params->adapter_srv,
+-			link->link_id);
++	link->connector = dal_connector_create(dc_ctx, as, link->link_id);
+ 	if (NULL == link->connector) {
+ 		DC_ERROR("Failed to create connector object!\n");
+ 		goto create_fail;
+ 	}
+ 
+ 
+-	hpd_gpio = dal_adapter_service_obtain_hpd_irq(
+-			init_params->adapter_srv,
+-			link->link_id);
++	hpd_gpio = dal_adapter_service_obtain_hpd_irq(as, link->link_id);
+ 
+ 	if (hpd_gpio != NULL) {
+ 		link->public.irq_source_hpd = dal_irq_get_source(hpd_gpio);
+-		dal_adapter_service_release_irq(
+-					init_params->adapter_srv, hpd_gpio);
++		dal_adapter_service_release_irq(as, hpd_gpio);
+ 	}
+ 
+-	ddc_service_init_data.as = link->adapter_srv;
++	ddc_service_init_data.as = as;
+ 	ddc_service_init_data.ctx = link->ctx;
+ 	ddc_service_init_data.id = link->link_id;
+ 	link->ddc = dal_ddc_service_create(&ddc_service_init_data);
+@@ -757,10 +755,10 @@ static bool construct(
+ 
+ 	dal_connector_get_features(link->connector, &cfs);
+ 
+-	enc_init_data.adapter_service = link->adapter_srv;
++	enc_init_data.adapter_service = as;
+ 	enc_init_data.ctx = dc_ctx;
+ 	enc_init_data.encoder = dal_adapter_service_get_src_obj(
+-					link->adapter_srv, link->link_id, 0);
++							as, link->link_id, 0);
+ 	enc_init_data.connector = link->link_id;
+ 	enc_init_data.channel = cfs.ddc_line;
+ 	enc_init_data.hpd_source = cfs.hpd_line;
+@@ -771,6 +769,50 @@ static bool construct(
+ 		goto create_fail;
+ 	}
+ 
++	if (!dal_adapter_service_get_integrated_info(as, &info)) {
++		DC_ERROR("Failed to get integrated info!\n");
++		goto create_fail;
++	}
++
++	for (i = 0; ; i++) {
++		if (!dal_adapter_service_get_device_tag(
++				as, link->link_id, i, &link->device_tag)) {
++			DC_ERROR("Failed to find device tag!\n");
++			goto create_fail;
++		}
++
++		/* Look for device tag that matches connector signal,
++		 * CRT for rgb, LCD for other supported signal tyes
++		 */
++		if (!dal_adapter_service_is_device_id_supported(
++						as, link->device_tag.dev_id))
++			continue;
++		if (link->device_tag.dev_id.device_type == DEVICE_TYPE_CRT
++			&& link->public.connector_signal != SIGNAL_TYPE_RGB)
++			continue;
++		if (link->device_tag.dev_id.device_type == DEVICE_TYPE_LCD
++			&& link->public.connector_signal == SIGNAL_TYPE_RGB)
++			continue;
++		if (link->device_tag.dev_id.device_type == DEVICE_TYPE_WIRELESS
++			&& link->public.connector_signal != SIGNAL_TYPE_WIRELESS)
++			continue;
++		break;
++	}
++
++	/* Look for channel mapping corresponding to connector and device tag */
++	for (i = 0; i < MAX_NUMBER_OF_EXT_DISPLAY_PATH; i++) {
++		struct external_display_path *path =
++			&info.ext_disp_conn_info.path[i];
++		if (path->device_connector_id.enum_id == link->link_id.enum_id
++			&& path->device_connector_id.id == link->link_id.id
++			&& path->device_connector_id.type == link->link_id.type
++			&& path->device_acpi_enum
++					== link->device_tag.acpi_device) {
++			link->ddi_channel_mapping = path->channel_mapping;
++			break;
++		}
++	}
++
+ 	/*
+ 	 * TODO check if GPIO programmed correctly
+ 	 *
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index 2d92d14..df76992 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -437,7 +437,6 @@ bool dc_write_dpcd(
+ 		uint32_t link_index,
+ 		uint32_t address,
+ 		uint8_t *data,
+-		uint32_t size);
+-
++	uint32_t size);
+ 
+ #endif /* DC_INTERFACE_H_ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_services.h b/drivers/gpu/drm/amd/dal/dc/dc_services.h
+index 3dcbc54..c2172ea 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc_services.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc_services.h
+@@ -32,10 +32,11 @@
+ 
+ /* TODO: remove when DC is complete. */
+ #include "dal_services_types.h"
+-#include "include/dal_types.h"
+ #include "logger_interface.h"
++#include "include/dal_types.h"
+ #include "irq_types.h"
+ #include "dal_power_interface_types.h"
++#include "link_service_types.h"
+ 
+ /* if the pointer is not NULL, the allocated memory is zeroed */
+ void *dc_service_alloc(struct dc_context *ctx, uint32_t size);
+@@ -87,15 +88,25 @@ bool dc_service_pp_pre_dce_clock_change(
+ 	struct dal_to_power_info *input,
+ 	struct power_to_dal_info *output);
+ 
++struct dc_pp_single_disp_config
++{
++	enum signal_type signal;
++	uint8_t transmitter;
++	uint8_t ddi_channel_mapping;
++	uint8_t pipe_idx;
++	uint32_t src_height;
++	uint32_t src_width;
++	uint32_t v_refresh;
++	uint32_t sym_clock; /* HDMI only */
++	struct link_settings link_settings; /* DP only */
++};
++
+ struct dc_pp_display_configuration {
+ 	bool nb_pstate_switch_disable;/* controls NB PState switch */
+ 	bool cpu_cc6_disable; /* controls CPU CState switch ( on or off) */
+ 	bool cpu_pstate_disable;
+ 	uint32_t cpu_pstate_separation_time;
+ 
+-	uint32_t max_displays;
+-	uint32_t active_displays;
+-
+ 	/* 10khz steps */
+ 	uint32_t min_memory_clock_khz;
+ 	uint32_t min_engine_clock_khz;
+@@ -108,9 +119,12 @@ struct dc_pp_display_configuration {
+ 
+ 	bool all_displays_in_sync;
+ 
++	uint8_t display_count;
++	struct dc_pp_single_disp_config disp_configs[3];
++
+ 	/*Controller Index of primary display - used in MCLK SMC switching hang
+ 	 * SW Workaround*/
+-	uint32_t crtc_index;
++	uint8_t crtc_index;
+ 	/*htotal*1000/pixelclk - used in MCLK SMC switching hang SW Workaround*/
+ 	uint32_t line_time_in_us;
+ };
+@@ -149,7 +163,7 @@ struct dc_pp_static_clock_info {
+  *		false - call failed
+  */
+ bool dc_service_get_system_clocks_range(
+-	struct dc_context *ctx,
++	const struct dc_context *ctx,
+ 	struct dal_system_clock_range *sys_clks);
+ 
+ enum dc_pp_clock_type {
+@@ -179,7 +193,7 @@ struct dc_pp_clock_levels {
+  *
+  */
+ bool dc_service_pp_get_clock_levels_by_type(
+-	struct dc_context *ctx,
++	const struct dc_context *ctx,
+ 	enum dc_pp_clock_type clk_type,
+ 	struct dc_pp_clock_levels *clk_level_info);
+ 
+@@ -196,7 +210,7 @@ bool dc_service_pp_get_clock_levels_by_type(
+  *		false - call failed
+  */
+ bool dc_service_pp_apply_display_requirements(
+-	struct dc_context *ctx,
++	const struct dc_context *ctx,
+ 	const struct dc_pp_display_configuration *pp_display_cfg);
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.c
+index 04105ed..f45da2e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.c
+@@ -48,14 +48,14 @@ bool dce110_ipp_construct(
+ 	struct dc_context *ctx,
+ 	uint32_t inst)
+ {
+-	if ((inst < 1) || (inst > ARRAY_SIZE(reg_offsets)))
++	if (inst >= ARRAY_SIZE(reg_offsets))
+ 		return false;
+ 
+ 	ipp->base.ctx = ctx;
+ 
+ 	ipp->base.inst = inst;
+ 
+-	ipp->offsets = reg_offsets[inst-1];
++	ipp->offsets = reg_offsets[inst];
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
+index f7ef317..ab2241d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
+@@ -931,14 +931,14 @@ bool dce110_mem_input_construct(
+ 	struct dc_context *ctx,
+ 	uint32_t inst)
+ {
+-	if ((inst < 1) || (inst > ARRAY_SIZE(reg_offsets)))
++	if (inst >= ARRAY_SIZE(reg_offsets))
+ 		return false;
+ 
+ 	mem_input110->base.ctx = ctx;
+ 
+ 	mem_input110->base.inst = inst;
+ 
+-	mem_input110->offsets = reg_offsets[inst - 1];
++	mem_input110->offsets = reg_offsets[inst];
+ 
+ 	mem_input110->supported_stutter_mode = 0;
+ 	dal_adapter_service_get_feature_value(FEATURE_STUTTER_MODE,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
+index 0fdffac..410b52f 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
+@@ -106,14 +106,14 @@ bool dce110_opp_construct(struct dce110_opp *opp110,
+ 	struct dc_context *ctx,
+ 	uint32_t inst)
+ {
+-	if ((inst < 1) || (inst > ARRAY_SIZE(reg_offsets)))
++	if (inst >= ARRAY_SIZE(reg_offsets))
+ 		return false;
+ 
+ 	opp110->base.ctx = ctx;
+ 
+ 	opp110->base.inst = inst;
+ 
+-	opp110->offsets = reg_offsets[inst - 1];
++	opp110->offsets = reg_offsets[inst];
+ 
+ 	opp110->regamma.hw_points_num = 128;
+ 	opp110->regamma.coordinates_x = NULL;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index e206802..45a069a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -120,18 +120,14 @@ bool dce110_construct_resource_pool(
+ 
+ 	for (i = 0; i < pool->controller_count; i++) {
+ 		pool->timing_generators[i] = dce110_timing_generator_create(
+-				adapter_serv,
+-				ctx,
+-				i + 1);
++				adapter_serv, ctx, i + 1);
+ 		if (pool->timing_generators[i] == NULL) {
+ 			BREAK_TO_DEBUGGER();
+ 			dal_error("DC: failed to create tg!\n");
+ 			goto controller_create_fail;
+ 		}
+ 
+-		pool->mis[i] = dce110_mem_input_create(
+-			ctx,
+-			i + 1);
++		pool->mis[i] = dce110_mem_input_create(ctx, i);
+ 		if (pool->mis[i] == NULL) {
+ 			BREAK_TO_DEBUGGER();
+ 			dal_error(
+@@ -139,9 +135,7 @@ bool dce110_construct_resource_pool(
+ 			goto controller_create_fail;
+ 		}
+ 
+-		pool->ipps[i] = dce110_ipp_create(
+-			ctx,
+-			i + 1);
++		pool->ipps[i] = dce110_ipp_create(ctx, i);
+ 		if (pool->ipps[i] == NULL) {
+ 			BREAK_TO_DEBUGGER();
+ 			dal_error(
+@@ -149,9 +143,7 @@ bool dce110_construct_resource_pool(
+ 			goto controller_create_fail;
+ 		}
+ 
+-		pool->transforms[i] = dce110_transform_create(
+-				ctx,
+-				i + 1);
++		pool->transforms[i] = dce110_transform_create(ctx, i);
+ 		if (pool->transforms[i] == NULL) {
+ 			BREAK_TO_DEBUGGER();
+ 			dal_error(
+@@ -162,9 +154,7 @@ bool dce110_construct_resource_pool(
+ 				pool->transforms[i],
+ 				pool->scaler_filter);
+ 
+-		pool->opps[i] = dce110_opp_create(
+-			ctx,
+-			i + 1);
++		pool->opps[i] = dce110_opp_create(ctx, i);
+ 		if (pool->opps[i] == NULL) {
+ 			BREAK_TO_DEBUGGER();
+ 			dal_error(
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c
+index f3b3630..a7648e5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c
+@@ -67,14 +67,14 @@ bool dce110_transform_construct(
+ 	struct dc_context *ctx,
+ 	uint32_t inst)
+ {
+-	if ((inst < 1) || (inst > ARRAY_SIZE(reg_offsets)))
++	if (inst >= ARRAY_SIZE(reg_offsets))
+ 		return false;
+ 
+ 	xfm110->base.ctx = ctx;
+ 
+ 	xfm110->base.inst = inst;
+ 
+-	xfm110->offsets = reg_offsets[inst - 1];
++	xfm110->offsets = reg_offsets[inst];
+ 
+ 	xfm110->lb_pixel_depth_supported =
+ 			LB_PIXEL_DEPTH_18BPP |
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+index 3781751..a728446 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+@@ -211,6 +211,8 @@ struct core_link {
+ 	struct link_encoder *link_enc;
+ 	struct ddc_service *ddc;
+ 	struct graphics_object_id link_id;
++	union ddi_channel_mapping ddi_channel_mapping;
++	struct connector_device_tag_info device_tag;
+ 	/* caps is the same as reported_link_cap. link_traing use
+ 	 * reported_link_cap. Will clean up.  TODO */
+ 	struct link_settings reported_link_cap;
+-- 
+2.7.4
+

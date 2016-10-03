@@ -1,0 +1,344 @@
+From 5b752785d79aa0a7a87d1a314ec189ed49f45adf Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Mon, 18 Jan 2016 16:57:50 -0500
+Subject: [PATCH 0699/1110] drm/amd/dal: restyle transorm, remove redundant
+ code
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Jordan Lazare <Jordan.Lazare@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |  3 +-
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 10 ++--
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    | 49 +++++++++++++++-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_transform.c   | 68 +++++++---------------
+ .../gpu/drm/amd/dal/dc/dce110/dce110_transform.h   |  9 +--
+ drivers/gpu/drm/amd/dal/dc/inc/transform.h         | 34 +++++++++++
+ 6 files changed, 111 insertions(+), 62 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 841e02e..737ed87 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -39,6 +39,7 @@
+ #include "include/irq_service_interface.h"
+ #include "bandwidth_calcs.h"
+ #include "include/irq_service_interface.h"
++#include "inc/transform.h"
+ 
+ #include "link_hwss.h"
+ #include "link_encoder.h"
+@@ -157,7 +158,7 @@ static void init_hw(struct dc *dc)
+ 				dc->ctx, i, bp,
+ 				PIPE_GATING_CONTROL_DISABLE);
+ 
+-		dc->hwss.transform_power_up(xfm);
++		xfm->funcs->transform_power_up(xfm);
+ 		dc->hwss.enable_display_pipe_clock_gating(
+ 			dc->ctx,
+ 			true);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 14ad0cd..612afe5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -1332,7 +1332,7 @@ static bool setup_line_buffer_pixel_depth(
+ 	struct timing_generator *tg = stream->tg;
+ 	struct transform *xfm = stream->xfm;
+ 
+-	if (!dce110_transform_get_current_pixel_storage_depth(
++	if (!xfm->funcs->transform_get_current_pixel_storage_depth(
+ 		xfm,
+ 		&current_depth))
+ 		return false;
+@@ -1341,7 +1341,7 @@ static bool setup_line_buffer_pixel_depth(
+ 		if (blank)
+ 			tg->funcs->wait_for_state(tg, CRTC_STATE_VBLANK);
+ 
+-		return dce110_transform_set_pixel_storage_depth(xfm, depth);
++		return xfm->funcs->transform_set_pixel_storage_depth(xfm, depth);
+ 	}
+ 
+ 	return false;
+@@ -1426,9 +1426,9 @@ static void program_scaler(
+ 
+ 	tg->funcs->set_overscan_blank_color(tg, surface->public.colorimetry.color_space);
+ 
+-	dce110_transform_set_scaler(xfm, &scaler_data);
++	xfm->funcs->transform_set_scaler(xfm, &scaler_data);
+ 
+-	dce110_transform_update_viewport(
++	xfm->funcs->transform_update_viewport(
+ 			xfm,
+ 			&scaler_data.viewport,
+ 			false);
+@@ -1582,7 +1582,7 @@ static void reset_single_stream_hw_ctx(struct core_stream *stream,
+ 	stream->tg->funcs->disable_crtc(stream->tg);
+ 	stream->mi->funcs->mem_input_deallocate_dmif_buffer(
+ 			stream->mi, context->target_count);
+-	dce110_transform_set_scaler_bypass(stream->xfm);
++	stream->xfm->funcs->transform_set_scaler_bypass(stream->xfm);
+ 	disable_stereo_mixer(stream->ctx);
+ 	unreference_clock_source(&context->res_ctx, stream->clock_source);
+ 	dce110_enable_display_power_gating(
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index 49c70fc..4c85dd1 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -104,6 +104,25 @@ static const struct dce110_mem_input_reg_offsets dce110_mi_reg_offsets[] = {
+ 	}
+ };
+ 
++static const struct dce110_transform_reg_offsets dce110_xfm_offsets[] = {
++{
++	.scl_offset = (mmSCL0_SCL_CONTROL - mmSCL0_SCL_CONTROL),
++	.dcfe_offset = (mmDCFE0_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
++	.dcp_offset = (mmDCP0_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
++	.lb_offset = (mmLB0_LB_DATA_FORMAT - mmLB0_LB_DATA_FORMAT),
++},
++{	.scl_offset = (mmSCL1_SCL_CONTROL - mmSCL0_SCL_CONTROL),
++	.dcfe_offset = (mmDCFE1_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
++	.dcp_offset = (mmDCP1_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
++	.lb_offset = (mmLB1_LB_DATA_FORMAT - mmLB0_LB_DATA_FORMAT),
++},
++{	.scl_offset = (mmSCL2_SCL_CONTROL - mmSCL0_SCL_CONTROL),
++	.dcfe_offset = (mmDCFE2_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
++	.dcp_offset = (mmDCP2_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
++	.lb_offset = (mmLB2_LB_DATA_FORMAT - mmLB0_LB_DATA_FORMAT),
++}
++};
++
+ static struct timing_generator *dce110_timing_generator_create(
+ 		struct adapter_service *as,
+ 		struct dc_context *ctx,
+@@ -164,6 +183,31 @@ static struct mem_input *dce110_mem_input_create(
+ 	return NULL;
+ }
+ 
++static void dce110_transform_destroy(struct transform **xfm)
++{
++	dc_service_free((*xfm)->ctx, TO_DCE110_TRANSFORM(*xfm));
++	*xfm = NULL;
++}
++
++static struct transform *dce110_transform_create(
++	struct dc_context *ctx,
++	uint32_t inst,
++	const struct dce110_transform_reg_offsets *offsets)
++{
++	struct dce110_transform *transform =
++		dc_service_alloc(ctx, sizeof(struct dce110_transform));
++
++	if (!transform)
++		return NULL;
++
++	if (dce110_transform_construct(transform, ctx, inst, offsets))
++		return &transform->base;
++
++	BREAK_TO_DEBUGGER();
++	dc_service_free(ctx, transform);
++	return NULL;
++}
++
+ bool dce110_construct_resource_pool(
+ 	struct adapter_service *adapter_serv,
+ 	struct dc *dc,
+@@ -258,14 +302,15 @@ bool dce110_construct_resource_pool(
+ 			goto controller_create_fail;
+ 		}
+ 
+-		pool->transforms[i] = dce110_transform_create(ctx, i);
++		pool->transforms[i] = dce110_transform_create(
++					ctx, i, &dce110_xfm_offsets[i]);
+ 		if (pool->transforms[i] == NULL) {
+ 			BREAK_TO_DEBUGGER();
+ 			dal_error(
+ 				"DC: failed to create transform!\n");
+ 			goto controller_create_fail;
+ 		}
+-		dce110_transform_set_scaler_filter(
++		pool->transforms[i]->funcs->transform_set_scaler_filter(
+ 				pool->transforms[i],
+ 				pool->scaler_filter);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c
+index a7648e5..5a87ded 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c
+@@ -39,23 +39,23 @@
+ #include "dce110_transform.h"
+ #include "dce110_transform_bit_depth.h"
+ 
+-static const struct dce110_transform_reg_offsets reg_offsets[] = {
+-{
+-	.scl_offset = (mmSCL0_SCL_CONTROL - mmSCL0_SCL_CONTROL),
+-	.dcfe_offset = (mmDCFE0_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+-	.dcp_offset = (mmDCP0_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
+-	.lb_offset = (mmLB0_LB_DATA_FORMAT - mmLB0_LB_DATA_FORMAT),
+-},
+-{	.scl_offset = (mmSCL1_SCL_CONTROL - mmSCL0_SCL_CONTROL),
+-	.dcfe_offset = (mmDCFE1_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+-	.dcp_offset = (mmDCP1_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
+-	.lb_offset = (mmLB1_LB_DATA_FORMAT - mmLB0_LB_DATA_FORMAT),
+-},
+-{	.scl_offset = (mmSCL2_SCL_CONTROL - mmSCL0_SCL_CONTROL),
+-	.dcfe_offset = (mmDCFE2_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+-	.dcp_offset = (mmDCP2_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
+-	.lb_offset = (mmLB2_LB_DATA_FORMAT - mmLB0_LB_DATA_FORMAT),
+-}
++static struct transform_funcs dce110_transform_funcs = {
++	.transform_power_up =
++		dce110_transform_power_up,
++	.transform_set_scaler =
++		dce110_transform_set_scaler,
++	.transform_set_scaler_bypass =
++		dce110_transform_set_scaler_bypass,
++	.transform_update_viewport =
++		dce110_transform_update_viewport,
++	.transform_set_scaler_filter =
++		dce110_transform_set_scaler_filter,
++	.transform_set_gamut_remap =
++		dce110_transform_set_gamut_remap,
++	.transform_set_pixel_storage_depth =
++		dce110_transform_set_pixel_storage_depth,
++	.transform_get_current_pixel_storage_depth =
++		dce110_transform_get_current_pixel_storage_depth
+ };
+ 
+ /*****************************************/
+@@ -65,16 +65,15 @@ static const struct dce110_transform_reg_offsets reg_offsets[] = {
+ bool dce110_transform_construct(
+ 	struct dce110_transform *xfm110,
+ 	struct dc_context *ctx,
+-	uint32_t inst)
++	uint32_t inst,
++	const struct dce110_transform_reg_offsets *reg_offsets)
+ {
+-	if (inst >= ARRAY_SIZE(reg_offsets))
+-		return false;
+-
+ 	xfm110->base.ctx = ctx;
+ 
+ 	xfm110->base.inst = inst;
++	xfm110->base.funcs = &dce110_transform_funcs;
+ 
+-	xfm110->offsets = reg_offsets[inst];
++	xfm110->offsets = *reg_offsets;
+ 
+ 	xfm110->lb_pixel_depth_supported =
+ 			LB_PIXEL_DEPTH_18BPP |
+@@ -84,31 +83,6 @@ bool dce110_transform_construct(
+ 	return true;
+ }
+ 
+-void dce110_transform_destroy(struct transform **xfm)
+-{
+-	dc_service_free((*xfm)->ctx, TO_DCE110_TRANSFORM(*xfm));
+-	*xfm = NULL;
+-}
+-
+-struct transform *dce110_transform_create(
+-	struct dc_context *ctx,
+-	uint32_t inst)
+-{
+-	struct dce110_transform *transform =
+-		dc_service_alloc(ctx, sizeof(struct dce110_transform));
+-
+-	if (!transform)
+-		return NULL;
+-
+-	if (dce110_transform_construct(transform,
+-			ctx, inst))
+-		return &transform->base;
+-
+-	BREAK_TO_DEBUGGER();
+-	dc_service_free(ctx, transform);
+-	return NULL;
+-}
+-
+ bool dce110_transform_power_up(struct transform *xfm)
+ {
+ 	return dce110_transform_power_up_line_buffer(xfm);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h
+index edf016c..229f588 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h
+@@ -47,13 +47,8 @@ struct dce110_transform {
+ 
+ bool dce110_transform_construct(struct dce110_transform *xfm110,
+ 	struct dc_context *ctx,
+-	uint32_t inst);
+-
+-void dce110_transform_destroy(struct transform **xfm);
+-
+-struct transform *dce110_transform_create(
+-	struct dc_context *ctx,
+-	uint32_t inst);
++	uint32_t inst,
++	const struct dce110_transform_reg_offsets *reg_offsets);
+ 
+ bool dce110_transform_power_up(struct transform *xfm);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/transform.h b/drivers/gpu/drm/amd/dal/dc/inc/transform.h
+index 8e111ce..7b882ec 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/transform.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/transform.h
+@@ -27,6 +27,7 @@
+ #define __DAL_TRANSFORM_H__
+ 
+ #include "include/scaler_types.h"
++#include "include/grph_csc_types.h"
+ #include "calcs/scaler_filter.h"
+ #include "grph_object_id.h"
+ 
+@@ -37,11 +38,13 @@ enum scaling_type {
+ };
+ 
+ struct transform {
++	struct transform_funcs *funcs;
+ 	struct dc_context *ctx;
+ 	uint32_t inst;
+ 	struct scaler_filter *filter;
+ };
+ 
++
+ struct scaler_taps_and_ratio {
+ 	uint32_t h_tap;
+ 	uint32_t v_tap;
+@@ -78,4 +81,35 @@ enum lb_pixel_depth {
+ 	LB_PIXEL_DEPTH_36BPP = 8
+ };
+ 
++struct transform_funcs {
++	bool (*transform_power_up)(struct transform *xfm);
++
++	bool (*transform_set_scaler)(
++		struct transform *xfm,
++		const struct scaler_data *data);
++
++	void (*transform_set_scaler_bypass)(struct transform *xfm);
++
++	bool (*transform_update_viewport)(
++		struct transform *xfm,
++		const struct rect *view_port,
++		bool is_fbc_attached);
++
++	void (*transform_set_scaler_filter)(
++		struct transform *xfm,
++		struct scaler_filter *filter);
++
++	void (*transform_set_gamut_remap)(
++		struct transform *xfm,
++		const struct grph_csc_adjustment *adjust);
++
++	bool (*transform_set_pixel_storage_depth)(
++		struct transform *xfm,
++		enum lb_pixel_depth depth);
++
++	bool (*transform_get_current_pixel_storage_depth)(
++		struct transform *xfm,
++		enum lb_pixel_depth *depth);
++};
++
+ #endif
+-- 
+2.7.4
+

@@ -1,0 +1,178 @@
+From 722aac86197d621d2b8a2db2ffcf21c4e464c3a1 Mon Sep 17 00:00:00 2001
+From: Yongqiang Sun <yongqiang.sun@amd.com>
+Date: Wed, 30 Dec 2015 10:27:05 -0500
+Subject: [PATCH 0654/1110] drm/amd/dal: Fixed DVI passive dongle not lightup
+ issue.
+
+In case of HDMI or DVI, combined two callback to one.
+
+Signed-off-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          | 20 +++-----
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |  2 -
+ .../drm/amd/dal/dc/dce110/dce110_link_encoder.c    | 53 +++++-----------------
+ .../drm/amd/dal/dc/dce110/dce110_link_encoder.h    | 10 +---
+ drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h      |  8 +---
+ 5 files changed, 22 insertions(+), 71 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 646706e..2211f38 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -1009,19 +1009,13 @@ static void enable_link_hdmi(struct core_stream *stream)
+ 	dc_service_memset(&stream->sink->link->cur_link_settings, 0,
+ 			sizeof(struct link_settings));
+ 
+-	if (stream->signal == SIGNAL_TYPE_DVI_DUAL_LINK)
+-		link->ctx->dc->hwss.encoder_enable_dual_link_tmds_output(
+-				stream->sink->link->link_enc,
+-				dal_clock_source_get_id(stream->clock_source),
+-				stream->public.timing.display_color_depth,
+-				stream->public.timing.pix_clk_khz);
+-	else
+-		link->ctx->dc->hwss.encoder_enable_tmds_output(
+-				stream->sink->link->link_enc,
+-				dal_clock_source_get_id(stream->clock_source),
+-				stream->public.timing.display_color_depth,
+-				stream->public.timing.pix_clk_khz);
+-
++	link->ctx->dc->hwss.encoder_enable_tmds_output(
++			stream->sink->link->link_enc,
++			dal_clock_source_get_id(stream->clock_source),
++			stream->public.timing.display_color_depth,
++			stream->signal == SIGNAL_TYPE_HDMI_TYPE_A,
++			stream->signal == SIGNAL_TYPE_DVI_DUAL_LINK,
++			stream->public.timing.pix_clk_khz);
+ 
+ 	if (stream->signal == SIGNAL_TYPE_HDMI_TYPE_A)
+ 		dal_ddc_service_read_scdc_data(link->ddc);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index a34cd6d..b71f7e7 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -1727,8 +1727,6 @@ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.encoder_destroy = dce110_link_encoder_destroy,
+ 	.encoder_hw_init = dce110_link_encoder_hw_init,
+ 	.encoder_enable_tmds_output = dce110_link_encoder_enable_tmds_output,
+-	.encoder_enable_dual_link_tmds_output =
+-			dce110_link_encoder_enable_dual_link_tmds_output,
+ 	.encoder_enable_dp_output = dce110_link_encoder_enable_dp_output,
+ 	.encoder_enable_dp_mst_output =
+ 			dce110_link_encoder_enable_dp_mst_output,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
+index a2dd6ed..deaf94d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
+@@ -1386,6 +1386,8 @@ void dce110_link_encoder_enable_tmds_output(
+ 	struct link_encoder *enc,
+ 	enum clock_source_id clock_source,
+ 	enum dc_color_depth color_depth,
++	bool hdmi,
++	bool dual_link,
+ 	uint32_t pixel_clock)
+ {
+ 	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+@@ -1399,49 +1401,16 @@ void dce110_link_encoder_enable_tmds_output(
+ 	cntl.engine_id = ENGINE_ID_UNKNOWN;
+ 	cntl.transmitter = enc110->base.transmitter;
+ 	cntl.pll_id = clock_source;
+-	cntl.signal = SIGNAL_TYPE_HDMI_TYPE_A;
+-	cntl.lanes_number = 4;
+-	cntl.hpd_sel = enc110->base.hpd_source;
+-
+-	cntl.pixel_clock = pixel_clock;
+-	cntl.color_depth = color_depth;
+-
+-	result = dal_bios_parser_transmitter_control(
+-		dal_adapter_service_get_bios_parser(
+-			enc110->base.adapter_service),
+-		&cntl);
+-
+-	if (result != BP_RESULT_OK) {
+-		dal_logger_write(ctx->logger,
+-			LOG_MAJOR_ERROR,
+-			LOG_MINOR_COMPONENT_ENCODER,
+-			"%s: Failed to execute VBIOS command table!\n",
+-			__func__);
+-		BREAK_TO_DEBUGGER();
++	if (hdmi) {
++		cntl.signal = SIGNAL_TYPE_HDMI_TYPE_A;
++		cntl.lanes_number = 4;
++	} else if (dual_link) {
++		cntl.signal = SIGNAL_TYPE_DVI_DUAL_LINK;
++		cntl.lanes_number = 8;
++	} else {
++		cntl.signal = SIGNAL_TYPE_DVI_SINGLE_LINK;
++		cntl.lanes_number = 4;
+ 	}
+-}
+-
+-/* enables TMDS PHY output */
+-/* TODO: still need this or just pass in adjusted pixel clock? */
+-void dce110_link_encoder_enable_dual_link_tmds_output(
+-	struct link_encoder *enc,
+-	enum clock_source_id clock_source,
+-	enum dc_color_depth color_depth,
+-	uint32_t pixel_clock)
+-{
+-	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+-	struct dc_context *ctx = enc110->base.ctx;
+-	struct bp_transmitter_control cntl = { 0 };
+-	enum bp_result result;
+-
+-	/* Enable the PHY */
+-
+-	cntl.action = TRANSMITTER_CONTROL_ENABLE;
+-	cntl.engine_id = ENGINE_ID_UNKNOWN;
+-	cntl.transmitter = enc110->base.transmitter;
+-	cntl.pll_id = clock_source;
+-	cntl.signal = SIGNAL_TYPE_DVI_DUAL_LINK;
+-	cntl.lanes_number = 8;
+ 	cntl.hpd_sel = enc110->base.hpd_source;
+ 
+ 	cntl.pixel_clock = pixel_clock;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h
+index c5b16f6..156cdc8 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h
+@@ -67,14 +67,8 @@ void dce110_link_encoder_enable_tmds_output(
+ 	struct link_encoder *enc,
+ 	enum clock_source_id clock_source,
+ 	enum dc_color_depth color_depth,
+-	uint32_t pixel_clock);
+-
+-/* enables TMDS PHY output */
+-/* TODO: still need this or just pass in adjusted pixel clock? */
+-void dce110_link_encoder_enable_dual_link_tmds_output(
+-	struct link_encoder *enc,
+-	enum clock_source_id clock_source,
+-	enum dc_color_depth color_depth,
++	bool hdmi,
++	bool dual_link,
+ 	uint32_t pixel_clock);
+ 
+ /* enables DP PHY output */
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+index 50af714..317110e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+@@ -98,12 +98,8 @@ struct hw_sequencer_funcs {
+ 					struct link_encoder *enc,
+ 					enum clock_source_id clock_source,
+ 					enum dc_color_depth color_depth,
+-					uint32_t pixel_clock);
+-
+-	void (*encoder_enable_dual_link_tmds_output)(
+-					struct link_encoder *enc,
+-					enum clock_source_id clock_source,
+-					enum dc_color_depth color_depth,
++					bool hdmi,
++					bool dual_link,
+ 					uint32_t pixel_clock);
+ 
+ 	void (*encoder_enable_dp_output)(
+-- 
+2.7.4
+

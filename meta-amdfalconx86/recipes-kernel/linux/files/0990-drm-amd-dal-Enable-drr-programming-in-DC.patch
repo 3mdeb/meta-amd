@@ -1,0 +1,722 @@
+From d0c2b064afa27b4a261d54961aa4eac4b436f678 Mon Sep 17 00:00:00 2001
+From: Jun Lei <Jun.Lei@amd.com>
+Date: Wed, 30 Mar 2016 11:20:27 -0400
+Subject: [PATCH 0990/1110] drm/amd/dal: Enable drr programming in DC.
+
+1.) To support freesync, crtc drr registers must be programmed.
+Since DRR use cases are driven by DM, DC must expose stream
+interfaces to directly program vmin and vmax.
+2.) Check ignore msa stream flag and program accordingly when
+enabling DP output.
+3.) Add interfaces for freesync module to track sink.  When sinks
+are added freesync module will remember.  Removing sinks stop
+tracking.  Tracking is necessary since freesync module must modify
+freesync relevant params in dc_stream, and to manage freesync mode
+(BTR, Flicker, etc.)
+4.) Fill out implementation of module
+
+Signed-off-by: Jun Lei <Jun.Lei@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |  30 +++++
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          |  18 +++
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |   4 +-
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |  20 ++-
+ .../amd/dal/dc/dce110/dce110_timing_generator.c    | 118 +++++++----------
+ .../amd/dal/dc/dce110/dce110_timing_generator.h    |   4 +-
+ .../gpu/drm/amd/dal/dc/inc/hw/timing_generator.h   |   3 +
+ drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h      |   2 +
+ .../gpu/drm/amd/dal/include/hw_sequencer_types.h   |   6 +-
+ .../gpu/drm/amd/dal/modules/freesync/freesync.c    | 139 +++++++++++++++++++--
+ .../gpu/drm/amd/dal/modules/freesync/freesync.h    |  41 ------
+ drivers/gpu/drm/amd/dal/modules/inc/mod_freesync.h |  29 ++++-
+ 12 files changed, 274 insertions(+), 140 deletions(-)
+ delete mode 100644 drivers/gpu/drm/amd/dal/modules/freesync/freesync.h
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 7d234cf..c5aa460 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -201,6 +201,34 @@ static struct adapter_service *create_as(
+ 	return as;
+ }
+ 
++static bool dc_stream_adjust_vmin_vmax(struct dc *dc, const struct dc_stream **stream, int num_streams, int vmin, int vmax)
++{
++	/* TODO: Support multiple streams */
++	struct core_dc *core_dc = DC_TO_CORE(dc);
++	struct core_stream *core_stream = DC_STREAM_TO_CORE(stream[0]);
++	int i = 0;
++	bool ret = false;
++	struct pipe_ctx *pipes;
++
++	for (i = 0; i < MAX_PIPES; i++) {
++		if (core_dc->current_context.res_ctx.pipe_ctx[i].stream == core_stream) {
++			pipes = &core_dc->current_context.res_ctx.pipe_ctx[i];
++			core_dc->hwss.set_drr(&pipes, 1, vmin, vmax);
++
++			ret = true;
++		}
++	}
++
++	return ret;
++}
++
++static void allocate_dc_stream_funcs(struct core_dc *core_dc)
++{
++	if (core_dc->hwss.set_drr != NULL) {
++		core_dc->public.stream_funcs.dc_stream_adjust_vmin_vmax = dc_stream_adjust_vmin_vmax;
++	}
++}
++
+ static bool construct(struct core_dc *dc, const struct dc_init_data *init_params)
+ {
+ 	struct dal_logger *logger;
+@@ -275,6 +303,8 @@ static bool construct(struct core_dc *dc, const struct dc_init_data *init_params
+ 			goto create_links_fail;
+ 	}
+ 
++	allocate_dc_stream_funcs(dc);
++
+ 	return true;
+ 
+ 	/**** error handling here ****/
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 06c8fa6..73dbf4f 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -1159,6 +1159,22 @@ static void dpcd_configure_panel_mode(
+ 			panel_mode_edp);
+ }
+ 
++static void enable_stream_features(struct pipe_ctx *pipe_ctx)
++{
++	struct core_stream *stream = pipe_ctx->stream;
++	struct core_link *link = stream->sink->link;
++	union down_spread_ctrl downspread;
++
++	core_link_read_dpcd(link, DPCD_ADDRESS_DOWNSPREAD_CNTL,
++			&downspread.raw, sizeof(downspread));
++
++	downspread.bits.IGNORE_MSA_TIMING_PARAM =
++			(stream->public.ignore_msa_timing_param) ? 1 : 0;
++
++	core_link_write_dpcd(link, DPCD_ADDRESS_DOWNSPREAD_CNTL,
++			&downspread.raw, sizeof(downspread));
++}
++
+ static enum dc_status enable_link_dp(struct pipe_ctx *pipe_ctx)
+ {
+ 	struct core_stream *stream = pipe_ctx->stream;
+@@ -1195,6 +1211,8 @@ static enum dc_status enable_link_dp(struct pipe_ctx *pipe_ctx)
+ 	else
+ 		status = DC_ERROR_UNEXPECTED;
+ 
++	enable_stream_features(pipe_ctx);
++
+ 	return status;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index 13fa582..e394dd2 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -50,7 +50,7 @@ struct dc_surface;
+ 
+ struct dc_stream_funcs {
+ 	bool (*dc_stream_adjust_vmin_vmax)(struct dc *dc,
+-			struct dc_stream *stream, int vmin, int vmax);
++			const struct dc_stream **stream, int num_streams, int vmin, int vmax);
+ };
+ 
+ struct dc {
+@@ -311,7 +311,7 @@ struct dc_stream {
+ 
+ 	struct audio_info audio_info;
+ 
+-	bool enable_freesync;
++	bool ignore_msa_timing_param;
+ 
+ 	/* TODO: dithering */
+ 	/* TODO: transfer function (CSC/regamma/gamut remap) */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index fa282c0..0673a1b 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -1224,7 +1224,6 @@ static void switch_dp_clock_sources(
+  * Public functions
+  ******************************************************************************/
+ 
+-
+ static void reset_single_pipe_hw_ctx(
+ 		const struct core_dc *dc,
+ 		struct pipe_ctx *pipe_ctx,
+@@ -1261,6 +1260,22 @@ static void reset_single_pipe_hw_ctx(
+ 	pipe_ctx->stream = NULL;
+ }
+ 
++static void set_drr(struct pipe_ctx **pipe_ctx,
++		int num_pipes, int vmin, int vmax)
++{
++	int i = 0;
++	struct drr_params params = {0};
++
++	params.vertical_total_max = vmax;
++	params.vertical_total_min = vmin;
++
++	/* TODO: If multiple pipes are to be supported, you need some GSL stuff */
++
++	for (i = 0; i < num_pipes; i++) {
++		pipe_ctx[i]->tg->funcs->set_drr(pipe_ctx[i]->tg, &params);
++	}
++}
++
+ /*TODO: const validate_context*/
+ static enum dc_status apply_ctx_to_hw(
+ 		struct core_dc *dc,
+@@ -1667,7 +1682,8 @@ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.set_blender_mode = dce110_set_blender_mode,
+ 	.clock_gating_power_up = dal_dc_clock_gating_dce110_power_up,/*todo*/
+ 	.set_display_clock = set_display_clock,
+-	.set_displaymarks = set_displaymarks
++	.set_displaymarks = set_displaymarks,
++	.set_drr = set_drr
+ };
+ 
+ bool dce110_hw_sequencer_construct(struct core_dc *dc)
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
+index e4fe49a..b17fb79 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
+@@ -148,7 +148,10 @@ static struct timing_generator_funcs dce110_tg_funcs = {
+ 		.tear_down_global_swap_lock =
+ 				dce110_timing_generator_tear_down_global_swap_lock,
+ 		.enable_advanced_request =
+-				dce110_timing_generator_enable_advanced_request
++				dce110_timing_generator_enable_advanced_request,
++		.set_drr =
++				dce110_timing_generator_set_drr
++
+ };
+ 
+ static const struct crtc_black_color black_color_format[] = {
+@@ -585,7 +588,7 @@ bool dce110_timing_generator_program_timing_generator(
+ 
+ /**
+  *****************************************************************************
+- *  Function: program_drr
++ *  Function: set_drr
+  *
+  *  @brief
+  *     Program dynamic refresh rate registers m_DxCRTC_V_TOTAL_*.
+@@ -594,9 +597,9 @@ bool dce110_timing_generator_program_timing_generator(
+  *  wCrtcTiming struct
+  *****************************************************************************
+  */
+-void dce110_timing_generator_program_drr(
++void dce110_timing_generator_set_drr(
+ 	struct timing_generator *tg,
+-	const struct hw_ranged_timing *timing)
++	const struct drr_params *params)
+ {
+ 	/* register values */
+ 	uint32_t v_total_min = 0;
+@@ -619,90 +622,53 @@ void dce110_timing_generator_program_drr(
+ 	addr = CRTC_REG(mmCRTC_STATIC_SCREEN_CONTROL);
+ 	static_screen_cntl = dm_read_reg(tg->ctx, addr);
+ 
+-	if (timing != NULL) {
+-		/* Set Static Screen trigger events
+-		 * If CRTC_SET_V_TOTAL_MIN_MASK_EN is set, use legacy event mask
+-		 * register
+-		 */
+-		if (get_reg_field_value(
+-			v_total_cntl,
+-			CRTC_V_TOTAL_CONTROL,
+-			CRTC_SET_V_TOTAL_MIN_MASK_EN)) {
+-			set_reg_field_value(v_total_cntl,
+-				/* TODO: add implementation
+-				translate_to_dce_static_screen_events(
+-					timing->control.event_mask.u_all),
+-					*/ 0,
+-				CRTC_V_TOTAL_CONTROL,
+-				CRTC_SET_V_TOTAL_MIN_MASK);
+-		} else {
+-			set_reg_field_value(static_screen_cntl,
+-				/* TODO: add implementation
+-				translate_to_dce_static_screen_events(
+-					timing->control.event_mask.u_all),
+-					*/ 0,
+-				CRTC_STATIC_SCREEN_CONTROL,
+-				CRTC_STATIC_SCREEN_EVENT_MASK);
+-		}
++	if (params != NULL &&
++		params->vertical_total_max > 0 &&
++		params->vertical_total_min > 0) {
+ 
+-		/* Number of consecutive static screen frames before interrupt
+-		 * is triggered. 0 is an invalid setting, which means we should
+-		 * leaving HW setting unchanged. */
+-		if (timing->control.static_frame_count != 0) {
+-			set_reg_field_value(
+-				static_screen_cntl,
+-				timing->control.static_frame_count,
+-				CRTC_STATIC_SCREEN_CONTROL,
+-				CRTC_STATIC_SCREEN_FRAME_COUNT);
+-		}
++		set_reg_field_value(v_total_max,
++				params->vertical_total_max - 1,
++				CRTC_V_TOTAL_MAX,
++				CRTC_V_TOTAL_MAX);
+ 
+-		/* This value is reduced by 1 based on the register definition
+-		 * of the VTOTAL value:
+-		 * CRTC_V_TOTAL should be set to Vertical total minus one. (E.g.
+-		 * for 525 lines, set to 524 = 0x20C)
+-		 */
+ 		set_reg_field_value(v_total_min,
+-				timing->vertical_total_min,
++				params->vertical_total_min - 1,
+ 				CRTC_V_TOTAL_MIN,
+ 				CRTC_V_TOTAL_MIN);
+-		set_reg_field_value(v_total_max,
+-				timing->vertical_total_max,
+-				CRTC_V_TOTAL_MAX,
+-				CRTC_V_TOTAL_MAX);
+ 
+-		/* set VTotalControl value according to ranged timing control.
+-		 */
+-
+-		if (timing->vertical_total_min != 0) {
+-			set_reg_field_value(v_total_cntl,
+-					1,
+-					CRTC_V_TOTAL_CONTROL,
+-					CRTC_V_TOTAL_MIN_SEL);
+-		} else {
+-			set_reg_field_value(v_total_cntl,
+-					0,
+-					CRTC_V_TOTAL_CONTROL,
+-					CRTC_V_TOTAL_MIN_SEL);
+-		}
+-		if (timing->vertical_total_max != 0) {
+-			set_reg_field_value(v_total_cntl,
+-					1,
+-					CRTC_V_TOTAL_CONTROL,
+-					CRTC_V_TOTAL_MAX_SEL);
+-		} else {
+-			set_reg_field_value(v_total_cntl,
+-					0,
+-					CRTC_V_TOTAL_CONTROL,
+-					CRTC_V_TOTAL_MAX_SEL);
+-		}
+ 		set_reg_field_value(v_total_cntl,
+-				timing->control.force_lock_on_event,
++				1,
++				CRTC_V_TOTAL_CONTROL,
++				CRTC_V_TOTAL_MIN_SEL);
++
++		set_reg_field_value(v_total_cntl,
++				1,
++				CRTC_V_TOTAL_CONTROL,
++				CRTC_V_TOTAL_MAX_SEL);
++
++		set_reg_field_value(v_total_cntl,
++				0,
+ 				CRTC_V_TOTAL_CONTROL,
+ 				CRTC_FORCE_LOCK_ON_EVENT);
+ 		set_reg_field_value(v_total_cntl,
+-				timing->control.lock_to_master_vsync,
++				0,
+ 				CRTC_V_TOTAL_CONTROL,
+ 				CRTC_FORCE_LOCK_TO_MASTER_VSYNC);
++
++		set_reg_field_value(v_total_cntl,
++				0,
++				CRTC_V_TOTAL_CONTROL,
++				CRTC_SET_V_TOTAL_MIN_MASK_EN);
++
++		set_reg_field_value(v_total_cntl,
++				0,
++				CRTC_V_TOTAL_CONTROL,
++				CRTC_SET_V_TOTAL_MIN_MASK);
++
++		set_reg_field_value(static_screen_cntl,
++				0x180,
++			CRTC_STATIC_SCREEN_CONTROL,
++			CRTC_STATIC_SCREEN_EVENT_MASK);
+ 	} else {
+ 		set_reg_field_value(v_total_cntl,
+ 			0,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+index 7e01bde..fadff7f 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+@@ -187,9 +187,9 @@ void dce110_timing_generator_set_test_pattern(
+ 	enum controller_dp_test_pattern test_pattern,
+ 	enum dc_color_depth color_depth);
+ 
+-void dce110_timing_generator_program_drr(
++void dce110_timing_generator_set_drr(
+ 	struct timing_generator *tg,
+-	const struct hw_ranged_timing *timing);
++	const struct drr_params *params);
+ 
+ uint32_t dce110_timing_generator_get_crtc_scanoutpos(
+ 	struct timing_generator *tg,
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h b/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h
+index 9347310..770e3d3 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h
+@@ -111,6 +111,8 @@ struct timing_generator {
+ 
+ struct dc_crtc_timing;
+ 
++struct drr_params;
++
+ struct timing_generator_funcs {
+ 	bool (*validate_timing)(struct timing_generator *tg,
+ 							const struct dc_crtc_timing *timing);
+@@ -150,6 +152,7 @@ struct timing_generator_funcs {
+ 	void (*tear_down_global_swap_lock)(struct timing_generator *tg);
+ 	void (*enable_advanced_request)(struct timing_generator *tg,
+ 					bool enable, const struct dc_crtc_timing *timing);
++	void (*set_drr)(struct timing_generator *tg, const struct drr_params *params);
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+index a38c6f5..e36a9a9 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+@@ -110,6 +110,8 @@ struct hw_sequencer_funcs {
+ 				struct validate_context *context);
+ 
+ 	void (*set_display_clock)(struct validate_context *context);
++
++	void (*set_drr)(struct pipe_ctx **pipe_ctx, int num_pipes, int vmin, int vmax);
+ };
+ 
+ bool dc_construct_hw_sequencer(
+diff --git a/drivers/gpu/drm/amd/dal/include/hw_sequencer_types.h b/drivers/gpu/drm/amd/dal/include/hw_sequencer_types.h
+index 76c551c..60dcf81 100644
+--- a/drivers/gpu/drm/amd/dal/include/hw_sequencer_types.h
++++ b/drivers/gpu/drm/amd/dal/include/hw_sequencer_types.h
+@@ -103,15 +103,13 @@ struct hw_ranged_timing_control {
+ };
+ 
+ /* define the structure of Dynamic Refresh Mode */
+-struct hw_ranged_timing {
++struct drr_params {
+ 	/* defines the minimum possible vertical dimension of display timing
+ 	 * for CRTC as supported by the panel */
+ 	uint32_t vertical_total_min;
+ 	/* defines the maximum possible vertical dimension of display timing
+ 	 * for CRTC as supported by the panel */
+ 	uint32_t vertical_total_max;
+-
+-	struct hw_ranged_timing_control control;
+ };
+ 
+ /* CRTC timing structure */
+@@ -130,8 +128,6 @@ struct hw_crtc_timing {
+ 	uint32_t v_sync_start;
+ 	uint32_t v_sync_width;
+ 
+-	struct hw_ranged_timing ranged_timing;
+-
+ 	/* in KHz */
+ 	uint32_t pixel_clock;
+ 
+diff --git a/drivers/gpu/drm/amd/dal/modules/freesync/freesync.c b/drivers/gpu/drm/amd/dal/modules/freesync/freesync.c
+index d0113d5..01cfeb0 100644
+--- a/drivers/gpu/drm/amd/dal/modules/freesync/freesync.c
++++ b/drivers/gpu/drm/amd/dal/modules/freesync/freesync.c
+@@ -23,9 +23,26 @@
+  *
+  */
+ 
+-#include "freesync.h"
+ #include "dm_services.h"
+ #include "dc.h"
++#include "mod_freesync.h"
++
++static const MOD_FREESYNC_MAX_CONCURRENT_SINKS = 32;
++
++struct sink_caps {
++    const struct dc_sink *sink;
++    struct mod_freesync_caps caps;
++};
++
++struct core_freesync {
++    struct mod_freesync public;
++    struct dc *dc;
++    struct sink_caps *caps;
++    int num_sinks;
++};
++
++#define MOD_FREESYNC_TO_CORE(mod_freesync)\
++    container_of(mod_freesync, struct core_freesync, public)
+ 
+ static bool check_dc_support(const struct dc *dc)
+ {
+@@ -38,10 +55,21 @@ static bool check_dc_support(const struct dc *dc)
+ struct mod_freesync *mod_freesync_create(struct dc *dc)
+ {
+ 	struct core_freesync *core_freesync = dm_alloc(sizeof(struct core_freesync));
++	int i = 0;
+ 
+ 	if (core_freesync == NULL)
+ 		goto fail_alloc_context;
+ 
++	core_freesync->caps = dm_alloc(sizeof(struct sink_caps) * MOD_FREESYNC_MAX_CONCURRENT_SINKS);
++
++	if (core_freesync->caps == NULL)
++		goto fail_alloc_caps;
++
++	for (i = 0; i < MOD_FREESYNC_MAX_CONCURRENT_SINKS; i++)
++		core_freesync->caps[i].sink = NULL;
++
++	core_freesync->num_sinks = 0;
++
+ 	if (dc == NULL)
+ 		goto fail_construct;
+ 
+@@ -53,6 +81,9 @@ struct mod_freesync *mod_freesync_create(struct dc *dc)
+ 	return &core_freesync->public;
+ 
+ fail_construct:
++	dm_free(core_freesync->caps);
++
++fail_alloc_caps:
+ 	dm_free(core_freesync);
+ 
+ fail_alloc_context:
+@@ -68,32 +99,120 @@ void mod_freesync_destroy(struct mod_freesync *mod_freesync)
+ 	}
+ }
+ 
++bool mod_freesync_add_sink(struct mod_freesync *mod_freesync,
++		const struct dc_sink *sink, struct mod_freesync_caps *caps)
++{
++	int i = 0;
++	struct core_freesync *core_freesync = MOD_FREESYNC_TO_CORE(mod_freesync);
++
++	if (core_freesync->num_sinks < MOD_FREESYNC_MAX_CONCURRENT_SINKS) {
++		dc_sink_retain(sink);
++
++		core_freesync->caps[core_freesync->num_sinks].sink = sink;
++		core_freesync->caps[core_freesync->num_sinks].caps = *caps;
++		core_freesync->num_sinks++;
++
++		return true;
++	}
++
++	return false;
++}
++
++bool mod_freesync_remove_sink(struct mod_freesync *mod_freesync,
++		const struct dc_sink *sink)
++{
++	int i = 0, j = 0;
++	struct core_freesync *core_freesync = MOD_FREESYNC_TO_CORE(mod_freesync);
++
++	for (i = 0; i < core_freesync->num_sinks; i++) {
++		if (core_freesync->caps[i].sink == sink) {
++			/* To remove this sink, shift everything after it down */
++			for (j = i; j < core_freesync->num_sinks - 1; j++) {
++				core_freesync->caps[j].sink = core_freesync->caps[j + 1].sink;
++				core_freesync->caps[j].caps = core_freesync->caps[j + 1].caps;
++			}
++
++			core_freesync->num_sinks--;
++
++			dc_sink_release(sink);
++
++			return true;
++		}
++	}
++
++	return false;
++}
++
++void mod_freesync_update_stream(struct mod_freesync *mod_freesync,
++		struct dc_stream *stream)
++{
++	int i = 0;
++	struct core_freesync *core_freesync = MOD_FREESYNC_TO_CORE(mod_freesync);
++
++	for (i = 0; i < core_freesync->num_sinks; i++) {
++		if (core_freesync->caps[i].sink == stream->sink &&
++			core_freesync->caps[i].caps.supported) {
++			stream->ignore_msa_timing_param = 1;
++		}
++	}
++}
++
++static void calc_vmin_vmax (const struct dc_stream *stream,
++		struct mod_freesync_caps *caps, int *vmin, int *vmax)
++{
++	/* TODO: This calculation is probably wrong... */
++
++	unsigned int min_frame_duration_in_ns = 0, max_frame_duration_in_ns = 0;
++
++	min_frame_duration_in_ns = (unsigned int)((1000000000ULL * 1000000) / caps->maxRefreshInMicroHz);
++	max_frame_duration_in_ns = (unsigned int)((1000000000ULL * 1000000) / caps->minRefreshInMicroHz);
++
++	*vmax = (unsigned long long)(max_frame_duration_in_ns) * stream->timing.pix_clk_khz / stream->timing.h_total / 1000000;
++	*vmin = (unsigned long long)(min_frame_duration_in_ns) * stream->timing.pix_clk_khz / stream->timing.h_total / 1000000;
++
++	if (*vmin < stream->timing.v_total) {
++	    *vmin = stream->timing.v_total;
++	}
++}
++
+ bool mod_freesync_set_freesync_on_streams(struct mod_freesync *mod_freesync,
+-		struct dc_stream **streams,	int num_streams,
+-		struct mod_freesync_params *params)
++		const struct dc_stream **streams,	int num_streams,
++		const struct mod_freesync_params *params)
+ {
+-	int v_total_nominal = 0;
++	int v_total_nominal = 0, v_total_min = 0, v_total_max = 0;
+ 	int i = 0;
+ 	struct core_freesync *core_freesync = NULL;
+ 
+ 	if (num_streams == 0 || streams == NULL || mod_freesync == NULL
+-			|| params == NULL)
++			|| params == NULL || num_streams > 1)
+ 		return false;
+ 
++	/* TODO: Multi-stream support */
++
+ 	core_freesync = MOD_FREESYNC_TO_CORE(mod_freesync);
+ 
+ 	if (params->mode == FREESYNC_MODE_DISABLED)	{
+ 		/* Disable freesync */
+-		for (i = 0; i < num_streams; i++) {
+-			v_total_nominal = streams[i]->timing.v_total;
++		v_total_nominal = streams[0]->timing.v_total;
+ 
+-			core_freesync->dc->stream_funcs.dc_stream_adjust_vmin_vmax(core_freesync->dc,
+-					streams[i], v_total_nominal, v_total_nominal);
+-		}
++		core_freesync->dc->stream_funcs.dc_stream_adjust_vmin_vmax(core_freesync->dc,
++				streams, num_streams, v_total_nominal, v_total_nominal);
+ 
+ 		return true;
+ 	} else if (params->mode == FREESYNC_MODE_VARIABLE) {
+ 		/* Enable freesync */
++		for (i = 0; i < core_freesync->num_sinks; i++) {
++			if (core_freesync->caps[i].sink == streams[0]->sink &&
++				core_freesync->caps[i].caps.supported) {
++
++				calc_vmin_vmax(streams[0], &core_freesync->caps[i].caps, &v_total_min, &v_total_max);
++
++				core_freesync->dc->stream_funcs.dc_stream_adjust_vmin_vmax(core_freesync->dc,
++									streams, num_streams, v_total_min, v_total_max);
++
++				return true;
++			}
++		}
+ 	}
+ 
+ 	return false;
+diff --git a/drivers/gpu/drm/amd/dal/modules/freesync/freesync.h b/drivers/gpu/drm/amd/dal/modules/freesync/freesync.h
+deleted file mode 100644
+index 65a4194..0000000
+--- a/drivers/gpu/drm/amd/dal/modules/freesync/freesync.h
++++ /dev/null
+@@ -1,41 +0,0 @@
+-/*
+- * Copyright 2016 Advanced Micro Devices, Inc.
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice shall be included in
+- * all copies or substantial portions of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+- * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+- * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+- * OTHER DEALINGS IN THE SOFTWARE.
+- *
+- * Authors: AMD
+- *
+- */
+-
+-#ifndef FREESYNC_H_
+-#define FREESYNC_H_
+-
+-#include "mod_freesync.h"
+-
+-struct dc;
+-
+-struct core_freesync {
+-	struct mod_freesync public;
+-	struct dc *dc;
+-};
+-
+-#define MOD_FREESYNC_TO_CORE(mod_freesync)\
+-	container_of(mod_freesync, struct core_freesync, public)
+-
+-#endif /* FREESYNC_H_ */
+diff --git a/drivers/gpu/drm/amd/dal/modules/inc/mod_freesync.h b/drivers/gpu/drm/amd/dal/modules/inc/mod_freesync.h
+index e12d844..8df086a 100644
+--- a/drivers/gpu/drm/amd/dal/modules/inc/mod_freesync.h
++++ b/drivers/gpu/drm/amd/dal/modules/inc/mod_freesync.h
+@@ -42,16 +42,41 @@ struct mod_freesync_params {
+ 	enum mod_freesync_mode mode;
+ };
+ 
++struct mod_freesync_caps {
++	bool supported;
++	int minRefreshInMicroHz;
++	int maxRefreshInMicroHz;
++};
++
+ struct mod_freesync *mod_freesync_create(struct dc *dc);
+ void mod_freesync_destroy(struct mod_freesync *mod_freesync);
+ 
+ /*
++ * Add sink to be tracked by module
++ */
++bool mod_freesync_add_sink(struct mod_freesync *mod_freesync,
++		const struct dc_sink *sink, struct mod_freesync_caps *caps);
++
++/*
++ * Remove sink to be tracked by module
++ */
++bool mod_freesync_remove_sink(struct mod_freesync *mod_freesync,
++		const struct dc_sink *sink);
++
++/*
++ * Build additional parameters for dc_stream when creating stream for
++ * sink to support freesync
++ */
++void mod_freesync_update_stream(struct mod_freesync *mod_freesync,
++		struct dc_stream *stream);
++
++/*
+  * This interface sets the freesync mode on a stream.  Mode and associated
+  * parameters required to set it are defined in mod_freesync_params.
+  */
+ bool mod_freesync_set_freesync_on_streams(struct mod_freesync *mod_freesync,
+-		struct dc_stream **streams, int num_streams,
+-		struct mod_freesync_params *params);
++		const struct dc_stream **streams, int num_streams,
++		const struct mod_freesync_params *params);
+ 
+ /*
+  * This interface must be called for on every VUPDATE event for every stream
+-- 
+2.7.4
+

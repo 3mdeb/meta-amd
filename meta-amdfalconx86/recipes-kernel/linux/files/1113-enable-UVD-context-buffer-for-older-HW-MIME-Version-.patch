@@ -1,0 +1,137 @@
+From d4fc4a943bb3f18c6a1d89c367a04c5ea82c7575 Mon Sep 17 00:00:00 2001
+From: Sanjay R Mehta <sanju.mehta@amd.com>
+Date: Sat, 17 Sep 2016 14:39:50 +0530
+Subject: [PATCH 03/12] enable UVD context buffer for older HW MIME-Version:
+ 1.0
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Supported starting on certain FW versions.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Leo Liu <leo.liu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c | 63 +++++++++++++++++++++++++++++++--
+ 2 files changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 551f763..28f8481 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1670,6 +1670,7 @@ struct amdgpu_uvd {
+ 	struct amdgpu_ring	ring;
+ 	struct amdgpu_irq_src	irq;
+ 	bool			address_64_bit;
++	bool			use_ctx_buf;
+ 	struct amd_sched_entity entity;
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+index 74f0019..9050af2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+@@ -42,6 +42,15 @@
+ /* 1 second timeout */
+ #define UVD_IDLE_TIMEOUT_MS	1000
+ 
++/* Firmware versions for VI */
++#define FW_1_65_10     ((1 << 24) | (65 << 16) | (10 << 8))
++#define FW_1_87_11     ((1 << 24) | (87 << 16) | (11 << 8))
++#define FW_1_87_12     ((1 << 24) | (87 << 16) | (12 << 8))
++#define FW_1_37_15     ((1 << 24) | (37 << 16) | (15 << 8))
++
++/* Polaris10/11 firmware version */
++#define FW_1_66_16     ((1 << 24) | (66 << 16) | (16 << 8))
++
+ /* Firmware Names */
+ #ifdef CONFIG_DRM_AMDGPU_CIK
+ #define FIRMWARE_BONAIRE	"radeon/bonaire_uvd.bin"
+@@ -415,7 +424,8 @@ static int amdgpu_uvd_cs_pass1(struct amdgpu_uvd_cs_ctx *ctx)
+  *
+  * Peek into the decode message and calculate the necessary buffer sizes.
+  */
+-static int amdgpu_uvd_cs_msg_decode(uint32_t *msg, unsigned buf_sizes[])
++static int amdgpu_uvd_cs_msg_decode(struct amdgpu_device *adev, uint32_t *msg,
++	unsigned buf_sizes[])
+ {
+ 	unsigned stream_type = msg[4];
+ 	unsigned width = msg[6];
+@@ -437,7 +447,6 @@ static int amdgpu_uvd_cs_msg_decode(uint32_t *msg, unsigned buf_sizes[])
+ 
+ 	switch (stream_type) {
+ 	case 0: /* H264 */
+-	case 7: /* H264 Perf */
+ 		switch(level) {
+ 		case 30:
+ 			num_dpb_buffer = 8100 / fs_in_mb;
+@@ -515,6 +524,54 @@ static int amdgpu_uvd_cs_msg_decode(uint32_t *msg, unsigned buf_sizes[])
+ 		min_dpb_size += ALIGN(width_in_mb * height_in_mb * 32, 64);
+ 		break;
+ 
++	case 7: /* H264 Perf */
++		switch(level) {
++		case 30:
++			num_dpb_buffer = 8100 / fs_in_mb;
++			break;
++		case 31:
++			num_dpb_buffer = 18000 / fs_in_mb;
++			break;
++		case 32:
++			num_dpb_buffer = 20480 / fs_in_mb;
++			break;
++		case 41:
++			num_dpb_buffer = 32768 / fs_in_mb;
++			break;
++		case 42:
++			num_dpb_buffer = 34816 / fs_in_mb;
++			break;
++		case 50:
++			num_dpb_buffer = 110400 / fs_in_mb;
++			break;
++		case 51:
++			num_dpb_buffer = 184320 / fs_in_mb;
++			break;
++		default:
++			num_dpb_buffer = 184320 / fs_in_mb;
++			break;
++		}
++		num_dpb_buffer++;
++		if (num_dpb_buffer > 17)
++			num_dpb_buffer = 17;
++
++		/* reference picture buffer */
++		min_dpb_size = image_size * num_dpb_buffer;
++
++		if (!adev->uvd.use_ctx_buf){
++			/* macroblock context buffer */
++			min_dpb_size +=
++				width_in_mb * height_in_mb * num_dpb_buffer * 192;
++
++			/* IT surface buffer */
++			min_dpb_size += width_in_mb * height_in_mb * 32;
++		} else {
++			/* macroblock context buffer */
++			min_ctx_size =
++				width_in_mb * height_in_mb * num_dpb_buffer * 192;
++		}
++		break;
++
+ 	case 16: /* H265 */
+ 		image_size = (ALIGN(width, 16) * ALIGN(height, 16) * 3) / 2;
+ 		image_size = ALIGN(image_size, 256);
+@@ -610,7 +667,7 @@ static int amdgpu_uvd_cs_msg(struct amdgpu_uvd_cs_ctx *ctx,
+ 
+ 	case 1:
+ 		/* it's a decode msg, calc buffer sizes */
+-		r = amdgpu_uvd_cs_msg_decode(msg, ctx->buf_sizes);
++		r = amdgpu_uvd_cs_msg_decode(adev, msg, ctx->buf_sizes);
+ 		amdgpu_bo_kunmap(bo);
+ 		if (r)
+ 			return r;
+-- 
+2.7.4
+

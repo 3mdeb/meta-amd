@@ -1,0 +1,225 @@
+From 733b067a8a1d587ff27072eb2ba55dc5c5e695f0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 21 Jan 2016 10:19:11 +0100
+Subject: [PATCH 0239/1110] drm/amdgpu: use a global LRU list for VMIDs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+With the scheduler enabled managing per ring LRUs don't
+make much sense any more.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    | 19 ++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 88 ++++++++++++++++------------------
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c  |  3 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c  |  3 +-
+ 4 files changed, 55 insertions(+), 58 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 64784e4..5135635 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -886,18 +886,20 @@ struct amdgpu_vm {
+ 	spinlock_t		freed_lock;
+ };
+ 
++struct amdgpu_vm_manager_id {
++	struct list_head	list;
++	struct fence		*active;
++	atomic_long_t		owner;
++};
++
+ struct amdgpu_vm_manager {
+-	/* protecting IDs */
++	/* Handling of VMIDs */
+ 	struct mutex				lock;
+-
+-	struct {
+-		struct fence	*active;
+-		atomic_long_t	owner;
+-	} ids[AMDGPU_NUM_VM];
++	unsigned				num_ids;
++	struct list_head			ids_lru;
++	struct amdgpu_vm_manager_id		ids[AMDGPU_NUM_VM];
+ 
+ 	uint32_t				max_pfn;
+-	/* number of VMIDs */
+-	unsigned				nvm;
+ 	/* vram base address for page table entry  */
+ 	u64					vram_base_offset;
+ 	/* is vm enabled? */
+@@ -907,6 +909,7 @@ struct amdgpu_vm_manager {
+ 	struct amdgpu_ring                      *vm_pte_funcs_ring;
+ };
+ 
++void amdgpu_vm_manager_init(struct amdgpu_device *adev);
+ void amdgpu_vm_manager_fini(struct amdgpu_device *adev);
+ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm);
+ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 38ab4a5..796fe49 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -168,79 +168,52 @@ void amdgpu_vm_move_pt_bos_in_lru(struct amdgpu_device *adev,
+ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 		      struct amdgpu_sync *sync, struct fence *fence)
+ {
+-	struct fence *best[AMDGPU_MAX_RINGS] = {};
+ 	struct amdgpu_vm_id *vm_id = &vm->ids[ring->idx];
+ 	struct amdgpu_device *adev = ring->adev;
+-
+-	unsigned choices[2] = {};
+-	unsigned i;
++	struct amdgpu_vm_manager_id *id;
++	int r;
+ 
+ 	mutex_lock(&adev->vm_manager.lock);
+ 
+ 	/* check if the id is still valid */
+ 	if (vm_id->id) {
+-		unsigned id = vm_id->id;
+ 		long owner;
+ 
+-		owner = atomic_long_read(&adev->vm_manager.ids[id].owner);
++		id = &adev->vm_manager.ids[vm_id->id];
++		owner = atomic_long_read(&id->owner);
+ 		if (owner == (long)vm) {
++			list_move_tail(&id->list, &adev->vm_manager.ids_lru);
+ 			trace_amdgpu_vm_grab_id(vm, vm_id->id, ring->idx);
+-			fence_put(adev->vm_manager.ids[id].active);
+-			adev->vm_manager.ids[id].active = fence_get(fence);
+-			mutex_unlock(&adev->vm_manager.lock);
+-			return 0;
+-		}
+-	}
+ 
+-	/* we definately need to flush */
+-	vm_id->pd_gpu_addr = ~0ll;
++			fence_put(id->active);
++			id->active = fence_get(fence);
+ 
+-	/* skip over VMID 0, since it is the system VM */
+-	for (i = 1; i < adev->vm_manager.nvm; ++i) {
+-		struct fence *fence = adev->vm_manager.ids[i].active;
+-		struct amdgpu_ring *fring;
+-
+-		if (fence == NULL) {
+-			/* found a free one */
+-			vm_id->id = i;
+-			trace_amdgpu_vm_grab_id(vm, i, ring->idx);
+ 			mutex_unlock(&adev->vm_manager.lock);
+ 			return 0;
+ 		}
+-
+-		fring = amdgpu_ring_from_fence(fence);
+-		if (best[fring->idx] == NULL ||
+-		    fence_is_later(best[fring->idx], fence)) {
+-			best[fring->idx] = fence;
+-			choices[fring == ring ? 0 : 1] = i;
+-		}
+ 	}
+ 
+-	for (i = 0; i < 2; ++i) {
+-		struct fence *active;
+-		int r;
+-
+-		if (!choices[i])
+-			continue;
++	/* we definately need to flush */
++	vm_id->pd_gpu_addr = ~0ll;
+ 
+-		vm_id->id = choices[i];
+-		active  = adev->vm_manager.ids[vm_id->id].active;
+-		r = amdgpu_sync_fence(ring->adev, sync, active);
++	id = list_first_entry(&adev->vm_manager.ids_lru,
++			      struct amdgpu_vm_manager_id,
++			      list);
++	list_move_tail(&id->list, &adev->vm_manager.ids_lru);
++	atomic_long_set(&id->owner, (long)vm);
+ 
+-		trace_amdgpu_vm_grab_id(vm, choices[i], ring->idx);
+-		atomic_long_set(&adev->vm_manager.ids[vm_id->id].owner, (long)vm);
++	vm_id->id = id - adev->vm_manager.ids;
++	trace_amdgpu_vm_grab_id(vm, vm_id->id, ring->idx);
+ 
+-		fence_put(adev->vm_manager.ids[vm_id->id].active);
+-		adev->vm_manager.ids[vm_id->id].active = fence_get(fence);
++	r = amdgpu_sync_fence(ring->adev, sync, id->active);
+ 
+-		mutex_unlock(&adev->vm_manager.lock);
+-		return r;
++	if (!r) {
++		fence_put(id->active);
++		id->active = fence_get(fence);
+ 	}
+ 
+-	/* should never happen */
+-	BUG();
+ 	mutex_unlock(&adev->vm_manager.lock);
+-	return -EINVAL;
++	return r;
+ }
+ 
+ /**
+@@ -1366,6 +1339,25 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ }
+ 
+ /**
++ * amdgpu_vm_manager_init - init the VM manager
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * Initialize the VM manager structures
++ */
++void amdgpu_vm_manager_init(struct amdgpu_device *adev)
++{
++	unsigned i;
++
++	INIT_LIST_HEAD(&adev->vm_manager.ids_lru);
++
++	/* skip over VMID 0, since it is the system VM */
++	for (i = 1; i < adev->vm_manager.num_ids; ++i)
++		list_add_tail(&adev->vm_manager.ids[i].list,
++			      &adev->vm_manager.ids_lru);
++}
++
++/**
+  * amdgpu_vm_manager_fini - cleanup VM manager
+  *
+  * @adev: amdgpu_device pointer
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index c01b861..7864318 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -694,7 +694,8 @@ static int gmc_v7_0_vm_init(struct amdgpu_device *adev)
+ 	 * amdgpu graphics/compute will use VMIDs 1-7
+ 	 * amdkfd will use VMIDs 8-15
+ 	 */
+-	adev->vm_manager.nvm = AMDGPU_NUM_OF_VMIDS;
++	adev->vm_manager.num_ids = AMDGPU_NUM_OF_VMIDS;
++	amdgpu_vm_manager_init(adev);
+ 
+ 	/* base offset of vram pages */
+ 	if (adev->flags & AMD_IS_APU) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index e59251f..009fe5f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -774,7 +774,8 @@ static int gmc_v8_0_vm_init(struct amdgpu_device *adev)
+ 	 * amdgpu graphics/compute will use VMIDs 1-7
+ 	 * amdkfd will use VMIDs 8-15
+ 	 */
+-	adev->vm_manager.nvm = AMDGPU_NUM_OF_VMIDS;
++	adev->vm_manager.num_ids = AMDGPU_NUM_OF_VMIDS;
++	amdgpu_vm_manager_init(adev);
+ 
+ 	/* base offset of vram pages */
+ 	if (adev->flags & AMD_IS_APU) {
+-- 
+2.7.4
+

@@ -1,0 +1,230 @@
+From 9a0d113114485b5286a3af62b5f2b3a638a42c56 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 15 Feb 2016 16:59:57 +0100
+Subject: [PATCH 0326/1110] drm/amdgpu: cleanup gem init/finit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Remove the double housekeeping and use something sane to
+forcefuly delete BOs on unload.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  9 +--------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c    | 31 +++++++++++++++++++-----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 23 ----------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h |  1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c  |  4 ----
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c      |  6 +-----
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c      |  6 +-----
+ 8 files changed, 23 insertions(+), 58 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index ba66640..af4f128 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -567,13 +567,7 @@ struct amdgpu_sa_bo {
+ /*
+  * GEM objects.
+  */
+-struct amdgpu_gem {
+-	struct mutex		mutex;
+-	struct list_head	objects;
+-};
+-
+-int amdgpu_gem_init(struct amdgpu_device *adev);
+-void amdgpu_gem_fini(struct amdgpu_device *adev);
++void amdgpu_gem_force_release(struct amdgpu_device *adev);
+ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
+ 				int alignment, u32 initial_domain,
+ 				u64 flags, bool kernel,
+@@ -1976,7 +1970,6 @@ struct amdgpu_device {
+ 
+ 	/* memory management */
+ 	struct amdgpu_mman		mman;
+-	struct amdgpu_gem		gem;
+ 	struct amdgpu_vram_scratch	vram_scratch;
+ 	struct amdgpu_wb		wb;
+ 	atomic64_t			vram_usage;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 736d560..9663d17 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1426,7 +1426,6 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	 * can recall function without having locking issues */
+ 	mutex_init(&adev->vm_manager.lock);
+ 	atomic_set(&adev->irq.ih.lock, 0);
+-	mutex_init(&adev->gem.mutex);
+ 	mutex_init(&adev->pm.mutex);
+ 	mutex_init(&adev->gfx.gpu_clock_mutex);
+ 	mutex_init(&adev->srbm_mutex);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index c44905a..6270a20 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -84,22 +84,31 @@ retry:
+ 	}
+ 	*obj = &robj->gem_base;
+ 
+-	mutex_lock(&adev->gem.mutex);
+-	list_add_tail(&robj->list, &adev->gem.objects);
+-	mutex_unlock(&adev->gem.mutex);
+-
+ 	return 0;
+ }
+ 
+-int amdgpu_gem_init(struct amdgpu_device *adev)
++void amdgpu_gem_force_release(struct amdgpu_device *adev)
+ {
+-	INIT_LIST_HEAD(&adev->gem.objects);
+-	return 0;
+-}
++	struct drm_device *ddev = adev->ddev;
++	struct drm_file *file;
+ 
+-void amdgpu_gem_fini(struct amdgpu_device *adev)
+-{
+-	amdgpu_bo_force_delete(adev);
++	mutex_lock(&ddev->struct_mutex);
++
++	list_for_each_entry(file, &ddev->filelist, lhead) {
++		struct drm_gem_object *gobj;
++		int handle;
++
++		WARN_ONCE(1, "Still active user space clients!\n");
++		spin_lock(&file->table_lock);
++		idr_for_each_entry(&file->object_idr, gobj, handle) {
++			WARN_ONCE(1, "And also active allocations!\n");
++			drm_gem_object_unreference(gobj);
++		}
++		idr_destroy(&file->object_idr);
++		spin_unlock(&file->table_lock);
++	}
++
++	mutex_unlock(&ddev->struct_mutex);
+ }
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index c884873..c980cba 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -97,9 +97,6 @@ static void amdgpu_ttm_bo_destroy(struct ttm_buffer_object *tbo)
+ 
+ 	amdgpu_update_memory_usage(bo->adev, &bo->tbo.mem, NULL);
+ 
+-	mutex_lock(&bo->adev->gem.mutex);
+-	list_del_init(&bo->list);
+-	mutex_unlock(&bo->adev->gem.mutex);
+ 	drm_gem_object_release(&bo->gem_base);
+ 	amdgpu_bo_unref(&bo->parent);
+ 	kfree(bo->metadata);
+@@ -473,26 +470,6 @@ int amdgpu_bo_evict_vram(struct amdgpu_device *adev)
+ 	return ttm_bo_evict_mm(&adev->mman.bdev, TTM_PL_VRAM);
+ }
+ 
+-void amdgpu_bo_force_delete(struct amdgpu_device *adev)
+-{
+-	struct amdgpu_bo *bo, *n;
+-
+-	if (list_empty(&adev->gem.objects)) {
+-		return;
+-	}
+-	dev_err(adev->dev, "Userspace still has active objects !\n");
+-	list_for_each_entry_safe(bo, n, &adev->gem.objects, list) {
+-		dev_err(adev->dev, "%p %p %lu %lu force free\n",
+-			&bo->gem_base, bo, (unsigned long)bo->gem_base.size,
+-			*((unsigned long *)&bo->gem_base.refcount));
+-		mutex_lock(&bo->adev->gem.mutex);
+-		list_del_init(&bo->list);
+-		mutex_unlock(&bo->adev->gem.mutex);
+-		/* this should unref the ttm bo */
+-		drm_gem_object_unreference_unlocked(&bo->gem_base);
+-	}
+-}
+-
+ int amdgpu_bo_init(struct amdgpu_device *adev)
+ {
+ 	/* Add an MTRR for the VRAM */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index 5107fb2..acc0801 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -149,7 +149,6 @@ int amdgpu_bo_pin_restricted(struct amdgpu_bo *bo, u32 domain,
+ 			     u64 *gpu_addr);
+ int amdgpu_bo_unpin(struct amdgpu_bo *bo);
+ int amdgpu_bo_evict_vram(struct amdgpu_device *adev);
+-void amdgpu_bo_force_delete(struct amdgpu_device *adev);
+ int amdgpu_bo_init(struct amdgpu_device *adev);
+ void amdgpu_bo_fini(struct amdgpu_device *adev);
+ int amdgpu_bo_fbdev_mmap(struct amdgpu_bo *bo,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+index 39db99a..32b0247 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+@@ -73,10 +73,6 @@ struct drm_gem_object *amdgpu_gem_prime_import_sg_table(struct drm_device *dev,
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
+-	mutex_lock(&adev->gem.mutex);
+-	list_add_tail(&bo->list, &adev->gem.objects);
+-	mutex_unlock(&adev->gem.mutex);
+-
+ 	return &bo->gem_base;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index 7864318..3065184 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -919,10 +919,6 @@ static int gmc_v7_0_sw_init(void *handle)
+ 	int dma_bits;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	r = amdgpu_gem_init(adev);
+-	if (r)
+-		return r;
+-
+ 	if (adev->flags & AMD_IS_APU) {
+ 		adev->mc.vram_type = AMDGPU_VRAM_TYPE_UNKNOWN;
+ 	} else {
+@@ -1010,7 +1006,7 @@ static int gmc_v7_0_sw_fini(void *handle)
+ 		adev->vm_manager.enabled = false;
+ 	}
+ 	gmc_v7_0_gart_fini(adev);
+-	amdgpu_gem_fini(adev);
++        amdgpu_gem_force_release(adev);
+ 	amdgpu_bo_fini(adev);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index b410c32..f589e1b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -881,10 +881,6 @@ static int gmc_v8_0_sw_init(void *handle)
+ 	int dma_bits;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	r = amdgpu_gem_init(adev);
+-	if (r)
+-		return r;
+-
+ 	if (adev->flags & AMD_IS_APU) {
+ 		adev->mc.vram_type = AMDGPU_VRAM_TYPE_UNKNOWN;
+ 	} else {
+@@ -978,7 +974,7 @@ static int gmc_v8_0_sw_fini(void *handle)
+ 		adev->vm_manager.enabled = false;
+ 	}
+ 	gmc_v8_0_gart_fini(adev);
+-	amdgpu_gem_fini(adev);
++        amdgpu_gem_force_release(adev);
+ 	amdgpu_bo_fini(adev);
+ 
+ 	return 0;
+-- 
+2.7.4
+

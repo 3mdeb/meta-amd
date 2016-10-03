@@ -1,0 +1,288 @@
+From b92469fcc4bf7e3291852123f38c4f66c6d58545 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Fri, 8 Jan 2016 16:28:50 -0500
+Subject: [PATCH 0682/1110] drm/amd/dal: Split sinks into physical sink pointer
+ and array of sinks for MST
+
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Acked-by: Jordan Lazare <Jordan.Lazare@amd.com>
+---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      | 38 +++-------------------
+ .../drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c    |  8 ++---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 12 +++----
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          | 26 +++++----------
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |  7 ++--
+ .../drm/amd/dal/dc/dce_base/dce_base_resource.c    |  6 +++-
+ 6 files changed, 31 insertions(+), 66 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index a98d1dd..118821d 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -698,47 +698,19 @@ static struct drm_mode_config_funcs amdgpu_dm_mode_funcs = {
+ 	.atomic_commit = amdgpu_dm_atomic_commit
+ };
+ 
+-static bool dm_get_sink_from_link(const struct dc_link *link,
+-						struct amdgpu_connector *aconnector,
+-						const struct dc_sink **sink)
+-{
+-	int i;
+-	*sink = NULL;
+-
+-	if (!link->sink_count) {
+-		DRM_INFO("No sinks on link!\n");
+-		return true;
+-	} else if (link->sink_count > 1 && !aconnector) {
+-		DRM_ERROR("Multi sink link but no connector given!\n");
+-		return false;
+-	}
+-
+-	if (link->sink_count == 1) {
+-		*sink = link->sink[0];
+-		return true;
+-	}
+-
+-	for (i = 0; i < link->sink_count; i++)
+-		if (aconnector->dc_sink == link->sink[i])
+-			*sink =  aconnector->dc_sink;
+-
+-	return true;
+-}
+ 
+ void amdgpu_dm_update_connector_after_detect(
+ 	struct amdgpu_connector *aconnector)
+ {
+ 	struct drm_connector *connector = &aconnector->base;
+ 	struct drm_device *dev = connector->dev;
+-	const struct dc_link *dc_link = aconnector->dc_link;
+ 	const struct dc_sink *sink;
+ 
+ 	/* MST handled by drm_mst framework */
+ 	if (aconnector->mst_mgr.mst_state == true)
+ 		return;
+ 
+-	if (!dm_get_sink_from_link(dc_link, aconnector, &sink))
+-		return;
++	sink = aconnector->dc_link->local_sink;
+ 
+ 	/*
+ 	 * TODO: temporary guard to look for proper fix
+@@ -789,13 +761,11 @@ static void handle_hpd_irq(void *param)
+ 	struct amdgpu_connector *aconnector = (struct amdgpu_connector *)param;
+ 	struct drm_connector *connector = &aconnector->base;
+ 	struct drm_device *dev = connector->dev;
+-	bool mst_connector = aconnector->mst_mgr.mst_state;
+ 
+ 	dc_link_detect(aconnector->dc_link);
+-	/*Wait for complition of all MST connectors reset
+-	 * so the link is clean from sinks. */
+-	if (mst_connector && aconnector->dc_link->type == dc_connection_none)
+-		flush_work(&aconnector->mst_mgr.destroy_connector_work);
++	if (aconnector->dc_link->type == dc_connection_mst_branch)
++		return;
++
+ 	amdgpu_dm_update_connector_after_detect(aconnector);
+ 	drm_kms_helper_hotplug_event(dev);
+ }
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+index 61e12ad..88b9730 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -147,7 +147,7 @@ static struct dc_sink *dm_dp_mst_add_mst_sink(
+ 	dc_service_memmove(dc_sink->dc_edid.raw_edid, edid, len);
+ 	dc_sink->dc_edid.length = len;
+ 
+-	if (!dc_link_add_sink(
++	if (!dc_link_add_remote_sink(
+ 			dc_link,
+ 			dc_sink))
+ 		goto fail_add_sink;
+@@ -163,7 +163,7 @@ static struct dc_sink *dm_dp_mst_add_mst_sink(
+ 
+ 	return dc_sink;
+ fail:
+-	dc_link_remove_sink(dc_link, dc_sink);
++	dc_link_remove_remote_sink(dc_link, dc_sink);
+ fail_add_sink:
+ 	return NULL;
+ }
+@@ -190,7 +190,7 @@ static int dm_dp_mst_get_modes(struct drm_connector *connector)
+ 		aconnector->edid = edid;
+ 
+ 		if (aconnector->dc_sink)
+-			dc_link_remove_sink(
++			dc_link_remove_remote_sink(
+ 				aconnector->dc_link,
+ 				aconnector->dc_sink);
+ 
+@@ -354,7 +354,7 @@ static void dm_dp_destroy_mst_connector(
+ 
+ 	aconnector->port = NULL;
+ 	if (aconnector->dc_sink)
+-		dc_link_remove_sink(aconnector->dc_link, aconnector->dc_sink);
++		dc_link_remove_remote_sink(aconnector->dc_link, aconnector->dc_sink);
+ }
+ 
+ static void dm_dp_mst_hotplug(struct drm_dp_mst_topology_mgr *mgr)
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 397b664..e003f78 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -838,7 +838,7 @@ bool dc_write_dpcd(
+ 	return r == DDC_RESULT_SUCESSFULL;
+ }
+ 
+-bool dc_link_add_sink(const struct dc_link *link, struct dc_sink *sink)
++bool dc_link_add_remote_sink(const struct dc_link *link, struct dc_sink *sink)
+ {
+ 	struct core_link *core_link = DC_LINK_TO_LINK(link);
+ 	struct dc_link *dc_link = &core_link->public;
+@@ -848,7 +848,7 @@ bool dc_link_add_sink(const struct dc_link *link, struct dc_sink *sink)
+ 		return false;
+ 	}
+ 
+-	dc_link->sink[link->sink_count] = sink;
++	dc_link->remote_sinks[link->sink_count] = sink;
+ 	dc_link->sink_count++;
+ 	if (sink->sink_signal == SIGNAL_TYPE_VIRTUAL
+ 		&& link->connector_signal == SIGNAL_TYPE_VIRTUAL)
+@@ -858,7 +858,7 @@ bool dc_link_add_sink(const struct dc_link *link, struct dc_sink *sink)
+ }
+ 
+ 
+-void dc_link_remove_sink(const struct dc_link *link, const struct dc_sink *sink)
++void dc_link_remove_remote_sink(const struct dc_link *link, const struct dc_sink *sink)
+ {
+ 	int i;
+ 	struct core_link *core_link = DC_LINK_TO_LINK(link);
+@@ -870,13 +870,13 @@ void dc_link_remove_sink(const struct dc_link *link, const struct dc_sink *sink)
+ 	}
+ 
+ 	for (i = 0; i < dc_link->sink_count; i++) {
+-		if (dc_link->sink[i] == sink) {
++		if (dc_link->remote_sinks[i] == sink) {
+ 			dc_sink_release(sink);
+-			dc_link->sink[i] = NULL;
++			dc_link->remote_sinks[i] = NULL;
+ 
+ 			/* shrink array to remove empty place */
+ 			while (i < dc_link->sink_count - 1) {
+-				dc_link->sink[i] = dc_link->sink[i+1];
++				dc_link->remote_sinks[i] = dc_link->remote_sinks[i+1];
+ 				i++;
+ 			}
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 2ef0451..c5ff145 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -427,15 +427,12 @@ static bool is_dp_active_dongle(enum display_dongle_type dongle_type)
+ 		dongle_type == DISPLAY_DONGLE_DP_HDMI_CONVERTER);
+ }
+ 
+-static void link_disconnect_all_sinks(struct core_link *link)
++static void link_disconnect_sink(struct core_link *link)
+ {
+-	/*
+-	 * as sink_count changed inside dc_link_remove_sink, we should not
+-	 * use it for range check for loop, because half of sinks will not
+-	 * be removed
+-	 */
+-	while (link->public.sink_count)
+-		dc_link_remove_sink(&link->public, link->public.sink[0]);
++	if (link->public.local_sink) {
++		dc_sink_release(link->public.local_sink);
++		link->public.local_sink = NULL;
++	}
+ 
+ 	link->dpcd_sink_count = 0;
+ }
+@@ -496,7 +493,7 @@ static void dc_link_detect_dp(
+ 				/*
+ 				 * active dongle unplug processing for short irq
+ 				 */
+-				link_disconnect_all_sinks(link);
++				link_disconnect_sink(link);
+ 				return;
+ 			}
+ 
+@@ -574,10 +571,7 @@ void dc_link_detect(const struct dc_link *dc_link)
+ 		return;
+ 	}
+ 
+-	/* Free existing state before doing detection on SST
+-	 * TODO: For MST, need to investigate if the same is required. */
+-	if (link->public.type != dc_connection_mst_branch)
+-		link_disconnect_all_sinks(link);
++	link_disconnect_sink(link);
+ 
+ 	if (new_connection_type != dc_connection_none) {
+ 		link->public.type = new_connection_type;
+@@ -657,11 +651,7 @@ void dc_link_detect(const struct dc_link *dc_link)
+ 		}
+ 
+ 		sink = DC_SINK_TO_CORE(dc_sink);
+-
+-		/*AG TODO handle failure */
+-		/*Only non MST case here */
+-		if (!dc_link_add_sink(&link->public, &sink->public))
+-				BREAK_TO_DEBUGGER();
++		link->public.local_sink = &sink->public;
+ 
+ 		edid_status = read_edid(link, sink);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index bcfd96d..df7e34b 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -272,8 +272,9 @@ void dc_update_stream(const struct dc_stream *dc_stream,
+  * The currently active signal type (HDMI, DP-SST, DP-MST) is also reported.
+  */
+ struct dc_link {
+-	const struct dc_sink *sink[MAX_SINKS_PER_LINK];
++	const struct dc_sink *remote_sinks[MAX_SINKS_PER_LINK];
+ 	unsigned int sink_count;
++	const struct dc_sink *local_sink;
+ 	unsigned int link_index;
+ 	enum dc_connection_type type;
+ 	enum signal_type connector_signal;
+@@ -306,9 +307,9 @@ void dc_link_detect(const struct dc_link *dc_link);
+  * from DM. */
+ bool dc_link_handle_hpd_rx_irq(const struct dc_link *dc_link);
+ 
+-bool dc_link_add_sink(const struct dc_link *link, struct dc_sink *sink);
++bool dc_link_add_remote_sink(const struct dc_link *link, struct dc_sink *sink);
+ 
+-void dc_link_remove_sink(
++void dc_link_remove_remote_sink(
+ 	const struct dc_link *link,
+ 	const struct dc_sink *sink);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce_base/dce_base_resource.c b/drivers/gpu/drm/amd/dal/dc/dce_base/dce_base_resource.c
+index 85cff3b..0907f3c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce_base/dce_base_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce_base/dce_base_resource.c
+@@ -93,6 +93,7 @@ static struct stream_encoder *find_first_free_match_stream_enc_for_link(
+ {
+ 	uint8_t i;
+ 	int8_t j = -1;
++	const struct dc_sink *sink = NULL;
+ 
+ 	for (i = 0; i < res_ctx->pool.stream_enc_count; i++) {
+ 		if (!res_ctx->is_stream_enc_acquired[i] &&
+@@ -118,7 +119,10 @@ static struct stream_encoder *find_first_free_match_stream_enc_for_link(
+ 	 * TODO - This is just a patch up and a generic solution is
+ 	 * required for non DP connectors.
+ 	 */
+-	if (j >= 0 &&  dc_is_dp_signal(link->public.sink[0]->sink_signal))
++
++	sink = link->public.local_sink ? link->public.local_sink : link->public.remote_sinks[0];
++
++	if (sink && j >= 0 &&  dc_is_dp_signal(sink->sink_signal))
+ 		return res_ctx->pool.stream_enc[j];
+ 
+ 	return NULL;
+-- 
+2.7.4
+

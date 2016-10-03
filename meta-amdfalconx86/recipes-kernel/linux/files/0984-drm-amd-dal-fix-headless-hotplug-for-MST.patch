@@ -1,0 +1,155 @@
+From c53d5370b35d53f5fdf05830e507d5365657fa9c Mon Sep 17 00:00:00 2001
+From: Eric Yang <eric.yang2@amd.com>
+Date: Tue, 22 Mar 2016 18:27:11 -0400
+Subject: [PATCH 0984/1110] drm/amd/dal: fix headless hotplug for MST
+
+This mirrors the fix to handle the non-MST case for xinit
+when there's no desktop manager calling mode set for us.
+
+This will allow MST to work in the case of going to headless
+state then plug back in the same configuration (be it one MST
+capable display or a daisy chain), which was broken by the
+xinit fix before. This will also allow MST displays to light
+up from hotplug in xinit environment, which was not supported
+before.
+
+Signed-off-by: Eric Yang <eric.yang2@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c    | 74 ++++++++++++----------
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    | 11 +++-
+ 2 files changed, 47 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+index 7f3f8f2..c00c4d1 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -225,43 +225,8 @@ fail_add_sink:
+ static int dm_dp_mst_get_modes(struct drm_connector *connector)
+ {
+ 	struct amdgpu_connector *aconnector = to_amdgpu_connector(connector);
+-	struct amdgpu_connector *master = aconnector->mst_port;
+-	struct edid *edid;
+-	const struct dc_sink *sink;
+ 	int ret = 0;
+ 
+-	if (!aconnector->edid) {
+-		edid = drm_dp_mst_get_edid(connector, &master->mst_mgr, aconnector->port);
+-
+-		if (!edid) {
+-			drm_mode_connector_update_edid_property(
+-				&aconnector->base,
+-				NULL);
+-
+-			return ret;
+-		}
+-
+-		aconnector->edid = edid;
+-
+-		if (aconnector->dc_sink)
+-			dc_link_remove_remote_sink(
+-				aconnector->dc_link,
+-				aconnector->dc_sink);
+-
+-		sink = dm_dp_mst_add_mst_sink(
+-			aconnector->dc_link,
+-			(uint8_t *)edid,
+-			(edid->extensions + 1) * EDID_LENGTH);
+-		aconnector->dc_sink = sink;
+-	} else
+-		edid = aconnector->edid;
+-
+-	DRM_DEBUG_KMS("edid retrieved %p\n", edid);
+-
+-	drm_mode_connector_update_edid_property(
+-		&aconnector->base,
+-		aconnector->edid);
+-
+ 	ret = drm_add_edid_modes(&aconnector->base, aconnector->edid);
+ 
+ 	drm_edid_to_eld(&aconnector->base, aconnector->edid);
+@@ -417,6 +382,45 @@ static void dm_dp_mst_hotplug(struct drm_dp_mst_topology_mgr *mgr)
+ 	struct amdgpu_connector *master = container_of(mgr, struct amdgpu_connector, mst_mgr);
+ 	struct drm_device *dev = master->base.dev;
+ 	struct amdgpu_device *adev = dev->dev_private;
++	struct drm_connector *connector;
++	struct amdgpu_connector *aconnector;
++	struct edid *edid;
++	const struct dc_sink *sink;
++
++	drm_modeset_lock_all(dev);
++	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
++		aconnector = to_amdgpu_connector(connector);
++		if (aconnector->mst_port && !aconnector->dc_sink) {
++			if (!aconnector->edid) {
++				edid = drm_dp_mst_get_edid(connector, &aconnector->mst_port->mst_mgr, aconnector->port);
++
++				if (!edid) {
++					drm_mode_connector_update_edid_property(
++						&aconnector->base,
++						NULL);
++					continue;
++				}
++
++				aconnector->edid = edid;
++
++				sink = dm_dp_mst_add_mst_sink(
++					aconnector->dc_link,
++					(uint8_t *)edid,
++					(edid->extensions + 1) * EDID_LENGTH);
++				aconnector->dc_sink = sink;
++
++				dm_restore_drm_connector_state(connector->dev, connector);
++			} else
++				edid = aconnector->edid;
++
++			DRM_DEBUG_KMS("edid retrieved %p\n", edid);
++
++			drm_mode_connector_update_edid_property(
++				&aconnector->base,
++				aconnector->edid);
++		}
++	}
++	drm_modeset_unlock_all(dev);
+ 
+ 	schedule_work(&adev->dm.mst_hotplug_work);
+ }
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index 2f59c55..e418422 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -2347,15 +2347,18 @@ void dm_restore_drm_connector_state(struct drm_device *dev, struct drm_connector
+ 	struct amdgpu_device *adev = dev->dev_private;
+ 	struct dc *dc = adev->dm.dc;
+ 	struct amdgpu_connector *aconnector = to_amdgpu_connector(connector);
+-	struct amdgpu_crtc *disconnected_acrtc = to_amdgpu_crtc(connector->state->crtc);
++	struct amdgpu_crtc *disconnected_acrtc;
+ 	const struct dc_sink *sink;
+ 	struct dc_target *commit_targets[6];
+ 	uint32_t commit_targets_count = 0;
+ 
+-	if (!aconnector->dc_sink || !connector->state || !connector->state->crtc)
++
++	if (!aconnector->dc_sink || !connector->state || !connector->encoder)
+ 		return;
+ 
+-	if (!disconnected_acrtc->target)
++	disconnected_acrtc = to_amdgpu_crtc(connector->encoder->crtc);
++
++	if (!disconnected_acrtc || !disconnected_acrtc->target)
+ 		return;
+ 
+ 	sink = disconnected_acrtc->target->streams[0]->sink;
+@@ -2370,6 +2373,8 @@ void dm_restore_drm_connector_state(struct drm_device *dev, struct drm_connector
+ 			create_target_for_sink(
+ 				aconnector,
+ 				&disconnected_acrtc->base.state->mode);
++
++		DRM_INFO("Headless hotplug, restoring connector state\n");
+ 		/*
+ 		 * we evade vblanks and pflips on crtc that
+ 		 * should be changed
+-- 
+2.7.4
+

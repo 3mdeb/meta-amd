@@ -1,0 +1,114 @@
+From d1418336f40446595c3081efa14d74721ccad847 Mon Sep 17 00:00:00 2001
+From: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Date: Fri, 4 Dec 2015 19:51:18 +0800
+Subject: [PATCH 0581/1110] drm/amd/dal: prototype change of detection scheme
+
+Some facts below:
+
+1. One interrupt handler work can be processed at a time;
+2. Remote i2c read starts at hpd rx thread;
+3. Even though new interrupts come, they are blocked.
+
+This change is just work in progress in order to understand real
+root cause of the issue.
+
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c          | 18 +++++++++++++++++-
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h          |  2 ++
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c    |  5 ++++-
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index a414586..ab546a7 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -465,6 +465,14 @@ static void detect_on_all_dc_links(struct amdgpu_display_manager *dm)
+ 	}
+ }
+ 
++static void hotplug_notify_work_func(struct work_struct *work)
++{
++	struct amdgpu_display_manager *dm = container_of(work, struct amdgpu_display_manager, mst_hotplug_work);
++	struct drm_device *dev = dm->ddev;
++
++	drm_kms_helper_hotplug_event(dev);
++}
++
+ /* Init display KMS
+  *
+  * Returns 0 on success
+@@ -536,6 +544,8 @@ int amdgpu_dm_init(struct amdgpu_device *adev)
+ 	/* Display Core create. */
+ 	adev->dm.dc = dc_create(&init_data);
+ 
++	INIT_WORK(&adev->dm.mst_hotplug_work, hotplug_notify_work_func);
++
+ 	if (amdgpu_dm_initialize_drm_device(adev)) {
+ 		DRM_ERROR(
+ 		"amdgpu: failed to initialize sw for display support.\n");
+@@ -785,6 +795,10 @@ static void handle_hpd_rx_irq(void *param)
+ 	struct drm_connector *connector = &aconnector->base;
+ 	struct drm_device *dev = connector->dev;
+ 
++	if (aconnector->mst_mgr.mst_state) {
++		mutex_lock(&aconnector->mst_mgr.aux->hw_mutex);
++	}
++
+ 	if (dc_link_handle_hpd_rx_irq(aconnector->dc_link) &&
+ 			!aconnector->mst_mgr.mst_state) {
+ 		/* Downstream Port status changed. */
+@@ -793,8 +807,10 @@ static void handle_hpd_rx_irq(void *param)
+ 		drm_helper_hpd_irq_event(dev);
+ 	}
+ 
+-	if (aconnector->mst_mgr.mst_state)
++	if (aconnector->mst_mgr.mst_state) {
++		mutex_unlock(&aconnector->mst_mgr.aux->hw_mutex);
+ 		dc_helpers_dp_mst_handle_mst_hpd_rx_irq(param);
++	}
+ }
+ 
+ static void register_hpd_handlers(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h
+index 57e9c45..c4ae90b 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h
+@@ -123,6 +123,8 @@ struct amdgpu_display_manager {
+ 	struct backlight_device *backlight_dev;
+ 
+ 	const struct dc_link *backlight_link;
++
++	struct work_struct mst_hotplug_work;
+ };
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+index df80f5c..2f3a784 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -152,6 +152,8 @@ static int dm_dp_mst_get_modes(struct drm_connector *connector)
+ 	const struct dc_sink *sink;
+ 	int ret = 0;
+ 
++	flush_work(&master->mst_mgr.work);
++
+ 	edid = drm_dp_mst_get_edid(connector, &master->mst_mgr, aconnector->port);
+ 
+ 	if (!edid) {
+@@ -299,8 +301,9 @@ static void dm_dp_mst_hotplug(struct drm_dp_mst_topology_mgr *mgr)
+ {
+ 	struct amdgpu_connector *master = container_of(mgr, struct amdgpu_connector, mst_mgr);
+ 	struct drm_device *dev = master->base.dev;
++	struct amdgpu_device *adev = dev->dev_private;
+ 
+-	drm_kms_helper_hotplug_event(dev);
++	schedule_work(&adev->dm.mst_hotplug_work);
+ }
+ 
+ static void dm_dp_mst_register_connector(struct drm_connector *connector)
+-- 
+2.7.4
+

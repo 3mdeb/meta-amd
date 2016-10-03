@@ -1,0 +1,193 @@
+From 18510c1c4a1505f2e79edc206b997bee011913f6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 30 Mar 2016 14:42:57 +0200
+Subject: [PATCH 0464/1110] drm/amdgpu: optionally enable GART debugfs file
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Keeping the pages array around can use a lot of system memory
+when you want a large GART.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/Kconfig       | 10 +++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h      |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c | 35 +++++++++++++++++++-------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c  |  9 ++++++++
+ 4 files changed, 42 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Kconfig b/drivers/gpu/drm/amd/amdgpu/Kconfig
+index b30fcfa..7335c04 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Kconfig
++++ b/drivers/gpu/drm/amd/amdgpu/Kconfig
+@@ -15,3 +15,13 @@ config DRM_AMDGPU_USERPTR
+ 	help
+ 	  This option selects CONFIG_MMU_NOTIFIER if it isn't already
+ 	  selected to enabled full userptr support.
++
++config DRM_AMDGPU_GART_DEBUGFS
++	bool "Allow GART access through debugfs"
++	depends on DRM_AMDGPU
++	depends on DEBUG_FS
++	default n
++	help
++	  Selecting this option creates a debugfs file to inspect the mapped
++	  pages. Uses more memory for housekeeping, enable only for debugging.
++
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 35e07fb..993b574 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -612,7 +612,9 @@ struct amdgpu_gart {
+ 	unsigned			num_gpu_pages;
+ 	unsigned			num_cpu_pages;
+ 	unsigned			table_size;
++#ifdef CONFIG_DRM_AMDGPU_GART_DEBUGFS
+ 	struct page			**pages;
++#endif
+ 	bool				ready;
+ 	const struct amdgpu_gart_funcs *gart_funcs;
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
+index a13603a..921bce2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
+@@ -238,17 +238,17 @@ void amdgpu_gart_unbind(struct amdgpu_device *adev, unsigned offset,
+ 	t = offset / AMDGPU_GPU_PAGE_SIZE;
+ 	p = t / (PAGE_SIZE / AMDGPU_GPU_PAGE_SIZE);
+ 	for (i = 0; i < pages; i++, p++) {
+-		if (adev->gart.pages[p]) {
+-			adev->gart.pages[p] = NULL;
+-			page_base = adev->dummy_page.addr;
+-			if (!adev->gart.ptr)
+-				continue;
++#ifdef CONFIG_AMDGPU_GART_DEBUGFS
++		adev->gart.pages[p] = NULL;
++#endif
++		page_base = adev->dummy_page.addr;
++		if (!adev->gart.ptr)
++			continue;
+ 
+-			for (j = 0; j < (PAGE_SIZE / AMDGPU_GPU_PAGE_SIZE); j++, t++) {
+-				amdgpu_gart_set_pte_pde(adev, adev->gart.ptr,
+-							t, page_base, flags);
+-				page_base += AMDGPU_GPU_PAGE_SIZE;
+-			}
++		for (j = 0; j < (PAGE_SIZE / AMDGPU_GPU_PAGE_SIZE); j++, t++) {
++			amdgpu_gart_set_pte_pde(adev, adev->gart.ptr,
++						t, page_base, flags);
++			page_base += AMDGPU_GPU_PAGE_SIZE;
+ 		}
+ 	}
+ 	mb();
+@@ -286,7 +286,9 @@ int amdgpu_gart_bind(struct amdgpu_device *adev, unsigned offset,
+ 	p = t / (PAGE_SIZE / AMDGPU_GPU_PAGE_SIZE);
+ 
+ 	for (i = 0; i < pages; i++, p++) {
++#ifdef CONFIG_AMDGPU_GART_DEBUGFS
+ 		adev->gart.pages[p] = pagelist[i];
++#endif
+ 		if (adev->gart.ptr) {
+ 			page_base = dma_addr[i];
+ 			for (j = 0; j < (PAGE_SIZE / AMDGPU_GPU_PAGE_SIZE); j++, t++) {
+@@ -312,9 +314,9 @@ int amdgpu_gart_init(struct amdgpu_device *adev)
+ {
+ 	int r;
+ 
+-	if (adev->gart.pages) {
++	if (adev->dummy_page.page)
+ 		return 0;
+-	}
++
+ 	/* We need PAGE_SIZE >= AMDGPU_GPU_PAGE_SIZE */
+ 	if (PAGE_SIZE < AMDGPU_GPU_PAGE_SIZE) {
+ 		DRM_ERROR("Page size is smaller than GPU page size!\n");
+@@ -328,12 +330,16 @@ int amdgpu_gart_init(struct amdgpu_device *adev)
+ 	adev->gart.num_gpu_pages = adev->mc.gtt_size / AMDGPU_GPU_PAGE_SIZE;
+ 	DRM_INFO("GART: num cpu pages %u, num gpu pages %u\n",
+ 		 adev->gart.num_cpu_pages, adev->gart.num_gpu_pages);
++
++#ifdef CONFIG_AMDGPU_GART_DEBUGFS
+ 	/* Allocate pages table */
+ 	adev->gart.pages = vzalloc(sizeof(void *) * adev->gart.num_cpu_pages);
+ 	if (adev->gart.pages == NULL) {
+ 		amdgpu_gart_fini(adev);
+ 		return -ENOMEM;
+ 	}
++#endif
++
+ 	return 0;
+ }
+ 
+@@ -346,13 +352,14 @@ int amdgpu_gart_init(struct amdgpu_device *adev)
+  */
+ void amdgpu_gart_fini(struct amdgpu_device *adev)
+ {
+-	if (adev->gart.pages && adev->gart.ready) {
++	if (adev->gart.ready) {
+ 		/* unbind pages */
+ 		amdgpu_gart_unbind(adev, 0, adev->gart.num_cpu_pages);
+ 	}
+ 	adev->gart.ready = false;
++#ifdef CONFIG_AMDGPU_GART_DEBUGFS
+ 	vfree(adev->gart.pages);
+ 	adev->gart.pages = NULL;
+-
++#endif
+ 	amdgpu_dummy_page_fini(adev);
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index fbc3c2b..228ccab 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1226,6 +1226,8 @@ static const struct file_operations amdgpu_ttm_vram_fops = {
+ 	.llseek = default_llseek
+ };
+ 
++#ifdef CONFIG_DRM_AMDGPU_GART_DEBUGFS
++
+ static ssize_t amdgpu_ttm_gtt_read(struct file *f, char __user *buf,
+ 				   size_t size, loff_t *pos)
+ {
+@@ -1273,6 +1275,8 @@ static const struct file_operations amdgpu_ttm_gtt_fops = {
+ 
+ #endif
+ 
++#endif
++
+ static int amdgpu_ttm_debugfs_init(struct amdgpu_device *adev)
+ {
+ #if defined(CONFIG_DEBUG_FS)
+@@ -1288,6 +1292,7 @@ static int amdgpu_ttm_debugfs_init(struct amdgpu_device *adev)
+ 	i_size_write(ent->d_inode, adev->mc.mc_vram_size);
+ 	adev->mman.vram = ent;
+ 
++#ifdef CONFIG_DRM_AMDGPU_GART_DEBUGFS
+ 	ent = debugfs_create_file("amdgpu_gtt", S_IFREG | S_IRUGO, root,
+ 				  adev, &amdgpu_ttm_gtt_fops);
+ 	if (IS_ERR(ent))
+@@ -1295,6 +1300,7 @@ static int amdgpu_ttm_debugfs_init(struct amdgpu_device *adev)
+ 	i_size_write(ent->d_inode, adev->mc.gtt_size);
+ 	adev->mman.gtt = ent;
+ 
++#endif
+ 	count = ARRAY_SIZE(amdgpu_ttm_debugfs_list);
+ 
+ #ifdef CONFIG_SWIOTLB
+@@ -1316,7 +1322,10 @@ static void amdgpu_ttm_debugfs_fini(struct amdgpu_device *adev)
+ 	debugfs_remove(adev->mman.vram);
+ 	adev->mman.vram = NULL;
+ 
++#ifdef CONFIG_DRM_AMDGPU_GART_DEBUGFS
+ 	debugfs_remove(adev->mman.gtt);
+ 	adev->mman.gtt = NULL;
+ #endif
++
++#endif
+ }
+-- 
+2.7.4
+

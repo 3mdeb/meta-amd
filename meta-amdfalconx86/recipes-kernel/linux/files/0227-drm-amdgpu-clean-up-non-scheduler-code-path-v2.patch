@@ -1,0 +1,378 @@
+From 01607789c113795bf3b0c406c61246718290ff1d Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <David1.Zhou@amd.com>
+Date: Fri, 15 Jan 2016 11:25:00 +0800
+Subject: [PATCH 0227/1110] drm/amdgpu: clean up non-scheduler code path (v2)
+
+Non-scheduler code is longer supported.
+
+v2: agd: rebased on upstream
+
+Signed-off-by: Chunming Zhou <David1.Zhou@amd.com>
+Reviewed-by: Ken Wang  <Qingqing.Wang@amd.com>
+Reviewed-by: Monk Liu <monk.liu@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |  1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c    | 11 +------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c   | 48 ++++++++++++++-----------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c   |  4 ---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c | 39 ++++++++++++-------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c    |  4 ---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c | 44 ++++++++++++----------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c   |  4 ---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c   |  4 ---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c   |  6 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c    |  9 ++----
+ 11 files changed, 64 insertions(+), 110 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 1ab88b5..1e9452b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -82,7 +82,6 @@ extern int amdgpu_vm_size;
+ extern int amdgpu_vm_block_size;
+ extern int amdgpu_vm_fault_stop;
+ extern int amdgpu_vm_debug;
+-extern int amdgpu_enable_scheduler;
+ extern int amdgpu_sched_jobs;
+ extern int amdgpu_sched_hw_submission;
+ extern int amdgpu_enable_semaphores;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index a07a525..ddc8339 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -856,7 +856,7 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 	if (r)
+ 		goto out;
+ 
+-	if (amdgpu_enable_scheduler && parser.num_ibs) {
++	if (parser.num_ibs) {
+ 		struct amdgpu_ring * ring = parser.ibs->ring;
+ 		struct amd_sched_fence *fence;
+ 		struct amdgpu_job *job;
+@@ -901,15 +901,6 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 
+ 		trace_amdgpu_cs_ioctl(job);
+ 		amd_sched_entity_push_job(&job->base);
+-
+-	} else {
+-		struct amdgpu_fence *fence;
+-
+-		r = amdgpu_ib_schedule(adev, parser.num_ibs, parser.ibs,
+-				       parser.filp);
+-		fence = parser.ibs[parser.num_ibs - 1].fence;
+-		parser.fence = fence_get(&fence->base);
+-		cs->out.handle = parser.ibs[parser.num_ibs - 1].sequence;
+ 	}
+ 
+ out:
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index 17d1fb1..f1f4b45 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -45,29 +45,27 @@ int amdgpu_ctx_init(struct amdgpu_device *adev, enum amd_sched_priority pri,
+ 		ctx->rings[i].fences = (void *)ctx->fences + sizeof(struct fence *) *
+ 			amdgpu_sched_jobs * i;
+ 	}
+-	if (amdgpu_enable_scheduler) {
+-		/* create context entity for each ring */
+-		for (i = 0; i < adev->num_rings; i++) {
+-			struct amd_sched_rq *rq;
+-			if (pri >= AMD_SCHED_MAX_PRIORITY) {
+-				kfree(ctx->fences);
+-				return -EINVAL;
+-			}
+-			rq = &adev->rings[i]->sched.sched_rq[pri];
+-			r = amd_sched_entity_init(&adev->rings[i]->sched,
+-						  &ctx->rings[i].entity,
+-						  rq, amdgpu_sched_jobs);
+-			if (r)
+-				break;
+-		}
+-
+-		if (i < adev->num_rings) {
+-			for (j = 0; j < i; j++)
+-				amd_sched_entity_fini(&adev->rings[j]->sched,
+-						      &ctx->rings[j].entity);
++	/* create context entity for each ring */
++	for (i = 0; i < adev->num_rings; i++) {
++		struct amd_sched_rq *rq;
++		if (pri >= AMD_SCHED_MAX_PRIORITY) {
+ 			kfree(ctx->fences);
+-			return r;
++			return -EINVAL;
+ 		}
++		rq = &adev->rings[i]->sched.sched_rq[pri];
++		r = amd_sched_entity_init(&adev->rings[i]->sched,
++					  &ctx->rings[i].entity,
++					  rq, amdgpu_sched_jobs);
++		if (r)
++			break;
++	}
++
++	if (i < adev->num_rings) {
++		for (j = 0; j < i; j++)
++			amd_sched_entity_fini(&adev->rings[j]->sched,
++					      &ctx->rings[j].entity);
++		kfree(ctx->fences);
++		return r;
+ 	}
+ 	return 0;
+ }
+@@ -85,11 +83,9 @@ void amdgpu_ctx_fini(struct amdgpu_ctx *ctx)
+ 			fence_put(ctx->rings[i].fences[j]);
+ 	kfree(ctx->fences);
+ 
+-	if (amdgpu_enable_scheduler) {
+-		for (i = 0; i < adev->num_rings; i++)
+-			amd_sched_entity_fini(&adev->rings[i]->sched,
+-					      &ctx->rings[i].entity);
+-	}
++	for (i = 0; i < adev->num_rings; i++)
++		amd_sched_entity_fini(&adev->rings[i]->sched,
++				      &ctx->rings[i].entity);
+ }
+ 
+ static int amdgpu_ctx_alloc(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 78fac51..58c81a4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -78,7 +78,6 @@ int amdgpu_vm_block_size = -1;
+ int amdgpu_vm_fault_stop = 0;
+ int amdgpu_vm_debug = 0;
+ int amdgpu_exp_hw_support = 0;
+-int amdgpu_enable_scheduler = 1;
+ int amdgpu_sched_jobs = 32;
+ int amdgpu_sched_hw_submission = 2;
+ int amdgpu_powerplay = -1;
+@@ -154,9 +153,6 @@ module_param_named(vm_debug, amdgpu_vm_debug, int, 0644);
+ MODULE_PARM_DESC(exp_hw_support, "experimental hw support (1 = enable, 0 = disable (default))");
+ module_param_named(exp_hw_support, amdgpu_exp_hw_support, int, 0444);
+ 
+-MODULE_PARM_DESC(enable_scheduler, "enable SW GPU scheduler (1 = enable (default), 0 = disable)");
+-module_param_named(enable_scheduler, amdgpu_enable_scheduler, int, 0444);
+-
+ MODULE_PARM_DESC(sched_jobs, "the max number of jobs supported in the sw queue (default 32)");
+ module_param_named(sched_jobs, amdgpu_sched_jobs, int, 0444);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index 3671f9f..cac03e7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -472,6 +472,7 @@ int amdgpu_fence_driver_start_ring(struct amdgpu_ring *ring,
+ int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring)
+ {
+ 	int i, r;
++	long timeout;
+ 
+ 	ring->fence_drv.cpu_addr = NULL;
+ 	ring->fence_drv.gpu_addr = 0;
+@@ -486,26 +487,24 @@ int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring)
+ 
+ 	init_waitqueue_head(&ring->fence_drv.fence_queue);
+ 
+-	if (amdgpu_enable_scheduler) {
+-		long timeout = msecs_to_jiffies(amdgpu_lockup_timeout);
+-		if (timeout == 0) {
+-			/*
+-			 * FIXME:
+-			 * Delayed workqueue cannot use it directly,
+-			 * so the scheduler will not use delayed workqueue if
+-			 * MAX_SCHEDULE_TIMEOUT is set.
+-			 * Currently keep it simple and silly.
+-			 */
+-			timeout = MAX_SCHEDULE_TIMEOUT;
+-		}
+-		r = amd_sched_init(&ring->sched, &amdgpu_sched_ops,
+-				   amdgpu_sched_hw_submission,
+-				   timeout, ring->name);
+-		if (r) {
+-			DRM_ERROR("Failed to create scheduler on ring %s.\n",
+-				  ring->name);
+-			return r;
+-		}
++	timeout = msecs_to_jiffies(amdgpu_lockup_timeout);
++	if (timeout == 0) {
++		/*
++		 * FIXME:
++		 * Delayed workqueue cannot use it directly,
++		 * so the scheduler will not use delayed workqueue if
++		 * MAX_SCHEDULE_TIMEOUT is set.
++		 * Currently keep it simple and silly.
++		 */
++		timeout = MAX_SCHEDULE_TIMEOUT;
++	}
++	r = amd_sched_init(&ring->sched, &amdgpu_sched_ops,
++			   amdgpu_sched_hw_submission,
++			   timeout, ring->name);
++	if (r) {
++		DRM_ERROR("Failed to create scheduler on ring %s.\n",
++			  ring->name);
++		return r;
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 3b58d70..54cede3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -199,10 +199,6 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 		return r;
+ 	}
+ 
+-	if (!amdgpu_enable_scheduler && ib->ctx)
+-		ib->sequence = amdgpu_ctx_add_fence(ib->ctx, ring,
+-						    &ib->fence->base);
+-
+ 	/* wrap the last IB with fence */
+ 	if (ib->user) {
+ 		uint64_t addr = amdgpu_bo_gpu_offset(ib->user->bo);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index 438c052..dd9fac3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -76,33 +76,25 @@ int amdgpu_sched_ib_submit_kernel_helper(struct amdgpu_device *adev,
+ 					 void *owner,
+ 					 struct fence **f)
+ {
+-	int r = 0;
+-	if (amdgpu_enable_scheduler) {
+-		struct amdgpu_job *job =
+-			kzalloc(sizeof(struct amdgpu_job), GFP_KERNEL);
+-		if (!job)
+-			return -ENOMEM;
+-		job->base.sched = &ring->sched;
+-		job->base.s_entity = &adev->kernel_ctx.rings[ring->idx].entity;
+-		job->base.s_fence = amd_sched_fence_create(job->base.s_entity, owner);
+-		if (!job->base.s_fence) {
+-			kfree(job);
+-			return -ENOMEM;
+-		}
+-		*f = fence_get(&job->base.s_fence->base);
+-
+-		job->adev = adev;
+-		job->ibs = ibs;
+-		job->num_ibs = num_ibs;
+-		job->owner = owner;
+-		job->free_job = free_job;
+-		amd_sched_entity_push_job(&job->base);
+-	} else {
+-		r = amdgpu_ib_schedule(adev, num_ibs, ibs, owner);
+-		if (r)
+-			return r;
+-		*f = fence_get(&ibs[num_ibs - 1].fence->base);
++	struct amdgpu_job *job =
++		kzalloc(sizeof(struct amdgpu_job), GFP_KERNEL);
++	if (!job)
++		return -ENOMEM;
++	job->base.sched = &ring->sched;
++	job->base.s_entity = &adev->kernel_ctx.rings[ring->idx].entity;
++	job->base.s_fence = amd_sched_fence_create(job->base.s_entity, owner);
++	if (!job->base.s_fence) {
++		kfree(job);
++		return -ENOMEM;
+ 	}
++	*f = fence_get(&job->base.s_fence->base);
++
++	job->adev = adev;
++	job->ibs = ibs;
++	job->num_ibs = num_ibs;
++	job->owner = owner;
++	job->free_job = free_job;
++	amd_sched_entity_push_job(&job->base);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index e8fe0b7..f08d53f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1070,10 +1070,6 @@ int amdgpu_copy_buffer(struct amdgpu_ring *ring,
+ 	if (r)
+ 		goto error_free;
+ 
+-	if (!amdgpu_enable_scheduler) {
+-		amdgpu_ib_free(adev, ib);
+-		kfree(ib);
+-	}
+ 	return 0;
+ error_free:
+ 	amdgpu_ib_free(adev, ib);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+index 3b35ad8..b4e902c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+@@ -900,11 +900,7 @@ static int amdgpu_uvd_send_msg(struct amdgpu_ring *ring,
+ 		*fence = fence_get(f);
+ 	amdgpu_bo_unref(&bo);
+ 	fence_put(f);
+-	if (amdgpu_enable_scheduler)
+-		return 0;
+ 
+-	amdgpu_ib_free(ring->adev, ib);
+-	kfree(ib);
+ 	return 0;
+ err2:
+ 	amdgpu_ib_free(ring->adev, ib);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+index 9c3e271..d83efc7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+@@ -433,8 +433,7 @@ int amdgpu_vce_get_create_msg(struct amdgpu_ring *ring, uint32_t handle,
+ 	if (fence)
+ 		*fence = fence_get(f);
+ 	fence_put(f);
+-	if (amdgpu_enable_scheduler)
+-		return 0;
++	return 0;
+ err:
+ 	amdgpu_ib_free(adev, ib);
+ 	kfree(ib);
+@@ -500,8 +499,7 @@ int amdgpu_vce_get_destroy_msg(struct amdgpu_ring *ring, uint32_t handle,
+ 	if (fence)
+ 		*fence = fence_get(f);
+ 	fence_put(f);
+-	if (amdgpu_enable_scheduler)
+-		return 0;
++	return 0;
+ err:
+ 	amdgpu_ib_free(adev, ib);
+ 	kfree(ib);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 8c729b1..870379a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -408,8 +408,7 @@ static int amdgpu_vm_clear_bo(struct amdgpu_device *adev,
+ 	if (!r)
+ 		amdgpu_bo_fence(bo, fence, true);
+ 	fence_put(fence);
+-	if (amdgpu_enable_scheduler)
+-		return 0;
++	return 0;
+ 
+ error_free:
+ 	amdgpu_ib_free(adev, ib);
+@@ -543,7 +542,7 @@ int amdgpu_vm_update_page_directory(struct amdgpu_device *adev,
+ 		fence_put(fence);
+ 	}
+ 
+-	if (!amdgpu_enable_scheduler || ib->length_dw == 0) {
++	if (ib->length_dw == 0) {
+ 		amdgpu_ib_free(adev, ib);
+ 		kfree(ib);
+ 	}
+@@ -826,10 +825,6 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 		*fence = fence_get(f);
+ 	}
+ 	fence_put(f);
+-	if (!amdgpu_enable_scheduler) {
+-		amdgpu_ib_free(adev, ib);
+-		kfree(ib);
+-	}
+ 	return 0;
+ 
+ error_free:
+-- 
+2.7.4
+

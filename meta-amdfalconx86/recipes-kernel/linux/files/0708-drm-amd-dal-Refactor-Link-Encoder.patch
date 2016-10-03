@@ -1,0 +1,1169 @@
+From b29a44047266c022dac059e93bf902cb078704ea Mon Sep 17 00:00:00 2001
+From: Chris Park <Chris.Park@amd.com>
+Date: Tue, 12 Jan 2016 16:53:50 -0500
+Subject: [PATCH 0708/1110] drm/amd/dal: Refactor Link Encoder
+
+DCE8, 11, etc. refactored with duplicate reduction.
+
+Signed-off-by: Chris Park <Chris.Park@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |   2 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          |  89 +++++-
+ drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c     |  31 ++-
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |  63 ++---
+ .../drm/amd/dal/dc/dce110/dce110_link_encoder.c    | 306 ++++++++-------------
+ .../drm/amd/dal/dc/dce110/dce110_link_encoder.h    |  24 +-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    |  45 ++-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.h    |   5 +
+ .../drm/amd/dal/dc/dce110/dce110_stream_encoder.h  |   5 +-
+ .../amd/dal/dc/dce110/dce110_timing_generator.h    |   7 +-
+ drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h      |  37 ---
+ drivers/gpu/drm/amd/dal/dc/inc/link_encoder.h      |  40 +++
+ drivers/gpu/drm/amd/dal/include/encoder_types.h    |   1 +
+ 13 files changed, 348 insertions(+), 307 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 14a1171..e49ec86 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -175,7 +175,7 @@ static void init_hw(struct dc *dc)
+ 		 * default signal on connector). */
+ 		struct core_link *link = dc->links[i];
+ 		if (link->public.connector_signal != SIGNAL_TYPE_VIRTUAL)
+-			dc->hwss.encoder_hw_init(link->link_enc);
++			link->link_enc->funcs->hw_init(link->link_enc);
+ 	}
+ 
+ 	for(i = 0; i < dc->res_pool.controller_count; i++) {
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 3c96810..3f6a7bb 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -817,6 +817,71 @@ static enum channel_id get_ddc_line(struct core_link *link, struct adapter_servi
+ 	return channel;
+ }
+ 
++static enum transmitter translate_encoder_to_transmitter(
++	struct graphics_object_id encoder)
++{
++	switch (encoder.id) {
++	case ENCODER_ID_INTERNAL_UNIPHY:
++		switch (encoder.enum_id) {
++		case ENUM_ID_1:
++			return TRANSMITTER_UNIPHY_A;
++		case ENUM_ID_2:
++			return TRANSMITTER_UNIPHY_B;
++		default:
++			return TRANSMITTER_UNKNOWN;
++		}
++	break;
++	case ENCODER_ID_INTERNAL_UNIPHY1:
++		switch (encoder.enum_id) {
++		case ENUM_ID_1:
++			return TRANSMITTER_UNIPHY_C;
++		case ENUM_ID_2:
++			return TRANSMITTER_UNIPHY_D;
++		default:
++			return TRANSMITTER_UNKNOWN;
++		}
++	break;
++	case ENCODER_ID_INTERNAL_UNIPHY2:
++		switch (encoder.enum_id) {
++		case ENUM_ID_1:
++			return TRANSMITTER_UNIPHY_E;
++		case ENUM_ID_2:
++			return TRANSMITTER_UNIPHY_F;
++		default:
++			return TRANSMITTER_UNKNOWN;
++		}
++	break;
++	case ENCODER_ID_INTERNAL_UNIPHY3:
++		switch (encoder.enum_id) {
++		case ENUM_ID_1:
++			return TRANSMITTER_UNIPHY_G;
++		default:
++			return TRANSMITTER_UNKNOWN;
++		}
++	break;
++	case ENCODER_ID_EXTERNAL_NUTMEG:
++		switch (encoder.enum_id) {
++		case ENUM_ID_1:
++			return TRANSMITTER_NUTMEG_CRT;
++		default:
++			return TRANSMITTER_UNKNOWN;
++		}
++	break;
++	case ENCODER_ID_EXTERNAL_TRAVIS:
++		switch (encoder.enum_id) {
++		case ENUM_ID_1:
++			return TRANSMITTER_TRAVIS_CRT;
++		case ENUM_ID_2:
++			return TRANSMITTER_TRAVIS_LCD;
++		default:
++			return TRANSMITTER_UNKNOWN;
++		}
++	break;
++	default:
++		return TRANSMITTER_UNKNOWN;
++	}
++}
++
+ 
+ static bool construct(
+ 	struct core_link *link,
+@@ -921,6 +986,8 @@ static bool construct(
+ 	enc_init_data.connector = link->link_id;
+ 	enc_init_data.channel = get_ddc_line(link, as);
+ 	enc_init_data.hpd_source = get_hpd_line(link, as);
++	enc_init_data.transmitter =
++			translate_encoder_to_transmitter(enc_init_data.encoder);
+ 	link->link_enc = dc_ctx->dc->hwss.encoder_create(&enc_init_data);
+ 
+ 	if( link->link_enc == NULL) {
+@@ -1146,8 +1213,8 @@ static void enable_link_hdmi(struct core_stream *stream)
+ 	dc_service_memset(&stream->sink->link->cur_link_settings, 0,
+ 			sizeof(struct link_settings));
+ 
+-	link->ctx->dc->hwss.encoder_enable_tmds_output(
+-			stream->sink->link->link_enc,
++	link->link_enc->funcs->enable_tmds_output(
++			link->link_enc,
+ 			dal_clock_source_get_id(stream->clock_source),
+ 			stream->public.timing.display_color_depth,
+ 			stream->signal == SIGNAL_TYPE_HDMI_TYPE_A,
+@@ -1198,8 +1265,6 @@ static enum dc_status enable_link(struct core_stream *stream)
+ 
+ static void disable_link(struct core_stream *stream)
+ {
+-	struct dc *dc = stream->ctx->dc;
+-
+ 	/* TODO  dp_set_hw_test_pattern */
+ 
+ 	/* here we need to specify that encoder output settings
+@@ -1217,8 +1282,10 @@ static void disable_link(struct core_stream *stream)
+ 					stream->sink->link, stream);
+ 		}
+ 	} else {
+-		dc->hwss.encoder_disable_output(
+-				stream->sink->link->link_enc, stream->signal);
++		struct link_encoder *encoder =
++				stream->sink->link->link_enc;
++
++		encoder->funcs->disable_output(encoder, stream->signal);
+ 	}
+ }
+ 
+@@ -1249,14 +1316,14 @@ enum dc_status dc_link_validate_mode_timing(
+ 
+ bool dc_link_set_backlight_level(const struct dc_link *public, uint32_t level)
+ {
+-	struct core_link *protected = DC_LINK_TO_CORE(public);
+-	struct dc_context *ctx = protected->ctx;
++	struct core_link *link = DC_LINK_TO_CORE(public);
++	struct dc_context *ctx = link->ctx;
+ 
+ 	dal_logger_write(ctx->logger, LOG_MAJOR_BACKLIGHT,
+ 			LOG_MINOR_BACKLIGHT_INTERFACE,
+ 			"New Backlight level: %d (0x%X)\n", level, level);
+ 
+-	ctx->dc->hwss.encoder_set_lcd_backlight_level(protected->link_enc, level);
++	link->link_enc->funcs->set_lcd_backlight_level(link->link_enc, level);
+ 
+ 	return true;
+ }
+@@ -1383,7 +1450,7 @@ static enum dc_status allocate_mst_payload(struct core_stream *stream)
+ 		return DC_OK;
+ 
+ 	/* program DP source TX for payload */
+-	dc->hwss.update_mst_stream_allocation_table(
++	link_encoder->funcs->update_mst_stream_allocation_table(
+ 		link_encoder,
+ 		&proposed_table);
+ 
+@@ -1468,7 +1535,7 @@ static enum dc_status deallocate_mst_payload(struct core_stream *stream)
+ 		proposed_table.stream_allocations[i].slot_count);
+ 	}
+ 
+-	dc->hwss.update_mst_stream_allocation_table(
++	link_encoder->funcs->update_mst_stream_allocation_table(
+ 		link_encoder,
+ 		&proposed_table);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
+index e9ae9e1..8f1b869 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
+@@ -56,16 +56,24 @@ void dp_enable_link_phy(
+ 	enum signal_type signal,
+ 	const struct link_settings *link_settings)
+ {
+-	if (dc_is_dp_sst_signal(signal))
+-		link->dc->hwss.encoder_enable_dp_output(
+-						link->link_enc,
++	struct link_encoder *link_enc = link->link_enc;
++
++	if (dc_is_dp_sst_signal(signal)) {
++		if (signal == SIGNAL_TYPE_EDP) {
++			link_enc->funcs->power_control(link_enc, true);
++			link_enc->funcs->backlight_control(link_enc, true);
++		}
++
++		link_enc->funcs->enable_dp_output(
++						link_enc,
+ 						link_settings,
+ 						CLOCK_SOURCE_ID_EXTERNAL);
+-	else
+-		link->dc->hwss.encoder_enable_dp_mst_output(
+-						link->link_enc,
++	} else {
++		link_enc->funcs->enable_dp_mst_output(
++						link_enc,
+ 						link_settings,
+ 						CLOCK_SOURCE_ID_EXTERNAL);
++	}
+ 
+ 	dp_receiver_power_ctrl(link, true);
+ }
+@@ -75,7 +83,10 @@ void dp_disable_link_phy(struct core_link *link, enum signal_type signal)
+ 	if (!link->wa_flags.dp_keep_receiver_powered)
+ 		dp_receiver_power_ctrl(link, false);
+ 
+-	link->dc->hwss.encoder_disable_output(link->link_enc, signal);
++	if (signal == SIGNAL_TYPE_EDP)
++		link->link_enc->funcs->backlight_control(link->link_enc, false);
++
++	link->link_enc->funcs->disable_output(link->link_enc, signal);
+ 
+ 	/* Clear current link setting.*/
+ 	dc_service_memset(&link->cur_link_settings, 0,
+@@ -118,7 +129,7 @@ bool dp_set_hw_training_pattern(
+ 	pattern_param.custom_pattern_size = 0;
+ 	pattern_param.dp_panel_mode = dp_get_panel_mode(link);
+ 
+-	link->ctx->dc->hwss.encoder_set_dp_phy_pattern(encoder, &pattern_param);
++	encoder->funcs->dp_set_phy_pattern(encoder, &pattern_param);
+ 
+ 	return true;
+ }
+@@ -131,7 +142,7 @@ void dp_set_hw_lane_settings(
+ 	struct link_encoder *encoder = link->link_enc;
+ 
+ 	/* call Encoder to set lane settings */
+-	link->ctx->dc->hwss.encoder_dp_set_lane_settings(encoder, link_settings);
++	encoder->funcs->dp_set_lane_settings(encoder, link_settings);
+ }
+ 
+ enum dp_panel_mode dp_get_panel_mode(struct core_link *link)
+@@ -186,5 +197,5 @@ void dp_set_hw_test_pattern(
+ 	pattern_param.custom_pattern_size = 0;
+ 	pattern_param.dp_panel_mode = dp_get_panel_mode(link);
+ 
+-	link->ctx->dc->hwss.encoder_set_dp_phy_pattern(encoder, &pattern_param);
++	encoder->funcs->dp_set_phy_pattern(encoder, &pattern_param);
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 59a3bce..8afd42e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -46,10 +46,10 @@
+ #include "dce/dce_11_0_sh_mask.h"
+ 
+ struct dce110_hw_seq_reg_offsets {
+-	uint32_t dcfe_offset;
+-	uint32_t blnd_offset;
+-	uint32_t crtc_offset;
+-	uint32_t dcp_offset;
++	uint32_t dcfe;
++	uint32_t blnd;
++	uint32_t crtc;
++	uint32_t dcp;
+ };
+ 
+ enum crtc_stereo_mixer_mode {
+@@ -99,36 +99,36 @@ enum {
+ 
+ static const struct dce110_hw_seq_reg_offsets reg_offsets[] = {
+ {
+-	.dcfe_offset = (mmDCFE0_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+-	.blnd_offset = (mmBLND0_BLND_CONTROL - mmBLND0_BLND_CONTROL),
+-	.crtc_offset = (mmCRTC0_CRTC_GSL_CONTROL - mmCRTC0_CRTC_GSL_CONTROL),
+-	.dcp_offset = (mmDCP0_DVMM_PTE_CONTROL - mmDCP0_DVMM_PTE_CONTROL),
++	.dcfe = (mmDCFE0_DCFE_MEM_PWR_CTRL - mmDCFE_MEM_PWR_CTRL),
++	.blnd = (mmBLND0_BLND_CONTROL - mmBLND_CONTROL),
++	.crtc = (mmCRTC0_CRTC_GSL_CONTROL - mmCRTC_GSL_CONTROL),
++	.dcp = (mmDCP0_DVMM_PTE_CONTROL - mmDVMM_PTE_CONTROL),
+ },
+ {
+-	.dcfe_offset = (mmDCFE1_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+-	.blnd_offset = (mmBLND1_BLND_CONTROL - mmBLND0_BLND_CONTROL),
+-	.crtc_offset = (mmCRTC1_CRTC_GSL_CONTROL - mmCRTC0_CRTC_GSL_CONTROL),
+-	.dcp_offset = (mmDCP1_DVMM_PTE_CONTROL - mmDCP0_DVMM_PTE_CONTROL),
++	.dcfe = (mmDCFE1_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
++	.blnd = (mmBLND1_BLND_CONTROL - mmBLND0_BLND_CONTROL),
++	.crtc = (mmCRTC1_CRTC_GSL_CONTROL - mmCRTC0_CRTC_GSL_CONTROL),
++	.dcp = (mmDCP1_DVMM_PTE_CONTROL - mmDCP0_DVMM_PTE_CONTROL),
+ },
+ {
+-	.dcfe_offset = (mmDCFE2_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+-	.blnd_offset = (mmBLND2_BLND_CONTROL - mmBLND0_BLND_CONTROL),
+-	.crtc_offset = (mmCRTC2_CRTC_GSL_CONTROL - mmCRTC0_CRTC_GSL_CONTROL),
+-	.dcp_offset = (mmDCP2_DVMM_PTE_CONTROL - mmDCP0_DVMM_PTE_CONTROL),
++	.dcfe = (mmDCFE2_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
++	.blnd = (mmBLND2_BLND_CONTROL - mmBLND0_BLND_CONTROL),
++	.crtc = (mmCRTC2_CRTC_GSL_CONTROL - mmCRTC0_CRTC_GSL_CONTROL),
++	.dcp = (mmDCP2_DVMM_PTE_CONTROL - mmDCP0_DVMM_PTE_CONTROL),
+ }
+ };
+ 
+ #define HW_REG_DCFE(reg, id)\
+-	(reg + reg_offsets[id].dcfe_offset)
++	(reg + reg_offsets[id].dcfe)
+ 
+ #define HW_REG_BLND(reg, id)\
+-	(reg + reg_offsets[id].blnd_offset)
++	(reg + reg_offsets[id].blnd)
+ 
+ #define HW_REG_CRTC(reg, id)\
+-	(reg + reg_offsets[id].crtc_offset)
++	(reg + reg_offsets[id].crtc)
+ 
+ #define HW_REG_DCP(reg, id)\
+-	(reg + reg_offsets[id].dcp_offset)
++	(reg + reg_offsets[id].dcp)
+ 
+ 
+ static void init_pte(struct dc_context *ctx);
+@@ -689,7 +689,7 @@ static void enable_stream(struct core_stream *stream)
+ 	 * connect DIG back_end to front_end while enable_stream and
+ 	 * disconnect them during disable_stream
+ 	 * BY this, it is logic clean to separate stream and link */
+-	dce110_link_encoder_connect_dig_be_to_fe(link->link_enc,
++	 link->link_enc->funcs->connect_dig_be_to_fe(link->link_enc,
+ 			stream->stream_enc->id, true);
+ 
+ }
+@@ -722,7 +722,7 @@ static void disable_stream(struct core_stream *stream)
+ 	if (dc_is_dp_signal(stream->signal))
+ 		stream->stream_enc->funcs->dp_blank(stream->stream_enc);
+ 
+-	dce110_link_encoder_connect_dig_be_to_fe(
++	link->link_enc->funcs->connect_dig_be_to_fe(
+ 			link->link_enc,
+ 			stream->stream_enc->id,
+ 			false);
+@@ -854,7 +854,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 	program_fmt(opp, &stream->fmt_bit_depth, &stream->clamping);
+ 
+ 	if (stream->signal != SIGNAL_TYPE_VIRTUAL)
+-		dce110_link_encoder_setup(
++		stream->sink->link->link_enc->funcs->setup(
+ 			stream->sink->link->link_enc,
+ 			stream->signal);
+ 
+@@ -921,7 +921,7 @@ static void power_down_encoders(struct dc *dc)
+ 
+ 	for (i = 0; i < dc->link_count; i++) {
+ 		if (dc->links[i]->public.connector_signal != SIGNAL_TYPE_VIRTUAL)
+-			dce110_link_encoder_disable_output(
++			dc->links[i]->link_enc->funcs->disable_output(
+ 				dc->links[i]->link_enc, SIGNAL_TYPE_NONE);
+ 	}
+ }
+@@ -1758,28 +1758,19 @@ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.disable_vga = disable_vga,
+ 	.encoder_create = dce110_link_encoder_create,
+ 	.encoder_destroy = dce110_link_encoder_destroy,
+-	.encoder_hw_init = dce110_link_encoder_hw_init,
+-	.encoder_enable_tmds_output = dce110_link_encoder_enable_tmds_output,
+-	.encoder_enable_dp_output = dce110_link_encoder_enable_dp_output,
+-	.encoder_enable_dp_mst_output =
+-			dce110_link_encoder_enable_dp_mst_output,
+-	.encoder_disable_output = dce110_link_encoder_disable_output,
+-	.encoder_set_dp_phy_pattern = dce110_link_encoder_set_dp_phy_pattern,
+-	.encoder_dp_set_lane_settings = dce110_link_encoder_dp_set_lane_settings,
+-	.encoder_set_lcd_backlight_level = dce110_link_encoder_set_lcd_backlight_level,
+ 	.clock_gating_power_up = dal_dc_clock_gating_dce110_power_up,
+ 	.transform_power_up = dce110_transform_power_up,
+ 	.construct_resource_pool = dce110_construct_resource_pool,
+ 	.destruct_resource_pool = dce110_destruct_resource_pool,
+ 	.validate_with_context = dce110_validate_with_context,
+ 	.validate_bandwidth = dce110_validate_bandwidth,
+-	.enable_display_pipe_clock_gating = dce110_enable_display_pipe_clock_gating,
++	.enable_display_pipe_clock_gating =
++		dce110_enable_display_pipe_clock_gating,
+ 	.enable_display_power_gating = dce110_enable_display_power_gating,
+ 	.program_bw = dce110_program_bw,
+ 	.enable_stream = enable_stream,
+ 	.disable_stream = disable_stream,
+-	.update_mst_stream_allocation_table = dce110_link_encoder_update_mst_stream_allocation_table,
+-	.set_mst_bandwidth = set_mst_bandwidth
++	.set_mst_bandwidth = set_mst_bandwidth,
+ };
+ 
+ bool dce110_hw_sequencer_construct(struct dc *dc)
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
+index 0f0ecfe..3eaced4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
+@@ -51,6 +51,9 @@
+ #define DCE110_DIG_FE_SOURCE_SELECT_DIGA 0x1
+ #define DCE110_DIG_FE_SOURCE_SELECT_DIGB 0x2
+ #define DCE110_DIG_FE_SOURCE_SELECT_DIGC 0x4
++#define DCE110_DIG_FE_SOURCE_SELECT_DIGD 0x08
++#define DCE110_DIG_FE_SOURCE_SELECT_DIGE 0x10
++#define DCE110_DIG_FE_SOURCE_SELECT_DIGF 0x20
+ 
+ /* all values are in milliseconds */
+ /* For eDP, after power-up/power/down,
+@@ -85,91 +88,30 @@ enum {
+ 
+ 
+ #define DIG_REG(reg)\
+-	(reg + enc110->offsets.dig_offset)
++	(reg + enc110->offsets.dig)
+ 
+ #define DP_REG(reg)\
+-	(reg + enc110->offsets.dp_offset)
+-
+-static const struct dce110_link_enc_offsets reg_offsets[] = {
+-{
+-	.dig_offset = (mmDIG0_DIG_FE_CNTL - mmDIG0_DIG_FE_CNTL),
+-	.dp_offset = (mmDP0_DP_SEC_CNTL - mmDP0_DP_SEC_CNTL)
+-},
+-{
+-	.dig_offset = (mmDIG1_DIG_FE_CNTL - mmDIG0_DIG_FE_CNTL),
+-	.dp_offset = (mmDP1_DP_SEC_CNTL - mmDP0_DP_SEC_CNTL)
+-},
+-{
+-	.dig_offset = (mmDIG2_DIG_FE_CNTL - mmDIG0_DIG_FE_CNTL),
+-	.dp_offset = (mmDP2_DP_SEC_CNTL - mmDP0_DP_SEC_CNTL)
+-}
++	(reg + enc110->offsets.dp)
++
++static struct link_encoder_funcs dce110_lnk_enc_funcs = {
++	.validate_output_with_stream =
++		dce110_link_encoder_validate_output_with_stream,
++	.hw_init = dce110_link_encoder_hw_init,
++	.setup = dce110_link_encoder_setup,
++	.enable_tmds_output = dce110_link_encoder_enable_tmds_output,
++	.enable_dp_output = dce110_link_encoder_enable_dp_output,
++	.enable_dp_mst_output = dce110_link_encoder_enable_dp_mst_output,
++	.disable_output = dce110_link_encoder_disable_output,
++	.dp_set_lane_settings = dce110_link_encoder_dp_set_lane_settings,
++	.dp_set_phy_pattern = dce110_link_encoder_dp_set_phy_pattern,
++	.update_mst_stream_allocation_table =
++		dce110_link_encoder_update_mst_stream_allocation_table,
++	.set_lcd_backlight_level = dce110_link_encoder_set_lcd_backlight_level,
++	.backlight_control = dce110_link_encoder_edp_backlight_control,
++	.power_control = dce110_link_encoder_edp_power_control,
++	.connect_dig_be_to_fe = dce110_link_encoder_connect_dig_be_to_fe
+ };
+ 
+-static enum transmitter translate_encoder_to_transmitter(
+-	struct graphics_object_id encoder)
+-{
+-	switch (encoder.id) {
+-	case ENCODER_ID_INTERNAL_UNIPHY:
+-		switch (encoder.enum_id) {
+-		case ENUM_ID_1:
+-			return TRANSMITTER_UNIPHY_A;
+-		case ENUM_ID_2:
+-			return TRANSMITTER_UNIPHY_B;
+-		default:
+-			return TRANSMITTER_UNKNOWN;
+-		}
+-	break;
+-	case ENCODER_ID_INTERNAL_UNIPHY1:
+-		switch (encoder.enum_id) {
+-		case ENUM_ID_1:
+-			return TRANSMITTER_UNIPHY_C;
+-		case ENUM_ID_2:
+-			return TRANSMITTER_UNIPHY_D;
+-		default:
+-			return TRANSMITTER_UNKNOWN;
+-		}
+-	break;
+-	case ENCODER_ID_INTERNAL_UNIPHY2:
+-		switch (encoder.enum_id) {
+-		case ENUM_ID_1:
+-			return TRANSMITTER_UNIPHY_E;
+-		case ENUM_ID_2:
+-			return TRANSMITTER_UNIPHY_F;
+-		default:
+-			return TRANSMITTER_UNKNOWN;
+-		}
+-	break;
+-	case ENCODER_ID_INTERNAL_UNIPHY3:
+-		switch (encoder.enum_id) {
+-		case ENUM_ID_1:
+-			return TRANSMITTER_UNIPHY_G;
+-		default:
+-			return TRANSMITTER_UNKNOWN;
+-		}
+-	break;
+-	case ENCODER_ID_EXTERNAL_NUTMEG:
+-		switch (encoder.enum_id) {
+-		case ENUM_ID_1:
+-			return TRANSMITTER_NUTMEG_CRT;
+-		default:
+-			return TRANSMITTER_UNKNOWN;
+-		}
+-	break;
+-	case ENCODER_ID_EXTERNAL_TRAVIS:
+-		switch (encoder.enum_id) {
+-		case ENUM_ID_1:
+-			return TRANSMITTER_TRAVIS_CRT;
+-		case ENUM_ID_2:
+-			return TRANSMITTER_TRAVIS_LCD;
+-		default:
+-			return TRANSMITTER_UNKNOWN;
+-		}
+-	break;
+-	default:
+-		return TRANSMITTER_UNKNOWN;
+-	}
+-}
+-
+ static enum bp_result link_transmitter_control(
+ 	struct dce110_link_encoder *enc110,
+ 	struct bp_transmitter_control *cntl)
+@@ -503,7 +445,7 @@ static void set_dp_phy_pattern_hbr2_compliance(
+ 
+ 	/* Setup DIG encoder in DP SST mode */
+ 
+-	dce110_link_encoder_setup(&enc110->base, SIGNAL_TYPE_DISPLAY_PORT);
++	enc110->base.funcs->setup(&enc110->base, SIGNAL_TYPE_DISPLAY_PORT);
+ 
+ 	/* program correct panel mode*/
+ 	{
+@@ -611,6 +553,12 @@ static uint8_t get_frontend_source(
+ 		return DCE110_DIG_FE_SOURCE_SELECT_DIGB;
+ 	case ENGINE_ID_DIGC:
+ 		return DCE110_DIG_FE_SOURCE_SELECT_DIGC;
++	case ENGINE_ID_DIGD:
++		return DCE110_DIG_FE_SOURCE_SELECT_DIGD;
++	case ENGINE_ID_DIGE:
++		return DCE110_DIG_FE_SOURCE_SELECT_DIGE;
++	case ENGINE_ID_DIGF:
++		return DCE110_DIG_FE_SOURCE_SELECT_DIGF;
+ 	default:
+ 		ASSERT_CRITICAL(false);
+ 		return DCE110_DIG_FE_SOURCE_SELECT_INVALID;
+@@ -651,63 +599,6 @@ static bool is_panel_powered_on(struct dce110_link_encoder *enc110)
+ 
+ /*
+  * @brief
+- * eDP only. Control the power of the eDP panel.
+- */
+-static void link_encoder_edp_power_control(
+-	struct dce110_link_encoder *enc110,
+-	bool power_up)
+-{
+-	struct dc_context *ctx = enc110->base.ctx;
+-	struct bp_transmitter_control cntl = { 0 };
+-	enum bp_result bp_result;
+-
+-	if (dal_graphics_object_id_get_connector_id(enc110->base.connector) !=
+-		CONNECTOR_ID_EDP) {
+-		BREAK_TO_DEBUGGER();
+-		return;
+-	}
+-
+-	if ((power_up && !is_panel_powered_on(enc110)) ||
+-		(!power_up && is_panel_powered_on(enc110))) {
+-
+-		/* Send VBIOS command to prompt eDP panel power */
+-
+-		dal_logger_write(ctx->logger,
+-				LOG_MAJOR_HW_TRACE,
+-				LOG_MINOR_HW_TRACE_RESUME_S3,
+-				"%s: Panel Power action: %s\n",
+-				__func__, (power_up ? "On":"Off"));
+-
+-		cntl.action = power_up ?
+-			TRANSMITTER_CONTROL_POWER_ON :
+-			TRANSMITTER_CONTROL_POWER_OFF;
+-		cntl.transmitter = enc110->base.transmitter;
+-		cntl.connector_obj_id = enc110->base.connector;
+-		cntl.coherent = false;
+-		cntl.lanes_number = LANE_COUNT_FOUR;
+-		cntl.hpd_sel = enc110->base.hpd_source;
+-
+-		bp_result = link_transmitter_control(enc110, &cntl);
+-
+-		if (BP_RESULT_OK != bp_result) {
+-
+-			dal_logger_write(ctx->logger,
+-					LOG_MAJOR_ERROR,
+-					LOG_MINOR_HW_TRACE_RESUME_S3,
+-					"%s: Panel Power bp_result: %d\n",
+-					__func__, bp_result);
+-		}
+-	} else {
+-		dal_logger_write(ctx->logger,
+-				LOG_MAJOR_HW_TRACE,
+-				LOG_MINOR_HW_TRACE_RESUME_S3,
+-				"%s: Skipping Panel Power action: %s\n",
+-				__func__, (power_up ? "On":"Off"));
+-	}
+-}
+-
+-/*
+- * @brief
+  * eDP only.
+  */
+ static void link_encoder_edp_wait_for_hpd_ready(
+@@ -778,6 +669,66 @@ static void link_encoder_edp_wait_for_hpd_ready(
+ 	}
+ }
+ 
++/*
++ * @brief
++ * eDP only. Control the power of the eDP panel.
++ */
++void dce110_link_encoder_edp_power_control(
++	struct link_encoder *enc,
++	bool power_up)
++{
++	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
++	struct dc_context *ctx = enc110->base.ctx;
++	struct bp_transmitter_control cntl = { 0 };
++	enum bp_result bp_result;
++
++	if (dal_graphics_object_id_get_connector_id(enc110->base.connector) !=
++		CONNECTOR_ID_EDP) {
++		BREAK_TO_DEBUGGER();
++		return;
++	}
++
++	if ((power_up && !is_panel_powered_on(enc110)) ||
++		(!power_up && is_panel_powered_on(enc110))) {
++
++		/* Send VBIOS command to prompt eDP panel power */
++
++		dal_logger_write(ctx->logger,
++				LOG_MAJOR_HW_TRACE,
++				LOG_MINOR_HW_TRACE_RESUME_S3,
++				"%s: Panel Power action: %s\n",
++				__func__, (power_up ? "On":"Off"));
++
++		cntl.action = power_up ?
++			TRANSMITTER_CONTROL_POWER_ON :
++			TRANSMITTER_CONTROL_POWER_OFF;
++		cntl.transmitter = enc110->base.transmitter;
++		cntl.connector_obj_id = enc110->base.connector;
++		cntl.coherent = false;
++		cntl.lanes_number = LANE_COUNT_FOUR;
++		cntl.hpd_sel = enc110->base.hpd_source;
++
++		bp_result = link_transmitter_control(enc110, &cntl);
++
++		if (BP_RESULT_OK != bp_result) {
++
++			dal_logger_write(ctx->logger,
++					LOG_MAJOR_ERROR,
++					LOG_MINOR_HW_TRACE_RESUME_S3,
++					"%s: Panel Power bp_result: %d\n",
++					__func__, bp_result);
++		}
++	} else {
++		dal_logger_write(ctx->logger,
++				LOG_MAJOR_HW_TRACE,
++				LOG_MINOR_HW_TRACE_RESUME_S3,
++				"%s: Skipping Panel Power action: %s\n",
++				__func__, (power_up ? "On":"Off"));
++	}
++
++	link_encoder_edp_wait_for_hpd_ready(enc110, true);
++}
++
+ static void aux_initialize(
+ 	struct dce110_link_encoder *enc110)
+ {
+@@ -819,10 +770,11 @@ static bool is_panel_backlight_on(struct dce110_link_encoder *enc110)
+  * @brief
+  * eDP only. Control the backlight of the eDP panel
+  */
+-static void link_encoder_edp_backlight_control(
+-	struct dce110_link_encoder *enc110,
++void dce110_link_encoder_edp_backlight_control(
++	struct link_encoder *enc,
+ 	bool enable)
+ {
++	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+ 	struct dc_context *ctx = enc110->base.ctx;
+ 	struct bp_transmitter_control cntl = { 0 };
+ 
+@@ -987,10 +939,14 @@ static bool validate_hdmi_output(
+ 	uint32_t max_hdmi_pixel_clock)
+ {
+ 	enum dc_color_depth max_deep_color = max_hdmi_deep_color;
+-
+ 	/* expressed in KHz */
+ 	uint32_t pixel_clock = 0;
+ 
++	/*TODO: unhardcode*/
++	max_tmds_clk_from_edid_in_mhz = 0;
++	max_hdmi_deep_color = COLOR_DEPTH_121212;
++	max_hdmi_pixel_clock = 600000;
++
+ 	if (max_deep_color > enc110->base.features.max_deep_color)
+ 		max_deep_color = enc110->base.features.max_deep_color;
+ 
+@@ -1101,12 +1057,14 @@ static bool validate_wireless_output(
+ 	return false;
+ }
+ 
+-static bool construct(
++bool dce110_link_encoder_construct(
+ 	struct dce110_link_encoder *enc110,
+-	const struct encoder_init_data *init_data)
++	const struct encoder_init_data *init_data,
++	const struct dce110_link_enc_offsets *offsets)
+ {
+ 	struct graphics_object_encoder_cap_info enc_cap_info = {0};
+ 
++	enc110->base.funcs = &dce110_lnk_enc_funcs;
+ 	enc110->base.ctx = init_data->ctx;
+ 	enc110->base.id = init_data->encoder;
+ 
+@@ -1120,8 +1078,7 @@ static bool construct(
+ 
+ 	enc110->base.features.flags.raw = 0;
+ 
+-	enc110->base.transmitter = translate_encoder_to_transmitter(
+-		init_data->encoder);
++	enc110->base.transmitter = init_data->transmitter;
+ 
+ 	enc110->base.features.flags.bits.IS_AUDIO_CAPABLE = true;
+ 
+@@ -1157,6 +1114,8 @@ static bool construct(
+ 	 * This will let DCE 8.1 share DCE 8.0 as much as possible
+ 	 */
+ 
++	enc110->offsets = *offsets;
++
+ 	switch (enc110->base.transmitter) {
+ 	case TRANSMITTER_UNIPHY_A:
+ 		enc110->base.preferred_engine = ENGINE_ID_DIGA;
+@@ -1172,8 +1131,6 @@ static bool construct(
+ 		enc110->base.preferred_engine = ENGINE_ID_UNKNOWN;
+ 	}
+ 
+-	enc110->offsets = reg_offsets[enc110->base.transmitter];
+-
+ 	dal_logger_write(init_data->ctx->logger,
+ 			LOG_MAJOR_I2C_AUX,
+ 			LOG_MINOR_I2C_AUX_CFG,
+@@ -1224,32 +1181,9 @@ static bool construct(
+ 	return true;
+ }
+ 
+-struct link_encoder *dce110_link_encoder_create(
+-	const struct encoder_init_data *init)
+-{
+-	struct dce110_link_encoder *enc110 =
+-		dc_service_alloc(init->ctx, sizeof(struct dce110_link_encoder));
+-
+-	if (!enc110)
+-		return NULL;
+-
+-	if (construct(enc110, init))
+-		return &enc110->base;
+-
+-	BREAK_TO_DEBUGGER();
+-	dc_service_free(init->ctx, enc110);
+-	return NULL;
+-}
+-
+-void dce110_link_encoder_destroy(struct link_encoder **enc)
+-{
+-	dc_service_free((*enc)->ctx, TO_DCE110_LINK_ENC(*enc));
+-	*enc = NULL;
+-}
+-
+ bool dce110_link_encoder_validate_output_with_stream(
+ 	struct link_encoder *enc,
+-	const struct core_stream *stream)
++	struct core_stream *stream)
+ {
+ 	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+ 	bool is_valid;
+@@ -1329,11 +1263,7 @@ void dce110_link_encoder_hw_init(
+ 		ASSERT(result == BP_RESULT_OK);
+ 
+ 	} else if (enc110->base.connector.id == CONNECTOR_ID_EDP) {
+-		link_encoder_edp_power_control(enc110, true);
+-
+-		link_encoder_edp_wait_for_hpd_ready(
+-			enc110, true);
+-
++		enc->funcs->power_control(&enc110->base, true);
+ 	}
+ 	aux_initialize(enc110);
+ 
+@@ -1444,19 +1374,6 @@ void dce110_link_encoder_enable_dp_output(
+ 	struct bp_transmitter_control cntl = { 0 };
+ 	enum bp_result result;
+ 
+-	if (enc110->base.connector.id == CONNECTOR_ID_EDP) {
+-		/* power up eDP panel */
+-
+-		link_encoder_edp_power_control(enc110, true);
+-
+-		link_encoder_edp_wait_for_hpd_ready(enc110, true);
+-
+-		/* have to turn off the backlight
+-		 * before power down eDP panel
+-		 */
+-		link_encoder_edp_backlight_control(enc110, true);
+-	}
+-
+ 	/* Enable the PHY */
+ 
+ 	/* number_of_lanes is used for pixel clock adjust,
+@@ -1544,13 +1461,6 @@ void dce110_link_encoder_disable_output(
+ 	struct bp_transmitter_control cntl = { 0 };
+ 	enum bp_result result;
+ 
+-	if (enc110->base.connector.id == CONNECTOR_ID_EDP) {
+-		/* have to turn off the backlight
+-		 * before power down eDP panel */
+-		link_encoder_edp_backlight_control(
+-				enc110, false);
+-	}
+-
+ 	if (!is_dig_enabled(enc110) &&
+ 		dal_adapter_service_should_optimize(
+ 			enc110->base.adapter_service,
+@@ -1653,7 +1563,7 @@ void dce110_link_encoder_dp_set_lane_settings(
+ }
+ 
+ /* set DP PHY test and training patterns */
+-void dce110_link_encoder_set_dp_phy_pattern(
++void dce110_link_encoder_dp_set_phy_pattern(
+ 	struct link_encoder *enc,
+ 	const struct encoder_set_dp_phy_pattern_param *param)
+ {
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h
+index 156cdc8..df6e265 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h
+@@ -32,8 +32,8 @@
+ 	container_of(link_encoder, struct dce110_link_encoder, base)
+ 
+ struct dce110_link_enc_offsets {
+-	uint32_t dig_offset;
+-	uint32_t dp_offset;
++	int32_t dig;
++	int32_t dp;
+ };
+ 
+ struct dce110_link_encoder {
+@@ -41,14 +41,14 @@ struct dce110_link_encoder {
+ 	struct dce110_link_enc_offsets offsets;
+ };
+ 
+-struct link_encoder *dce110_link_encoder_create(
+-	const struct encoder_init_data *init);
+-
+-void dce110_link_encoder_destroy(struct link_encoder **enc);
++bool dce110_link_encoder_construct(
++	struct dce110_link_encoder *enc110,
++	const struct encoder_init_data *init_data,
++	const struct dce110_link_enc_offsets *offsets);
+ 
+ bool dce110_link_encoder_validate_output_with_stream(
+ 	struct link_encoder *enc,
+-	const struct core_stream *stream);
++	struct core_stream *stream);
+ 
+ /****************** HW programming ************************/
+ 
+@@ -93,7 +93,7 @@ void dce110_link_encoder_dp_set_lane_settings(
+ 	struct link_encoder *enc,
+ 	const struct link_training_settings *link_settings);
+ 
+-void dce110_link_encoder_set_dp_phy_pattern(
++void dce110_link_encoder_dp_set_phy_pattern(
+ 	struct link_encoder *enc,
+ 	const struct encoder_set_dp_phy_pattern_param *param);
+ 
+@@ -106,6 +106,14 @@ void dce110_link_encoder_set_lcd_backlight_level(
+ 	struct link_encoder *enc,
+ 	uint32_t level);
+ 
++void dce110_link_encoder_edp_backlight_control(
++	struct link_encoder *enc,
++	bool enable);
++
++void dce110_link_encoder_edp_power_control(
++	struct link_encoder *enc,
++	bool power_up);
++
+ void dce110_link_encoder_connect_dig_be_to_fe(
+ 	struct link_encoder *enc,
+ 	enum engine_id engine,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index 8f04707..c43dd07 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -79,6 +79,21 @@ static const struct dce110_stream_enc_offsets dce110_str_enc_offsets[] = {
+ 	}
+ };
+ 
++static const struct dce110_link_enc_offsets dce110_lnk_enc_reg_offsets[] = {
++	{
++		.dig = (mmDIG0_DIG_FE_CNTL - mmDIG_FE_CNTL),
++		.dp  = (mmDP0_DP_SEC_CNTL - mmDP_SEC_CNTL)
++	},
++	{
++		.dig = (mmDIG1_DIG_FE_CNTL - mmDIG_FE_CNTL),
++		.dp  = (mmDP1_DP_SEC_CNTL - mmDP_SEC_CNTL)
++	},
++	{
++		.dig = (mmDIG2_DIG_FE_CNTL - mmDIG_FE_CNTL),
++		.dp  = (mmDP2_DP_SEC_CNTL - mmDP_SEC_CNTL)
++	}
++};
++
+ static const struct dce110_mem_input_reg_offsets dce110_mi_reg_offsets[] = {
+ 	{
+ 		.dcp = (mmDCP0_GRPH_CONTROL - mmGRPH_CONTROL),
+@@ -239,6 +254,34 @@ static struct input_pixel_processor *dce110_ipp_create(
+ 	return NULL;
+ }
+ 
++struct link_encoder *dce110_link_encoder_create(
++	const struct encoder_init_data *enc_init_data)
++{
++	struct dce110_link_encoder *enc110 =
++		dc_service_alloc(
++			enc_init_data->ctx,
++			sizeof(struct dce110_link_encoder));
++
++	if (!enc110)
++		return NULL;
++
++	if (dce110_link_encoder_construct(
++			enc110,
++			enc_init_data,
++			&dce110_lnk_enc_reg_offsets[enc_init_data->transmitter]))
++		return &enc110->base;
++
++	BREAK_TO_DEBUGGER();
++	dc_service_free(enc_init_data->ctx, enc110);
++	return NULL;
++}
++
++void dce110_link_encoder_destroy(struct link_encoder **enc)
++{
++	dc_service_free((*enc)->ctx, TO_DCE110_LINK_ENC(*enc));
++	*enc = NULL;
++}
++
+ bool dce110_construct_resource_pool(
+ 	struct adapter_service *adapter_serv,
+ 	struct dc *dc,
+@@ -667,7 +710,7 @@ static enum dc_status validate_mapped_resource(
+ 			if (status != DC_OK)
+ 				return status;
+ 
+-			if (!dce110_link_encoder_validate_output_with_stream(
++			if (!link->link_enc->funcs->validate_output_with_stream(
+ 					link->link_enc,
+ 					stream))
+ 				return DC_FAIL_ENC_VALIDATE;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
+index e113d11..e47b19d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
+@@ -51,5 +51,10 @@ enum dc_status dce110_validate_bandwidth(
+ 		const struct dc *dc,
+ 		struct validate_context *context);
+ 
++struct link_encoder *dce110_link_encoder_create(
++	const struct encoder_init_data *enc_init_data);
++
++void dce110_link_encoder_destroy(struct link_encoder **enc);
++
+ #endif /* __DC_RESOURCE_DCE110_H__ */
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.h
+index ddc16cd..7e110b4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.h
+@@ -32,13 +32,14 @@
+ 	container_of(stream_encoder, struct dce110_stream_encoder, base)
+ 
+ struct dce110_stream_enc_offsets {
+-	uint32_t dig;
+-	uint32_t dp;
++	int32_t dig;
++	int32_t dp;
+ };
+ 
+ struct dce110_stream_encoder {
+ 	struct stream_encoder base;
+ 	struct dce110_stream_enc_offsets offsets;
++	struct dce110_stream_enc_offsets derived_offsets;
+ };
+ 
+ bool dce110_stream_encoder_construct(
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+index a84ab8b..e6aaacc 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+@@ -51,16 +51,17 @@
+ #define CRTC_OVERSCAN_COLOR_BLACK_COLOR_R_RGB_LIMITED_RANGE 0X40
+ 
+ struct dce110_timing_generator_offsets {
+-	uint32_t crtc;
+-	uint32_t dcp;
++	int32_t crtc;
++	int32_t dcp;
+ 
+ 	/* DCE80 use only */
+-	uint32_t dmif;
++	int32_t dmif;
+ };
+ 
+ struct dce110_timing_generator {
+ 	struct timing_generator base;
+ 	struct dce110_timing_generator_offsets offsets;
++	struct dce110_timing_generator_offsets derived_offsets;
+ 
+ 	enum controller_id controller_id;
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+index 59ed137..46721cd 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+@@ -83,39 +83,6 @@ struct hw_sequencer_funcs {
+ 
+ 	void (*encoder_destroy)(struct link_encoder **enc);
+ 
+-	void (*encoder_hw_init)(
+-					struct link_encoder *enc);
+-
+-	void (*encoder_enable_tmds_output)(
+-					struct link_encoder *enc,
+-					enum clock_source_id clock_source,
+-					enum dc_color_depth color_depth,
+-					bool hdmi,
+-					bool dual_link,
+-					uint32_t pixel_clock);
+-
+-	void (*encoder_enable_dp_output)(
+-				struct link_encoder *enc,
+-				const struct link_settings *link_settings,
+-				enum clock_source_id clock_source);
+-
+-	void (*encoder_enable_dp_mst_output)(
+-				struct link_encoder *enc,
+-				const struct link_settings *link_settings,
+-				enum clock_source_id clock_source);
+-
+-	void (*encoder_disable_output)(
+-					struct link_encoder *enc,
+-					enum signal_type signal);
+-
+-	void (*encoder_set_dp_phy_pattern)(
+-			struct link_encoder *enc,
+-			const struct encoder_set_dp_phy_pattern_param *param);
+-
+-	void (*encoder_dp_set_lane_settings)(
+-			struct link_encoder *enc,
+-			const struct link_training_settings *link_settings);
+-
+ 	/* backlight control */
+ 	void (*encoder_set_lcd_backlight_level)(struct link_encoder *enc,
+ 					uint32_t level);
+@@ -162,10 +129,6 @@ struct hw_sequencer_funcs {
+ 	void (*disable_stream)(
+ 					struct core_stream *stream);
+ 
+-	void (*update_mst_stream_allocation_table)(
+-					struct link_encoder *enc,
+-					const struct dp_mst_stream_allocation_table *table);
+-
+ 	void (*set_mst_bandwidth)(
+ 					struct stream_encoder *enc,
+ 					struct fixed31_32 avg_time_slots_per_mtp);
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/link_encoder.h b/drivers/gpu/drm/amd/dal/dc/inc/link_encoder.h
+index d4a0d24..f63c479 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/link_encoder.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/link_encoder.h
+@@ -9,11 +9,13 @@
+ #define LINK_ENCODER_H_
+ 
+ #include "include/encoder_types.h"
++#include "core_types.h"
+ 
+ struct link_enc_status {
+ 	int dummy; /*TODO*/
+ };
+ struct link_encoder {
++	struct link_encoder_funcs *funcs;
+ 	struct adapter_service *adapter_service;
+ 	int32_t aux_channel_offset;
+ 	struct dc_context *ctx;
+@@ -27,4 +29,42 @@ struct link_encoder {
+ 	enum hpd_source_id hpd_source;
+ };
+ 
++struct link_encoder_funcs {
++	bool (*validate_output_with_stream)(struct link_encoder *enc,
++		struct core_stream *stream);
++	void (*hw_init)(struct link_encoder *enc);
++	void (*setup)(struct link_encoder *enc,
++		enum signal_type signal);
++	void (*enable_tmds_output)(struct link_encoder *enc,
++		enum clock_source_id clock_source,
++		enum dc_color_depth color_depth,
++		bool hdmi,
++		bool dual_link,
++		uint32_t pixel_clock);
++	void (*enable_dp_output)(struct link_encoder *enc,
++		const struct link_settings *link_settings,
++		enum clock_source_id clock_source);
++	void (*enable_dp_mst_output)(struct link_encoder *enc,
++		const struct link_settings *link_settings,
++		enum clock_source_id clock_source);
++	void (*disable_output)(struct link_encoder *link_enc,
++		enum signal_type signal);
++	void (*dp_set_lane_settings)(struct link_encoder *enc,
++		const struct link_training_settings *link_settings);
++	void (*dp_set_phy_pattern)(struct link_encoder *enc,
++		const struct encoder_set_dp_phy_pattern_param *para);
++	void (*update_mst_stream_allocation_table)(
++		struct link_encoder *enc,
++		const struct dp_mst_stream_allocation_table *table);
++	void (*set_lcd_backlight_level) (struct link_encoder *enc,
++		uint32_t level);
++	void (*backlight_control) (struct link_encoder *enc,
++		bool enable);
++	void (*power_control) (struct link_encoder *enc,
++		bool power_up);
++	void (*connect_dig_be_to_fe)(struct link_encoder *enc,
++		enum engine_id engine,
++		bool connect);
++};
++
+ #endif /* LINK_ENCODER_H_ */
+diff --git a/drivers/gpu/drm/amd/dal/include/encoder_types.h b/drivers/gpu/drm/amd/dal/include/encoder_types.h
+index c267d30..6a7b317 100644
+--- a/drivers/gpu/drm/amd/dal/include/encoder_types.h
++++ b/drivers/gpu/drm/amd/dal/include/encoder_types.h
+@@ -39,6 +39,7 @@ struct encoder_init_data {
+ 	/* TODO: in DAL2, here was pointer to EventManagerInterface */
+ 	struct graphics_object_id encoder;
+ 	struct dc_context *ctx;
++	enum transmitter transmitter;
+ };
+ 
+ struct encoder_context {
+-- 
+2.7.4
+

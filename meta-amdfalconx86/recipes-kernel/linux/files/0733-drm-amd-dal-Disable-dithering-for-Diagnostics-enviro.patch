@@ -1,0 +1,366 @@
+From 0a6fcf118b9bfaeffd3ff647afafc14638f0ea3e Mon Sep 17 00:00:00 2001
+From: David Rokhvarg <David.Rokhvarg@amd.com>
+Date: Fri, 22 Jan 2016 15:38:15 -0500
+Subject: [PATCH 0733/1110] drm/amd/dal: Disable dithering for Diagnostics
+ environment.
+
+Signed-off-by: David Rokhvarg <David.Rokhvarg@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ .../gpu/drm/amd/dal/dc/adapter/adapter_service.c   |  6 +----
+ drivers/gpu/drm/amd/dal/dc/core/dc_stream.c        | 25 ++++++++++++--------
+ drivers/gpu/drm/amd/dal/dc/dc_types.h              | 23 ++++++++++++++++++
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |  5 ++--
+ .../gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c   |  4 ++--
+ .../gpu/drm/amd/dal/dc/dce110/dce110_transform.h   |  3 ++-
+ .../amd/dal/dc/dce110/dce110_transform_bit_depth.c | 27 +++++++++++++++-------
+ drivers/gpu/drm/amd/dal/dc/gpio/hw_factory.c       |  5 +---
+ drivers/gpu/drm/amd/dal/dc/gpio/hw_translate.c     |  5 +---
+ drivers/gpu/drm/amd/dal/dc/i2caux/i2caux.c         |  5 +---
+ drivers/gpu/drm/amd/dal/dc/inc/core_types.h        |  2 +-
+ drivers/gpu/drm/amd/dal/dc/inc/transform.h         |  3 ++-
+ drivers/gpu/drm/amd/dal/include/dal_types.h        |  8 -------
+ 13 files changed, 72 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c b/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c
+index 66c5034..d0dd6c9 100644
+--- a/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c
++++ b/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c
+@@ -661,12 +661,8 @@ static struct hw_ctx_adapter_service *create_hw_ctx(
+ 	enum dce_environment dce_environment,
+ 	struct dc_context *ctx)
+ {
+-	switch (dce_environment) {
+-	case DCE_ENV_DIAG_FPGA_MAXIMUS:
++	if (IS_FPGA_MAXIMUS_DC(dce_environment))
+ 		return dal_adapter_service_create_hw_ctx_diag(ctx);
+-	default:
+-		break;
+-	}
+ 
+ 	switch (dce_version) {
+ #if defined(CONFIG_DRM_AMD_DAL_DCE10_0)
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_stream.c b/drivers/gpu/drm/amd/dal/dc/core/dc_stream.c
+index 986368a..ab8999b 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_stream.c
+@@ -41,26 +41,33 @@ struct stream {
+ /*******************************************************************************
+  * Private functions
+  ******************************************************************************/
+-
+ static void build_bit_depth_reduction_params(
++		const struct core_stream *stream,
+ 		struct bit_depth_reduction_params *fmt_bit_depth)
+ {
++	dc_service_memset(fmt_bit_depth, 0, sizeof(*fmt_bit_depth));
++
+ 	/*TODO: Need to un-hardcode, refer to function with same name
+ 	 * in dal2 hw_sequencer*/
+ 
+ 	fmt_bit_depth->flags.TRUNCATE_ENABLED = 0;
+ 	fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 0;
+ 	fmt_bit_depth->flags.FRAME_MODULATION_ENABLED = 0;
+-	fmt_bit_depth->flags.SPATIAL_DITHER_DEPTH = 1;
+ 
+-	fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 1;
+-	/* frame random is on by default */
+-	fmt_bit_depth->flags.FRAME_RANDOM = 1;
+-	/* apply RGB dithering */
+-	fmt_bit_depth->flags.RGB_RANDOM = true;
++	/* Diagnostics need consistent CRC of the image, that means
++	 * dithering should not be enabled for Diagnostics. */
++	if (IS_DIAG_DC(stream->ctx->dce_environment) == false) {
+ 
+-	return;
++		fmt_bit_depth->flags.SPATIAL_DITHER_DEPTH = 1;
++		fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 1;
+ 
++		/* frame random is on by default */
++		fmt_bit_depth->flags.FRAME_RANDOM = 1;
++		/* apply RGB dithering */
++		fmt_bit_depth->flags.RGB_RANDOM = true;
++	}
++
++	return;
+ }
+ 
+ static void setup_pixel_encoding(
+@@ -85,7 +92,7 @@ static bool construct(struct core_stream *stream,
+ 
+ 	dc_sink_retain(dc_sink_data);
+ 
+-	build_bit_depth_reduction_params(&stream->fmt_bit_depth);
++	build_bit_depth_reduction_params(stream, &stream->bit_depth_params);
+ 	setup_pixel_encoding(&stream->clamping);
+ 
+ 	/* Copy audio modes */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_types.h b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+index b932ec1..18ecb0d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+@@ -39,6 +39,29 @@ struct dc_link;
+ struct dc_sink;
+ struct dal;
+ 
++/********************************
++ * Environment definitions
++ ********************************/
++enum dce_environment {
++	DCE_ENV_PRODUCTION_DRV = 0,
++	/* Emulation on FPGA, in "Maximus" System.
++	 * This environment enforces that *only* DC registers accessed.
++	 * (access to non-DC registers will hang FPGA) */
++	DCE_ENV_FPGA_MAXIMUS,
++	/* Emulation on real HW or on FPGA. Used by Diagnostics, enforces
++	 * requirements of Diagnostics team. */
++	DCE_ENV_DIAG
++};
++
++/* Note: use these macro definitions instead of direct comparison! */
++#define IS_FPGA_MAXIMUS_DC(dce_environment) \
++	(dce_environment == DCE_ENV_FPGA_MAXIMUS)
++
++#define IS_DIAG_DC(dce_environment) \
++	(IS_FPGA_MAXIMUS_DC(dce_environment) || (dce_environment == DCE_ENV_DIAG))
++
++/********************************/
++
+ #define MAX_EDID_BUFFER_SIZE 512
+ 
+ /*Displayable pixel format in fb*/
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 1fc4c07..e716219 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -847,7 +847,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 			stream->public.timing.display_color_depth,
+ 			stream->sink->public.sink_signal);
+ 
+-	program_fmt(opp, &stream->fmt_bit_depth, &stream->clamping);
++	program_fmt(opp, &stream->bit_depth_params, &stream->clamping);
+ 
+ 	stream->sink->link->link_enc->funcs->setup(
+ 		stream->sink->link->link_enc,
+@@ -1350,7 +1350,8 @@ static bool setup_line_buffer_pixel_depth(
+ 		if (blank)
+ 			tg->funcs->wait_for_state(tg, CRTC_STATE_VBLANK);
+ 
+-		return xfm->funcs->transform_set_pixel_storage_depth(xfm, depth);
++		return xfm->funcs->transform_set_pixel_storage_depth(xfm, depth,
++				&stream->bit_depth_params);
+ 	}
+ 
+ 	return false;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
+index 392a075..f5cf5ad 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
+@@ -842,7 +842,7 @@ void dce110_mem_input_allocate_dmif_buffer(
+ 	 * 02 - enable DMIF rdreq limit, disable by DMIF stall = 1
+ 	 * 03 - force enable DMIF rdreq limit, ignore DMIF stall / urgent
+ 	 */
+-	if (!IS_DIAG_MAXIMUS_DC(mi->ctx)) {
++	if (!IS_FPGA_MAXIMUS_DC(mi->ctx->dce_environment)) {
+ 		addr = mmMC_HUB_RDREQ_DMIF_LIMIT;
+ 		value = dal_read_reg(mi->ctx, addr);
+ 
+@@ -912,7 +912,7 @@ void dce110_mem_input_deallocate_dmif_buffer(
+ 	 * 02 - enable dmif rdreq limit, disable by dmif stall=1
+ 	 * 03 - force enable dmif rdreq limit, ignore dmif stall/urgent
+ 	 * Stella Wong proposed this change. */
+-	if (!IS_DIAG_MAXIMUS_DC(mi->ctx)) {
++	if (!IS_FPGA_MAXIMUS_DC(mi->ctx->dce_environment)) {
+ 		value = dal_read_reg(mi->ctx, mmMC_HUB_RDREQ_DMIF_LIMIT);
+ 		if (paths_num > 1)
+ 			set_reg_field_value(value, 0, MC_HUB_RDREQ_DMIF_LIMIT, ENABLE);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h
+index 229f588..117aca3 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h
+@@ -76,7 +76,8 @@ void dce110_transform_set_gamut_remap(
+ /* BIT DEPTH RELATED */
+ bool dce110_transform_set_pixel_storage_depth(
+ 	struct transform *xfm,
+-	enum lb_pixel_depth depth);
++	enum lb_pixel_depth depth,
++	const struct bit_depth_reduction_params *bit_depth_params);
+ 
+ bool dce110_transform_get_current_pixel_storage_depth(
+ 	struct transform *xfm,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_bit_depth.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_bit_depth.c
+index 747f2c7..3e0d151 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_bit_depth.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_bit_depth.c
+@@ -114,7 +114,8 @@ static bool set_dither(
+  */
+ static bool program_bit_depth_reduction(
+ 	struct dce110_transform *xfm110,
+-	enum dc_color_depth depth)
++	enum dc_color_depth depth,
++	const struct bit_depth_reduction_params *bit_depth_params)
+ {
+ 	enum dcp_bit_depth_reduction_mode depth_reduction_mode;
+ 	enum dcp_spatial_dither_mode spatial_dither_mode;
+@@ -127,19 +128,27 @@ static bool program_bit_depth_reduction(
+ 		return false;
+ 	}
+ 
+-	depth_reduction_mode = DCP_BIT_DEPTH_REDUCTION_MODE_DITHER;
++	if (bit_depth_params->flags.SPATIAL_DITHER_ENABLED) {
++		depth_reduction_mode = DCP_BIT_DEPTH_REDUCTION_MODE_DITHER;
++		frame_random_enable = true;
++		rgb_random_enable = true;
++		highpass_random_enable = true;
++
++	} else {
++		depth_reduction_mode = DCP_BIT_DEPTH_REDUCTION_MODE_DISABLED;
++		frame_random_enable = false;
++		rgb_random_enable = false;
++		highpass_random_enable = false;
++	}
+ 
+ 	spatial_dither_mode = DCP_SPATIAL_DITHER_MODE_A_AA_A;
+ 
+-	frame_random_enable = true;
+-	rgb_random_enable = true;
+-	highpass_random_enable = true;
+-
+ 	if (!set_clamp(xfm110, depth)) {
+ 		/* Failure in set_clamp() */
+ 		ASSERT_CRITICAL(false);
+ 		return false;
+ 	}
++
+ 	switch (depth_reduction_mode) {
+ 	case DCP_BIT_DEPTH_REDUCTION_MODE_DITHER:
+ 		/*  Spatial Dither: Set round/truncate to bypass (12bit),
+@@ -754,7 +763,8 @@ static void set_denormalization(
+ 
+ bool dce110_transform_set_pixel_storage_depth(
+ 	struct transform *xfm,
+-	enum lb_pixel_depth depth)
++	enum lb_pixel_depth depth,
++	const struct bit_depth_reduction_params *bit_depth_params)
+ {
+ 	struct dce110_transform *xfm110 = TO_DCE110_TRANSFORM(xfm);
+ 	bool ret = true;
+@@ -792,7 +802,8 @@ bool dce110_transform_set_pixel_storage_depth(
+ 
+ 	if (ret == true) {
+ 		set_denormalization(xfm110, color_depth);
+-		ret = program_bit_depth_reduction(xfm110, color_depth);
++		ret = program_bit_depth_reduction(xfm110, color_depth,
++				bit_depth_params);
+ 
+ 		set_reg_field_value(value, 0, LB_DATA_FORMAT, ALPHA_EN);
+ 		dal_write_reg(
+diff --git a/drivers/gpu/drm/amd/dal/dc/gpio/hw_factory.c b/drivers/gpu/drm/amd/dal/dc/gpio/hw_factory.c
+index 7e93014..17b5fdf 100644
+--- a/drivers/gpu/drm/amd/dal/dc/gpio/hw_factory.c
++++ b/drivers/gpu/drm/amd/dal/dc/gpio/hw_factory.c
+@@ -56,12 +56,9 @@ bool dal_hw_factory_init(
+ 	enum dce_version dce_version,
+ 	enum dce_environment dce_environment)
+ {
+-	switch (dce_environment) {
+-	case DCE_ENV_DIAG_FPGA_MAXIMUS:
++	if (IS_FPGA_MAXIMUS_DC(dce_environment)) {
+ 		dal_hw_factory_diag_fpga_init(factory);
+ 		return true;
+-	default:
+-		break;
+ 	}
+ 
+ 	switch (dce_version) {
+diff --git a/drivers/gpu/drm/amd/dal/dc/gpio/hw_translate.c b/drivers/gpu/drm/amd/dal/dc/gpio/hw_translate.c
+index 0e768df..d22504f 100644
+--- a/drivers/gpu/drm/amd/dal/dc/gpio/hw_translate.c
++++ b/drivers/gpu/drm/amd/dal/dc/gpio/hw_translate.c
+@@ -56,12 +56,9 @@ bool dal_hw_translate_init(
+ 	enum dce_version dce_version,
+ 	enum dce_environment dce_environment)
+ {
+-	switch (dce_environment) {
+-	case DCE_ENV_DIAG_FPGA_MAXIMUS:
++	if (IS_FPGA_MAXIMUS_DC(dce_environment)) {
+ 		dal_hw_translate_diag_fpga_init(translate);
+ 		return true;
+-	default:
+-		break;
+ 	}
+ 
+ 	switch (dce_version) {
+diff --git a/drivers/gpu/drm/amd/dal/dc/i2caux/i2caux.c b/drivers/gpu/drm/amd/dal/dc/i2caux/i2caux.c
+index 941213d..68409b3 100644
+--- a/drivers/gpu/drm/amd/dal/dc/i2caux/i2caux.c
++++ b/drivers/gpu/drm/amd/dal/dc/i2caux/i2caux.c
+@@ -75,11 +75,8 @@ struct i2caux *dal_i2caux_create(
+ 	dce_version = dal_adapter_service_get_dce_version(as);
+ 	dce_environment = dal_adapter_service_get_dce_environment(as);
+ 
+-	switch (dce_environment) {
+-	case DCE_ENV_DIAG_FPGA_MAXIMUS:
++	if (IS_FPGA_MAXIMUS_DC(dce_environment)) {
+ 		return dal_i2caux_diag_fpga_create(as, ctx);
+-	default:
+-		break;
+ 	}
+ 
+ 	switch (dce_version) {
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+index b0654ca..8282f99 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+@@ -120,7 +120,7 @@ struct core_stream {
+ 	/*fmt*/
+ 	/*TODO: AUTO new codepath in apply_context to hw to
+ 	 * generate these bw unrelated/no fail params*/
+-	struct bit_depth_reduction_params fmt_bit_depth;
++	struct bit_depth_reduction_params bit_depth_params;/* used by DCP and FMT */
+ 	struct clamping_and_pixel_encoding_params clamping;
+ 	struct hw_info_frame info_frame;
+ 	struct encoder_info_frame encoder_info_frame;
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/transform.h b/drivers/gpu/drm/amd/dal/dc/inc/transform.h
+index 50dde2d..d453aac 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/transform.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/transform.h
+@@ -204,7 +204,8 @@ struct transform_funcs {
+ 
+ 	bool (*transform_set_pixel_storage_depth)(
+ 		struct transform *xfm,
+-		enum lb_pixel_depth depth);
++		enum lb_pixel_depth depth,
++		const struct bit_depth_reduction_params *bit_depth_params);
+ 
+ 	bool (*transform_get_current_pixel_storage_depth)(
+ 		struct transform *xfm,
+diff --git a/drivers/gpu/drm/amd/dal/include/dal_types.h b/drivers/gpu/drm/amd/dal/include/dal_types.h
+index 77bd09b..fe884da 100644
+--- a/drivers/gpu/drm/amd/dal/include/dal_types.h
++++ b/drivers/gpu/drm/amd/dal/include/dal_types.h
+@@ -44,12 +44,6 @@ enum dce_version {
+ 	DCE_VERSION_MAX
+ };
+ 
+-enum dce_environment {
+-	DCE_ENV_PRODUCTION_DRV = 0,
+-	DCE_ENV_DIAG_FPGA_MAXIMUS, /* Emulation on FPGA, in Maximus System. */
+-	DCE_ENV_DIAG_SILICON, /* Emulation on real HW */
+-};
+-
+ /*
+  * ASIC Runtime Flags
+  */
+@@ -183,8 +177,6 @@ struct dc_context {
+ 	enum dce_environment dce_environment;
+ };
+ 
+-#define IS_DIAG_MAXIMUS_DC(dcctx) ((dcctx)->dce_environment == DCE_ENV_DIAG_FPGA_MAXIMUS)
+-
+ /* Wireless display structs */
+ 
+ union dal_remote_display_cea_mode_bitmap {
+-- 
+2.7.4
+

@@ -1,0 +1,194 @@
+From 2708dd4f43bf9542e55188db188403ef1d71e1a2 Mon Sep 17 00:00:00 2001
+From: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Date: Thu, 10 Mar 2016 05:22:27 -0500
+Subject: [PATCH 0901/1110] drm/amd/dal: on resume do not set mode on
+ disconnected sink
+
+In case display got disconnected during sleep (s3), it should not
+be restored during resume, as for DP it will try to link train
+which will fail and generate backtrace with warning
+
+Signed-off-by: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      | 77 +++++++++++++++++++---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h      |  5 ++
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    | 19 ++----
+ 3 files changed, 79 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index 20654b9..6cea7e2 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -440,6 +440,33 @@ static int dm_suspend(void *handle)
+ 	return ret;
+ }
+ 
++struct amdgpu_connector *amdgpu_dm_find_first_crct_matching_connector(
++	struct drm_atomic_state *state,
++	struct drm_crtc *crtc,
++	bool from_state_var)
++{
++	uint32_t i;
++	struct drm_connector_state *conn_state;
++	struct drm_connector *connector;
++	struct drm_crtc *crtc_from_state;
++
++	for_each_connector_in_state(
++		state,
++		connector,
++		conn_state,
++		i) {
++		crtc_from_state =
++			from_state_var ?
++				conn_state->crtc :
++				connector->state->crtc;
++
++		if (crtc_from_state == crtc)
++			return to_amdgpu_connector(connector);
++	}
++
++	return NULL;
++}
++
+ static int dm_display_resume(struct drm_device *ddev)
+ {
+ 	int ret = 0;
+@@ -448,13 +475,38 @@ static int dm_display_resume(struct drm_device *ddev)
+ 	struct drm_atomic_state *state = drm_atomic_state_alloc(ddev);
+ 	struct drm_plane *plane;
+ 	struct drm_crtc *crtc;
++	struct amdgpu_connector *aconnector;
++	struct drm_connector_state *conn_state;
+ 
+ 	if (!state)
+ 		return ENOMEM;
+ 
+ 	state->acquire_ctx = ddev->mode_config.acquire_ctx;
+ 
+-	/* Construct an atomic state to restore previous display setting*/
++	/* Construct an atomic state to restore previous display setting */
++
++	/*
++	 * Attach connectors to drm_atomic_state
++	 * Should be done in the first place in order to make connectors
++	 * available in state during crtc state processing. It is used for
++	 * making decision if crtc should be disabled in case sink got
++	 * disconnected.
++	 *
++	 * Connectors state crtc with NULL dc_sink should be cleared, because it
++	 * will fail validation during commit
++	 */
++	list_for_each_entry(connector, &ddev->mode_config.connector_list, head) {
++		aconnector = to_amdgpu_connector(connector);
++		conn_state = drm_atomic_get_connector_state(state, connector);
++
++		ret = PTR_ERR_OR_ZERO(conn_state);
++		if (ret)
++			goto err;
++
++		if (!aconnector->dc_sink)
++			conn_state->crtc = NULL;
++	}
++
+ 	/* Attach crtcs to drm_atomic_state*/
+ 	list_for_each_entry(crtc, &ddev->mode_config.crtc_list, head) {
+ 		struct drm_crtc_state *crtc_state =
+@@ -464,24 +516,31 @@ static int dm_display_resume(struct drm_device *ddev)
+ 		if (ret)
+ 			goto err;
+ 
++		aconnector =
++			amdgpu_dm_find_first_crct_matching_connector(
++				state,
++				crtc,
++				true);
++
++		/*
++		 * this is the case when display disappear during sleep
++		 */
++		if (!aconnector) {
++			crtc_state->active = false;
++			crtc_state->enable = false;
++		}
++
+ 		/* force a restore */
+ 		crtc_state->mode_changed = true;
+ 	}
+ 
+-	/* Attach planes to drm_atomic_state*/
++	/* Attach planes to drm_atomic_state */
+ 	list_for_each_entry(plane, &ddev->mode_config.plane_list, head) {
+ 		ret = PTR_ERR_OR_ZERO(drm_atomic_get_plane_state(state, plane));
+ 		if (ret)
+ 			goto err;
+ 	}
+ 
+-	/* Attach connectors to drm_atomic_state*/
+-	list_for_each_entry(connector, &ddev->mode_config.connector_list, head) {
+-		ret = PTR_ERR_OR_ZERO(drm_atomic_get_connector_state(state, connector));
+-		if (ret)
+-			goto err;
+-	}
+-
+ 	/* Call commit internally with the state we just constructed */
+ 	ret = drm_atomic_commit(state);
+ 	if (!ret)
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h
+index 94c20d5..5674a82 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h
+@@ -165,4 +165,9 @@ extern const struct amd_ip_funcs amdgpu_dm_funcs;
+ void amdgpu_dm_update_connector_after_detect(
+ 	struct amdgpu_connector *aconnector);
+ 
++struct amdgpu_connector *amdgpu_dm_find_first_crct_matching_connector(
++	struct drm_atomic_state *state,
++	struct drm_crtc *crtc,
++	bool from_state_var);
++
+ #endif /* __AMDGPU_DM_H__ */
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index 572c5bd..474439f 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -2115,7 +2115,7 @@ int amdgpu_dm_atomic_commit(
+ 	struct amdgpu_display_manager *dm = &adev->dm;
+ 	struct drm_plane *plane;
+ 	struct drm_plane_state *old_plane_state;
+-	uint32_t i, j;
++	uint32_t i;
+ 	int32_t ret;
+ 	uint32_t commit_targets_count = 0;
+ 	uint32_t new_crtcs_count = 0;
+@@ -2157,21 +2157,14 @@ int amdgpu_dm_atomic_commit(
+ 		struct amdgpu_connector *aconnector = NULL;
+ 		enum dm_commit_action action;
+ 		struct drm_crtc_state *new_state = crtc->state;
+-		struct drm_connector *connector;
+-		struct drm_connector_state *old_con_state;
+ 
+ 		acrtc = to_amdgpu_crtc(crtc);
+ 
+-		for_each_connector_in_state(
+-			state,
+-			connector,
+-			old_con_state,
+-			j) {
+-			if (connector->state->crtc == crtc) {
+-				aconnector = to_amdgpu_connector(connector);
+-				break;
+-			}
+-		}
++		aconnector =
++			amdgpu_dm_find_first_crct_matching_connector(
++				state,
++				crtc,
++				false);
+ 
+ 		/* handles headless hotplug case, updating new_state and
+ 		 * aconnector as needed
+-- 
+2.7.4
+

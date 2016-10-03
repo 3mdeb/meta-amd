@@ -1,0 +1,406 @@
+From 735bfe630c7dbbd8387dbeba3e353b5898d7c8be Mon Sep 17 00:00:00 2001
+From: Eric Yang <eric.yang2@amd.com>
+Date: Sat, 27 Feb 2016 14:22:46 -0500
+Subject: [PATCH 0856/1110] drm/amd/dal: Refactor DC creation merge dc and dal
+ init_data
+
+Also deletes unused members in the two init data structures
+
+Signed-off-by: Eric Yang <eric.yang2@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      | 11 +--
+ .../gpu/drm/amd/dal/dc/adapter/adapter_service.c   |  5 --
+ .../gpu/drm/amd/dal/dc/adapter/adapter_service.h   |  1 -
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 89 ++++++++++------------
+ drivers/gpu/drm/amd/dal/dc/dc.h                    | 12 +--
+ drivers/gpu/drm/amd/dal/dc/dc_types.h              | 15 ----
+ .../amd/dal/include/adapter_service_interface.h    |  4 -
+ 7 files changed, 44 insertions(+), 93 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index 257969f..ed2cdc5 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -246,8 +246,7 @@ static void hotplug_notify_work_func(struct work_struct *work)
+  */
+ int amdgpu_dm_init(struct amdgpu_device *adev)
+ {
+-	struct dal_init_data init_data;
+-	struct drm_device *ddev = adev->ddev;
++	struct dc_init_data init_data;
+ 	adev->dm.ddev = adev->ddev;
+ 	adev->dm.adev = adev;
+ 
+@@ -265,14 +264,6 @@ int amdgpu_dm_init(struct amdgpu_device *adev)
+ 		goto error;
+ 	}
+ 
+-	if (ddev->pdev) {
+-		init_data.bdf_info.DEVICE_NUMBER = PCI_SLOT(ddev->pdev->devfn);
+-		init_data.bdf_info.FUNCTION_NUMBER =
+-			PCI_FUNC(ddev->pdev->devfn);
+-		if (ddev->pdev->bus)
+-			init_data.bdf_info.BUS_NUMBER = ddev->pdev->bus->number;
+-	}
+-
+ 	init_data.display_param = display_param;
+ 
+ 	init_data.asic_id.chip_family = adev->family;
+diff --git a/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c b/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c
+index 99ba0c7..339f046 100644
+--- a/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c
++++ b/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c
+@@ -1938,11 +1938,6 @@ struct ddc *dal_adapter_service_obtain_ddc_from_i2c_info(
+ 		(1 << info->gpio_info.clk_a_shift), &hw_info);
+ }
+ 
+-struct bdf_info dal_adapter_service_get_adapter_info(struct adapter_service *as)
+-{
+-	return as->bdf_info;
+-}
+-
+ /*
+  * dal_adapter_service_should_psr_skip_wait_for_pll_lock
+  *
+diff --git a/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.h b/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.h
+index 7cc8991..57f9a87 100644
+--- a/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.h
++++ b/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.h
+@@ -49,7 +49,6 @@ struct adapter_service {
+ 	struct wireless_data wireless_data;
+ 	struct hw_ctx_adapter_service *hw_ctx;
+ 	struct integrated_info *integrated_info;
+-	struct bdf_info bdf_info;
+ 	uint32_t platform_methods_mask;
+ 	uint32_t ac_level_percentage;
+ 	uint32_t dc_level_percentage;
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 44f43ea..ef238a0 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -69,7 +69,10 @@ static void destroy_links(struct core_dc *dc)
+ 	}
+ }
+ 
+-static bool create_links(struct core_dc *dc, const struct dc_init_data *init_params)
++static bool create_links(
++		struct core_dc *dc,
++		struct adapter_service *as,
++		uint32_t num_virtual_links)
+ {
+ 	int i;
+ 	int connectors_num;
+@@ -77,7 +80,7 @@ static bool create_links(struct core_dc *dc, const struct dc_init_data *init_par
+ 
+ 	dc->link_count = 0;
+ 
+-	dcb = dal_adapter_service_get_bios_parser(init_params->adapter_srv);
++	dcb = dal_adapter_service_get_bios_parser(as);
+ 
+ 	connectors_num = dcb->funcs->get_connectors_number(dcb);
+ 
+@@ -89,7 +92,7 @@ static bool create_links(struct core_dc *dc, const struct dc_init_data *init_par
+ 		return false;
+ 	}
+ 
+-	if (connectors_num == 0 && init_params->num_virtual_links == 0) {
++	if (connectors_num == 0 && num_virtual_links == 0) {
+ 		dm_error("DC: Number of connectors can not be zero!\n");
+ 		return false;
+ 	}
+@@ -98,14 +101,14 @@ static bool create_links(struct core_dc *dc, const struct dc_init_data *init_par
+ 		"DC: %s: connectors_num: physical:%d, virtual:%d\n",
+ 		__func__,
+ 		connectors_num,
+-		init_params->num_virtual_links);
++		num_virtual_links);
+ 
+ 	for (i = 0; i < connectors_num; i++) {
+ 		struct link_init_data link_init_params = {0};
+ 		struct core_link *link;
+ 
+-		link_init_params.ctx = init_params->ctx;
+-		link_init_params.adapter_srv = init_params->adapter_srv;
++		link_init_params.ctx = dc->ctx;
++		link_init_params.adapter_srv = as;
+ 		link_init_params.connector_index = i;
+ 		link_init_params.link_index = dc->link_count;
+ 		link_init_params.dc = dc;
+@@ -120,7 +123,7 @@ static bool create_links(struct core_dc *dc, const struct dc_init_data *init_par
+ 		}
+ 	}
+ 
+-	for (i = 0; i < init_params->num_virtual_links; i++) {
++	for (i = 0; i < num_virtual_links; i++) {
+ 		struct core_link *link = dm_alloc(sizeof(*link));
+ 		struct encoder_init_data enc_init = {0};
+ 
+@@ -129,8 +132,8 @@ static bool create_links(struct core_dc *dc, const struct dc_init_data *init_par
+ 			goto failed_alloc;
+ 		}
+ 
+-		link->adapter_srv = init_params->adapter_srv;
+-		link->ctx = init_params->ctx;
++		link->adapter_srv = as;
++		link->ctx = dc->ctx;
+ 		link->dc = dc;
+ 		link->public.connector_signal = SIGNAL_TYPE_VIRTUAL;
+ 		link->link_id.type = OBJECT_TYPE_CONNECTOR;
+@@ -138,8 +141,8 @@ static bool create_links(struct core_dc *dc, const struct dc_init_data *init_par
+ 		link->link_id.enum_id = ENUM_ID_1;
+ 		link->link_enc = dm_alloc(sizeof(*link->link_enc));
+ 
+-		enc_init.adapter_service = init_params->adapter_srv;
+-		enc_init.ctx = init_params->ctx;
++		enc_init.adapter_service = as;
++		enc_init.ctx = dc->ctx;
+ 		enc_init.channel = CHANNEL_ID_UNKNOWN;
+ 		enc_init.hpd_source = HPD_SOURCEID_UNKNOWN;
+ 		enc_init.transmitter = TRANSMITTER_UNKNOWN;
+@@ -215,18 +218,18 @@ static void init_hw(struct core_dc *dc)
+ }
+ 
+ static struct adapter_service *create_as(
+-		struct dc_init_data *dc_init_data,
+-		const struct dal_init_data *init)
++		const struct dc_init_data *init,
++		struct dc_context *dc_ctx)
+ {
+ 	struct adapter_service *as = NULL;
+ 	struct as_init_data init_data;
+ 
+ 	dm_memset(&init_data, 0, sizeof(init_data));
+ 
+-	init_data.ctx = dc_init_data->ctx;
++	init_data.ctx = dc_ctx;
+ 
+ 	/* BIOS parser init data */
+-	init_data.bp_init_data.ctx = dc_init_data->ctx;
++	init_data.bp_init_data.ctx = dc_ctx;
+ 	init_data.bp_init_data.bios = init->asic_id.atombios_base_address;
+ 
+ 	/* HW init data */
+@@ -240,9 +243,6 @@ static struct adapter_service *create_as(
+ 	init_data.hw_init_data.vram_width = init->asic_id.vram_width;
+ 	init_data.hw_init_data.vram_type = init->asic_id.vram_type;
+ 
+-	/* bdf is BUS,DEVICE,FUNCTION*/
+-	init_data.bdf_info = init->bdf_info;
+-
+ 	init_data.display_param = &init->display_param;
+ 	init_data.vbios_override = init->vbios_override;
+ 	init_data.dce_environment = init->dce_environment;
+@@ -298,72 +298,63 @@ static void bw_calcs_data_update_from_pplib(struct core_dc *dc)
+ 		1000);
+ }
+ 
+-static bool construct(struct core_dc *dc, const struct dal_init_data *init_params)
++static bool construct(struct core_dc *dc, const struct dc_init_data *init_params)
+ {
+ 	struct dal_logger *logger;
+-	/* Tempory code
+-	 * TODO: replace dal_init_data with dc_init_data when dal is removed
+-	 */
+-	struct dc_init_data dc_init_data = {0};
+-
+-	/* Create dc context */
+-	/* A temp dc context is used only to allocate the memory for actual
+-	 * dc context */
+-	struct dc_context ctx = {0};
+-	ctx.cgs_device = init_params->cgs_device;
+-	ctx.dc = dc;
++	struct adapter_service *as;
++	struct dc_context *dc_ctx = dm_alloc(sizeof(*dc_ctx));
+ 
+-	dc_init_data.ctx = dm_alloc(sizeof(*dc_init_data.ctx));
+-	if (!dc_init_data.ctx) {
++
++	if (!dc_ctx) {
+ 		dm_error("%s: failed to create ctx\n", __func__);
+ 		goto ctx_fail;
+ 	}
+-	dc_init_data.ctx->driver_context = init_params->driver;
+-	dc_init_data.ctx->cgs_device = init_params->cgs_device;
+-	dc_init_data.num_virtual_links = init_params->num_virtual_links;
+-	dc_init_data.ctx->dc = dc;
++
++	dc_ctx->cgs_device = init_params->cgs_device;
++	dc_ctx->driver_context = init_params->driver;
++	dc_ctx->dc = dc;
+ 
+ 	/* Create logger */
+-	logger = dal_logger_create(dc_init_data.ctx);
++	logger = dal_logger_create(dc_ctx);
+ 
+ 	if (!logger) {
+ 		/* can *not* call logger. call base driver 'print error' */
+ 		dm_error("%s: failed to create Logger!\n", __func__);
+ 		goto logger_fail;
+ 	}
+-	dc_init_data.ctx->logger = logger;
++	dc_ctx->logger = logger;
+ 
+ 	/* Create adapter service */
+-	dc_init_data.adapter_srv = create_as(&dc_init_data, init_params);
++	as = create_as(init_params, dc_ctx);
+ 
+-	if (!dc_init_data.adapter_srv) {
++	if (!as) {
+ 		dm_error("%s: create_as() failed!\n", __func__);
+ 		goto as_fail;
+ 	}
+ 
+ 	/* Initialize HW controlled by Adapter Service */
+ 	if (false == dal_adapter_service_initialize_hw_data(
+-			dc_init_data.adapter_srv)) {
++			as)) {
+ 		dm_error("%s: dal_adapter_service_initialize_hw_data()"\
+ 				"  failed!\n", __func__);
+ 		/* Note that AS exist, so have to destroy it.*/
+ 		goto as_fail;
+ 	}
+ 
+-	dc->ctx = dc_init_data.ctx;
++	dc->ctx = dc_ctx;
+ 
+ 	dc->ctx->dce_environment = dal_adapter_service_get_dce_environment(
+-			dc_init_data.adapter_srv);
++			as);
+ 
+ 	/* Create hardware sequencer */
+-	if (!dc_construct_hw_sequencer(dc_init_data.adapter_srv, dc))
++	if (!dc_construct_hw_sequencer(as, dc))
+ 		goto hwss_fail;
+ 
+ 	if (!dc_construct_resource_pool(
+-		dc_init_data.adapter_srv, dc, dc_init_data.num_virtual_links))
++		as, dc, init_params->num_virtual_links))
+ 		goto construct_resource_fail;
+ 
+-	if (!create_links(dc, &dc_init_data))
++	if (!create_links(dc, as, init_params->num_virtual_links))
+ 		goto create_links_fail;
+ 
+ 	bw_calcs_init(&dc->bw_dceip, &dc->bw_vbios);
+@@ -376,10 +367,10 @@ static bool construct(struct core_dc *dc, const struct dal_init_data *init_param
+ construct_resource_fail:
+ create_links_fail:
+ as_fail:
+-	dal_logger_destroy(&dc_init_data.ctx->logger);
++	dal_logger_destroy(&dc_ctx->logger);
+ logger_fail:
+ hwss_fail:
+-	dm_free(dc_init_data.ctx);
++	dm_free(dc_ctx);
+ ctx_fail:
+ 	return false;
+ }
+@@ -463,7 +454,7 @@ static int8_t acquire_first_free_underlay(
+  * Public functions
+  ******************************************************************************/
+ 
+-struct core_dc *dc_create(const struct dal_init_data *init_params)
++struct core_dc *dc_create(const struct dc_init_data *init_params)
+  {
+ 	struct dc_context ctx = {
+ 		.driver_context = init_params->driver,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index aacdefe..41010f7 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -38,11 +38,6 @@
+ /*******************************************************************************
+  * Display Core Interfaces
+  ******************************************************************************/
+-struct dc_init_data {
+-	struct dc_context *ctx;
+-	struct adapter_service *adapter_srv;
+-	uint8_t num_virtual_links;
+-};
+ 
+ struct dc_caps {
+     uint32_t max_targets;
+@@ -52,13 +47,12 @@ struct dc_caps {
+ 
+ void dc_get_caps(const struct core_dc *dc, struct dc_caps *caps);
+ 
+-struct dal_init_data {
++struct dc_init_data {
+ 	struct hw_asic_id asic_id;
+-	struct view_port_alignment vp_alignment;
+-	struct bdf_info bdf_info;
+ 	struct dal_override_parameters display_param;
+ 	void *driver; /* ctx */
+ 	void *cgs_device;
++
+ 	uint8_t num_virtual_links;
+ 	/*
+ 	 * If 'vbios_override' not NULL, it will be called instead
+@@ -68,7 +62,7 @@ struct dal_init_data {
+ 	enum dce_environment dce_environment;
+ };
+ 
+-struct core_dc *dc_create(const struct dal_init_data *init_params);
++struct core_dc *dc_create(const struct dc_init_data *init_params);
+ void dc_destroy(struct core_dc **dc);
+ 
+ /*******************************************************************************
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_types.h b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+index b737206..0fb4822 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+@@ -120,14 +120,6 @@ struct hw_asic_id {
+ 	void *atombios_base_address;
+ };
+ 
+-/* this is pci information. BDF stands for BUS,DEVICE,FUNCTION*/
+-
+-struct bdf_info {
+-	uint16_t BUS_NUMBER:8;
+-	uint16_t DEVICE_NUMBER:5;
+-	uint16_t FUNCTION_NUMBER:3;
+-};
+-
+ /* array index for integer override parameters*/
+ enum int_param_array_index {
+ 	DAL_PARAM_MAX_COFUNC_NON_DP_DISPLAYS = 0,
+@@ -534,13 +526,6 @@ enum dc_acpi_cm_power_state {
+ 	DC_ACPI_CM_POWER_STATE_D3 = 8
+ };
+ 
+-struct view_port_alignment {
+-	uint8_t x_width_size_alignment;
+-	uint8_t y_height_size_alignment;
+-	uint8_t x_start_alignment;
+-	uint8_t y_start_alignment;
+-};
+-
+ enum dc_connection_type {
+ 	dc_connection_none,
+ 	dc_connection_single,
+diff --git a/drivers/gpu/drm/amd/dal/include/adapter_service_interface.h b/drivers/gpu/drm/amd/dal/include/adapter_service_interface.h
+index a4b37ff..cc093b1 100644
+--- a/drivers/gpu/drm/amd/dal/include/adapter_service_interface.h
++++ b/drivers/gpu/drm/amd/dal/include/adapter_service_interface.h
+@@ -318,7 +318,6 @@ struct as_init_data {
+ 	struct hw_asic_id hw_init_data;
+ 	struct bp_init_data bp_init_data;
+ 	struct dc_context *ctx;
+-	struct bdf_info bdf_info;
+ 	const struct dal_override_parameters *display_param;
+ 	struct dc_bios *vbios_override;
+ 	enum dce_environment dce_environment;
+@@ -580,9 +579,6 @@ struct ddc *dal_adapter_service_obtain_ddc_from_i2c_info(
+ 	struct adapter_service *as,
+ 	struct graphics_object_i2c_info *info);
+ 
+-struct bdf_info dal_adapter_service_get_adapter_info(
+-	struct adapter_service *as);
+-
+ /* Determine if this ASIC needs to wait on PLL lock bit */
+ bool dal_adapter_service_should_psr_skip_wait_for_pll_lock(
+ 	struct adapter_service *as);
+-- 
+2.7.4
+

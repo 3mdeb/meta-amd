@@ -1,0 +1,294 @@
+From b41e2d348c8fb3df94d5d358c27c008a63f979e7 Mon Sep 17 00:00:00 2001
+From: Jun Lei <Jun.Lei@amd.com>
+Date: Wed, 23 Mar 2016 11:26:03 -0400
+Subject: [PATCH 0987/1110] drm/amd/dal: Pattern for freesync module
+ implementation in DC/DM
+
+Signed-off-by: Jun Lei <Jun.Lei@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |  18 +++-
+ .../gpu/drm/amd/dal/modules/freesync/freesync.c    | 106 +++++++++++++++++++++
+ .../gpu/drm/amd/dal/modules/freesync/freesync.h    |  41 ++++++++
+ drivers/gpu/drm/amd/dal/modules/inc/mod_freesync.h |  64 +++++++++++++
+ 4 files changed, 225 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/dal/modules/freesync/freesync.c
+ create mode 100644 drivers/gpu/drm/amd/dal/modules/freesync/freesync.h
+ create mode 100644 drivers/gpu/drm/amd/dal/modules/inc/mod_freesync.h
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index 5c2fe6d..13fa582 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -40,13 +40,22 @@
+  ******************************************************************************/
+ 
+ struct dc_caps {
+-    uint32_t max_targets;
+-    uint32_t max_links;
+-    uint32_t max_audios;
++	uint32_t max_targets;
++	uint32_t max_links;
++	uint32_t max_audios;
++};
++
++struct dc;
++struct dc_surface;
++
++struct dc_stream_funcs {
++	bool (*dc_stream_adjust_vmin_vmax)(struct dc *dc,
++			struct dc_stream *stream, int vmin, int vmax);
+ };
+ 
+ struct dc {
+ 	struct dc_caps caps;
++	struct dc_stream_funcs stream_funcs;
+ };
+ 
+ struct dc_init_data {
+@@ -302,10 +311,11 @@ struct dc_stream {
+ 
+ 	struct audio_info audio_info;
+ 
++	bool enable_freesync;
++
+ 	/* TODO: dithering */
+ 	/* TODO: transfer function (CSC/regamma/gamut remap) */
+ 	/* TODO: custom INFO packets */
+-	/* TODO: DRR/Freesync parameters */
+ 	/* TODO: ABM info (DMCU) */
+ 	/* TODO: PSR info */
+ 	/* TODO: CEA VIC */
+diff --git a/drivers/gpu/drm/amd/dal/modules/freesync/freesync.c b/drivers/gpu/drm/amd/dal/modules/freesync/freesync.c
+new file mode 100644
+index 0000000..d0113d5
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/modules/freesync/freesync.c
+@@ -0,0 +1,106 @@
++/*
++ * Copyright 2016 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#include "freesync.h"
++#include "dm_services.h"
++#include "dc.h"
++
++static bool check_dc_support(const struct dc *dc)
++{
++	if (dc->stream_funcs.dc_stream_adjust_vmin_vmax == NULL)
++		return false;
++
++	return true;
++}
++
++struct mod_freesync *mod_freesync_create(struct dc *dc)
++{
++	struct core_freesync *core_freesync = dm_alloc(sizeof(struct core_freesync));
++
++	if (core_freesync == NULL)
++		goto fail_alloc_context;
++
++	if (dc == NULL)
++		goto fail_construct;
++
++	core_freesync->dc = dc;
++
++	if (!check_dc_support(dc))
++		goto fail_construct;
++
++	return &core_freesync->public;
++
++fail_construct:
++	dm_free(core_freesync);
++
++fail_alloc_context:
++	return NULL;
++}
++
++void mod_freesync_destroy(struct mod_freesync *mod_freesync)
++{
++	if (mod_freesync != NULL) {
++		struct core_freesync *core_freesync = MOD_FREESYNC_TO_CORE(mod_freesync);
++
++		dm_free(core_freesync);
++	}
++}
++
++bool mod_freesync_set_freesync_on_streams(struct mod_freesync *mod_freesync,
++		struct dc_stream **streams,	int num_streams,
++		struct mod_freesync_params *params)
++{
++	int v_total_nominal = 0;
++	int i = 0;
++	struct core_freesync *core_freesync = NULL;
++
++	if (num_streams == 0 || streams == NULL || mod_freesync == NULL
++			|| params == NULL)
++		return false;
++
++	core_freesync = MOD_FREESYNC_TO_CORE(mod_freesync);
++
++	if (params->mode == FREESYNC_MODE_DISABLED)	{
++		/* Disable freesync */
++		for (i = 0; i < num_streams; i++) {
++			v_total_nominal = streams[i]->timing.v_total;
++
++			core_freesync->dc->stream_funcs.dc_stream_adjust_vmin_vmax(core_freesync->dc,
++					streams[i], v_total_nominal, v_total_nominal);
++		}
++
++		return true;
++	} else if (params->mode == FREESYNC_MODE_VARIABLE) {
++		/* Enable freesync */
++	}
++
++	return false;
++}
++
++void mod_freesync_vupdate_callback(struct mod_freesync *mod_freesync,
++		struct dc_stream *stream)
++{
++
++}
+diff --git a/drivers/gpu/drm/amd/dal/modules/freesync/freesync.h b/drivers/gpu/drm/amd/dal/modules/freesync/freesync.h
+new file mode 100644
+index 0000000..65a4194
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/modules/freesync/freesync.h
+@@ -0,0 +1,41 @@
++/*
++ * Copyright 2016 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#ifndef FREESYNC_H_
++#define FREESYNC_H_
++
++#include "mod_freesync.h"
++
++struct dc;
++
++struct core_freesync {
++	struct mod_freesync public;
++	struct dc *dc;
++};
++
++#define MOD_FREESYNC_TO_CORE(mod_freesync)\
++	container_of(mod_freesync, struct core_freesync, public)
++
++#endif /* FREESYNC_H_ */
+diff --git a/drivers/gpu/drm/amd/dal/modules/inc/mod_freesync.h b/drivers/gpu/drm/amd/dal/modules/inc/mod_freesync.h
+new file mode 100644
+index 0000000..e12d844
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/modules/inc/mod_freesync.h
+@@ -0,0 +1,64 @@
++/*
++ * Copyright 2016 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#ifndef MOD_FREESYNC_H_
++#define MOD_FREESYNC_H_
++
++#include "dm_services.h"
++
++struct mod_freesync {
++	int dummy;
++};
++
++enum mod_freesync_mode {
++	FREESYNC_MODE_DISABLED,
++	FREESYNC_MODE_FIXED,
++	FREESYNC_MODE_VARIABLE,
++};
++
++struct mod_freesync_params {
++	enum mod_freesync_mode mode;
++};
++
++struct mod_freesync *mod_freesync_create(struct dc *dc);
++void mod_freesync_destroy(struct mod_freesync *mod_freesync);
++
++/*
++ * This interface sets the freesync mode on a stream.  Mode and associated
++ * parameters required to set it are defined in mod_freesync_params.
++ */
++bool mod_freesync_set_freesync_on_streams(struct mod_freesync *mod_freesync,
++		struct dc_stream **streams, int num_streams,
++		struct mod_freesync_params *params);
++
++/*
++ * This interface must be called for on every VUPDATE event for every stream
++ * which is not FREESYNC_MODE_DISABLED.  Calling this for a stream that is in
++ * FREESYNC_MODE_DISABLED has no effect.
++ */
++void mod_freesync_vupdate_callback(struct mod_freesync *mod_freesync,
++	struct dc_stream *stream);
++
++#endif
+-- 
+2.7.4
+

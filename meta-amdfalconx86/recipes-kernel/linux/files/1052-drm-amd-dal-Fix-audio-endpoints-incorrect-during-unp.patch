@@ -1,0 +1,420 @@
+From 09f20b864f331a3e75034a5be09b4dad70fe4b6a Mon Sep 17 00:00:00 2001
+From: Yongqiang Sun <yongqiang.sun@amd.com>
+Date: Wed, 6 Apr 2016 17:15:27 -0400
+Subject: [PATCH 1052/1110] drm/amd/dal: Fix audio endpoints incorrect during
+ unplug.
+
+Issue:
+Audio endpoints isn't disappears in sound setting after
+unplug a HDMI/DP monitor on Baffin.
+
+Root cause:
+During unplug, sometime pipe_ctx isn't reset at all due
+to check condition isn't enough.
+
+Solution:
+Remove unchanged and timing changed flag in pipe_ctx,
+change check condition for reset pipe_ctx.
+
+Signed-off-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      | 24 ------
+ .../gpu/drm/amd/dal/dc/dce100/dce100_resource.c    | 20 +----
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 97 ++++++++++++++++------
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    | 25 +-----
+ .../gpu/drm/amd/dal/dc/dce112/dce112_resource.c    | 14 ----
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c  | 20 +----
+ 6 files changed, 74 insertions(+), 126 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index edf0aab..12e4515 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -604,23 +604,6 @@ static struct audio *find_first_free_audio(struct resource_context *res_ctx)
+ 	return 0;
+ }
+ 
+-static bool check_timing_change(struct core_stream *cur_stream,
+-		struct core_stream *new_stream)
+-{
+-	if (cur_stream == NULL)
+-		return true;
+-
+-	/* If sink pointer changed, it means this is a hotplug, we should do
+-	 * full hw setting.
+-	 */
+-	if (cur_stream->sink != new_stream->sink)
+-		return true;
+-
+-	return !resource_is_same_timing(
+-					&cur_stream->public.timing,
+-					&new_stream->public.timing);
+-}
+-
+ static void set_stream_signal(struct pipe_ctx *pipe_ctx)
+ {
+ 	struct dc_sink *dc_sink =
+@@ -680,8 +663,6 @@ enum dc_status resource_map_pool_resources(
+ 
+ 				*pipe_ctx =
+ 					dc->current_context.res_ctx.pipe_ctx[k];
+-				pipe_ctx->flags.timing_changed = false;
+-				pipe_ctx->flags.unchanged = true;
+ 
+ 				set_stream_engine_in_use(
+ 					&context->res_ctx,
+@@ -720,8 +701,6 @@ enum dc_status resource_map_pool_resources(
+ 
+ 			curr_stream =
+ 				dc->current_context.res_ctx.pipe_ctx[pipe_idx].stream;
+-			context->res_ctx.pipe_ctx[pipe_idx].flags.timing_changed =
+-				check_timing_change(curr_stream, stream);
+ 
+ 			pipe_ctx->stream_enc =
+ 				find_first_free_match_stream_enc_for_link(
+@@ -1282,9 +1261,6 @@ enum dc_status resource_map_clock_resources(
+ 						&context->res_ctx,
+ 						pipe_ctx->clock_source);
+ 
+-				if (dc->current_context.res_ctx.pipe_ctx[k].clock_source
+-					!= pipe_ctx->clock_source)
+-					pipe_ctx->flags.timing_changed = true;
+ 				/* only one cs per stream regardless of mpo */
+ 				break;
+ 			}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+index 5185e91..4820af7 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+@@ -765,24 +765,6 @@ enum dc_status dce100_validate_bandwidth(
+ 	return DC_OK;
+ }
+ 
+-static void set_target_unchanged(
+-		struct validate_context *context,
+-		uint8_t target_idx)
+-{
+-	uint8_t i, j;
+-	struct core_target *target = context->targets[target_idx];
+-	context->target_flags[target_idx].unchanged = true;
+-	for (i = 0; i < target->public.stream_count; i++) {
+-		struct core_stream *stream =
+-			DC_STREAM_TO_CORE(target->public.streams[i]);
+-		for (j = 0; j < MAX_PIPES; j++) {
+-			if (context->res_ctx.pipe_ctx[j].stream == stream)
+-				context->res_ctx.pipe_ctx[j].flags.unchanged =
+-									true;
+-		}
+-	}
+-}
+-
+ enum dc_status dce100_validate_with_context(
+ 		const struct core_dc *dc,
+ 		const struct dc_validation_set set[],
+@@ -804,7 +786,7 @@ enum dc_status dce100_validate_with_context(
+ 			if (dc->current_context.targets[j]
+ 						== context->targets[i]) {
+ 				unchanged = true;
+-				set_target_unchanged(context, i);
++				context->target_flags[i].unchanged = true;
+ 				resource_attach_surfaces_to_context(
+ 					(struct dc_surface **)dc->current_context.
+ 						target_status[j].surfaces,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index b7c6a51..62363ef 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -673,33 +673,17 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 		struct validate_context *context,
+ 		struct core_dc *dc)
+ {
+-	int i;
+ 	struct core_stream *stream = pipe_ctx->stream;
+-	bool timing_changed = context->res_ctx.pipe_ctx[pipe_ctx->pipe_idx]
+-							.flags.timing_changed;
+ 	enum dc_color_space color_space;
++	struct pipe_ctx *pipe_ctx_old = &dc->current_context.res_ctx.
++			pipe_ctx[pipe_ctx->pipe_idx];
+ 
+-	struct pipe_ctx *pipe_ctx_old = NULL;
+-
+-	for (i = 0; i < MAX_PIPES; i++) {
+-		if (dc->current_context.res_ctx.pipe_ctx[i].stream == pipe_ctx->stream)
+-			pipe_ctx_old = &dc->current_context.res_ctx.pipe_ctx[i];
+-	}
+-
+-	if (timing_changed) {
++	if (!pipe_ctx_old->stream) {
+ 		/* Must blank CRTC after disabling power gating and before any
+ 		 * programming, otherwise CRTC will be hung in bad state
+ 		 */
+ 		pipe_ctx->tg->funcs->set_blank(pipe_ctx->tg, true);
+ 
+-		if (pipe_ctx_old) {
+-			core_link_disable_stream(pipe_ctx);
+-			resource_unreference_clock_source(
+-						&dc->current_context.res_ctx,
+-						pipe_ctx_old->clock_source);
+-		}
+-
+-		/*TODO: AUTO check if timing changed*/
+ 		if (false == pipe_ctx->clock_source->funcs->program_pix_clk(
+ 				pipe_ctx->clock_source,
+ 				&pipe_ctx->pix_clk_params,
+@@ -722,7 +706,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 					stream->public.timing.pix_clk_khz,
+ 					context->target_count);
+ 
+-	if (timing_changed) {
++	if (!pipe_ctx_old->stream) {
+ 		if (false == pipe_ctx->tg->funcs->enable_crtc(
+ 				pipe_ctx->tg)) {
+ 			BREAK_TO_DEBUGGER();
+@@ -783,12 +767,13 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 			pipe_ctx->tg,
+ 			color_space);
+ 
+-	if (timing_changed)
++	if (!pipe_ctx_old->stream) {
+ 		core_link_enable_stream(pipe_ctx);
+ 
+-	if (dc_is_dp_signal(pipe_ctx->signal))
+-		unblank_stream(pipe_ctx,
+-			&stream->sink->link->public.cur_link_settings);
++		if (dc_is_dp_signal(pipe_ctx->signal))
++			unblank_stream(pipe_ctx,
++				&stream->sink->link->public.cur_link_settings);
++	}
+ 
+ 	return DC_OK;
+ }
+@@ -1171,6 +1156,49 @@ static void set_drr(struct pipe_ctx **pipe_ctx,
+ 	}
+ }
+ 
++static bool check_timing_change(struct core_stream *cur_stream,
++		struct core_stream *new_stream)
++{
++	if (cur_stream == NULL)
++		return true;
++
++	/* If sink pointer changed, it means this is a hotplug, we should do
++	 * full hw setting.
++	 */
++	if (cur_stream->sink != new_stream->sink)
++		return true;
++
++	return !resource_is_same_timing(
++					&cur_stream->public.timing,
++					&new_stream->public.timing);
++}
++
++static bool pipe_need_reprogram(
++		struct pipe_ctx *pipe_ctx_old,
++		struct pipe_ctx *pipe_ctx)
++{
++	if (pipe_ctx_old->stream->sink != pipe_ctx->stream->sink)
++		return true;
++
++	if (pipe_ctx_old->signal != pipe_ctx->signal)
++		return true;
++
++	if (pipe_ctx_old->audio != pipe_ctx->audio)
++		return true;
++
++	if (pipe_ctx_old->clock_source != pipe_ctx->clock_source)
++		return true;
++
++	if (pipe_ctx_old->stream_enc != pipe_ctx->stream_enc)
++		return true;
++
++	if (check_timing_change(pipe_ctx_old->stream, pipe_ctx->stream))
++		return true;
++
++
++	return false;
++}
++
+ /*TODO: const validate_context*/
+ static enum dc_status apply_ctx_to_hw(
+ 		struct core_dc *dc,
+@@ -1190,7 +1218,12 @@ static enum dc_status apply_ctx_to_hw(
+ 		 * since bios does optimization and doesn't apply if changing
+ 		 * PHY when not already disabled.
+ 		 */
+-		if (pipe_ctx_old->stream && !pipe_ctx->stream)
++
++		if (!pipe_ctx_old->stream)
++			continue;
++
++		if (!pipe_ctx->stream ||
++			pipe_need_reprogram(pipe_ctx_old, pipe_ctx))
+ 			reset_single_pipe_hw_ctx(
+ 				dc, pipe_ctx_old, &dc->current_context);
+ 	}
+@@ -1203,10 +1236,15 @@ static enum dc_status apply_ctx_to_hw(
+ 	update_bios_scratch_critical_state(dc, true);
+ 
+ 	for (i = 0; i < MAX_PIPES; i++) {
++		struct pipe_ctx *pipe_ctx_old =
++					&dc->current_context.res_ctx.pipe_ctx[i];
+ 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
+ 		struct dc_bios *dcb;
+ 
+-		if (pipe_ctx->stream == NULL || pipe_ctx->flags.unchanged)
++		if (pipe_ctx->stream == NULL)
++			continue;
++
++		if (pipe_ctx->stream == pipe_ctx_old->stream)
+ 			continue;
+ 
+ 		dcb = dal_adapter_service_get_bios_parser(
+@@ -1226,9 +1264,14 @@ static enum dc_status apply_ctx_to_hw(
+ 		set_display_clock(context);
+ 
+ 	for (i = 0; i < MAX_PIPES; i++) {
++		struct pipe_ctx *pipe_ctx_old =
++					&dc->current_context.res_ctx.pipe_ctx[i];
+ 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
+ 
+-		if (pipe_ctx->stream == NULL || pipe_ctx->flags.unchanged)
++		if (pipe_ctx->stream == NULL)
++			continue;
++
++		if (pipe_ctx->stream == pipe_ctx_old->stream)
+ 			continue;
+ 
+ 		status = apply_single_controller_ctx_to_hw(
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index ccf6bd8..cf3a6ed 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -886,24 +886,6 @@ enum dc_status dce110_validate_bandwidth(
+ 	return result;
+ }
+ 
+-static void set_target_unchanged(
+-		struct validate_context *context,
+-		uint8_t target_idx)
+-{
+-	uint8_t i, j;
+-	struct core_target *target = context->targets[target_idx];
+-	context->target_flags[target_idx].unchanged = true;
+-	for (i = 0; i < target->public.stream_count; i++) {
+-		struct core_stream *stream =
+-			DC_STREAM_TO_CORE(target->public.streams[i]);
+-		for (j = 0; j < MAX_PIPES; j++) {
+-			if (context->res_ctx.pipe_ctx[j].stream == stream)
+-				context->res_ctx.pipe_ctx[j].flags.unchanged =
+-									true;
+-		}
+-	}
+-}
+-
+ enum dc_status dce110_validate_with_context(
+ 		const struct core_dc *dc,
+ 		const struct dc_validation_set set[],
+@@ -915,8 +897,6 @@ enum dc_status dce110_validate_with_context(
+ 	struct dc_context *dc_ctx = dc->ctx;
+ 
+ 	for (i = 0; i < set_count; i++) {
+-		bool unchanged = false;
+-
+ 		context->targets[i] = DC_TARGET_TO_CORE(set[i].target);
+ 		dc_target_retain(&context->targets[i]->public);
+ 		context->target_count++;
+@@ -924,8 +904,7 @@ enum dc_status dce110_validate_with_context(
+ 		for (j = 0; j < dc->current_context.target_count; j++)
+ 			if (dc->current_context.targets[j]
+ 						== context->targets[i]) {
+-				unchanged = true;
+-				set_target_unchanged(context, i);
++				context->target_flags[i].unchanged = true;
+ 				resource_attach_surfaces_to_context(
+ 					(struct dc_surface **)dc->current_context.
+ 						target_status[j].surfaces,
+@@ -935,7 +914,7 @@ enum dc_status dce110_validate_with_context(
+ 				context->target_status[i] =
+ 					dc->current_context.target_status[j];
+ 			}
+-		if (!unchanged || set[i].surface_count != 0)
++		if (set[i].surface_count != 0)
+ 			if (!resource_attach_surfaces_to_context(
+ 					(struct dc_surface **)set[i].surfaces,
+ 					set[i].surface_count,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
+index 5cf61bd..4759a41 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
+@@ -968,18 +968,7 @@ static void set_target_unchanged(
+ 		struct validate_context *context,
+ 		uint8_t target_idx)
+ {
+-	uint8_t i, j;
+-	struct core_target *target = context->targets[target_idx];
+ 	context->target_flags[target_idx].unchanged = true;
+-	for (i = 0; i < target->public.stream_count; i++) {
+-		struct core_stream *stream =
+-			DC_STREAM_TO_CORE(target->public.streams[i]);
+-		for (j = 0; j < MAX_PIPES; j++) {
+-			if (context->res_ctx.pipe_ctx[j].stream == stream)
+-				context->res_ctx.pipe_ctx[j].flags.unchanged =
+-									true;
+-		}
+-	}
+ }
+ 
+ static enum dc_status map_clock_resources(
+@@ -1022,9 +1011,6 @@ static enum dc_status map_clock_resources(
+ 						&context->res_ctx,
+ 						pipe_ctx->clock_source);
+ 
+-				if (pipe_ctx->clock_source
+-					!= dc->current_context.res_ctx.pipe_ctx[k].clock_source)
+-					pipe_ctx->flags.timing_changed = true;
+ 				/* only one cs per stream regardless of mpo */
+ 				break;
+ 			}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+index 56487fd..b2aa2cc 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+@@ -719,24 +719,6 @@ enum dc_status dce80_validate_bandwidth(
+ 	return DC_OK;
+ }
+ 
+-static void set_target_unchanged(
+-		struct validate_context *context,
+-		uint8_t target_idx)
+-{
+-	uint8_t i, j;
+-	struct core_target *target = context->targets[target_idx];
+-	context->target_flags[target_idx].unchanged = true;
+-	for (i = 0; i < target->public.stream_count; i++) {
+-		struct core_stream *stream =
+-			DC_STREAM_TO_CORE(target->public.streams[i]);
+-		for (j = 0; j < MAX_PIPES; j++) {
+-			if (context->res_ctx.pipe_ctx[j].stream == stream)
+-				context->res_ctx.pipe_ctx[j].flags.unchanged =
+-									true;
+-		}
+-	}
+-}
+-
+ enum dc_status dce80_validate_with_context(
+ 		const struct core_dc *dc,
+ 		const struct dc_validation_set set[],
+@@ -758,7 +740,7 @@ enum dc_status dce80_validate_with_context(
+ 			if (dc->current_context.targets[j]
+ 						== context->targets[i]) {
+ 				unchanged = true;
+-				set_target_unchanged(context, i);
++				context->target_flags[i].unchanged = true;
+ 				resource_attach_surfaces_to_context(
+ 					(struct dc_surface **)dc->current_context.
+ 						target_status[j].surfaces,
+-- 
+2.7.4
+

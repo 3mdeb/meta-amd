@@ -1,0 +1,151 @@
+From a039d976c4ee405b2e410e6e663223b262fa931e Mon Sep 17 00:00:00 2001
+From: Hersen Wu <hersenxs.wu@amd.com>
+Date: Tue, 1 Dec 2015 11:43:19 -0500
+Subject: [PATCH 0550/1110] drm/amd/dal: clean DP MST payload alloc and dealloc
+ for new stream before link enable
+
+Signed-off-by: Hersen Wu <hersenxs.wu@amd.com>
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          | 11 +++++---
+ drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c     |  5 ++--
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 33 ++++++++++++++++------
+ 3 files changed, 33 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 0af5005..f0719e9 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -890,6 +890,9 @@ static enum dc_status enable_link_dp(struct core_stream *stream)
+ 		stream->stream_enc->id,
+ 		&link_settings);
+ 
++	if (status == DC_ERROR_UNEXPECTED)
++		return status;
++
+ 	panel_mode = dp_get_panel_mode(link);
+ 	dpcd_configure_panel_mode(link, panel_mode);
+ 
+@@ -914,15 +917,15 @@ static enum dc_status enable_link_dp_mst(struct core_stream *stream)
+ 	bool already_enabled = false;
+ 	int i;
+ 
+-
+ 	for (i = 0; i < link->enabled_stream_count; i++) {
+ 		if (link->enabled_streams[i] == stream)
+ 			already_enabled = true;
+ 	}
+ 
+-	/* TODO MST link shared by stream. counter? */
+-	if (!already_enabled)
++	if (!already_enabled && link->enabled_stream_count < MAX_SINKS_PER_LINK)
+ 		link->enabled_streams[link->enabled_stream_count++] = stream;
++	else if (link->enabled_stream_count >= MAX_SINKS_PER_LINK)
++		return DC_ERROR_UNEXPECTED;
+ 
+ 	/* sink signal type after MST branch is MST. Multiple MST sinks
+ 	 * share one link. Link DP PHY is enable or training only once.
+@@ -1014,7 +1017,7 @@ enum dc_status core_link_enable(struct core_stream *stream)
+ 		break;
+ 	}
+ 
+-	if (stream->audio) {
++	if (stream->audio && status == DC_OK) {
+ 		/* notify audio driver for audio modes of monitor */
+ 		dal_audio_enable_azalia_audio_jack_presence(stream->audio,
+ 				stream->stream_enc->id);
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
+index 8ef4674..7961a4e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
+@@ -46,8 +46,6 @@ void dp_receiver_power_ctrl(struct core_link *link, bool on)
+ 			sizeof(state));
+ }
+ 
+-
+-/* TODO: HBR2 need raise clock for DP link training */
+ enum dc_status dp_enable_link_phy(
+ 	struct core_link *link,
+ 	enum signal_type signal,
+@@ -66,7 +64,8 @@ enum dc_status dp_enable_link_phy(
+ 					0) != ENCODER_RESULT_OK)
+ 		status = DC_ERROR_UNEXPECTED;
+ 
+-	dp_receiver_power_ctrl(link, true);
++	if (status == DC_OK)
++		dp_receiver_power_ctrl(link, true);
+ 
+ 	return status;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 9c0bcbb..046ab0c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -783,10 +783,10 @@ static enum dc_status allocate_mst_payload(struct core_stream *stream)
+ 	struct fixed31_32 avg_time_slots_per_mtp;
+ 	uint8_t cur_stream_payload_idx;
+ 
+-	if (stream_encoder->id == ENGINE_ID_UNKNOWN) {
+-		/* TODO ASSERT */
+-		return DC_ERROR_UNEXPECTED;
+-	}
++	/* enable_link_dp_mst already check link->enabled_stream_count
++	 * and stream is in link->stream[]. This is called during set mode,
++	 * stream_enc is available.
++	 */
+ 
+ 	/* get calculate VC payload for stream: stream_alloc */
+ 	dc_helpers_dp_mst_write_payload_allocation_table(
+@@ -831,11 +831,24 @@ static enum dc_status deallocate_mst_payload(struct core_stream *stream)
+ 	struct stream_encoder *stream_encoder = stream->stream_enc;
+ 	struct dp_mst_stream_allocation_table table = {0};
+ 	struct fixed31_32 avg_time_slots_per_mtp = dal_fixed31_32_from_int(0);
++	uint8_t i;
+ 
+-	if (stream_encoder->id == ENGINE_ID_UNKNOWN) {
+-		/* TODO ASSERT */
+-		return DC_ERROR_UNEXPECTED;
++	/* deallocate_mst_payload is called before disable link. When mode or
++	 * disable/enable monitor, new stream is created which is not in link
++	 * stream[] yet. For this, payload is not allocated yet, so de-alloc
++	 * should not done. For new mode set, map_resources will get engine
++	 * for new stream, so stream_enc->id should be validated until here.
++	 */
++	if (link->enabled_stream_count == 0)
++		return DC_OK;
++
++	for (i = 0; i < link->enabled_stream_count; i++) {
++		if (link->enabled_streams[i] == stream)
++			break;
+ 	}
++	/* stream is not in link stream list */
++	if (i == link->enabled_stream_count)
++		return DC_OK;
+ 
+ 	/* slot X.Y */
+ 	dce110_stream_encoder_set_mst_bandwidth(
+@@ -862,9 +875,7 @@ static enum dc_status deallocate_mst_payload(struct core_stream *stream)
+ 			&stream->sink->public,
+ 			false);
+ 
+-
+ 	return DC_OK;
+-
+ }
+ 
+ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+@@ -1009,6 +1020,10 @@ static void power_down_encoders(struct validate_context *context)
+ 	for (i = 0; i < context->target_count; i++) {
+ 		target = context->targets[i];
+ 		stream = DC_STREAM_TO_CORE(target->public.streams[0]);
++
++		if (stream->signal == SIGNAL_TYPE_DISPLAY_PORT_MST)
++			deallocate_mst_payload(stream);
++
+ 		core_link_disable(stream);
+ 	}
+ }
+-- 
+2.7.4
+

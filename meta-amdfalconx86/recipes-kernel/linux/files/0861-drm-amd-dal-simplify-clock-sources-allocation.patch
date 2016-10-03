@@ -1,0 +1,704 @@
+From 115c06efef095c72ba9fa30ebde9ab9418b59b8a Mon Sep 17 00:00:00 2001
+From: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Date: Thu, 25 Feb 2016 06:25:10 -0500
+Subject: [PATCH 0861/1110] drm/amd/dal: simplify clock sources allocation
+
+Separate DP clock source from regular clock sources
+and so simplify DP clock source access
+
+Signed-off-by: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c       | 74 ++++--------------
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      | 49 ++++++++----
+ .../gpu/drm/amd/dal/dc/dce100/dce100_resource.c    | 82 ++++++++------------
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |  5 ++
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    | 68 ++++++++--------
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c  | 90 +++++++++++-----------
+ drivers/gpu/drm/amd/dal/dc/inc/core_types.h        |  6 ++
+ drivers/gpu/drm/amd/dal/dc/inc/resource.h          |  3 +
+ 8 files changed, 174 insertions(+), 203 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
+index e4ea886..619e910 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
+@@ -1085,63 +1085,6 @@ static enum dc_link_rate get_max_link_rate(struct core_link *link)
+ 	return max_link_rate;
+ }
+ 
+-static enum clock_source_id get_clock_source_id_for_link_training(
+-	struct core_link *link)
+-{
+-	bool result;
+-	struct dc_sink_init_data init_params = {0};
+-	struct dc_sink *sink;
+-	struct dc_stream *stream;
+-	struct dc_target *target;
+-	struct validate_context *context;
+-	struct dc_validation_set set;
+-	enum clock_source_id id = CLOCK_SOURCE_ID_UNDEFINED;
+-
+-	init_params.link = &link->public;
+-	init_params.sink_signal = SIGNAL_TYPE_DISPLAY_PORT;
+-	sink = dc_sink_create(&init_params);
+-
+-	if (!sink)
+-		goto fail_sink;
+-
+-	stream = dc_create_stream_for_sink(sink);
+-
+-	if (!stream)
+-		goto fail_stream;
+-
+-	target = dc_create_target_for_streams(&stream, 1);
+-
+-	if (!target)
+-		goto fail_target;
+-
+-	set.surface_count = 0;
+-	set.target = target;
+-
+-	context = dm_alloc(sizeof(struct validate_context));
+-
+-	if (!context)
+-		goto fail_context;
+-
+-	result = link->dc->res_pool.funcs->validate_with_context(
+-		link->dc,
+-		&set,
+-		1,
+-		context);
+-
+-	if (result)
+-		id = context->res_ctx.pipe_ctx[0].clock_source->id;
+-
+-	dm_free(context);
+-fail_context:
+-	dc_target_release(target);
+-fail_target:
+-	dc_stream_release(stream);
+-fail_stream:
+-	dc_sink_release(sink);
+-fail_sink:
+-	return id;
+-}
+-
+ bool dp_hbr_verify_link_cap(
+ 	struct core_link *link,
+ 	struct dc_link_settings *known_limit_link_setting)
+@@ -1152,11 +1095,12 @@ bool dp_hbr_verify_link_cap(
+ 	const struct dc_link_settings *cur;
+ 	bool skip_video_pattern;
+ 	uint32_t i;
++	struct clock_source *dp_cs;
++	enum clock_source_id dp_cs_id = CLOCK_SOURCE_ID_EXTERNAL;
+ 
+ 	success = false;
+ 	skip_link_training = false;
+ 
+-	/* TODO confirm this is correct for cz */
+ 	max_link_cap.lane_count = LANE_COUNT_FOUR;
+ 	max_link_cap.link_rate = get_max_link_rate(link);
+ 	max_link_cap.link_spread = LINK_SPREAD_05_DOWNSPREAD_30KHZ;
+@@ -1169,6 +1113,18 @@ bool dp_hbr_verify_link_cap(
+ 	/* disable PHY done possible by BIOS, will be done by driver itself */
+ 	dp_disable_link_phy(link, link->public.connector_signal);
+ 
++	dp_cs = link->dc->res_pool.dp_clock_source;
++
++	if (dp_cs)
++		dp_cs_id = dp_cs->id;
++	else {
++		/*
++		 * dp clock source is not initialized for some reason.
++		 * Should not happen, CLOCK_SOURCE_ID_EXTERNAL will be used
++		 */
++		ASSERT(dp_cs);
++	}
++
+ 	for (i = 0; i < get_link_training_fallback_table_len(link) &&
+ 		!success; i++) {
+ 		cur = get_link_training_fallback_table(link, i);
+@@ -1188,7 +1144,7 @@ bool dp_hbr_verify_link_cap(
+ 		dp_enable_link_phy(
+ 				link,
+ 				link->public.connector_signal,
+-				get_clock_source_id_for_link_training(link),
++				dp_cs_id,
+ 				cur);
+ 
+ 		if (skip_link_training)
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index fcb9a0f..f5bfaf3 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -72,14 +72,23 @@ void unreference_clock_source(
+ {
+ 	int i;
+ 	for (i = 0; i < res_ctx->pool.clk_src_count; i++) {
+-		if (res_ctx->pool.clock_sources[i] == clock_source) {
+-			res_ctx->clock_source_ref_count[i]--;
++		if (res_ctx->pool.clock_sources[i] != clock_source)
++			continue;
++
++		res_ctx->clock_source_ref_count[i]--;
+ 
+ 		if (res_ctx->clock_source_ref_count[i] == 0)
+ 			clock_source->funcs->cs_power_down(clock_source);
+-		}
++
++		break;
+ 	}
+ 
++	if (res_ctx->pool.dp_clock_source == clock_source) {
++		res_ctx->dp_clock_source_ref_count--;
++
++		if (res_ctx->dp_clock_source_ref_count == 0)
++			clock_source->funcs->cs_power_down(clock_source);
++	}
+ }
+ 
+ void reference_clock_source(
+@@ -88,10 +97,15 @@ void reference_clock_source(
+ {
+ 	int i;
+ 	for (i = 0; i < res_ctx->pool.clk_src_count; i++) {
+-		if (res_ctx->pool.clock_sources[i] == clock_source) {
+-			res_ctx->clock_source_ref_count[i]++;
+-		}
++		if (res_ctx->pool.clock_sources[i] != clock_source)
++			continue;
++
++		res_ctx->clock_source_ref_count[i]++;
++		break;
+ 	}
++
++	if (res_ctx->pool.dp_clock_source == clock_source)
++		res_ctx->dp_clock_source_ref_count++;
+ }
+ 
+ bool is_same_timing(
+@@ -109,21 +123,17 @@ static bool is_sharable_clk_src(
+ 	enum dce_version dce_ver = dal_adapter_service_get_dce_version(
+ 		pipe->stream->sink->link->adapter_srv);
+ 
+-	/* Currently no clocks are shared for DCE 10 until VBIOS behaviour
++	/* Currently no clocks are shared for DCE 10 until VBIOS behavior
+ 	 * is verified for this use case
+ 	 */
+-	if (dce_ver == DCE_VERSION_10_0 && !dc_is_dp_signal(pipe->signal))
++	if (dce_ver == DCE_VERSION_10_0)
+ 		return false;
+ #endif
+ 
+ 	if (pipe_with_clk_src->clock_source == NULL)
+ 		return false;
+ 
+-	if (dc_is_dp_signal(pipe->signal) &&
+-		dc_is_dp_signal(pipe_with_clk_src->signal))
+-		return true;
+-
+-	if (pipe->signal != pipe_with_clk_src->signal)
++	if (dc_is_dp_signal(pipe_with_clk_src->signal))
+ 		return false;
+ 
+ 	if(!is_same_timing(
+@@ -1275,6 +1285,19 @@ void val_ctx_copy_construct(
+ 	}
+ }
+ 
++struct clock_source *dc_resource_find_first_free_pll(
++		struct resource_context *res_ctx)
++{
++	int i;
++
++	for (i = 0; i < res_ctx->pool.clk_src_count; ++i) {
++		if (res_ctx->clock_source_ref_count[i] == 0)
++			return res_ctx->pool.clock_sources[i];
++	}
++
++	return NULL;
++}
++
+ void build_info_frame(struct pipe_ctx *pipe_ctx)
+ {
+ 	enum signal_type signal = SIGNAL_TYPE_NONE;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+index 6260751..642c82a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+@@ -59,10 +59,9 @@
+ #endif
+ 
+ enum dce100_clk_src_array_id {
+-	DCE100_CLK_SRC_PLL0 = 0,
+-	DCE100_CLK_SRC_PLL1,
+-	DCE100_CLK_SRC_PLL2,
+-	DCE100_CLK_SRC_EXT,
++	DCE100_CLK_SRC0 = 0,
++	DCE100_CLK_SRC1,
++	DCE100_CLK_SRC2,
+ 
+ 	DCE100_CLK_SRC_TOTAL
+ };
+@@ -560,6 +559,9 @@ void dce100_destruct_resource_pool(struct resource_pool *pool)
+ 			dce100_clock_source_destroy(&pool->clock_sources[i]);
+ 	}
+ 
++	if (pool->dp_clock_source != NULL)
++		dce100_clock_source_destroy(&pool->dp_clock_source);
++
+ 	for (i = 0; i < pool->audio_count; i++)	{
+ 		if (pool->audios[i] != NULL)
+ 			dal_audio_destroy(&pool->audios[i]);
+@@ -578,19 +580,6 @@ void dce100_destruct_resource_pool(struct resource_pool *pool)
+ 		dal_adapter_service_destroy(&pool->adapter_srv);
+ }
+ 
+-static struct clock_source *find_first_free_pll(
+-		struct resource_context *res_ctx)
+-{
+-	int i;
+-
+-	for (i = 0; i < DCE100_CLK_SRC_EXT; ++i) {
+-		if (res_ctx->clock_source_ref_count[i] == 0)
+-			return res_ctx->pool.clock_sources[i];
+-	}
+-
+-	return NULL;
+-}
+-
+ static enum audio_dto_source translate_to_dto_source(enum controller_id crtc_id)
+ {
+ 	switch (crtc_id) {
+@@ -838,17 +827,18 @@ static enum dc_status map_clock_resources(
+ 				 */
+ 				if (dc_is_dp_signal(pipe_ctx->signal)
+ 					|| pipe_ctx->signal == SIGNAL_TYPE_VIRTUAL)
+-					pipe_ctx->clock_source = context->res_ctx.pool.clock_sources[DCE100_CLK_SRC_EXT];
+-
+-				if (pipe_ctx->clock_source == NULL)
++					pipe_ctx->clock_source =
++						context->res_ctx.pool.dp_clock_source;
++				else {
+ 					pipe_ctx->clock_source =
+ 						find_used_clk_src_for_sharing(
+ 							&context->res_ctx,
+ 							pipe_ctx);
+ 
+-				if (pipe_ctx->clock_source == NULL)
+-					pipe_ctx->clock_source =
+-						find_first_free_pll(&context->res_ctx);
++					if (pipe_ctx->clock_source == NULL)
++						pipe_ctx->clock_source =
++							dc_resource_find_first_free_pll(&context->res_ctx);
++				}
+ 
+ 				if (pipe_ctx->clock_source == NULL)
+ 					return DC_NO_CLOCK_SOURCE_RESOURCE;
+@@ -946,6 +936,7 @@ bool dce100_construct_resource_pool(
+ 	struct dc_context *ctx = dc->ctx;
+ 	struct firmware_info info;
+ 	struct dc_bios *bp;
++	int regular_pll_offset = 0;
+ 
+ 	pool->adapter_srv = as;
+ 	pool->funcs = &dce100_res_pool_funcs;
+@@ -959,38 +950,33 @@ bool dce100_construct_resource_pool(
+ 
+ 	bp = dal_adapter_service_get_bios_parser(as);
+ 
+-	pool->clock_sources[DCE100_CLK_SRC_PLL0] =
+-		dce100_clock_source_create(
+-			ctx,
+-			bp,
+-			CLOCK_SOURCE_ID_PLL0,
+-			&dce100_clk_src_reg_offsets[0]);
+-
+-	pool->clock_sources[DCE100_CLK_SRC_PLL1] =
+-		dce100_clock_source_create(
+-			ctx,
+-			bp,
+-			CLOCK_SOURCE_ID_PLL1,
+-			&dce100_clk_src_reg_offsets[1]);
+-
+-	pool->clock_sources[DCE100_CLK_SRC_PLL2] =
+-		dce100_clock_source_create(
+-			ctx,
+-			bp,
+-			CLOCK_SOURCE_ID_PLL2,
+-			&dce100_clk_src_reg_offsets[2]);
+-
+ 	if (dal_adapter_service_get_firmware_info(as, &info) &&
+ 		info.external_clock_source_frequency_for_dp != 0) {
+-		pool->clock_sources[DCE100_CLK_SRC_EXT] =
++		pool->dp_clock_source =
+ 			dce100_clock_source_create(
+ 				ctx,
+ 				bp,
+ 				CLOCK_SOURCE_ID_EXTERNAL,
+ 				NULL);
+-		pool->clk_src_count = DCE100_CLK_SRC_TOTAL;
+-	} else
+-		pool->clk_src_count = DCE100_CLK_SRC_TOTAL - 1;
++	} else {
++		pool->dp_clock_source =
++			dce100_clock_source_create(
++				ctx,
++				bp,
++				CLOCK_SOURCE_ID_PLL0,
++				&dce100_clk_src_reg_offsets[0]);
++		regular_pll_offset = 1;
++	}
++
++	pool->clk_src_count = DCE100_CLK_SRC_TOTAL - regular_pll_offset;
++
++	for (i = 0; i < pool->clk_src_count; ++i, ++regular_pll_offset)
++		pool->clock_sources[i] =
++			dce100_clock_source_create(
++				ctx,
++				bp,
++				CLOCK_SOURCE_ID_PLL0 + regular_pll_offset,
++				&dce100_clk_src_reg_offsets[regular_pll_offset]);
+ 
+ 	for (i = 0; i < pool->clk_src_count; i++) {
+ 		if (pool->clock_sources[i] == NULL) {
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index de727fb..4e4ada8 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -925,6 +925,10 @@ static void power_down_clock_sources(struct core_dc *dc)
+ {
+ 	int i;
+ 
++	if (dc->res_pool.dp_clock_source->funcs->cs_power_down(
++		dc->res_pool.dp_clock_source) == false)
++		dm_error("Failed to power down pll! (dp clk src)\n");
++
+ 	for (i = 0; i < dc->res_pool.clk_src_count; i++) {
+ 		if (dc->res_pool.clock_sources[i]->funcs->cs_power_down(
+ 				dc->res_pool.clock_sources[i]) == false)
+@@ -1429,6 +1433,7 @@ static void update_plane_addrs(struct core_dc *dc, struct resource_context *res_
+ 					PIPE_LOCK_CONTROL_SURFACE,
+ 					false);
+ 
++
+ 		if (!pipe_ctx->tg->funcs->set_blank(pipe_ctx->tg, false)) {
+ 			dm_error("DC: failed to unblank crtc!\n");
+ 			BREAK_TO_DEBUGGER();
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index 2ebd398..1a315c0 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -60,9 +60,8 @@
+ #endif
+ 
+ enum dce110_clk_src_array_id {
+-	DCE110_CLK_SRC_PLL0 = 0,
+-	DCE110_CLK_SRC_PLL1,
+-	DCE110_CLK_SRC_EXT,
++	DCE110_CLK_SRC0 = 0,
++	DCE110_CLK_SRC1,
+ 
+ 	DCE110_CLK_SRC_TOTAL
+ };
+@@ -508,6 +507,9 @@ void dce110_destruct_resource_pool(struct resource_pool *pool)
+ 		}
+ 	}
+ 
++	if (pool->dp_clock_source != NULL)
++		dce110_clock_source_destroy(&pool->dp_clock_source);
++
+ 	for (i = 0; i < pool->audio_count; i++)	{
+ 		if (pool->audios[i] != NULL) {
+ 			dal_audio_destroy(&pool->audios[i]);
+@@ -530,19 +532,6 @@ void dce110_destruct_resource_pool(struct resource_pool *pool)
+ 	}
+ }
+ 
+-static struct clock_source *find_first_free_pll(
+-		struct resource_context *res_ctx)
+-{
+-	if (res_ctx->clock_source_ref_count[DCE110_CLK_SRC_PLL0] == 0) {
+-		return res_ctx->pool.clock_sources[DCE110_CLK_SRC_PLL0];
+-	}
+-	if (res_ctx->clock_source_ref_count[DCE110_CLK_SRC_PLL1] == 0) {
+-		return res_ctx->pool.clock_sources[DCE110_CLK_SRC_PLL1];
+-	}
+-
+-	return 0;
+-}
+-
+ static enum audio_dto_source translate_to_dto_source(enum controller_id crtc_id)
+ {
+ 	switch (crtc_id) {
+@@ -955,15 +944,17 @@ static enum dc_status map_clock_resources(
+ 
+ 				if (dc_is_dp_signal(pipe_ctx->signal)
+ 					|| pipe_ctx->signal == SIGNAL_TYPE_VIRTUAL)
+-					pipe_ctx->clock_source = context->res_ctx.
+-						pool.clock_sources[DCE110_CLK_SRC_EXT];
+-				else
++					pipe_ctx->clock_source =
++						context->res_ctx.pool.dp_clock_source;
++				else {
+ 					pipe_ctx->clock_source =
+ 						find_used_clk_src_for_sharing(
+ 							&context->res_ctx, pipe_ctx);
+-				if (pipe_ctx->clock_source == NULL)
+-					pipe_ctx->clock_source =
+-						find_first_free_pll(&context->res_ctx);
++
++					if (pipe_ctx->clock_source == NULL)
++						pipe_ctx->clock_source =
++							dc_resource_find_first_free_pll(&context->res_ctx);
++				}
+ 
+ 				if (pipe_ctx->clock_source == NULL)
+ 					return DC_NO_CLOCK_SOURCE_RESOURCE;
+@@ -1097,32 +1088,37 @@ bool dce110_construct_resource_pool(
+ 
+ 	bp = dal_adapter_service_get_bios_parser(as);
+ 
+-	pool->clock_sources[DCE110_CLK_SRC_PLL0] =
++	if (dal_adapter_service_get_firmware_info(as, &info) &&
++		info.external_clock_source_frequency_for_dp != 0) {
++		pool->dp_clock_source =
++			dce110_clock_source_create(
++				ctx,
++				bp,
++				CLOCK_SOURCE_ID_EXTERNAL,
++				NULL);
++	} else {
++		pool->dp_clock_source =
++			dce110_clock_source_create(
++				ctx,
++				bp,
++				CLOCK_SOURCE_ID_PLL0,
++				&dce110_clk_src_reg_offsets[0]);
++	}
++
++	pool->clock_sources[DCE110_CLK_SRC0] =
+ 		dce110_clock_source_create(
+ 			ctx,
+ 			bp,
+ 			CLOCK_SOURCE_ID_PLL0,
+ 			&dce110_clk_src_reg_offsets[0]);
+ 
+-	pool->clock_sources[DCE110_CLK_SRC_PLL1] =
++	pool->clock_sources[DCE110_CLK_SRC1] =
+ 		dce110_clock_source_create(
+ 			ctx,
+ 			bp,
+ 			CLOCK_SOURCE_ID_PLL1,
+ 			&dce110_clk_src_reg_offsets[1]);
+ 
+-	if (dal_adapter_service_get_firmware_info(as, &info) &&
+-		info.external_clock_source_frequency_for_dp != 0) {
+-		pool->clock_sources[DCE110_CLK_SRC_EXT] =
+-			dce110_clock_source_create(
+-				ctx,
+-				bp,
+-				CLOCK_SOURCE_ID_EXTERNAL,
+-				NULL);
+-		pool->clk_src_count = DCE110_CLK_SRC_TOTAL;
+-	} else
+-		pool->clk_src_count = DCE110_CLK_SRC_TOTAL - 1;
+-
+ 	for (i = 0; i < pool->clk_src_count; i++) {
+ 		if (pool->clock_sources[i] == NULL) {
+ 			dm_error("DC: failed to create clock sources!\n");
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+index 04f235a..e4f2bef 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+@@ -62,10 +62,9 @@
+ #endif
+ 
+ enum dce80_clk_src_array_id {
+-	DCE80_CLK_SRC_PLL0 = 0,
+-	DCE80_CLK_SRC_PLL1,
+-	DCE80_CLK_SRC_PLL2,
+-	DCE80_CLK_SRC_EXT,
++	DCE80_CLK_SRC0 = 0,
++	DCE80_CLK_SRC1,
++	DCE80_CLK_SRC2,
+ 
+ 	DCE80_CLK_SRC_TOTAL
+ };
+@@ -518,6 +517,9 @@ void dce80_destruct_resource_pool(struct resource_pool *pool)
+ 		}
+ 	}
+ 
++	if (pool->dp_clock_source != NULL)
++		dce80_clock_source_destroy(&pool->dp_clock_source);
++
+ 	for (i = 0; i < pool->audio_count; i++)	{
+ 		if (pool->audios[i] != NULL) {
+ 			dal_audio_destroy(&pool->audios[i]);
+@@ -540,22 +542,6 @@ void dce80_destruct_resource_pool(struct resource_pool *pool)
+ 	}
+ }
+ 
+-static struct clock_source *find_first_free_pll(
+-		struct resource_context *res_ctx)
+-{
+-	if (res_ctx->clock_source_ref_count[DCE80_CLK_SRC_PLL0] == 0) {
+-		return res_ctx->pool.clock_sources[DCE80_CLK_SRC_PLL0];
+-	}
+-	if (res_ctx->clock_source_ref_count[DCE80_CLK_SRC_PLL1] == 0) {
+-		return res_ctx->pool.clock_sources[DCE80_CLK_SRC_PLL1];
+-	}
+-	if (res_ctx->clock_source_ref_count[DCE80_CLK_SRC_PLL2] == 0) {
+-		return res_ctx->pool.clock_sources[DCE80_CLK_SRC_PLL2];
+-	}
+-
+-	return 0;
+-}
+-
+ static enum audio_dto_source translate_to_dto_source(enum controller_id crtc_id)
+ {
+ 	switch (crtc_id) {
+@@ -953,15 +939,16 @@ static enum dc_status map_clock_resources(
+ 
+ 				if (dc_is_dp_signal(pipe_ctx->signal)
+ 					|| pipe_ctx->signal == SIGNAL_TYPE_VIRTUAL)
+-					pipe_ctx->clock_source = context->res_ctx.
+-							pool.clock_sources[DCE80_CLK_SRC_EXT];
+-				else
++					pipe_ctx->clock_source = context->res_ctx.pool.dp_clock_source;
++				else {
+ 					pipe_ctx->clock_source =
+ 						find_used_clk_src_for_sharing(
+ 							&context->res_ctx, pipe_ctx);
+-				if (pipe_ctx->clock_source == NULL)
+-					pipe_ctx->clock_source =
+-							find_first_free_pll(&context->res_ctx);
++
++					if (pipe_ctx->clock_source == NULL)
++						pipe_ctx->clock_source =
++							dc_resource_find_first_free_pll(&context->res_ctx);
++				}
+ 
+ 				if (pipe_ctx->clock_source == NULL)
+ 					return DC_NO_CLOCK_SOURCE_RESOURCE;
+@@ -1059,6 +1046,7 @@ bool dce80_construct_resource_pool(
+ 	struct dc_context *ctx = dc->ctx;
+ 	struct firmware_info info;
+ 	struct dc_bios *bp;
++	int regular_pll_offset = 0;
+ 
+ 	pool->adapter_srv = as;
+ 	pool->funcs = &dce80_res_pool_funcs;
+@@ -1072,40 +1060,48 @@ bool dce80_construct_resource_pool(
+ 
+ 	bp = dal_adapter_service_get_bios_parser(as);
+ 
+-	pool->clock_sources[DCE80_CLK_SRC_PLL0] =
+-		dce80_clock_source_create(
+-			ctx,
+-			bp,
+-			CLOCK_SOURCE_ID_PLL0,
+-			&dce80_clk_src_reg_offsets[0]);
++	if (dal_adapter_service_get_firmware_info(as, &info) &&
++		info.external_clock_source_frequency_for_dp != 0) {
++		pool->dp_clock_source =
++			dce80_clock_source_create(
++				ctx,
++				bp,
++				CLOCK_SOURCE_ID_EXTERNAL,
++				NULL);
++	} else {
++		pool->dp_clock_source =
++			dce80_clock_source_create(
++				ctx,
++				bp,
++				CLOCK_SOURCE_ID_PLL0,
++				&dce80_clk_src_reg_offsets[0]);
++		regular_pll_offset = 1;
++	}
++
++	pool->clk_src_count = DCE80_CLK_SRC_TOTAL - regular_pll_offset;
++
++	for (i = 0; i < DCE80_CLK_SRC_TOTAL; ++i, ++regular_pll_offset)
++		pool->clock_sources[DCE80_CLK_SRC0 + i] =
++			dce80_clock_source_create(
++				ctx,
++				bp,
++				CLOCK_SOURCE_ID_PLL0 + regular_pll_offset,
++				&dce80_clk_src_reg_offsets[regular_pll_offset]);
+ 
+-	pool->clock_sources[DCE80_CLK_SRC_PLL1] =
++	pool->clock_sources[DCE80_CLK_SRC1] =
+ 		dce80_clock_source_create(
+ 			ctx,
+ 			bp,
+ 			CLOCK_SOURCE_ID_PLL1,
+ 			&dce80_clk_src_reg_offsets[1]);
+ 
+-	pool->clock_sources[DCE80_CLK_SRC_PLL2] =
++	pool->clock_sources[DCE80_CLK_SRC2] =
+ 		dce80_clock_source_create(
+ 			ctx,
+ 			bp,
+ 			CLOCK_SOURCE_ID_PLL2,
+ 			&dce80_clk_src_reg_offsets[2]);
+ 
+-	if (dal_adapter_service_get_firmware_info(as, &info) &&
+-		info.external_clock_source_frequency_for_dp != 0) {
+-		pool->clock_sources[DCE80_CLK_SRC_EXT] =
+-			dce80_clock_source_create(
+-				ctx,
+-				bp,
+-				CLOCK_SOURCE_ID_EXTERNAL,
+-				NULL);
+-
+-		pool->clk_src_count = DCE80_CLK_SRC_TOTAL;
+-	} else
+-		pool->clk_src_count = DCE80_CLK_SRC_TOTAL - 1;
+-
+ 	for (i = 0; i < pool->clk_src_count; i++) {
+ 		if (pool->clock_sources[i] == NULL) {
+ 			dm_error("DC: failed to create clock sources!\n");
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+index be3a693..02dddc4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+@@ -265,6 +265,11 @@ struct resource_pool {
+ 
+ 	union supported_stream_engines stream_engines;
+ 
++	/*
++	 * reserved clock source for DP
++	 */
++	struct clock_source *dp_clock_source;
++
+ 	struct clock_source *clock_sources[MAX_CLOCK_SOURCES];
+ 	uint8_t clk_src_count;
+ 
+@@ -327,6 +332,7 @@ struct resource_context {
+ 	bool is_stream_enc_acquired[MAX_PIPES * 2];
+ 	bool is_audio_acquired[MAX_PIPES];
+ 	uint8_t clock_source_ref_count[MAX_CLOCK_SOURCES];
++	uint8_t dp_clock_source_ref_count;
+  };
+ 
+ struct target_flags {
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/resource.h b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+index e6a386c..6991c3e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+@@ -61,6 +61,9 @@ struct clock_source *find_used_clk_src_for_sharing(
+ 	struct resource_context *res_ctx,
+ 	struct pipe_ctx *pipe_ctx);
+ 
++struct clock_source *dc_resource_find_first_free_pll(
++		struct resource_context *res_ctx);
++
+ bool attach_surfaces_to_context(
+ 		struct dc_surface *surfaces[],
+ 		uint8_t surface_count,
+-- 
+2.7.4
+

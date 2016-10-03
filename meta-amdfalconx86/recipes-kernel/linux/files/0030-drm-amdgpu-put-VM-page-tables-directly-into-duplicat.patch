@@ -1,0 +1,119 @@
+From 78fe04e337d615028fcbee472d8a3dc30a4177ea Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 11 Dec 2015 14:39:05 +0100
+Subject: [PATCH 0030/1110] drm/amdgpu: put VM page tables directly into
+ duplicates list
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+They share the reservation object with the page directory anyway.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c  | 13 ++++++++-----
+ 4 files changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index f6563fa..1447a5e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -982,6 +982,10 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm);
+ struct amdgpu_bo_list_entry *amdgpu_vm_get_bos(struct amdgpu_device *adev,
+ 					       struct amdgpu_vm *vm,
+ 					       struct list_head *head);
++struct amdgpu_bo_list_entry *amdgpu_vm_get_bos(struct amdgpu_device *adev,
++                                               struct amdgpu_vm *vm,
++                                               struct list_head *validated,
++                                               struct list_head *duplicates);
+ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 		      struct amdgpu_sync *sync);
+ void amdgpu_vm_flush(struct amdgpu_ring *ring,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 25a3e24..1d52144 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -406,8 +406,9 @@ static int amdgpu_cs_parser_relocs(struct amdgpu_cs_parser *p)
+ 		amdgpu_cs_buckets_get_list(&buckets, &p->validated);
+ 	}
+ 
++        INIT_LIST_HEAD(&duplicates);
+ 	p->vm_bos = amdgpu_vm_get_bos(p->adev, &fpriv->vm,
+-				      &p->validated);
++                                      &p->validated, &duplicates);
+ 
+ 	if (p->uf.bo)
+ 		list_add(&p->uf_entry.tv.head, &p->validated);
+@@ -415,7 +416,6 @@ static int amdgpu_cs_parser_relocs(struct amdgpu_cs_parser *p)
+ 	if (need_mmap_lock)
+ 		down_read(&current->mm->mmap_sem);
+ 
+-	INIT_LIST_HEAD(&duplicates);
+ 	r = ttm_eu_reserve_buffers(&p->ticket, &p->validated, true, &duplicates);
+ 	if (unlikely(r != 0))
+ 		goto error_reserve;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 9c253c5..df0444f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -461,7 +461,7 @@ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
+ 	tv.shared = true;
+ 	list_add(&tv.head, &list);
+ 
+-	vm_bos = amdgpu_vm_get_bos(adev, bo_va->vm, &list);
++        vm_bos = amdgpu_vm_get_bos(adev, bo_va->vm, &list, &duplicates);
+ 	if (!vm_bos)
+ 		return;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 8c5ec15..3c3404f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -78,14 +78,17 @@ static unsigned amdgpu_vm_directory_size(struct amdgpu_device *adev)
+  * amdgpu_vm_get_bos - add the vm BOs to a validation list
+  *
+  * @vm: vm providing the BOs
+- * @head: head of validation list
++ * @validated: head of validation list
++ * @duplicates: head of duplicates list
++
+  *
+  * Add the page directory to the list of BOs to
+  * validate for command submission (cayman+).
+  */
+ struct amdgpu_bo_list_entry *amdgpu_vm_get_bos(struct amdgpu_device *adev,
+-					  struct amdgpu_vm *vm,
+-					  struct list_head *head)
++                                               struct amdgpu_vm *vm,
++                                               struct list_head *validated,
++                                               struct list_head *duplicates)
+ {
+ 	struct amdgpu_bo_list_entry *list;
+ 	unsigned i, idx;
+@@ -103,7 +106,7 @@ struct amdgpu_bo_list_entry *amdgpu_vm_get_bos(struct amdgpu_device *adev,
+ 	list[0].priority = 0;
+ 	list[0].tv.bo = &vm->page_directory->tbo;
+ 	list[0].tv.shared = true;
+-	list_add(&list[0].tv.head, head);
++        list_add(&list[0].tv.head, validated);
+ 
+ 	for (i = 0, idx = 1; i <= vm->max_pde_used; i++) {
+ 		if (!vm->page_tables[i].bo)
+@@ -115,7 +118,7 @@ struct amdgpu_bo_list_entry *amdgpu_vm_get_bos(struct amdgpu_device *adev,
+ 		list[idx].priority = 0;
+ 		list[idx].tv.bo = &list[idx].robj->tbo;
+ 		list[idx].tv.shared = true;
+-		list_add(&list[idx++].tv.head, head);
++                list_add(&list[idx++].tv.head, duplicates);
+ 	}
+ 
+ 	return list;
+-- 
+2.7.4
+

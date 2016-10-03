@@ -1,0 +1,348 @@
+From 9e3086daf194226378bd489d9089328d3cf3cbc9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 18 Dec 2015 22:13:12 +0100
+Subject: [PATCH 0222/1110] drm/amdgpu: keep the prefered/allowed domains in
+ the BO
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Stop copying that to the bo list entry, it doesn't change anyway.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h         |  6 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c | 14 ++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c      | 86 ++++++++++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c     | 14 +++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c  | 15 +++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c      |  4 --
+ 6 files changed, 91 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index b7b5d2e..d5e4503 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -445,8 +445,6 @@ struct amdgpu_bo_list_entry {
+ 	struct amdgpu_bo		*robj;
+ 	struct ttm_validate_buffer	tv;
+ 	struct amdgpu_bo_va		*bo_va;
+-	unsigned			prefered_domains;
+-	unsigned			allowed_domains;
+ 	uint32_t			priority;
+ };
+ 
+@@ -484,6 +482,8 @@ struct amdgpu_bo {
+ 	struct list_head		list;
+ 	/* Protected by tbo.reserved */
+ 	u32				initial_domain;
++        u32                             prefered_domains;
++        u32                             allowed_domains;
+ 	struct ttm_place		placements[AMDGPU_GEM_DOMAIN_MAX + 1];
+ 	struct ttm_placement		placement;
+ 	struct ttm_buffer_object	tbo;
+@@ -1064,8 +1064,6 @@ struct amdgpu_bo_list {
+ 
+ struct amdgpu_bo_list *
+ amdgpu_bo_list_get(struct amdgpu_fpriv *fpriv, int id);
+-void amdgpu_bo_list_get_list(struct amdgpu_bo_list *list,
+-			     struct list_head *validated);
+ void amdgpu_bo_list_put(struct amdgpu_bo_list *list);
+ void amdgpu_bo_list_free(struct amdgpu_bo_list *list);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
+index 9da4bd0..1c6c0ac 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
+@@ -111,23 +111,17 @@ static int amdgpu_bo_list_set(struct amdgpu_device *adev,
+ 		drm_gem_object_unreference_unlocked(gobj);
+ 		entry->priority = min(info[i].bo_priority,
+ 				      AMDGPU_BO_LIST_MAX_PRIORITY);
+-		entry->prefered_domains = entry->robj->initial_domain;
+-		entry->allowed_domains = entry->prefered_domains;
+-		if (entry->allowed_domains == AMDGPU_GEM_DOMAIN_VRAM)
+-			entry->allowed_domains |= AMDGPU_GEM_DOMAIN_GTT;
+-		if (amdgpu_ttm_tt_has_userptr(entry->robj->tbo.ttm)) {
++                if (amdgpu_ttm_tt_has_userptr(entry->robj->tbo.ttm))
+ 			has_userptr = true;
+-			entry->prefered_domains = AMDGPU_GEM_DOMAIN_GTT;
+-			entry->allowed_domains = AMDGPU_GEM_DOMAIN_GTT;
+ 		}
+ 		entry->tv.bo = &entry->robj->tbo;
+ 		entry->tv.shared = true;
+ 
+-		if (entry->prefered_domains == AMDGPU_GEM_DOMAIN_GDS)
++                if (entry->robj->prefered_domains == AMDGPU_GEM_DOMAIN_GDS)
+ 			gds_obj = entry->robj;
+-		if (entry->prefered_domains == AMDGPU_GEM_DOMAIN_GWS)
++                if (entry->robj->prefered_domains == AMDGPU_GEM_DOMAIN_GWS)
+ 			gws_obj = entry->robj;
+-		if (entry->prefered_domains == AMDGPU_GEM_DOMAIN_OA)
++                if (entry->robj->prefered_domains == AMDGPU_GEM_DOMAIN_OA)
+ 			oa_obj = entry->robj;
+ 
+ 		trace_amdgpu_bo_list_set(list, entry->robj);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 76ec99d..dba4bad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -30,6 +30,47 @@
+ #include "amdgpu.h"
+ #include "amdgpu_trace.h"
+ 
++#define AMDGPU_CS_MAX_PRIORITY         32u
++#define AMDGPU_CS_NUM_BUCKETS          (AMDGPU_CS_MAX_PRIORITY + 1)
++
++/* This is based on the bucket sort with O(n) time complexity.
++ * An item with priority "i" is added to bucket[i]. The lists are then
++ * concatenated in descending order.
++ */
++struct amdgpu_cs_buckets {
++       struct list_head bucket[AMDGPU_CS_NUM_BUCKETS];
++};
++
++static void amdgpu_cs_buckets_init(struct amdgpu_cs_buckets *b)
++{
++       unsigned i;
++
++       for (i = 0; i < AMDGPU_CS_NUM_BUCKETS; i++)
++               INIT_LIST_HEAD(&b->bucket[i]);
++}
++
++static void amdgpu_cs_buckets_add(struct amdgpu_cs_buckets *b,
++                                 struct list_head *item, unsigned priority)
++{
++       /* Since buffers which appear sooner in the relocation list are
++        * likely to be used more often than buffers which appear later
++        * in the list, the sort mustn't change the ordering of buffers
++        * with the same priority, i.e. it must be stable.
++        */
++       list_add_tail(item, &b->bucket[min(priority, AMDGPU_CS_MAX_PRIORITY)]);
++}
++
++static void amdgpu_cs_buckets_get_list(struct amdgpu_cs_buckets *b,
++                                      struct list_head *out_list)
++{
++       unsigned i;
++
++       /* Connect the sorted buckets in the output list. */
++       for (i = 0; i < AMDGPU_CS_NUM_BUCKETS; i++) {
++               list_splice(&b->bucket[i], out_list);
++       }
++}
++
+ int amdgpu_cs_get_ring(struct amdgpu_device *adev, u32 ip_type,
+ 		       u32 ip_instance, u32 ring,
+ 		       struct amdgpu_ring **out_ring)
+@@ -107,8 +148,6 @@ static int amdgpu_cs_user_fence_chunk(struct amdgpu_cs_parser *p,
+ 	}
+ 
+ 	p->uf_entry.robj = amdgpu_bo_ref(p->uf.bo);
+-	p->uf_entry.prefered_domains = AMDGPU_GEM_DOMAIN_GTT;
+-	p->uf_entry.allowed_domains = AMDGPU_GEM_DOMAIN_GTT;
+ 	p->uf_entry.priority = 0;
+ 	p->uf_entry.tv.bo = &p->uf_entry.robj->tbo;
+ 	p->uf_entry.tv.shared = true;
+@@ -139,13 +178,16 @@ int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
+ 		ret = -EINVAL;
+ 		goto free_chunk;
+ 	}
++ 
++        p->bo_list = amdgpu_bo_list_get(fpriv, cs->in.bo_list_handle);
+ 
+ 	/* get chunks */
++        INIT_LIST_HEAD(&p->validated);
+ 	chunk_array_user = (uint64_t __user *)(unsigned long)(cs->in.chunks);
+ 	if (copy_from_user(chunk_array, chunk_array_user,
+ 			   sizeof(uint64_t)*cs->in.num_chunks)) {
+ 		ret = -EFAULT;
+-		goto put_ctx;
++                goto put_bo_list;
+ 	}
+ 
+ 	p->nchunks = cs->in.num_chunks;
+@@ -153,7 +195,7 @@ int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
+ 			    GFP_KERNEL);
+ 	if (!p->chunks) {
+ 		ret = -ENOMEM;
+-		goto put_ctx;
++                goto put_bo_list;
+ 	}
+ 
+ 	for (i = 0; i < p->nchunks; i++) {
+@@ -229,7 +271,9 @@ free_partial_kdata:
+ 	for (; i >= 0; i--)
+ 		drm_free_large(p->chunks[i].kdata);
+ 	kfree(p->chunks);
+-put_ctx:
++put_bo_list:
++       if (p->bo_list)
++               amdgpu_bo_list_put(p->bo_list);
+ 	amdgpu_ctx_put(p->ctx);
+ free_chunk:
+ 	kfree(chunk_array);
+@@ -315,9 +359,9 @@ int amdgpu_cs_list_validate(struct amdgpu_cs_parser *p,
+                 * completely.
+                 */
+                 if (p->bytes_moved <= p->bytes_moved_threshold)
+-                        domain = lobj->prefered_domains;
++                        domain = bo->prefered_domains;
+                 else
+-                        domain = lobj->allowed_domains;
++                        domain = bo->allowed_domains;
+  
+         retry:
+                 amdgpu_ttm_placement_from_domain(bo, domain);
+@@ -327,36 +371,38 @@ int amdgpu_cs_list_validate(struct amdgpu_cs_parser *p,
+                                initial_bytes_moved;
+  
+                 if (unlikely(r)) {
+-                        if (r != -ERESTARTSYS && domain != lobj->allowed_domains) {
+-                                domain = lobj->allowed_domains;
+-                                goto retry;
++                        if (r != -ERESTARTSYS && domain != bo->allowed_domains) {
++                                domain = bo->allowed_domains;
+ 
++                                goto retry;
+ 			}
++			return r;
+ 		}
+ 	}
+ 	return 0;
+ }
+ 
+-static int amdgpu_cs_parser_bos(struct amdgpu_cs_parser *p,
+-				union drm_amdgpu_cs *cs)
++static int amdgpu_cs_parser_relocs(struct amdgpu_cs_parser *p)
+ {
+-	struct amdgpu_fpriv *fpriv = p->filp->driver_priv;
++        struct amdgpu_cs_buckets buckets;
+ 	struct list_head duplicates;
+ 	bool need_mmap_lock = false;
+-	int r;
+-
+-	INIT_LIST_HEAD(&p->validated);
+ 
+-	p->bo_list = amdgpu_bo_list_get(fpriv, cs->in.bo_list_handle);
++	int i, r;
++	
+ 	if (p->bo_list) {
+ 		need_mmap_lock = p->bo_list->has_userptr;
+-                amdgpu_bo_list_get_list(p->bo_list, &p->validated);
++                amdgpu_cs_buckets_init(&buckets);
++                for (i = 0; i < p->bo_list->num_entries; i++)
++                        amdgpu_cs_buckets_add(&buckets, &p->bo_list->array[i].tv.head,
++                                                                 p->bo_list->array[i].priority);
++
++               amdgpu_cs_buckets_get_list(&buckets, &p->validated);
+ 	}
+ 
+         INIT_LIST_HEAD(&duplicates);
+         amdgpu_vm_get_pd_bo(&fpriv->vm, &p->validated, &p->vm_pd);
+ 
+-	if (p->uf.bo)
+ 		list_add(&p->uf_entry.tv.head, &p->validated);
+ 
+ 	if (need_mmap_lock)
+@@ -774,7 +820,7 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		r = amdgpu_cs_handle_lockup(adev, r);
+ 		return r;
+ 	}
+-	r = amdgpu_cs_parser_bos(&parser, data);
++        r = amdgpu_cs_parser_relocs(&parser);
+ 	if (r == -ENOMEM)
+ 		DRM_ERROR("Not enough memory for command submission!\n");
+ 	else if (r && r != -ERESTARTSYS)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index cb34ff6..95e12f4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -252,6 +252,8 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
+ 		goto handle_lockup;
+ 
+ 	bo = gem_to_amdgpu_bo(gobj);
++        bo->prefered_domains = AMDGPU_GEM_DOMAIN_GTT;
++        bo->allowed_domains = AMDGPU_GEM_DOMAIN_GTT;
+ 	r = amdgpu_ttm_tt_set_userptr(bo->tbo.ttm, args->addr, args->flags);
+ 	if (r)
+ 		goto release_object;
+@@ -629,7 +631,7 @@ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
+ 
+ 		info.bo_size = robj->gem_base.size;
+ 		info.alignment = robj->tbo.mem.page_alignment << PAGE_SHIFT;
+-		info.domains = robj->initial_domain;
++                info.domains = robj->prefered_domains;
+ 		info.domain_flags = robj->flags;
+ 		amdgpu_bo_unreserve(robj);
+ 		if (copy_to_user(out, &info, sizeof(info)))
+@@ -642,9 +644,13 @@ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
+ 			amdgpu_bo_unreserve(robj);
+ 			break;
+ 		}
+-		robj->initial_domain = args->value & (AMDGPU_GEM_DOMAIN_VRAM |
+-						      AMDGPU_GEM_DOMAIN_GTT |
+-						      AMDGPU_GEM_DOMAIN_CPU);
++                robj->prefered_domains = args->value & (AMDGPU_GEM_DOMAIN_VRAM |
++                                                        AMDGPU_GEM_DOMAIN_GTT |
++                                                        AMDGPU_GEM_DOMAIN_CPU);
++                robj->allowed_domains = robj->prefered_domains;
++                if (robj->allowed_domains == AMDGPU_GEM_DOMAIN_VRAM)
++                        robj->allowed_domains |= AMDGPU_GEM_DOMAIN_GTT;
++ 
+ 		amdgpu_bo_unreserve(robj);
+ 		break;
+ 	default:
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 73628c7..b79a4f3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -254,12 +254,15 @@ int amdgpu_bo_create_restricted(struct amdgpu_device *adev,
+ 	bo->adev = adev;
+ 	INIT_LIST_HEAD(&bo->list);
+ 	INIT_LIST_HEAD(&bo->va);
+-	bo->initial_domain = domain & (AMDGPU_GEM_DOMAIN_VRAM |
+-				       AMDGPU_GEM_DOMAIN_GTT |
+-				       AMDGPU_GEM_DOMAIN_CPU |
+-				       AMDGPU_GEM_DOMAIN_GDS |
+-				       AMDGPU_GEM_DOMAIN_GWS |
+-				       AMDGPU_GEM_DOMAIN_OA);
++        bo->prefered_domains = domain & (AMDGPU_GEM_DOMAIN_VRAM |
++                                         AMDGPU_GEM_DOMAIN_GTT |
++                                         AMDGPU_GEM_DOMAIN_CPU |
++                                         AMDGPU_GEM_DOMAIN_GDS |
++                                         AMDGPU_GEM_DOMAIN_GWS |
++                                         AMDGPU_GEM_DOMAIN_OA);
++        bo->allowed_domains = bo->prefered_domains;
++        if (!kernel && bo->allowed_domains == AMDGPU_GEM_DOMAIN_VRAM)
++                bo->allowed_domains |= AMDGPU_GEM_DOMAIN_GTT;
+ 
+ 	bo->flags = flags;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index d495db3..8c729b1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -88,8 +88,6 @@ void amdgpu_vm_get_pd_bo(struct amdgpu_vm *vm,
+                         struct amdgpu_bo_list_entry *entry)
+ {
+         entry->robj = vm->page_directory;
+-        entry->prefered_domains = AMDGPU_GEM_DOMAIN_VRAM;
+-        entry->allowed_domains = AMDGPU_GEM_DOMAIN_VRAM;
+         entry->priority = 0;
+         entry->tv.bo = &vm->page_directory->tbo;
+         entry->tv.shared = true;
+@@ -1131,8 +1129,6 @@ int amdgpu_vm_bo_map(struct amdgpu_device *adev,
+ 		}
+ 
+                 entry->robj = pt;
+-                entry->prefered_domains = AMDGPU_GEM_DOMAIN_VRAM;
+-                entry->allowed_domains = AMDGPU_GEM_DOMAIN_VRAM;
+                 entry->priority = 0;
+                 entry->tv.bo = &entry->robj->tbo;
+                 entry->tv.shared = true;
+-- 
+2.7.4
+

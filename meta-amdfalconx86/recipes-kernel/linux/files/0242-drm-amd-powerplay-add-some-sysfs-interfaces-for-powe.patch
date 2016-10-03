@@ -1,0 +1,653 @@
+From 86b96db7ca91553b3c87bad0206a6493257a74ea Mon Sep 17 00:00:00 2001
+From: Eric Huang <JinHuiEric.Huang@amd.com>
+Date: Fri, 11 Dec 2015 16:24:34 -0500
+Subject: [PATCH 0242/1110] drm/amd/powerplay: add some sysfs interfaces for
+ powerplay.
+
+The new sysfs interfaces:
+pp_num_states: Read-only, return the number of all pp states, 0 if powerplay is not available.
+pp_cur_state: Read-only, return the index number of current pp state.
+pp_force_state: Read-write, to write a power state index will switch to selected state forcedly and
+		enable forced state mode, disable forced state mode. such as "echo >...".
+pp_table: Read-write, binary output, to be used to read or write the dpm table, the maximum
+		file size is 4KB of page size.
+pp_dpm_sclk: Read-write, reading will return a dpm levels list, to write an index number will force
+		powerplay to set the corresponding dpm level.
+pp_dpm_mclk: same as sclk.
+pp_dpm_pcie: same as sclk.
+
+And add new setting "manual" to the existing interface power_dpm_force_performance_level.
+
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Eric Huang <JinHuiEric.Huang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h               |  17 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c            | 336 +++++++++++++++++++++-
+ drivers/gpu/drm/amd/powerplay/amd_powerplay.c     | 116 +++++++-
+ drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h |  17 ++
+ drivers/gpu/drm/amd/powerplay/inc/hwmgr.h         |   4 +
+ 5 files changed, 488 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index de1e6ca..0e65ffe 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1468,6 +1468,7 @@ enum amdgpu_dpm_forced_level {
+ 	AMDGPU_DPM_FORCED_LEVEL_AUTO = 0,
+ 	AMDGPU_DPM_FORCED_LEVEL_LOW = 1,
+ 	AMDGPU_DPM_FORCED_LEVEL_HIGH = 2,
++	AMDGPU_DPM_FORCED_LEVEL_MANUAL = 3,
+ };
+ 
+ struct amdgpu_vce_state {
+@@ -1980,6 +1981,7 @@ struct amdgpu_device {
+ 	/* powerplay */
+ 	struct amd_powerplay		powerplay;
+ 	bool				pp_enabled;
++	bool				pp_force_state_enabled;
+ 
+ 	/* dpm */
+ 	struct amdgpu_pm		pm;
+@@ -2267,6 +2269,21 @@ amdgpu_get_sdma_instance(struct amdgpu_ring *ring)
+ #define amdgpu_dpm_get_performance_level(adev) \
+ 	(adev)->powerplay.pp_funcs->get_performance_level((adev)->powerplay.pp_handle)
+ 
++#define amdgpu_dpm_get_pp_num_states(adev, data) \
++	(adev)->powerplay.pp_funcs->get_pp_num_states((adev)->powerplay.pp_handle, data)
++
++#define amdgpu_dpm_get_pp_table(adev, table) \
++	(adev)->powerplay.pp_funcs->get_pp_table((adev)->powerplay.pp_handle, table)
++
++#define amdgpu_dpm_set_pp_table(adev, buf, size) \
++	(adev)->powerplay.pp_funcs->set_pp_table((adev)->powerplay.pp_handle, buf, size)
++
++#define amdgpu_dpm_print_clock_levels(adev, type, buf) \
++	(adev)->powerplay.pp_funcs->print_clock_levels((adev)->powerplay.pp_handle, type, buf)
++
++#define amdgpu_dpm_force_clock_level(adev, type, level) \
++		(adev)->powerplay.pp_funcs->force_clock_level((adev)->powerplay.pp_handle, type, level)
++
+ #define amdgpu_dpm_dispatch_task(adev, event_id, input, output)		\
+ 	(adev)->powerplay.pp_funcs->dispatch_tasks((adev)->powerplay.pp_handle, (event_id), (input), (output))
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
+index 54e1cac..ff9597c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
+@@ -123,7 +123,9 @@ static ssize_t amdgpu_get_dpm_forced_performance_level(struct device *dev,
+ 		level = amdgpu_dpm_get_performance_level(adev);
+ 		return snprintf(buf, PAGE_SIZE, "%s\n",
+ 				(level == AMD_DPM_FORCED_LEVEL_AUTO) ? "auto" :
+-				(level == AMD_DPM_FORCED_LEVEL_LOW) ? "low" : "high");
++				(level == AMD_DPM_FORCED_LEVEL_LOW) ? "low" :
++				(level == AMD_DPM_FORCED_LEVEL_HIGH) ? "high" :
++				(level == AMD_DPM_FORCED_LEVEL_MANUAL) ? "manual" : "unknown");
+ 	} else {
+ 		enum amdgpu_dpm_forced_level level;
+ 
+@@ -155,6 +157,8 @@ static ssize_t amdgpu_set_dpm_forced_performance_level(struct device *dev,
+ 		level = AMDGPU_DPM_FORCED_LEVEL_HIGH;
+ 	} else if (strncmp("auto", buf, strlen("auto")) == 0) {
+ 		level = AMDGPU_DPM_FORCED_LEVEL_AUTO;
++	} else if (strncmp("manual", buf, strlen("manual")) == 0) {
++		level = AMDGPU_DPM_FORCED_LEVEL_MANUAL;
+ 	} else {
+ 		count = -EINVAL;
+ 		goto fail;
+@@ -180,10 +184,293 @@ fail:
+ 	return count;
+ }
+ 
++static ssize_t amdgpu_get_pp_num_states(struct device *dev,
++		struct device_attribute *attr,
++		char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	struct pp_states_info data;
++	int i, buf_len;
++
++	if (adev->pp_enabled)
++		amdgpu_dpm_get_pp_num_states(adev, &data);
++
++	buf_len = snprintf(buf, PAGE_SIZE, "states: %d\n", data.nums);
++	for (i = 0; i < data.nums; i++)
++		buf_len += snprintf(buf + buf_len, PAGE_SIZE, "%d %s\n", i,
++				(data.states[i] == POWER_STATE_TYPE_INTERNAL_BOOT) ? "boot" :
++				(data.states[i] == POWER_STATE_TYPE_BATTERY) ? "battery" :
++				(data.states[i] == POWER_STATE_TYPE_BALANCED) ? "balanced" :
++				(data.states[i] == POWER_STATE_TYPE_PERFORMANCE) ? "performance" : "default");
++
++	return buf_len;
++}
++
++static ssize_t amdgpu_get_pp_cur_state(struct device *dev,
++		struct device_attribute *attr,
++		char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	struct pp_states_info data;
++	enum amd_pm_state_type pm = 0;
++	int i = 0;
++
++	if (adev->pp_enabled) {
++
++		pm = amdgpu_dpm_get_current_power_state(adev);
++		amdgpu_dpm_get_pp_num_states(adev, &data);
++
++		for (i = 0; i < data.nums; i++) {
++			if (pm == data.states[i])
++				break;
++		}
++
++		if (i == data.nums)
++			i = -EINVAL;
++	}
++
++	return snprintf(buf, PAGE_SIZE, "%d\n", i);
++}
++
++static ssize_t amdgpu_get_pp_force_state(struct device *dev,
++		struct device_attribute *attr,
++		char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	struct pp_states_info data;
++	enum amd_pm_state_type pm = 0;
++	int i;
++
++	if (adev->pp_force_state_enabled && adev->pp_enabled) {
++		pm = amdgpu_dpm_get_current_power_state(adev);
++		amdgpu_dpm_get_pp_num_states(adev, &data);
++
++		for (i = 0; i < data.nums; i++) {
++			if (pm == data.states[i])
++				break;
++		}
++
++		if (i == data.nums)
++			i = -EINVAL;
++
++		return snprintf(buf, PAGE_SIZE, "%d\n", i);
++
++	} else
++		return snprintf(buf, PAGE_SIZE, "\n");
++}
++
++static ssize_t amdgpu_set_pp_force_state(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf,
++		size_t count)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	enum amd_pm_state_type state = 0;
++	long idx;
++	int ret;
++
++	if (strlen(buf) == 1)
++		adev->pp_force_state_enabled = false;
++	else {
++		ret = kstrtol(buf, 0, &idx);
++
++		if (ret) {
++			count = -EINVAL;
++			goto fail;
++		}
++
++		if (adev->pp_enabled) {
++			struct pp_states_info data;
++			amdgpu_dpm_get_pp_num_states(adev, &data);
++			state = data.states[idx];
++			/* only set user selected power states */
++			if (state != POWER_STATE_TYPE_INTERNAL_BOOT &&
++				state != POWER_STATE_TYPE_DEFAULT) {
++				amdgpu_dpm_dispatch_task(adev,
++						AMD_PP_EVENT_ENABLE_USER_STATE, &state, NULL);
++				adev->pp_force_state_enabled = true;
++			}
++		}
++	}
++fail:
++	return count;
++}
++
++static ssize_t amdgpu_get_pp_table(struct device *dev,
++		struct device_attribute *attr,
++		char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	char *table = NULL;
++	int size, i;
++
++	if (adev->pp_enabled)
++		size = amdgpu_dpm_get_pp_table(adev, &table);
++	else
++		return 0;
++
++	if (size >= PAGE_SIZE)
++		size = PAGE_SIZE - 1;
++
++	for (i = 0; i < size; i++) {
++		sprintf(buf + i, "%02x", table[i]);
++	}
++	sprintf(buf + i, "\n");
++
++	return size;
++}
++
++static ssize_t amdgpu_set_pp_table(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf,
++		size_t count)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++
++	if (adev->pp_enabled)
++		amdgpu_dpm_set_pp_table(adev, buf, count);
++
++	return count;
++}
++
++static ssize_t amdgpu_get_pp_dpm_sclk(struct device *dev,
++		struct device_attribute *attr,
++		char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	ssize_t size = 0;
++
++	if (adev->pp_enabled)
++		size = amdgpu_dpm_print_clock_levels(adev, PP_SCLK, buf);
++
++	return size;
++}
++
++static ssize_t amdgpu_set_pp_dpm_sclk(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf,
++		size_t count)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	int ret;
++	long level;
++
++	ret = kstrtol(buf, 0, &level);
++
++	if (ret) {
++		count = -EINVAL;
++		goto fail;
++	}
++
++	if (adev->pp_enabled)
++		amdgpu_dpm_force_clock_level(adev, PP_SCLK, level);
++fail:
++	return count;
++}
++
++static ssize_t amdgpu_get_pp_dpm_mclk(struct device *dev,
++		struct device_attribute *attr,
++		char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	ssize_t size = 0;
++
++	if (adev->pp_enabled)
++		size = amdgpu_dpm_print_clock_levels(adev, PP_MCLK, buf);
++
++	return size;
++}
++
++static ssize_t amdgpu_set_pp_dpm_mclk(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf,
++		size_t count)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	int ret;
++	long level;
++
++	ret = kstrtol(buf, 0, &level);
++
++	if (ret) {
++		count = -EINVAL;
++		goto fail;
++	}
++
++	if (adev->pp_enabled)
++		amdgpu_dpm_force_clock_level(adev, PP_MCLK, level);
++fail:
++	return count;
++}
++
++static ssize_t amdgpu_get_pp_dpm_pcie(struct device *dev,
++		struct device_attribute *attr,
++		char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	ssize_t size = 0;
++
++	if (adev->pp_enabled)
++		size = amdgpu_dpm_print_clock_levels(adev, PP_PCIE, buf);
++
++	return size;
++}
++
++static ssize_t amdgpu_set_pp_dpm_pcie(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf,
++		size_t count)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	int ret;
++	long level;
++
++	ret = kstrtol(buf, 0, &level);
++
++	if (ret) {
++		count = -EINVAL;
++		goto fail;
++	}
++
++	if (adev->pp_enabled)
++		amdgpu_dpm_force_clock_level(adev, PP_PCIE, level);
++fail:
++	return count;
++}
++
+ static DEVICE_ATTR(power_dpm_state, S_IRUGO | S_IWUSR, amdgpu_get_dpm_state, amdgpu_set_dpm_state);
+ static DEVICE_ATTR(power_dpm_force_performance_level, S_IRUGO | S_IWUSR,
+ 		   amdgpu_get_dpm_forced_performance_level,
+ 		   amdgpu_set_dpm_forced_performance_level);
++static DEVICE_ATTR(pp_num_states, S_IRUGO, amdgpu_get_pp_num_states, NULL);
++static DEVICE_ATTR(pp_cur_state, S_IRUGO, amdgpu_get_pp_cur_state, NULL);
++static DEVICE_ATTR(pp_force_state, S_IRUGO | S_IWUSR,
++		amdgpu_get_pp_force_state,
++		amdgpu_set_pp_force_state);
++static DEVICE_ATTR(pp_table, S_IRUGO | S_IWUSR,
++		amdgpu_get_pp_table,
++		amdgpu_set_pp_table);
++static DEVICE_ATTR(pp_dpm_sclk, S_IRUGO | S_IWUSR,
++		amdgpu_get_pp_dpm_sclk,
++		amdgpu_set_pp_dpm_sclk);
++static DEVICE_ATTR(pp_dpm_mclk, S_IRUGO | S_IWUSR,
++		amdgpu_get_pp_dpm_mclk,
++		amdgpu_set_pp_dpm_mclk);
++static DEVICE_ATTR(pp_dpm_pcie, S_IRUGO | S_IWUSR,
++		amdgpu_get_pp_dpm_pcie,
++		amdgpu_set_pp_dpm_pcie);
+ 
+ static ssize_t amdgpu_hwmon_show_temp(struct device *dev,
+ 				      struct device_attribute *attr,
+@@ -780,6 +1067,44 @@ int amdgpu_pm_sysfs_init(struct amdgpu_device *adev)
+ 		DRM_ERROR("failed to create device file for dpm state\n");
+ 		return ret;
+ 	}
++
++	if (adev->pp_enabled) {
++		ret = device_create_file(adev->dev, &dev_attr_pp_num_states);
++		if (ret) {
++			DRM_ERROR("failed to create device file pp_num_states\n");
++			return ret;
++		}
++		ret = device_create_file(adev->dev, &dev_attr_pp_cur_state);
++		if (ret) {
++			DRM_ERROR("failed to create device file pp_cur_state\n");
++			return ret;
++		}
++		ret = device_create_file(adev->dev, &dev_attr_pp_force_state);
++		if (ret) {
++			DRM_ERROR("failed to create device file pp_force_state\n");
++			return ret;
++		}
++		ret = device_create_file(adev->dev, &dev_attr_pp_table);
++		if (ret) {
++			DRM_ERROR("failed to create device file pp_table\n");
++			return ret;
++		}
++		ret = device_create_file(adev->dev, &dev_attr_pp_dpm_sclk);
++		if (ret) {
++			DRM_ERROR("failed to create device file pp_dpm_sclk\n");
++			return ret;
++		}
++		ret = device_create_file(adev->dev, &dev_attr_pp_dpm_mclk);
++		if (ret) {
++			DRM_ERROR("failed to create device file pp_dpm_mclk\n");
++			return ret;
++		}
++		ret = device_create_file(adev->dev, &dev_attr_pp_dpm_pcie);
++		if (ret) {
++			DRM_ERROR("failed to create device file pp_dpm_pcie\n");
++			return ret;
++		}
++	}
+ 	ret = amdgpu_debugfs_pm_init(adev);
+ 	if (ret) {
+ 		DRM_ERROR("Failed to register debugfs file for dpm!\n");
+@@ -797,6 +1122,15 @@ void amdgpu_pm_sysfs_fini(struct amdgpu_device *adev)
+ 		hwmon_device_unregister(adev->pm.int_hwmon_dev);
+ 	device_remove_file(adev->dev, &dev_attr_power_dpm_state);
+ 	device_remove_file(adev->dev, &dev_attr_power_dpm_force_performance_level);
++	if (adev->pp_enabled) {
++		device_remove_file(adev->dev, &dev_attr_pp_num_states);
++		device_remove_file(adev->dev, &dev_attr_pp_cur_state);
++		device_remove_file(adev->dev, &dev_attr_pp_force_state);
++		device_remove_file(adev->dev, &dev_attr_pp_table);
++		device_remove_file(adev->dev, &dev_attr_pp_dpm_sclk);
++		device_remove_file(adev->dev, &dev_attr_pp_dpm_mclk);
++		device_remove_file(adev->dev, &dev_attr_pp_dpm_pcie);
++	}
+ }
+ 
+ void amdgpu_pm_compute_clocks(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+index 589599f..bbc6bda 100644
+--- a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
++++ b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+@@ -436,7 +436,10 @@ enum amd_pm_state_type pp_dpm_get_current_power_state(void *handle)
+ 	case PP_StateUILabel_Performance:
+ 		return POWER_STATE_TYPE_PERFORMANCE;
+ 	default:
+-		return POWER_STATE_TYPE_DEFAULT;
++		if (state->classification.flags & PP_StateClassificationFlag_Boot)
++			return  POWER_STATE_TYPE_INTERNAL_BOOT;
++		else
++			return POWER_STATE_TYPE_DEFAULT;
+ 	}
+ }
+ 
+@@ -538,6 +541,112 @@ static int pp_dpm_get_temperature(void *handle)
+ 	return hwmgr->hwmgr_func->get_temperature(hwmgr);
+ }
+ 
++static int pp_dpm_get_pp_num_states(void *handle,
++		struct pp_states_info *data)
++{
++	struct pp_hwmgr *hwmgr;
++	int i;
++
++	if (!handle)
++		return -EINVAL;
++
++	hwmgr = ((struct pp_instance *)handle)->hwmgr;
++
++	if (hwmgr == NULL || hwmgr->ps == NULL)
++		return -EINVAL;
++
++	data->nums = hwmgr->num_ps;
++
++	for (i = 0; i < hwmgr->num_ps; i++) {
++		struct pp_power_state *state = (struct pp_power_state *)
++				((unsigned long)hwmgr->ps + i * hwmgr->ps_size);
++		switch (state->classification.ui_label) {
++		case PP_StateUILabel_Battery:
++			data->states[i] = POWER_STATE_TYPE_BATTERY;
++			break;
++		case PP_StateUILabel_Balanced:
++			data->states[i] = POWER_STATE_TYPE_BALANCED;
++			break;
++		case PP_StateUILabel_Performance:
++			data->states[i] = POWER_STATE_TYPE_PERFORMANCE;
++			break;
++		default:
++			if (state->classification.flags & PP_StateClassificationFlag_Boot)
++				data->states[i] = POWER_STATE_TYPE_INTERNAL_BOOT;
++			else
++				data->states[i] = POWER_STATE_TYPE_DEFAULT;
++		}
++	}
++
++	return 0;
++}
++
++static int pp_dpm_get_pp_table(void *handle, char **table)
++{
++	struct pp_hwmgr *hwmgr;
++
++	if (!handle)
++		return -EINVAL;
++
++	hwmgr = ((struct pp_instance *)handle)->hwmgr;
++
++	if (hwmgr == NULL || hwmgr->hwmgr_func == NULL ||
++		hwmgr->hwmgr_func->get_pp_table == NULL)
++		return -EINVAL;
++
++	return hwmgr->hwmgr_func->get_pp_table(hwmgr, table);
++}
++
++static int pp_dpm_set_pp_table(void *handle, const char *buf, size_t size)
++{
++	struct pp_hwmgr *hwmgr;
++
++	if (!handle)
++		return -EINVAL;
++
++	hwmgr = ((struct pp_instance *)handle)->hwmgr;
++
++	if (hwmgr == NULL || hwmgr->hwmgr_func == NULL ||
++		hwmgr->hwmgr_func->set_pp_table == NULL)
++			return -EINVAL;
++
++	return hwmgr->hwmgr_func->set_pp_table(hwmgr, buf, size);
++}
++
++static int pp_dpm_force_clock_level(void *handle,
++		enum pp_clock_type type, int level)
++{
++	struct pp_hwmgr *hwmgr;
++
++	if (!handle)
++		return -EINVAL;
++
++	hwmgr = ((struct pp_instance *)handle)->hwmgr;
++
++	if (hwmgr == NULL || hwmgr->hwmgr_func == NULL ||
++			hwmgr->hwmgr_func->force_clock_level == NULL)
++				return -EINVAL;
++
++	return hwmgr->hwmgr_func->force_clock_level(hwmgr, type, level);
++}
++
++static int pp_dpm_print_clock_levels(void *handle,
++		enum pp_clock_type type, char *buf)
++{
++	struct pp_hwmgr *hwmgr;
++
++	if (!handle)
++		return -EINVAL;
++
++	hwmgr = ((struct pp_instance *)handle)->hwmgr;
++
++	if (hwmgr == NULL || hwmgr->hwmgr_func == NULL ||
++			hwmgr->hwmgr_func->print_clock_levels == NULL)
++		return -EINVAL;
++
++	return hwmgr->hwmgr_func->print_clock_levels(hwmgr, type, buf);
++}
++
+ const struct amd_powerplay_funcs pp_dpm_funcs = {
+ 	.get_temperature = pp_dpm_get_temperature,
+ 	.load_firmware = pp_dpm_load_fw,
+@@ -555,6 +664,11 @@ const struct amd_powerplay_funcs pp_dpm_funcs = {
+ 	.get_fan_control_mode = pp_dpm_get_fan_control_mode,
+ 	.set_fan_speed_percent = pp_dpm_set_fan_speed_percent,
+ 	.get_fan_speed_percent = pp_dpm_get_fan_speed_percent,
++	.get_pp_num_states = pp_dpm_get_pp_num_states,
++	.get_pp_table = pp_dpm_get_pp_table,
++	.set_pp_table = pp_dpm_set_pp_table,
++	.force_clock_level = pp_dpm_force_clock_level,
++	.print_clock_levels = pp_dpm_print_clock_levels,
+ };
+ 
+ static int amd_pp_instance_init(struct amd_pp_init *pp_init,
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+index d9b8d3f..ee23606 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+@@ -122,6 +122,7 @@ enum amd_dpm_forced_level {
+ 	AMD_DPM_FORCED_LEVEL_AUTO = 0,
+ 	AMD_DPM_FORCED_LEVEL_LOW = 1,
+ 	AMD_DPM_FORCED_LEVEL_HIGH = 2,
++	AMD_DPM_FORCED_LEVEL_MANUAL = 3,
+ };
+ 
+ struct amd_pp_init {
+@@ -224,6 +225,17 @@ enum {
+ 	PP_GROUP_MAX
+ };
+ 
++enum pp_clock_type {
++	PP_SCLK,
++	PP_MCLK,
++	PP_PCIE,
++};
++
++struct pp_states_info {
++	uint32_t nums;
++	uint32_t states[16];
++};
++
+ #define PP_GROUP_MASK        0xF0000000
+ #define PP_GROUP_SHIFT       28
+ 
+@@ -277,6 +289,11 @@ struct amd_powerplay_funcs {
+ 	int (*get_fan_control_mode)(void *handle);
+ 	int (*set_fan_speed_percent)(void *handle, uint32_t percent);
+ 	int (*get_fan_speed_percent)(void *handle, uint32_t *speed);
++	int (*get_pp_num_states)(void *handle, struct pp_states_info *data);
++	int (*get_pp_table)(void *handle, char **table);
++	int (*set_pp_table)(void *handle, const char *buf, size_t size);
++	int (*force_clock_level)(void *handle, enum pp_clock_type type, int level);
++	int (*print_clock_levels)(void *handle, enum pp_clock_type type, char *buf);
+ };
+ 
+ struct amd_powerplay {
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+index aeaa3db..4094e81 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+@@ -327,6 +327,10 @@ struct pp_hwmgr_func {
+ 	int (*get_dal_power_level)(struct pp_hwmgr *hwmgr,
+ 				   struct amd_pp_dal_clock_info *info);
+ 	int (*power_off_asic)(struct pp_hwmgr *hwmgr);
++	int (*get_pp_table)(struct pp_hwmgr *hwmgr, char **table);
++	int (*set_pp_table)(struct pp_hwmgr *hwmgr, const char *buf, size_t size);
++	int (*force_clock_level)(struct pp_hwmgr *hwmgr, enum pp_clock_type type, int level);
++	int (*print_clock_levels)(struct pp_hwmgr *hwmgr, enum pp_clock_type type, char *buf);
+ };
+ 
+ struct pp_table_func {
+-- 
+2.7.4
+

@@ -1,0 +1,126 @@
+From 1a4d5a6525af12d0c7a3f4c9a81379b02b4fa89b Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Thu, 3 Mar 2016 19:00:50 +0800
+Subject: [PATCH 0447/1110] drm/amdgpu: delay job free to when it's finished
+ (v2)
+
+for those jobs submitted through scheduler, do not
+free it immediately after scheduled, instead free it
+in global workqueue by its sched fence signaling
+callback function.
+
+v2:
+call uf's bo_undef after job_run()
+call job's sync free after job_run()
+no static inline __amdgpu_job_free() anymore, just use
+kfree(job) to replace it.
+
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c       | 11 ++++++++++-
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c |  8 ++++++++
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  5 ++++-
+ 4 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index ddcd836..890844b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -2406,5 +2406,4 @@ amdgpu_cs_find_mapping(struct amdgpu_cs_parser *parser,
+ 		       uint64_t addr, struct amdgpu_bo **bo);
+ 
+ #include "amdgpu_object.h"
+-
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index b081671..e593ed2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -28,6 +28,12 @@
+ #include "amdgpu.h"
+ #include "amdgpu_trace.h"
+ 
++static void amdgpu_job_free_handler(struct work_struct *ws)
++{
++	struct amdgpu_job *job = container_of(ws, struct amdgpu_job, base.work_free_job);
++	kfree(job);
++}
++
+ int amdgpu_job_alloc(struct amdgpu_device *adev, unsigned num_ibs,
+                     struct amdgpu_job **job)
+ {
+@@ -45,6 +51,7 @@ int amdgpu_job_alloc(struct amdgpu_device *adev, unsigned num_ibs,
+        (*job)->adev = adev;
+        (*job)->ibs = (void *)&(*job)[1];
+        (*job)->num_ibs = num_ibs;
++       INIT_WORK(&(*job)->base.work_free_job, amdgpu_job_free_handler);
+ 
+        amdgpu_sync_create(&(*job)->sync);
+ 
+@@ -80,7 +87,9 @@ void amdgpu_job_free(struct amdgpu_job *job)
+ 
+        amdgpu_bo_unref(&job->uf.bo);
+        amdgpu_sync_free(&job->sync);
+-       kfree(job);
++
++       if (!job->base.use_sched)
++                kfree(job);
+ }
+ 
+ int amdgpu_job_submit(struct amdgpu_job *job, struct amdgpu_ring *ring,
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index b9d5822..8d49ea2 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -319,6 +319,11 @@ static bool amd_sched_entity_in(struct amd_sched_job *sched_job)
+ 	return added;
+ }
+ 
++static void amd_sched_free_job(struct fence *f, struct fence_cb *cb) {
++	struct amd_sched_job *job = container_of(cb, struct amd_sched_job, cb_free_job);
++	schedule_work(&job->work_free_job);
++}
++
+ /**
+  * Submit a job to the job queue
+  *
+@@ -330,6 +335,9 @@ void amd_sched_entity_push_job(struct amd_sched_job *sched_job)
+ {
+ 	struct amd_sched_entity *entity = sched_job->s_entity;
+ 
++	sched_job->use_sched = 1;
++	fence_add_callback(&sched_job->s_fence->base,
++					&sched_job->cb_free_job, amd_sched_free_job);
+ 	trace_amd_sched_job(sched_job);
+ 	wait_event(entity->sched->job_scheduled,
+ 		   amd_sched_entity_in(sched_job));
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index 74bbec8..ee1e812 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -37,7 +37,7 @@ extern atomic_t sched_fence_slab_ref;
+ 
+ /**
+  * A scheduler entity is a wrapper around a job queue or a group
+- * of other entities. Entities take turns emitting jobs from their 
++ * of other entities. Entities take turns emitting jobs from their
+  * job queues to corresponding hardware ring based on scheduling
+  * policy.
+ */
+@@ -82,6 +82,9 @@ struct amd_sched_job {
+ 	struct amd_gpu_scheduler        *sched;
+ 	struct amd_sched_entity         *s_entity;
+ 	struct amd_sched_fence          *s_fence;
++	bool	use_sched;	/* true if the job goes to scheduler */
++	struct fence_cb                cb_free_job;
++	struct work_struct             work_free_job;
+ };
+ 
+ extern const struct fence_ops amd_sched_fence_ops;
+-- 
+2.7.4
+

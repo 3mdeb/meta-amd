@@ -1,0 +1,128 @@
+From 074d0648329a4318ae292b6f78ee28aae15b801f Mon Sep 17 00:00:00 2001
+From: Eric Yang <eric.yang2@amd.com>
+Date: Fri, 8 Apr 2016 16:14:46 -0400
+Subject: [PATCH 1034/1110] drm/amd/dal: fix corruption before first flip upon
+ S3 resume
+
+Previously we erroneously double pin every fb at each flip because
+the pageflip run through same code path as mode set (atomic commit).
+This causes the pin count to remain above 0 when we try to unpin
+the front buffer during suspend, since the buffer remains pinned
+it was not evicted and once vram lose power during S3 all the data
+was lost. On resume we will show this fb that was destroyed by
+losing power until the next flip since it is still pinned.
+
+The new behaviour after this change is we do not double pin on flip,
+allowing the front buffer to be evicted on suspend. Then on resume
+we do an extra pin in dm_display_resume to bring the pin count from
+0 back to 1, this causes the framebuffer to be restored into vram,
+allowing us to show the correct surface.
+
+Signed-off-by: Eric Yang <eric.yang2@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      | 46 +++++++++++++++++++++-
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    | 18 +++++++--
+ 2 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index 468c4ba..35cecbc 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -546,11 +546,55 @@ static int dm_display_resume(struct drm_device *ddev)
+ 
+ 	/* Attach planes to drm_atomic_state */
+ 	list_for_each_entry(plane, &ddev->mode_config.plane_list, head) {
+-		ret = PTR_ERR_OR_ZERO(drm_atomic_get_plane_state(state, plane));
++
++		struct drm_crtc *crtc;
++		struct drm_gem_object *obj;
++		struct drm_framebuffer *fb;
++		struct amdgpu_framebuffer *afb;
++		struct amdgpu_bo *rbo;
++		int r;
++		struct drm_plane_state *plane_state = drm_atomic_get_plane_state(state, plane);
++
++		ret = PTR_ERR_OR_ZERO(plane_state);
+ 		if (ret)
+ 			goto err;
++
++		crtc = plane_state->crtc;
++		fb = plane_state->fb;
++
++		if (!crtc || !crtc->state || !crtc->state->active)
++			continue;
++
++		if (!fb) {
++			DRM_DEBUG_KMS("No FB bound\n");
++			return 0;
++		}
++
++		/*
++		 * Pin back the front buffers, cursor buffer was already pinned
++		 * back in amdgpu_resume_kms
++		 */
++
++		afb = to_amdgpu_framebuffer(fb);
++
++		obj = afb->obj;
++		rbo = gem_to_amdgpu_bo(obj);
++		r = amdgpu_bo_reserve(rbo, false);
++		if (unlikely(r != 0))
++		       return r;
++
++		r = amdgpu_bo_pin(rbo, AMDGPU_GEM_DOMAIN_VRAM, NULL);
++
++		amdgpu_bo_unreserve(rbo);
++
++		if (unlikely(r != 0)) {
++			DRM_ERROR("Failed to pin framebuffer\n");
++			return r;
++		}
++
+ 	}
+ 
++
+ 	/* Call commit internally with the state we just constructed */
+ 	ret = drm_atomic_commit(state);
+ 	if (!ret)
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index 8ad78f5..3e5c85d 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -2111,9 +2111,17 @@ int amdgpu_dm_atomic_commit(
+ 
+ 	/* In this step all new fb would be pinned */
+ 
+-	ret = drm_atomic_helper_prepare_planes(dev, state);
+-	if (ret)
+-		return ret;
++	/*
++	 * TODO: Revisit when we support true asynchronous commit.
++	 * Right now we receive async commit only from pageflip, in which case
++	 * we should not pin/unpin the fb here, it should be done in
++	 * amdgpu_crtc_flip and from the vblank irq handler.
++	 */
++	if (!async) {
++		ret = drm_atomic_helper_prepare_planes(dev, state);
++		if (ret)
++			return ret;
++	}
+ 
+ 	/*
+ 	 * This is the point of no return - everything below never fails except
+@@ -2339,7 +2347,9 @@ int amdgpu_dm_atomic_commit(
+ 
+ 	/* In this state all old framebuffers would be unpinned */
+ 
+-	drm_atomic_helper_cleanup_planes(dev, state);
++	/* TODO: Revisit when we support true asynchronous commit.*/
++	if (!async)
++		drm_atomic_helper_cleanup_planes(dev, state);
+ 
+ 	drm_atomic_state_free(state);
+ 
+-- 
+2.7.4
+

@@ -1,0 +1,394 @@
+From 714ad0e4b4990ccafe9a3d54496b8ddb6c0a5ba4 Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Mon, 7 Dec 2015 18:44:23 +0800
+Subject: [PATCH 0287/1110] drm/amd/powerplay: export interface to DAL.
+
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/powerplay/amd_powerplay.c      | 81 +++++++++++++++++++
+ .../gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c  | 91 +++++++++++++++++++++-
+ drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h  | 50 ++++++++++++
+ .../gpu/drm/amd/powerplay/inc/hardwaremanager.h    | 42 +++++-----
+ drivers/gpu/drm/amd/powerplay/inc/hwmgr.h          |  8 +-
+ 5 files changed, 251 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+index a5d7282..7a5baeb 100644
+--- a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
++++ b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+@@ -29,6 +29,7 @@
+ #include "pp_instance.h"
+ #include "power_state.h"
+ #include "eventmanager.h"
++#include "pp_debug.h"
+ 
+ #define PP_CHECK(handle)						\
+ 	do {								\
+@@ -780,3 +781,83 @@ int amd_powerplay_get_display_power_level(void *handle,
+ 
+ 	return phm_get_dal_power_level(hwmgr, output);
+ }
++
++int amd_powerplay_get_current_clocks(void *handle,
++		void *output)
++{
++	struct pp_hwmgr  *hwmgr;
++	struct amd_pp_simple_clock_info simple_clocks;
++	struct pp_clock_info hw_clocks;
++	struct amd_pp_clock_info *clocks = (struct amd_pp_clock_info *)output;
++
++	if (handle == NULL || output == NULL)
++		return -EINVAL;
++
++	hwmgr = ((struct pp_instance *)handle)->hwmgr;
++
++	phm_get_dal_power_level(hwmgr, &simple_clocks);
++
++	if (phm_cap_enabled(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_PowerContainment)) {
++		if (0 != phm_get_clock_info(hwmgr, &hwmgr->current_ps->hardware, &hw_clocks, PHM_PerformanceLevelDesignation_PowerContainment))
++			PP_ASSERT_WITH_CODE(0, "Error in PHM_GetPowerContainmentClockInfo", return -1);
++	} else {
++		if (0 != phm_get_clock_info(hwmgr, &hwmgr->current_ps->hardware, &hw_clocks, PHM_PerformanceLevelDesignation_Activity))
++			PP_ASSERT_WITH_CODE(0, "Error in PHM_GetClockInfo", return -1);
++	}
++
++	clocks->min_engine_clock = hw_clocks.min_eng_clk;
++	clocks->max_engine_clock = hw_clocks.max_eng_clk;
++	clocks->min_memory_clock = hw_clocks.min_mem_clk;
++	clocks->max_memory_clock = hw_clocks.max_mem_clk;
++	clocks->min_bus_bandwidth = hw_clocks.min_bus_bandwidth;
++	clocks->max_bus_bandwidth = hw_clocks.max_bus_bandwidth;
++
++	clocks->max_engine_clock_in_sr = hw_clocks.max_eng_clk;
++	clocks->min_engine_clock_in_sr = hw_clocks.min_eng_clk;
++
++	clocks->max_clocks_state = simple_clocks.level;
++
++	if (0 == phm_get_current_shallow_sleep_clocks(hwmgr, &hwmgr->current_ps->hardware, &hw_clocks)) {
++		clocks->max_engine_clock_in_sr = hw_clocks.max_eng_clk;
++		clocks->min_engine_clock_in_sr = hw_clocks.min_eng_clk;
++	}
++
++	return 0;
++
++}
++
++int amd_powerplay_get_clock_by_type(void *handle, enum amd_pp_clock_type type, struct amd_pp_clocks *clocks)
++{
++	int result = -1;
++
++	struct pp_hwmgr *hwmgr;
++
++	if (handle == NULL || clocks == NULL)
++		return -EINVAL;
++
++	hwmgr = ((struct pp_instance *)handle)->hwmgr;
++
++	result = phm_get_clock_by_type(hwmgr, type, clocks);
++
++	return result;
++}
++
++int amd_powerplay_get_display_mode_validation_clocks(void *handle, const void *input,
++							void *output)
++{
++	int result = -1;
++
++	struct amd_pp_simple_clock_info *clocks = output;
++	struct pp_hwmgr  *hwmgr;
++
++	if (handle == NULL || clocks == NULL)
++		return -EINVAL;
++
++	hwmgr = ((struct pp_instance *)handle)->hwmgr;
++
++	if (phm_cap_enabled(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DynamicPatchPowerState))
++		result = phm_get_max_high_clocks(hwmgr, clocks);
++
++	return result;
++}
++
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c b/drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c
+index a53d4f2..be31bed 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c
+@@ -26,7 +26,7 @@
+ #include "power_state.h"
+ #include "pp_acpi.h"
+ #include "amd_acpi.h"
+-#include "amd_powerplay.h"
++#include "pp_debug.h"
+ 
+ #define PHM_FUNC_CHECK(hw) \
+ 	do {							\
+@@ -319,7 +319,6 @@ int phm_get_dal_power_level(struct pp_hwmgr *hwmgr,
+ 
+ 	if (info == NULL || hwmgr->hwmgr_func->get_dal_power_level == NULL)
+ 		return -EINVAL;
+-
+ 	return hwmgr->hwmgr_func->get_dal_power_level(hwmgr, info);
+ }
+ 
+@@ -332,3 +331,91 @@ int phm_set_cpu_power_state(struct pp_hwmgr *hwmgr)
+ 
+ 	return 0;
+ }
++
++
++int phm_get_performance_level(struct pp_hwmgr *hwmgr, const struct pp_hw_power_state *state,
++				PHM_PerformanceLevelDesignation designation, uint32_t index,
++				PHM_PerformanceLevel *level)
++{
++	PHM_FUNC_CHECK(hwmgr);
++	if (hwmgr->hwmgr_func->get_performance_level == NULL)
++		return -EINVAL;
++
++	return hwmgr->hwmgr_func->get_performance_level(hwmgr, state, designation, index, level);
++
++
++}
++
++
++/**
++* Gets Clock Info.
++*
++* @param    pHwMgr  the address of the powerplay hardware manager.
++* @param    pPowerState the address of the Power State structure.
++* @param    pClockInfo the address of PP_ClockInfo structure where the result will be returned.
++* @exception PP_Result_Failed if any of the paramters is NULL, otherwise the return value from the back-end.
++*/
++int phm_get_clock_info(struct pp_hwmgr *hwmgr, const struct pp_hw_power_state *state, struct pp_clock_info *pclock_info,
++			PHM_PerformanceLevelDesignation designation)
++{
++	int result;
++	PHM_PerformanceLevel performance_level;
++
++	PHM_FUNC_CHECK(hwmgr);
++
++	PP_ASSERT_WITH_CODE((NULL != state), "Invalid Input!", return -EINVAL);
++	PP_ASSERT_WITH_CODE((NULL != pclock_info), "Invalid Input!", return -EINVAL);
++
++	result = phm_get_performance_level(hwmgr, state, PHM_PerformanceLevelDesignation_Activity, 0, &performance_level);
++
++	PP_ASSERT_WITH_CODE((0 == result), "Failed to retrieve minimum clocks.", return result);
++
++
++	pclock_info->min_mem_clk = performance_level.memory_clock;
++	pclock_info->min_eng_clk = performance_level.coreClock;
++	pclock_info->min_bus_bandwidth = performance_level.nonLocalMemoryFreq * performance_level.nonLocalMemoryWidth;
++
++
++	result = phm_get_performance_level(hwmgr, state, designation,
++					(hwmgr->platform_descriptor.hardwareActivityPerformanceLevels - 1), &performance_level);
++
++	PP_ASSERT_WITH_CODE((0 == result), "Failed to retrieve maximum clocks.", return result);
++
++	pclock_info->max_mem_clk = performance_level.memory_clock;
++	pclock_info->max_eng_clk = performance_level.coreClock;
++	pclock_info->max_bus_bandwidth = performance_level.nonLocalMemoryFreq * performance_level.nonLocalMemoryWidth;
++
++	return 0;
++}
++
++int phm_get_current_shallow_sleep_clocks(struct pp_hwmgr *hwmgr, const struct pp_hw_power_state *state, struct pp_clock_info *clock_info)
++{
++	PHM_FUNC_CHECK(hwmgr);
++
++	if (hwmgr->hwmgr_func->get_current_shallow_sleep_clocks == NULL)
++		return -EINVAL;
++
++	return hwmgr->hwmgr_func->get_current_shallow_sleep_clocks(hwmgr, state, clock_info);
++
++}
++
++int phm_get_clock_by_type(struct pp_hwmgr *hwmgr, enum amd_pp_clock_type type, struct amd_pp_clocks *clocks)
++{
++	PHM_FUNC_CHECK(hwmgr);
++
++	if (hwmgr->hwmgr_func->get_clock_by_type == NULL)
++		return -EINVAL;
++
++	return hwmgr->hwmgr_func->get_clock_by_type(hwmgr, type, clocks);
++
++}
++
++int phm_get_max_high_clocks(struct pp_hwmgr *hwmgr, struct amd_pp_simple_clock_info *clocks)
++{
++	PHM_FUNC_CHECK(hwmgr);
++
++	if (hwmgr->hwmgr_func->get_max_high_clocks == NULL)
++		return -EINVAL;
++
++	return hwmgr->hwmgr_func->get_max_high_clocks(hwmgr, clocks);
++}
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+index 3edc2d3..235f2fb 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+@@ -28,6 +28,7 @@
+ #include "amd_shared.h"
+ #include "cgs_common.h"
+ 
++
+ enum amd_pp_event {
+ 	AMD_PP_EVENT_INITIALIZE = 0,
+ 	AMD_PP_EVENT_UNINITIALIZE,
+@@ -218,6 +219,49 @@ struct amd_pp_simple_clock_info {
+ 	uint32_t	level;
+ };
+ 
++enum PP_DAL_POWERLEVEL {
++	PP_DAL_POWERLEVEL_INVALID = 0,
++	PP_DAL_POWERLEVEL_ULTRALOW,
++	PP_DAL_POWERLEVEL_LOW,
++	PP_DAL_POWERLEVEL_NOMINAL,
++	PP_DAL_POWERLEVEL_PERFORMANCE,
++
++	PP_DAL_POWERLEVEL_0 = PP_DAL_POWERLEVEL_ULTRALOW,
++	PP_DAL_POWERLEVEL_1 = PP_DAL_POWERLEVEL_LOW,
++	PP_DAL_POWERLEVEL_2 = PP_DAL_POWERLEVEL_NOMINAL,
++	PP_DAL_POWERLEVEL_3 = PP_DAL_POWERLEVEL_PERFORMANCE,
++	PP_DAL_POWERLEVEL_4 = PP_DAL_POWERLEVEL_3+1,
++	PP_DAL_POWERLEVEL_5 = PP_DAL_POWERLEVEL_4+1,
++	PP_DAL_POWERLEVEL_6 = PP_DAL_POWERLEVEL_5+1,
++	PP_DAL_POWERLEVEL_7 = PP_DAL_POWERLEVEL_6+1,
++};
++
++struct amd_pp_clock_info {
++	uint32_t min_engine_clock;
++	uint32_t max_engine_clock;
++	uint32_t min_memory_clock;
++	uint32_t max_memory_clock;
++	uint32_t min_bus_bandwidth;
++	uint32_t max_bus_bandwidth;
++	uint32_t max_engine_clock_in_sr;
++	uint32_t min_engine_clock_in_sr;
++	enum PP_DAL_POWERLEVEL max_clocks_state;
++};
++
++enum amd_pp_clock_type {
++	amd_pp_disp_clock = 1,
++	amd_pp_sys_clock,
++	amd_pp_mem_clock
++};
++
++#define MAX_NUM_CLOCKS 16
++
++struct amd_pp_clocks {
++	uint32_t count;
++	uint32_t clock[MAX_NUM_CLOCKS];
++};
++
++
+ enum {
+ 	PP_GROUP_UNKNOWN = 0,
+ 	PP_GROUP_GFX = 1,
+@@ -311,5 +355,11 @@ int amd_powerplay_display_configuration_change(void *handle, const void *input);
+ int amd_powerplay_get_display_power_level(void *handle,
+ 		struct amd_pp_simple_clock_info *output);
+ 
++int amd_powerplay_get_current_clocks(void *handle, void *output);
++
++int amd_powerplay_get_clock_by_type(void *handle, enum amd_pp_clock_type type, struct amd_pp_clocks *clocks);
++
++int amd_powerplay_get_display_mode_validation_clocks(void *handle, const void *input,
++							void *output);
+ 
+ #endif /* _AMD_POWERPLAY_H_ */
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h b/drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h
+index ce97bf2..040d3f7 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h
+@@ -31,6 +31,7 @@ struct pp_power_state;
+ enum amd_dpm_forced_level;
+ struct PP_TemperatureRange;
+ 
++
+ struct phm_fan_speed_info {
+ 	uint32_t min_percent;
+ 	uint32_t max_percent;
+@@ -290,6 +291,15 @@ struct PP_Clocks {
+ 	uint32_t engineClockInSR;
+ };
+ 
++struct pp_clock_info {
++	uint32_t min_mem_clk;
++	uint32_t max_mem_clk;
++	uint32_t min_eng_clk;
++	uint32_t max_eng_clk;
++	uint32_t min_bus_bandwidth;
++	uint32_t max_bus_bandwidth;
++};
++
+ struct phm_platform_descriptor {
+ 	uint32_t platformCaps[PHM_MAX_NUM_CAPS_ULONG_ENTRIES];
+ 	uint32_t vbiosInterruptId;
+@@ -323,24 +333,6 @@ struct phm_clocks {
+ 	uint32_t clock[MAX_NUM_CLOCKS];
+ };
+ 
+-enum PP_DAL_POWERLEVEL {
+-	PP_DAL_POWERLEVEL_INVALID = 0,
+-	PP_DAL_POWERLEVEL_ULTRALOW,
+-	PP_DAL_POWERLEVEL_LOW,
+-	PP_DAL_POWERLEVEL_NOMINAL,
+-	PP_DAL_POWERLEVEL_PERFORMANCE,
+-
+-	PP_DAL_POWERLEVEL_0 = PP_DAL_POWERLEVEL_ULTRALOW,
+-	PP_DAL_POWERLEVEL_1 = PP_DAL_POWERLEVEL_LOW,
+-	PP_DAL_POWERLEVEL_2 = PP_DAL_POWERLEVEL_NOMINAL,
+-	PP_DAL_POWERLEVEL_3 = PP_DAL_POWERLEVEL_PERFORMANCE,
+-	PP_DAL_POWERLEVEL_4 = PP_DAL_POWERLEVEL_3+1,
+-	PP_DAL_POWERLEVEL_5 = PP_DAL_POWERLEVEL_4+1,
+-	PP_DAL_POWERLEVEL_6 = PP_DAL_POWERLEVEL_5+1,
+-	PP_DAL_POWERLEVEL_7 = PP_DAL_POWERLEVEL_6+1,
+-};
+-
+-
+ extern int phm_enable_clock_power_gatings(struct pp_hwmgr *hwmgr);
+ extern int phm_powergate_uvd(struct pp_hwmgr *hwmgr, bool gate);
+ extern int phm_powergate_vce(struct pp_hwmgr *hwmgr, bool gate);
+@@ -381,5 +373,19 @@ extern int phm_set_cpu_power_state(struct pp_hwmgr *hwmgr);
+ 
+ extern int phm_power_down_asic(struct pp_hwmgr *hwmgr);
+ 
++extern int phm_get_performance_level(struct pp_hwmgr *hwmgr, const struct pp_hw_power_state *state,
++				PHM_PerformanceLevelDesignation designation, uint32_t index,
++				PHM_PerformanceLevel *level);
++
++extern int phm_get_clock_info(struct pp_hwmgr *hwmgr, const struct pp_hw_power_state *state,
++			struct pp_clock_info *pclock_info,
++			PHM_PerformanceLevelDesignation designation);
++
++extern int phm_get_current_shallow_sleep_clocks(struct pp_hwmgr *hwmgr, const struct pp_hw_power_state *state, struct pp_clock_info *clock_info);
++
++extern int phm_get_clock_by_type(struct pp_hwmgr *hwmgr, enum amd_pp_clock_type type, struct amd_pp_clocks *clocks);
++
++extern int phm_get_max_high_clocks(struct pp_hwmgr *hwmgr, struct amd_pp_simple_clock_info *clocks);
++
+ #endif /* _HARDWARE_MANAGER_H_ */
+ 
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+index e3214f1..928f5a7 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+@@ -325,7 +325,13 @@ struct pp_hwmgr_func {
+ 				bool cc6_disable, bool pstate_disable,
+ 				bool pstate_switch_disable);
+ 	int (*get_dal_power_level)(struct pp_hwmgr *hwmgr,
+-				   struct amd_pp_simple_clock_info *info);
++			struct amd_pp_simple_clock_info *info);
++	int (*get_performance_level)(struct pp_hwmgr *, const struct pp_hw_power_state *,
++			PHM_PerformanceLevelDesignation, uint32_t, PHM_PerformanceLevel *);
++	int (*get_current_shallow_sleep_clocks)(struct pp_hwmgr *hwmgr,
++				const struct pp_hw_power_state *state, struct pp_clock_info *clock_info);
++	int (*get_clock_by_type)(struct pp_hwmgr *hwmgr, enum amd_pp_clock_type type, struct amd_pp_clocks *clocks);
++	int (*get_max_high_clocks)(struct pp_hwmgr *hwmgr, struct amd_pp_simple_clock_info *clocks);
+ 	int (*power_off_asic)(struct pp_hwmgr *hwmgr);
+ 	int (*get_pp_table)(struct pp_hwmgr *hwmgr, char **table);
+ 	int (*set_pp_table)(struct pp_hwmgr *hwmgr, const char *buf, size_t size);
+-- 
+2.7.4
+

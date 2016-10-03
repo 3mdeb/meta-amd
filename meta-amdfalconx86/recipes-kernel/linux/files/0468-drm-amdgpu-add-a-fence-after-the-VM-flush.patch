@@ -1,0 +1,142 @@
+From e9f18e032cadfb8fe77b7d03b2688ae64b6d8d0e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 1 Mar 2016 16:46:18 +0100
+Subject: [PATCH 0468/1110] drm/amdgpu: add a fence after the VM flush
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This way we can track when the flush is done.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    | 11 ++++++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c | 12 ++++++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 26 +++++++++++++++++++++-----
+ 3 files changed, 35 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 915c2e3..6d87e4c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -879,6 +879,7 @@ struct amdgpu_vm_id {
+ 	struct list_head	list;
+         struct fence            *first;
+         struct amdgpu_sync      active;
++        struct fence            *last_flush;
+ 	atomic_long_t		owner;
+ 
+         uint64_t                pd_gpu_addr;
+@@ -932,11 +933,11 @@ void amdgpu_vm_move_pt_bos_in_lru(struct amdgpu_device *adev,
+ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+                       struct amdgpu_sync *sync, struct fence *fence,
+                       unsigned *vm_id, uint64_t *vm_pd_addr);
+-void amdgpu_vm_flush(struct amdgpu_ring *ring,
+-                     unsigned vm_id, uint64_t pd_addr,
+-                     uint32_t gds_base, uint32_t gds_size,
+-                     uint32_t gws_base, uint32_t gws_size,
+-                     uint32_t oa_base, uint32_t oa_size);
++int amdgpu_vm_flush(struct amdgpu_ring *ring,
++                    unsigned vm_id, uint64_t pd_addr,
++                    uint32_t gds_base, uint32_t gds_size,
++                    uint32_t gws_base, uint32_t gws_size,
++                    uint32_t oa_base, uint32_t oa_size);
+ void amdgpu_vm_reset_id(struct amdgpu_device *adev, unsigned vm_id);
+ uint64_t amdgpu_vm_map_gart(const dma_addr_t *pages_addr, uint64_t addr);
+ int amdgpu_vm_update_page_directory(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 964914b..209ab99 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -151,10 +151,14 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 
+ 	if (vm) {
+ 		/* do context switch */
+-                amdgpu_vm_flush(ring, ib->vm_id, ib->vm_pd_addr,
+-                                ib->gds_base, ib->gds_size,
+-                                ib->gws_base, ib->gws_size,
+-                                ib->oa_base, ib->oa_size);
++                r = amdgpu_vm_flush(ring, ib->vm_id, ib->vm_pd_addr,
++                                    ib->gds_base, ib->gds_size,
++                                    ib->gws_base, ib->gws_size,
++                                    ib->oa_base, ib->oa_size);
++                if (r) {
++                        amdgpu_ring_undo(ring);
++                        return r;
++                }
+ 
+ 		if (ring->funcs->emit_hdp_flush)
+ 			amdgpu_ring_emit_hdp_flush(ring);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 8382b7f..0da3fde 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -243,6 +243,9 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 	fence_put(id->first);
+ 	id->first = fence_get(fence);
+ 
++	fence_put(id->last_flush);
++	id->last_flush = NULL;
++
+ 	fence_put(id->flushed_updates);
+ 	id->flushed_updates = fence_get(updates);
+ 
+@@ -270,11 +273,11 @@ error:
+  *
+  * Emit a VM flush when it is necessary.
+  */
+-void amdgpu_vm_flush(struct amdgpu_ring *ring,
+-		     unsigned vm_id, uint64_t pd_addr,
+-		     uint32_t gds_base, uint32_t gds_size,
+-		     uint32_t gws_base, uint32_t gws_size,
+-		     uint32_t oa_base, uint32_t oa_size)
++int amdgpu_vm_flush(struct amdgpu_ring *ring,
++                    unsigned vm_id, uint64_t pd_addr,
++                    uint32_t gds_base, uint32_t gds_size,
++                    uint32_t gws_base, uint32_t gws_size,
++                    uint32_t oa_base, uint32_t oa_size)
+ {
+         struct amdgpu_device *adev = ring->adev;
+         struct amdgpu_vm_id *id = &adev->vm_manager.ids[vm_id];
+@@ -285,14 +288,25 @@ void amdgpu_vm_flush(struct amdgpu_ring *ring,
+                 id->gws_size != gws_size ||
+                 id->oa_base != oa_base ||
+                 id->oa_size != oa_size);
++        int r;
+ 
+         if (ring->funcs->emit_pipeline_sync && (
+            pd_addr != AMDGPU_VM_NO_FLUSH || gds_switch_needed))
+                amdgpu_ring_emit_pipeline_sync(ring);
+ 
+ 	if (pd_addr != AMDGPU_VM_NO_FLUSH) {
++                struct fence *fence;
++
+ 		trace_amdgpu_vm_flush(pd_addr, ring->idx, vm_id);
+ 		amdgpu_ring_emit_vm_flush(ring, vm_id, pd_addr);
++                r = amdgpu_fence_emit(ring, &fence);
++                if (r)
++                        return r;
++ 
++                mutex_lock(&adev->vm_manager.lock);
++                fence_put(id->last_flush);
++                id->last_flush = fence;
++                mutex_unlock(&adev->vm_manager.lock);
+ 	}
+ 
+         if (gds_switch_needed) {
+@@ -307,6 +321,8 @@ void amdgpu_vm_flush(struct amdgpu_ring *ring,
+ 					    gws_base, gws_size,
+ 					    oa_base, oa_size);
+ 	}
++
++	return 0;
+ }
+ 
+ /**
+-- 
+2.7.4
+

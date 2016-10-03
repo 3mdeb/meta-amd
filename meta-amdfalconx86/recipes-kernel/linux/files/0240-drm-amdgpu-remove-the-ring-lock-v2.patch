@@ -1,0 +1,685 @@
+From 1efdedaeccd078f50a532997bb0df5d5575e4a5b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 21 Jan 2016 11:28:53 +0100
+Subject: [PATCH 0240/1110] drm/amdgpu: remove the ring lock v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+It's not needed any more because all access goes through the scheduler now.
+
+v2: Update commit message.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  5 --
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c  |  6 ---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c     | 10 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c     | 19 +++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c   | 80 +++---------------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c    |  4 +-
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c      |  4 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c      |  8 +--
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c      |  8 +--
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c     |  4 +-
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c     |  4 +-
+ drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c      |  8 +--
+ drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c      |  8 +--
+ drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c      |  8 +--
+ 15 files changed, 45 insertions(+), 132 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 5135635..e05c6f4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -774,7 +774,6 @@ struct amdgpu_ring {
+ 	struct amd_gpu_scheduler 	sched;
+ 
+ 	spinlock_t              fence_lock;
+-	struct mutex		*ring_lock;
+ 	struct amdgpu_bo	*ring_obj;
+ 	volatile uint32_t	*ring;
+ 	unsigned		rptr_offs;
+@@ -1156,12 +1155,9 @@ int amdgpu_ib_ring_tests(struct amdgpu_device *adev);
+ /* Ring access between begin & end cannot sleep */
+ void amdgpu_ring_free_size(struct amdgpu_ring *ring);
+ int amdgpu_ring_alloc(struct amdgpu_ring *ring, unsigned ndw);
+-int amdgpu_ring_lock(struct amdgpu_ring *ring, unsigned ndw);
+ void amdgpu_ring_insert_nop(struct amdgpu_ring *ring, uint32_t count);
+ void amdgpu_ring_commit(struct amdgpu_ring *ring);
+-void amdgpu_ring_unlock_commit(struct amdgpu_ring *ring);
+ void amdgpu_ring_undo(struct amdgpu_ring *ring);
+-void amdgpu_ring_unlock_undo(struct amdgpu_ring *ring);
+ unsigned amdgpu_ring_backup(struct amdgpu_ring *ring,
+ 			    uint32_t **data);
+ int amdgpu_ring_restore(struct amdgpu_ring *ring,
+@@ -1975,7 +1971,6 @@ struct amdgpu_device {
+ 
+ 	/* rings */
+ 	unsigned			fence_context;
+-	struct mutex			ring_lock;
+ 	unsigned			num_rings;
+ 	struct amdgpu_ring		*rings[AMDGPU_MAX_RINGS];
+ 	bool				ib_pool_ready;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 9bab3dc..f9c0393 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1455,7 +1455,6 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 
+ 	/* mutex initialization are all done here so we
+ 	 * can recall function without having locking issues */
+-	mutex_init(&adev->ring_lock);
+ 	mutex_init(&adev->vm_manager.lock);
+ 	atomic_set(&adev->irq.ih.lock, 0);
+ 	mutex_init(&adev->gem.mutex);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index 08963fc..7210502 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -487,7 +487,6 @@ void amdgpu_fence_driver_fini(struct amdgpu_device *adev)
+ 
+ 	if (atomic_dec_and_test(&amdgpu_fence_slab_ref))
+ 		kmem_cache_destroy(amdgpu_fence_slab);
+-	mutex_lock(&adev->ring_lock);
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; i++) {
+ 		struct amdgpu_ring *ring = adev->rings[i];
+ 
+@@ -505,7 +504,6 @@ void amdgpu_fence_driver_fini(struct amdgpu_device *adev)
+ 		del_timer_sync(&ring->fence_drv.fallback_timer);
+ 		ring->fence_drv.initialized = false;
+ 	}
+-	mutex_unlock(&adev->ring_lock);
+ }
+ 
+ /**
+@@ -520,7 +518,6 @@ void amdgpu_fence_driver_suspend(struct amdgpu_device *adev)
+ {
+ 	int i, r;
+ 
+-	mutex_lock(&adev->ring_lock);
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; i++) {
+ 		struct amdgpu_ring *ring = adev->rings[i];
+ 		if (!ring || !ring->fence_drv.initialized)
+@@ -537,7 +534,6 @@ void amdgpu_fence_driver_suspend(struct amdgpu_device *adev)
+ 		amdgpu_irq_put(adev, ring->fence_drv.irq_src,
+ 			       ring->fence_drv.irq_type);
+ 	}
+-	mutex_unlock(&adev->ring_lock);
+ }
+ 
+ /**
+@@ -556,7 +552,6 @@ void amdgpu_fence_driver_resume(struct amdgpu_device *adev)
+ {
+ 	int i;
+ 
+-	mutex_lock(&adev->ring_lock);
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; i++) {
+ 		struct amdgpu_ring *ring = adev->rings[i];
+ 		if (!ring || !ring->fence_drv.initialized)
+@@ -566,7 +561,6 @@ void amdgpu_fence_driver_resume(struct amdgpu_device *adev)
+ 		amdgpu_irq_get(adev, ring->fence_drv.irq_src,
+ 			       ring->fence_drv.irq_type);
+ 	}
+-	mutex_unlock(&adev->ring_lock);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 56ae9a5..40c9779 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -147,7 +147,7 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 		return -EINVAL;
+ 	}
+ 
+-	r = amdgpu_ring_lock(ring, (256 + AMDGPU_NUM_SYNCS * 8) * num_ibs);
++	r = amdgpu_ring_alloc(ring, (256 + AMDGPU_NUM_SYNCS * 8) * num_ibs);
+ 	if (r) {
+ 		dev_err(adev->dev, "scheduling IB failed (%d).\n", r);
+ 		return r;
+@@ -155,7 +155,7 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 
+ 	r = amdgpu_sync_wait(&ibs->sync);
+ 	if (r) {
+-		amdgpu_ring_unlock_undo(ring);
++		amdgpu_ring_undo(ring);
+ 		dev_err(adev->dev, "failed to sync wait (%d)\n", r);
+ 		return r;
+ 	}
+@@ -180,7 +180,7 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 
+ 		if (ib->ring != ring || ib->ctx != ctx || ib->vm != vm) {
+ 			ring->current_ctx = old_ctx;
+-			amdgpu_ring_unlock_undo(ring);
++			amdgpu_ring_undo(ring);
+ 			return -EINVAL;
+ 		}
+ 		amdgpu_ring_emit_ib(ring, ib);
+@@ -191,7 +191,7 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 	if (r) {
+ 		dev_err(adev->dev, "failed to emit fence (%d)\n", r);
+ 		ring->current_ctx = old_ctx;
+-		amdgpu_ring_unlock_undo(ring);
++		amdgpu_ring_undo(ring);
+ 		return r;
+ 	}
+ 
+@@ -203,7 +203,7 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 				       AMDGPU_FENCE_FLAG_64BIT);
+ 	}
+ 
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
+index 95a4a25..54e1cac 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
+@@ -637,14 +637,12 @@ force:
+ 		amdgpu_dpm_print_power_state(adev, adev->pm.dpm.requested_ps);
+ 	}
+ 
+-	mutex_lock(&adev->ring_lock);
+-
+ 	/* update whether vce is active */
+ 	ps->vce_active = adev->pm.dpm.vce_active;
+ 
+ 	ret = amdgpu_dpm_pre_set_power_state(adev);
+ 	if (ret)
+-		goto done;
++		return;
+ 
+ 	/* update display watermarks based on new power state */
+ 	amdgpu_display_bandwidth_update(adev);
+@@ -682,9 +680,6 @@ force:
+ 			amdgpu_dpm_force_performance_level(adev, adev->pm.dpm.forced_level);
+ 		}
+ 	}
+-
+-done:
+-	mutex_unlock(&adev->ring_lock);
+ }
+ 
+ void amdgpu_dpm_enable_uvd(struct amdgpu_device *adev, bool enable)
+@@ -817,13 +812,11 @@ void amdgpu_pm_compute_clocks(struct amdgpu_device *adev)
+ 		int i = 0;
+ 
+ 		amdgpu_display_bandwidth_update(adev);
+-		mutex_lock(&adev->ring_lock);
+-			for (i = 0; i < AMDGPU_MAX_RINGS; i++) {
+-				struct amdgpu_ring *ring = adev->rings[i];
+-				if (ring && ring->ready)
+-					amdgpu_fence_wait_empty(ring);
+-			}
+-		mutex_unlock(&adev->ring_lock);
++		for (i = 0; i < AMDGPU_MAX_RINGS; i++) {
++			struct amdgpu_ring *ring = adev->rings[i];
++			if (ring && ring->ready)
++				amdgpu_fence_wait_empty(ring);
++		}
+ 
+ 		amdgpu_dpm_dispatch_task(adev, AMD_PP_EVENT_DISPLAY_CONFIG_CHANGE, NULL, NULL);
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index 66c6bbd..81d06d7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -105,30 +105,6 @@ int amdgpu_ring_alloc(struct amdgpu_ring *ring, unsigned ndw)
+ 	return 0;
+ }
+ 
+-/**
+- * amdgpu_ring_lock - lock the ring and allocate space on it
+- *
+- * @adev: amdgpu_device pointer
+- * @ring: amdgpu_ring structure holding ring information
+- * @ndw: number of dwords to allocate in the ring buffer
+- *
+- * Lock the ring and allocate @ndw dwords in the ring buffer
+- * (all asics).
+- * Returns 0 on success, error on failure.
+- */
+-int amdgpu_ring_lock(struct amdgpu_ring *ring, unsigned ndw)
+-{
+-	int r;
+-
+-	mutex_lock(ring->ring_lock);
+-	r = amdgpu_ring_alloc(ring, ndw);
+-	if (r) {
+-		mutex_unlock(ring->ring_lock);
+-		return r;
+-	}
+-	return 0;
+-}
+-
+ /** amdgpu_ring_insert_nop - insert NOP packets
+  *
+  * @ring: amdgpu_ring structure holding ring information
+@@ -168,20 +144,6 @@ void amdgpu_ring_commit(struct amdgpu_ring *ring)
+ }
+ 
+ /**
+- * amdgpu_ring_unlock_commit - tell the GPU to execute the new
+- * commands on the ring buffer and unlock it
+- *
+- * @ring: amdgpu_ring structure holding ring information
+- *
+- * Call amdgpu_ring_commit() then unlock the ring (all asics).
+- */
+-void amdgpu_ring_unlock_commit(struct amdgpu_ring *ring)
+-{
+-	amdgpu_ring_commit(ring);
+-	mutex_unlock(ring->ring_lock);
+-}
+-
+-/**
+  * amdgpu_ring_undo - reset the wptr
+  *
+  * @ring: amdgpu_ring structure holding ring information
+@@ -194,19 +156,6 @@ void amdgpu_ring_undo(struct amdgpu_ring *ring)
+ }
+ 
+ /**
+- * amdgpu_ring_unlock_undo - reset the wptr and unlock the ring
+- *
+- * @ring: amdgpu_ring structure holding ring information
+- *
+- * Call amdgpu_ring_undo() then unlock the ring (all asics).
+- */
+-void amdgpu_ring_unlock_undo(struct amdgpu_ring *ring)
+-{
+-	amdgpu_ring_undo(ring);
+-	mutex_unlock(ring->ring_lock);
+-}
+-
+-/**
+  * amdgpu_ring_backup - Back up the content of a ring
+  *
+  * @ring: the ring we want to back up
+@@ -218,43 +167,32 @@ unsigned amdgpu_ring_backup(struct amdgpu_ring *ring,
+ {
+ 	unsigned size, ptr, i;
+ 
+-	/* just in case lock the ring */
+-	mutex_lock(ring->ring_lock);
+ 	*data = NULL;
+ 
+-	if (ring->ring_obj == NULL) {
+-		mutex_unlock(ring->ring_lock);
++	if (ring->ring_obj == NULL)
+ 		return 0;
+-	}
+ 
+ 	/* it doesn't make sense to save anything if all fences are signaled */
+-	if (!amdgpu_fence_count_emitted(ring)) {
+-		mutex_unlock(ring->ring_lock);
++	if (!amdgpu_fence_count_emitted(ring))
+ 		return 0;
+-	}
+ 
+ 	ptr = le32_to_cpu(*ring->next_rptr_cpu_addr);
+ 
+ 	size = ring->wptr + (ring->ring_size / 4);
+ 	size -= ptr;
+ 	size &= ring->ptr_mask;
+-	if (size == 0) {
+-		mutex_unlock(ring->ring_lock);
++	if (size == 0)
+ 		return 0;
+-	}
+ 
+ 	/* and then save the content of the ring */
+ 	*data = kmalloc_array(size, sizeof(uint32_t), GFP_KERNEL);
+-	if (!*data) {
+-		mutex_unlock(ring->ring_lock);
++	if (!*data)
+ 		return 0;
+-	}
+ 	for (i = 0; i < size; ++i) {
+ 		(*data)[i] = ring->ring[ptr++];
+ 		ptr &= ring->ptr_mask;
+ 	}
+ 
+-	mutex_unlock(ring->ring_lock);
+ 	return size;
+ }
+ 
+@@ -276,7 +214,7 @@ int amdgpu_ring_restore(struct amdgpu_ring *ring,
+ 		return 0;
+ 
+ 	/* restore the saved ring content */
+-	r = amdgpu_ring_lock(ring, size);
++	r = amdgpu_ring_alloc(ring, size);
+ 	if (r)
+ 		return r;
+ 
+@@ -284,7 +222,7 @@ int amdgpu_ring_restore(struct amdgpu_ring *ring,
+ 		amdgpu_ring_write(ring, data[i]);
+ 	}
+ 
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 	kfree(data);
+ 	return 0;
+ }
+@@ -352,7 +290,6 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 		return r;
+ 	}
+ 
+-	ring->ring_lock = &adev->ring_lock;
+ 	/* Align ring size */
+ 	rb_bufsz = order_base_2(ring_size / 8);
+ 	ring_size = (1 << (rb_bufsz + 1)) * 4;
+@@ -410,15 +347,10 @@ void amdgpu_ring_fini(struct amdgpu_ring *ring)
+ 	int r;
+ 	struct amdgpu_bo *ring_obj;
+ 
+-	if (ring->ring_lock == NULL)
+-		return;
+-
+-	mutex_lock(ring->ring_lock);
+ 	ring_obj = ring->ring_obj;
+ 	ring->ready = false;
+ 	ring->ring = NULL;
+ 	ring->ring_obj = NULL;
+-	mutex_unlock(ring->ring_lock);
+ 
+ 	amdgpu_wb_free(ring->adev, ring->fence_offs);
+ 	amdgpu_wb_free(ring->adev, ring->rptr_offs);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+index d83efc7..a96bfe1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+@@ -789,14 +789,14 @@ int amdgpu_vce_ring_test_ring(struct amdgpu_ring *ring)
+ 	unsigned i;
+ 	int r;
+ 
+-	r = amdgpu_ring_lock(ring, 16);
++	r = amdgpu_ring_alloc(ring, 16);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: vce failed to lock ring %d (%d).\n",
+ 			  ring->idx, r);
+ 		return r;
+ 	}
+ 	amdgpu_ring_write(ring, VCE_CMD_END);
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+ 		if (amdgpu_ring_get_rptr(ring) != rptr)
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 2aede8f..c70d7b1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -560,7 +560,7 @@ static int cik_sdma_ring_test_ring(struct amdgpu_ring *ring)
+ 	tmp = 0xCAFEDEAD;
+ 	adev->wb.wb[index] = cpu_to_le32(tmp);
+ 
+-	r = amdgpu_ring_lock(ring, 5);
++	r = amdgpu_ring_alloc(ring, 5);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: dma failed to lock ring %d (%d).\n", ring->idx, r);
+ 		amdgpu_wb_free(adev, index);
+@@ -571,7 +571,7 @@ static int cik_sdma_ring_test_ring(struct amdgpu_ring *ring)
+ 	amdgpu_ring_write(ring, upper_32_bits(gpu_addr));
+ 	amdgpu_ring_write(ring, 1); /* number of DWs to follow */
+ 	amdgpu_ring_write(ring, 0xDEADBEEF);
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+ 		tmp = le32_to_cpu(adev->wb.wb[index]);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 82ede2f..bf0517d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2379,7 +2379,7 @@ static int gfx_v7_0_ring_test_ring(struct amdgpu_ring *ring)
+ 		return r;
+ 	}
+ 	WREG32(scratch, 0xCAFEDEAD);
+-	r = amdgpu_ring_lock(ring, 3);
++	r = amdgpu_ring_alloc(ring, 3);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: cp failed to lock ring %d (%d).\n", ring->idx, r);
+ 		amdgpu_gfx_scratch_free(adev, scratch);
+@@ -2388,7 +2388,7 @@ static int gfx_v7_0_ring_test_ring(struct amdgpu_ring *ring)
+ 	amdgpu_ring_write(ring, PACKET3(PACKET3_SET_UCONFIG_REG, 1));
+ 	amdgpu_ring_write(ring, (scratch - PACKET3_SET_UCONFIG_REG_START));
+ 	amdgpu_ring_write(ring, 0xDEADBEEF);
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+ 		tmp = RREG32(scratch);
+@@ -2812,7 +2812,7 @@ static int gfx_v7_0_cp_gfx_start(struct amdgpu_device *adev)
+ 
+ 	gfx_v7_0_cp_gfx_enable(adev, true);
+ 
+-	r = amdgpu_ring_lock(ring, gfx_v7_0_get_csb_size(adev) + 8);
++	r = amdgpu_ring_alloc(ring, gfx_v7_0_get_csb_size(adev) + 8);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: cp failed to lock ring (%d).\n", r);
+ 		return r;
+@@ -2881,7 +2881,7 @@ static int gfx_v7_0_cp_gfx_start(struct amdgpu_device *adev)
+ 	amdgpu_ring_write(ring, 0x0000000e); /* VGT_VERTEX_REUSE_BLOCK_CNTL */
+ 	amdgpu_ring_write(ring, 0x00000010); /* VGT_OUT_DEALLOC_CNTL */
+ 
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 73d8ac0..3a2b060 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -652,7 +652,7 @@ static int gfx_v8_0_ring_test_ring(struct amdgpu_ring *ring)
+ 		return r;
+ 	}
+ 	WREG32(scratch, 0xCAFEDEAD);
+-	r = amdgpu_ring_lock(ring, 3);
++	r = amdgpu_ring_alloc(ring, 3);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: cp failed to lock ring %d (%d).\n",
+ 			  ring->idx, r);
+@@ -662,7 +662,7 @@ static int gfx_v8_0_ring_test_ring(struct amdgpu_ring *ring)
+ 	amdgpu_ring_write(ring, PACKET3(PACKET3_SET_UCONFIG_REG, 1));
+ 	amdgpu_ring_write(ring, (scratch - PACKET3_SET_UCONFIG_REG_START));
+ 	amdgpu_ring_write(ring, 0xDEADBEEF);
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+ 		tmp = RREG32(scratch);
+@@ -3062,7 +3062,7 @@ static int gfx_v8_0_cp_gfx_start(struct amdgpu_device *adev)
+ 
+ 	gfx_v8_0_cp_gfx_enable(adev, true);
+ 
+-	r = amdgpu_ring_lock(ring, gfx_v8_0_get_csb_size(adev) + 4);
++	r = amdgpu_ring_alloc(ring, gfx_v8_0_get_csb_size(adev) + 4);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: cp failed to lock ring (%d).\n", r);
+ 		return r;
+@@ -3126,7 +3126,7 @@ static int gfx_v8_0_cp_gfx_start(struct amdgpu_device *adev)
+ 	amdgpu_ring_write(ring, 0x8000);
+ 	amdgpu_ring_write(ring, 0x8000);
+ 
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index 77d5f29..e86f85f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -611,7 +611,7 @@ static int sdma_v2_4_ring_test_ring(struct amdgpu_ring *ring)
+ 	tmp = 0xCAFEDEAD;
+ 	adev->wb.wb[index] = cpu_to_le32(tmp);
+ 
+-	r = amdgpu_ring_lock(ring, 5);
++	r = amdgpu_ring_alloc(ring, 5);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: dma failed to lock ring %d (%d).\n", ring->idx, r);
+ 		amdgpu_wb_free(adev, index);
+@@ -624,7 +624,7 @@ static int sdma_v2_4_ring_test_ring(struct amdgpu_ring *ring)
+ 	amdgpu_ring_write(ring, upper_32_bits(gpu_addr));
+ 	amdgpu_ring_write(ring, SDMA_PKT_WRITE_UNTILED_DW_3_COUNT(1));
+ 	amdgpu_ring_write(ring, 0xDEADBEEF);
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+ 		tmp = le32_to_cpu(adev->wb.wb[index]);
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index d6170e6..b2fbf96 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -762,7 +762,7 @@ static int sdma_v3_0_ring_test_ring(struct amdgpu_ring *ring)
+ 	tmp = 0xCAFEDEAD;
+ 	adev->wb.wb[index] = cpu_to_le32(tmp);
+ 
+-	r = amdgpu_ring_lock(ring, 5);
++	r = amdgpu_ring_alloc(ring, 5);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: dma failed to lock ring %d (%d).\n", ring->idx, r);
+ 		amdgpu_wb_free(adev, index);
+@@ -775,7 +775,7 @@ static int sdma_v3_0_ring_test_ring(struct amdgpu_ring *ring)
+ 	amdgpu_ring_write(ring, upper_32_bits(gpu_addr));
+ 	amdgpu_ring_write(ring, SDMA_PKT_WRITE_UNTILED_DW_3_COUNT(1));
+ 	amdgpu_ring_write(ring, 0xDEADBEEF);
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+ 		tmp = le32_to_cpu(adev->wb.wb[index]);
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+index fcc29c6..5ef96d6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+@@ -164,7 +164,7 @@ static int uvd_v4_2_hw_init(void *handle)
+ 		goto done;
+ 	}
+ 
+-	r = amdgpu_ring_lock(ring, 10);
++	r = amdgpu_ring_alloc(ring, 10);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: ring failed to lock UVD ring (%d).\n", r);
+ 		goto done;
+@@ -189,7 +189,7 @@ static int uvd_v4_2_hw_init(void *handle)
+ 	amdgpu_ring_write(ring, PACKET0(mmUVD_SEMA_CNTL, 0));
+ 	amdgpu_ring_write(ring, 3);
+ 
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 
+ done:
+ 	/* lower clocks again */
+@@ -453,7 +453,7 @@ static int uvd_v4_2_ring_test_ring(struct amdgpu_ring *ring)
+ 	int r;
+ 
+ 	WREG32(mmUVD_CONTEXT_ID, 0xCAFEDEAD);
+-	r = amdgpu_ring_lock(ring, 3);
++	r = amdgpu_ring_alloc(ring, 3);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: cp failed to lock ring %d (%d).\n",
+ 			  ring->idx, r);
+@@ -461,7 +461,7 @@ static int uvd_v4_2_ring_test_ring(struct amdgpu_ring *ring)
+ 	}
+ 	amdgpu_ring_write(ring, PACKET0(mmUVD_CONTEXT_ID, 0));
+ 	amdgpu_ring_write(ring, 0xDEADBEEF);
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+ 		tmp = RREG32(mmUVD_CONTEXT_ID);
+ 		if (tmp == 0xDEADBEEF)
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+index 67be97c..7d67772 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+@@ -160,7 +160,7 @@ static int uvd_v5_0_hw_init(void *handle)
+ 		goto done;
+ 	}
+ 
+-	r = amdgpu_ring_lock(ring, 10);
++	r = amdgpu_ring_alloc(ring, 10);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: ring failed to lock UVD ring (%d).\n", r);
+ 		goto done;
+@@ -185,7 +185,7 @@ static int uvd_v5_0_hw_init(void *handle)
+ 	amdgpu_ring_write(ring, PACKET0(mmUVD_SEMA_CNTL, 0));
+ 	amdgpu_ring_write(ring, 3);
+ 
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 
+ done:
+ 	/* lower clocks again */
+@@ -497,7 +497,7 @@ static int uvd_v5_0_ring_test_ring(struct amdgpu_ring *ring)
+ 	int r;
+ 
+ 	WREG32(mmUVD_CONTEXT_ID, 0xCAFEDEAD);
+-	r = amdgpu_ring_lock(ring, 3);
++	r = amdgpu_ring_alloc(ring, 3);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: cp failed to lock ring %d (%d).\n",
+ 			  ring->idx, r);
+@@ -505,7 +505,7 @@ static int uvd_v5_0_ring_test_ring(struct amdgpu_ring *ring)
+ 	}
+ 	amdgpu_ring_write(ring, PACKET0(mmUVD_CONTEXT_ID, 0));
+ 	amdgpu_ring_write(ring, 0xDEADBEEF);
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+ 		tmp = RREG32(mmUVD_CONTEXT_ID);
+ 		if (tmp == 0xDEADBEEF)
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+index 4d64769..2ef8150 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+@@ -157,7 +157,7 @@ static int uvd_v6_0_hw_init(void *handle)
+ 		goto done;
+ 	}
+ 
+-	r = amdgpu_ring_lock(ring, 10);
++	r = amdgpu_ring_alloc(ring, 10);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: ring failed to lock UVD ring (%d).\n", r);
+ 		goto done;
+@@ -182,7 +182,7 @@ static int uvd_v6_0_hw_init(void *handle)
+ 	amdgpu_ring_write(ring, PACKET0(mmUVD_SEMA_CNTL, 0));
+ 	amdgpu_ring_write(ring, 3);
+ 
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 
+ done:
+ 	if (!r)
+@@ -736,7 +736,7 @@ static int uvd_v6_0_ring_test_ring(struct amdgpu_ring *ring)
+ 	int r;
+ 
+ 	WREG32(mmUVD_CONTEXT_ID, 0xCAFEDEAD);
+-	r = amdgpu_ring_lock(ring, 3);
++	r = amdgpu_ring_alloc(ring, 3);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: cp failed to lock ring %d (%d).\n",
+ 			  ring->idx, r);
+@@ -744,7 +744,7 @@ static int uvd_v6_0_ring_test_ring(struct amdgpu_ring *ring)
+ 	}
+ 	amdgpu_ring_write(ring, PACKET0(mmUVD_CONTEXT_ID, 0));
+ 	amdgpu_ring_write(ring, 0xDEADBEEF);
+-	amdgpu_ring_unlock_commit(ring);
++	amdgpu_ring_commit(ring);
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+ 		tmp = RREG32(mmUVD_CONTEXT_ID);
+ 		if (tmp == 0xDEADBEEF)
+-- 
+2.7.4
+

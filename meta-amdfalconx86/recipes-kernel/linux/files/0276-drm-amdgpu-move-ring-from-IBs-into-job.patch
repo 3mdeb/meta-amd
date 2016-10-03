@@ -1,0 +1,439 @@
+From 7e425890bf4b71763f8603e26c8e94438804a4cf Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Sun, 31 Jan 2016 12:29:04 +0100
+Subject: [PATCH 0276/1110] drm/amdgpu: move ring from IBs into job
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We can't submit to multiple rings at the same time anyway.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucer@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |  6 +++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c    | 35 ++++++++++++++++++-------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c    | 11 ++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c |  5 +++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h |  8 +++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c   |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c    |  6 +++---
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c     |  2 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c     |  2 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c     |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c    |  2 +-
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c    |  2 +-
+ 14 files changed, 47 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 49d3c33..ea4e3aa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -731,7 +731,6 @@ struct amdgpu_ib {
+ 	uint32_t			length_dw;
+ 	uint64_t			gpu_addr;
+ 	uint32_t			*ptr;
+-	struct amdgpu_ring		*ring;
+ 	struct amdgpu_fence		*fence;
+ 	struct amdgpu_user_fence        *user;
+ 	bool				grabbed_vmid;
+@@ -1143,10 +1142,10 @@ struct amdgpu_gfx {
+ 	unsigned ce_ram_size;
+ };
+ 
+-int amdgpu_ib_get(struct amdgpu_ring *ring, struct amdgpu_vm *vm,
++int amdgpu_ib_get(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 		  unsigned size, struct amdgpu_ib *ib);
+ void amdgpu_ib_free(struct amdgpu_device *adev, struct amdgpu_ib *ib);
+-int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
++int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 		       struct amdgpu_ib *ib, void *owner);
+ int amdgpu_ib_pool_init(struct amdgpu_device *adev);
+ void amdgpu_ib_pool_fini(struct amdgpu_device *adev);
+@@ -1204,6 +1203,7 @@ struct amdgpu_cs_parser {
+ struct amdgpu_job {
+ 	struct amd_sched_job    base;
+ 	struct amdgpu_device	*adev;
++        struct amdgpu_ring      *ring;
+ 	struct amdgpu_ib	*ibs;
+ 	uint32_t		num_ibs;
+ 	void			*owner;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index a4805aa..45ba532 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -587,26 +587,26 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p,
+ }
+ 
+ static int amdgpu_cs_ib_vm_chunk(struct amdgpu_device *adev,
+-				 struct amdgpu_cs_parser *parser)
++                                 struct amdgpu_cs_parser *p)
+ {
+-	struct amdgpu_fpriv *fpriv = parser->filp->driver_priv;
++        struct amdgpu_fpriv *fpriv = p->filp->driver_priv;
+ 	struct amdgpu_vm *vm = &fpriv->vm;
+-	struct amdgpu_ring *ring;
++        struct amdgpu_ring *ring = p->job->ring;
+ 	int i, r;
+ 
+ 	/* Only for UVD/VCE VM emulation */
+-        for (i = 0; i < parser->job->num_ibs; i++) {
+-                ring = parser->job->ibs[i].ring;
+-		if (ring->funcs->parse_cs) {
+-			r = amdgpu_ring_parse_cs(ring, parser, i);
++        if (ring->funcs->parse_cs) {
++                for (i = 0; i < p->job->num_ibs; i++) {
++                        r = amdgpu_ring_parse_cs(ring, p, i);
++
+ 			if (r)
+ 				return r;
+ 		}
+ 	}
+ 
+-	r = amdgpu_bo_vm_update_pte(parser, vm);
++        r = amdgpu_bo_vm_update_pte(p, vm);
+ 	if (!r)
+-		amdgpu_cs_sync_rings(parser);
++                amdgpu_cs_sync_rings(p);
+ 
+ 	return r;
+ }
+@@ -648,6 +648,11 @@ static int amdgpu_cs_ib_fill(struct amdgpu_device *adev,
+ 		if (r)
+ 			return r;
+ 
++                if (parser->job->ring && parser->job->ring != ring)
++                        return -EINVAL;
++ 
++                parser->job->ring = ring;
++
+ 		if (ring->funcs->parse_cs) {
+ 			struct amdgpu_bo_va_mapping *m;
+ 			struct amdgpu_bo *aobj = NULL;
+@@ -676,7 +681,7 @@ static int amdgpu_cs_ib_fill(struct amdgpu_device *adev,
+ 			offset = ((uint64_t)m->it.start) * AMDGPU_GPU_PAGE_SIZE;
+ 			kptr += chunk_ib->va_start - offset;
+ 
+-			r =  amdgpu_ib_get(ring, NULL, chunk_ib->ib_bytes, ib);
++                        r =  amdgpu_ib_get(adev, NULL, chunk_ib->ib_bytes, ib);
+ 			if (r) {
+ 				DRM_ERROR("Failed to get ib !\n");
+ 				return r;
+@@ -685,7 +690,7 @@ static int amdgpu_cs_ib_fill(struct amdgpu_device *adev,
+ 			memcpy(ib->ptr, kptr, chunk_ib->ib_bytes);
+ 			amdgpu_bo_kunmap(aobj);
+ 		} else {
+-			r =  amdgpu_ib_get(ring, vm, 0, ib);
++                        r =  amdgpu_ib_get(adev, vm, 0, ib);
+ 			if (r) {
+ 				DRM_ERROR("Failed to get ib !\n");
+ 				return r;
+@@ -725,8 +730,9 @@ static int amdgpu_cs_ib_fill(struct amdgpu_device *adev,
+                 struct amdgpu_ib *ib = &parser->job->ibs[parser->job->num_ibs - 1];
+ 
+ 		/* UVD & VCE fw doesn't support user fences */
+-		if (ib->ring->type == AMDGPU_RING_TYPE_UVD ||
+-		    ib->ring->type == AMDGPU_RING_TYPE_VCE)
++                if (parser->job->ring->type == AMDGPU_RING_TYPE_UVD ||
++                    parser->job->ring->type == AMDGPU_RING_TYPE_VCE)
++
+ 			return -EINVAL;
+ 
+                 ib->user = &parser->job->uf;
+@@ -802,7 +808,7 @@ static int amdgpu_cs_free_job(struct amdgpu_job *job)
+ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ 			    union drm_amdgpu_cs *cs)
+ {
+-        struct amdgpu_ring * ring = p->job->ibs->ring;
++        struct amdgpu_ring *ring = p->job->ring;
+ 	struct amd_sched_fence *fence;
+ 	struct amdgpu_job *job;
+ 
+@@ -812,7 +818,6 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ 
+ 	job->base.sched = &ring->sched;
+ 	job->base.s_entity = &p->ctx->rings[ring->idx].entity;
+-	job->adev = p->adev;
+ 	job->owner = p->filp;
+ 	job->free_job = amdgpu_cs_free_job;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index b673770..640ff53 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -55,10 +55,9 @@ static int amdgpu_debugfs_sa_init(struct amdgpu_device *adev);
+  * suballocator.
+  * Returns 0 on success, error on failure.
+  */
+-int amdgpu_ib_get(struct amdgpu_ring *ring, struct amdgpu_vm *vm,
++int amdgpu_ib_get(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 		  unsigned size, struct amdgpu_ib *ib)
+ {
+-	struct amdgpu_device *adev = ring->adev;
+ 	int r;
+ 
+ 	if (size) {
+@@ -77,7 +76,6 @@ int amdgpu_ib_get(struct amdgpu_ring *ring, struct amdgpu_vm *vm,
+ 
+ 	amdgpu_sync_create(&ib->sync);
+ 
+-	ib->ring = ring;
+ 	ib->vm = vm;
+ 
+ 	return 0;
+@@ -120,11 +118,11 @@ void amdgpu_ib_free(struct amdgpu_device *adev, struct amdgpu_ib *ib)
+  * a CONST_IB), it will be put on the ring prior to the DE IB.  Prior
+  * to SI there was just a DE IB.
+  */
+-int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
++int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 		       struct amdgpu_ib *ibs, void *owner)
+ {
++        struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib *ib = &ibs[0];
+-	struct amdgpu_ring *ring;
+ 	struct amdgpu_ctx *ctx, *old_ctx;
+ 	struct amdgpu_vm *vm;
+ 	unsigned i;
+@@ -133,7 +131,6 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 	if (num_ibs == 0)
+ 		return -EINVAL;
+ 
+-	ring = ibs->ring;
+ 	ctx = ibs->ctx;
+ 	vm = ibs->vm;
+ 
+@@ -178,7 +175,7 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 	for (i = 0; i < num_ibs; ++i) {
+ 		ib = &ibs[i];
+ 
+-		if (ib->ring != ring || ib->ctx != ctx || ib->vm != vm) {
++                if (ib->ctx != ctx || ib->vm != vm) {
+ 			ring->current_ctx = old_ctx;
+ 			amdgpu_ring_undo(ring);
+ 			return -EINVAL;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index 91b4862..7c03d4a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -70,7 +70,7 @@ static struct fence *amdgpu_sched_dependency(struct amd_sched_job *sched_job)
+ 	struct fence *fence = amdgpu_sync_get_fence(sync);
+ 
+ 	if (fence == NULL && vm && !job->ibs->grabbed_vmid) {
+-		struct amdgpu_ring *ring = job->ibs->ring;
++                struct amdgpu_ring *ring = job->ring;
+ 		int r;
+ 
+ 		r = amdgpu_vm_grab_id(vm, ring, sync,
+@@ -98,7 +98,7 @@ static struct fence *amdgpu_sched_run_job(struct amd_sched_job *sched_job)
+ 	}
+ 	job = to_amdgpu_job(sched_job);
+ 	trace_amdgpu_sched_run_job(job);
+-	r = amdgpu_ib_schedule(job->adev, job->num_ibs, job->ibs, job->owner);
++        r = amdgpu_ib_schedule(job->ring, job->num_ibs, job->ibs, job->owner);
+ 	if (r) {
+ 		DRM_ERROR("Error scheduling IBs (%d)\n", r);
+ 		goto err;
+@@ -142,6 +142,7 @@ int amdgpu_sched_ib_submit_kernel_helper(struct amdgpu_device *adev,
+ 	*f = fence_get(&job->base.s_fence->base);
+ 
+ 	job->adev = adev;
++        job->ring = ring;
+ 	job->ibs = ibs;
+ 	job->num_ibs = num_ibs;
+ 	job->owner = owner;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
+index 9c15284..0254425 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
+@@ -38,10 +38,10 @@ TRACE_EVENT(amdgpu_cs,
+ 
+ 	    TP_fast_assign(
+ 			   __entry->bo_list = p->bo_list;
+-			   __entry->ring = p->ibs[i].ring->idx;
++                           __entry->ring = p->job->ring->idx;
+                            __entry->dw = p->job->ibs[i].length_dw;
+ 			   __entry->fences = amdgpu_fence_count_emitted(
+-                                p->job->ibs[i].ring);
++                                p->job->ring);
+ 			   ),
+ 	    TP_printk("bo_list=%p, ring=%u, dw=%u, fences=%u",
+ 		      __entry->bo_list, __entry->ring, __entry->dw,
+@@ -65,7 +65,7 @@ TRACE_EVENT(amdgpu_cs_ioctl,
+ 			   __entry->sched_job = &job->base;
+ 			   __entry->ib = job->ibs;
+ 			   __entry->fence = &job->base.s_fence->base;
+-			   __entry->ring_name = job->ibs[0].ring->name;
++                           __entry->ring_name = job->ring->name;
+ 			   __entry->num_ibs = job->num_ibs;
+ 			   ),
+ 	    TP_printk("adev=%p, sched_job=%p, first ib=%p, sched fence=%p, ring name:%s, num_ibs:%u",
+@@ -90,7 +90,7 @@ TRACE_EVENT(amdgpu_sched_run_job,
+ 			   __entry->sched_job = &job->base;
+ 			   __entry->ib = job->ibs;
+ 			   __entry->fence = &job->base.s_fence->base;
+-			   __entry->ring_name = job->ibs[0].ring->name;
++                           __entry->ring_name = job->ring->name;
+ 			   __entry->num_ibs = job->num_ibs;
+ 			   ),
+ 	    TP_printk("adev=%p, sched_job=%p, first ib=%p, sched fence=%p, ring name:%s, num_ibs:%u",
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 4a32bdd..df5ecc2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1030,7 +1030,7 @@ int amdgpu_copy_buffer(struct amdgpu_ring *ring,
+ 	if (!ib)
+ 		return -ENOMEM;
+ 
+-	r = amdgpu_ib_get(ring, NULL, num_dw * 4, ib);
++        r = amdgpu_ib_get(adev, NULL, num_dw * 4, ib);
+ 	if (r) {
+ 		kfree(ib);
+ 		return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+index 520ad02..35aa5a2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+@@ -872,7 +872,7 @@ static int amdgpu_uvd_send_msg(struct amdgpu_ring *ring,
+ 		r = -ENOMEM;
+ 		goto err;
+ 	}
+-	r = amdgpu_ib_get(ring, NULL, 64, ib);
++        r = amdgpu_ib_get(adev, NULL, 64, ib);
+ 	if (r)
+ 		goto err1;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+index 420b610..26cc9e4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+@@ -378,7 +378,7 @@ int amdgpu_vce_get_create_msg(struct amdgpu_ring *ring, uint32_t handle,
+ 	ib = kzalloc(sizeof(struct amdgpu_ib), GFP_KERNEL);
+ 	if (!ib)
+ 		return -ENOMEM;
+-	r = amdgpu_ib_get(ring, NULL, ib_size_dw * 4, ib);
++        r = amdgpu_ib_get(adev, NULL, ib_size_dw * 4, ib);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
+ 		kfree(ib);
+@@ -464,7 +464,7 @@ int amdgpu_vce_get_destroy_msg(struct amdgpu_ring *ring, uint32_t handle,
+ 	if (!ib)
+ 		return -ENOMEM;
+ 
+-	r = amdgpu_ib_get(ring, NULL, ib_size_dw * 4, ib);
++        r = amdgpu_ib_get(adev, NULL, ib_size_dw * 4, ib);
+ 	if (r) {
+ 		kfree(ib);
+ 		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 3487a11..ec9c967 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -362,7 +362,7 @@ static int amdgpu_vm_clear_bo(struct amdgpu_device *adev,
+ 	if (!ib)
+ 		goto error;
+ 
+-	r = amdgpu_ib_get(ring, NULL, 64, ib);
++        r = amdgpu_ib_get(adev, NULL, 64, ib);
+ 	if (r)
+ 		goto error_free;
+ 
+@@ -455,7 +455,7 @@ int amdgpu_vm_update_page_directory(struct amdgpu_device *adev,
+ 	if (!ib)
+ 		return -ENOMEM;
+ 
+-	r = amdgpu_ib_get(ring, NULL, ndw * 4, ib);
++        r = amdgpu_ib_get(adev, NULL, ndw * 4, ib);
+ 	if (r) {
+ 		kfree(ib);
+ 		return r;
+@@ -749,7 +749,7 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 	if (!ib)
+ 		return -ENOMEM;
+ 
+-	r = amdgpu_ib_get(ring, NULL, ndw * 4, ib);
++        r = amdgpu_ib_get(adev, NULL, ndw * 4, ib);
+ 	if (r) {
+ 		kfree(ib);
+ 		return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 0608326..1309d3e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -621,7 +621,7 @@ static int cik_sdma_ring_test_ib(struct amdgpu_ring *ring)
+ 	tmp = 0xCAFEDEAD;
+ 	adev->wb.wb[index] = cpu_to_le32(tmp);
+ 	memset(&ib, 0, sizeof(ib));
+-	r = amdgpu_ib_get(ring, NULL, 256, &ib);
++        r = amdgpu_ib_get(adev, NULL, 256, &ib);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
+ 		goto err0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 148311e..0a2fb19 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2631,7 +2631,7 @@ static int gfx_v7_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	}
+ 	WREG32(scratch, 0xCAFEDEAD);
+ 	memset(&ib, 0, sizeof(ib));
+-	r = amdgpu_ib_get(ring, NULL, 256, &ib);
++        r = amdgpu_ib_get(adev, NULL, 256, &ib);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
+ 		goto err1;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 2b69a15..98d9186 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -699,7 +699,7 @@ static int gfx_v8_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	}
+ 	WREG32(scratch, 0xCAFEDEAD);
+ 	memset(&ib, 0, sizeof(ib));
+-	r = amdgpu_ib_get(ring, NULL, 256, &ib);
++        r = amdgpu_ib_get(adev, NULL, 256, &ib);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
+ 		goto err1;
+@@ -1171,7 +1171,7 @@ static int gfx_v8_0_do_edc_gpr_workarounds(struct amdgpu_device *adev)
+ 
+ 	/* allocate an indirect buffer to put the commands in */
+ 	memset(&ib, 0, sizeof(ib));
+-	r = amdgpu_ib_get(ring, NULL, total_size, &ib);
++        r = amdgpu_ib_get(adev, NULL, total_size, &ib);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
+ 		return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index fc53db9..32bb31a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -674,7 +674,7 @@ static int sdma_v2_4_ring_test_ib(struct amdgpu_ring *ring)
+ 	tmp = 0xCAFEDEAD;
+ 	adev->wb.wb[index] = cpu_to_le32(tmp);
+ 	memset(&ib, 0, sizeof(ib));
+-	r = amdgpu_ib_get(ring, NULL, 256, &ib);
++        r = amdgpu_ib_get(adev, NULL, 256, &ib);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
+ 		goto err0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index 999a169..fe18e85 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -825,7 +825,7 @@ static int sdma_v3_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	tmp = 0xCAFEDEAD;
+ 	adev->wb.wb[index] = cpu_to_le32(tmp);
+ 	memset(&ib, 0, sizeof(ib));
+-	r = amdgpu_ib_get(ring, NULL, 256, &ib);
++        r = amdgpu_ib_get(adev, NULL, 256, &ib);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
+ 		goto err0;
+-- 
+2.7.4
+
