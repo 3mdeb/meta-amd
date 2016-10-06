@@ -7,6 +7,7 @@ do_install_append_amdgpu () {
 	else
 	        sed -i -e 's/^\tDriver      "radeon"/\tDriver      "amdgpu"/' ${D}/${sysconfdir}/X11/xorg.conf
 	        sed -i -e 's/^\tDriver      "fbdev"/\tDriver      "amdgpu"/' ${D}/${sysconfdir}/X11/xorg.conf
+		sed -i -e 's/^\tIdentifier  "Card0"/\tOption     "DRI3"\n\tIdentifier  "Card0"/' ${D}/${sysconfdir}/X11/xorg.conf
 	fi
 }
 
