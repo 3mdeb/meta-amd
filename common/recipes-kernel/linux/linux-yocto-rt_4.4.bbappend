@@ -10,6 +10,7 @@ SRCREV_meta_amdx86 ?= "e66032e2d93da24c6b9137dbbe66008c77f6d4aa"
 LINUX_VERSION_amdx86 ?= "4.4.20"
 
 SRC_URI_append_amdx86 += " \
+	file://linux-yocto-amd-patches.scc \
 	file://logo.cfg \
 	file://console.cfg \
 	file://drm.cfg \
