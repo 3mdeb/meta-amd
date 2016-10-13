@@ -1,0 +1,141 @@
+From 26605d32bf6727a47cda37191eeecaa7f92138ec Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 3 Nov 2015 20:58:50 +0100
+Subject: [PATCH 0237/1110] drm/amdgpu: grab VMID before submitting job v5
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This allows the scheduler to handle the dependencies on ID contention as well.
+
+v2: grab id only once
+v3: use a separate lock for the VMIDs
+v4: cleanup after semaphore removal
+v5: minor coding style change
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c     | 17 +++++------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c  | 26 +++++++++++++++++++++++++-
+ 4 files changed, 35 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index a1da7e2..f970afa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -737,6 +737,7 @@ struct amdgpu_ib {
+ 	struct amdgpu_ring		*ring;
+ 	struct amdgpu_fence		*fence;
+ 	struct amdgpu_user_fence        *user;
++	bool				grabbed_vmid;
+ 	struct amdgpu_vm		*vm;
+ 	struct amdgpu_ctx		*ctx;
+ 	struct amdgpu_sync		sync;
+@@ -886,6 +887,9 @@ struct amdgpu_vm {
+ };
+ 
+ struct amdgpu_vm_manager {
++	/* protecting IDs */
++	struct mutex				lock;
++
+ 	struct {
+ 		struct fence	*active;
+ 		atomic_long_t	owner;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index c96437c..9bab3dc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1456,6 +1456,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	/* mutex initialization are all done here so we
+ 	 * can recall function without having locking issues */
+ 	mutex_init(&adev->ring_lock);
++	mutex_init(&adev->vm_manager.lock);
+ 	atomic_set(&adev->irq.ih.lock, 0);
+ 	mutex_init(&adev->gem.mutex);
+ 	mutex_init(&adev->pm.mutex);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 54cede3..56ae9a5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -142,21 +142,17 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 		return -EINVAL;
+ 	}
+ 
++	if (vm && !ibs->grabbed_vmid) {
++		dev_err(adev->dev, "VM IB without ID\n");
++		return -EINVAL;
++	}
++
+ 	r = amdgpu_ring_lock(ring, (256 + AMDGPU_NUM_SYNCS * 8) * num_ibs);
+ 	if (r) {
+ 		dev_err(adev->dev, "scheduling IB failed (%d).\n", r);
+ 		return r;
+ 	}
+ 
+-	if (vm) {
+-		/* grab a vm id if necessary */
+-		r = amdgpu_vm_grab_id(ibs->vm, ibs->ring, &ibs->sync);
+-		if (r) {
+-			amdgpu_ring_unlock_undo(ring);
+-			return r;
+-		}
+-	}
+-
+ 	r = amdgpu_sync_wait(&ibs->sync);
+ 	if (r) {
+ 		amdgpu_ring_unlock_undo(ring);
+@@ -207,9 +203,6 @@ int amdgpu_ib_schedule(struct amdgpu_device *adev, unsigned num_ibs,
+ 				       AMDGPU_FENCE_FLAG_64BIT);
+ 	}
+ 
+-	if (ib->vm)
+-		amdgpu_vm_fence(adev, ib->vm, &ib->fence->base);
+-
+ 	amdgpu_ring_unlock_commit(ring);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index dd9fac3..b22a95f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -31,7 +31,31 @@
+ static struct fence *amdgpu_sched_dependency(struct amd_sched_job *sched_job)
+ {
+ 	struct amdgpu_job *job = to_amdgpu_job(sched_job);
+-	return amdgpu_sync_get_fence(&job->ibs->sync);
++	struct amdgpu_sync *sync = &job->ibs->sync;
++	struct amdgpu_vm *vm = job->ibs->vm;
++
++	struct fence *fence = amdgpu_sync_get_fence(sync);
++
++	if (fence == NULL && vm && !job->ibs->grabbed_vmid) {
++		struct amdgpu_ring *ring = job->ibs->ring;
++		struct amdgpu_device *adev = ring->adev;
++		int r;
++
++		mutex_lock(&adev->vm_manager.lock);
++		r = amdgpu_vm_grab_id(vm, ring, sync);
++		if (r) {
++			DRM_ERROR("Error getting VM ID (%d)\n", r);
++		} else {
++			fence = &job->base.s_fence->base;
++			amdgpu_vm_fence(ring->adev, vm, fence);
++			job->ibs->grabbed_vmid = true;
++		}
++		mutex_unlock(&adev->vm_manager.lock);
++
++		fence = amdgpu_sync_get_fence(sync);
++	}
++
++	return fence;
+ }
+ 
+ static struct fence *amdgpu_sched_run_job(struct amd_sched_job *sched_job)
+-- 
+2.7.4
+

@@ -1,0 +1,265 @@
+From 05558c0014a8623fa80476ead752aa294d14513f Mon Sep 17 00:00:00 2001
+From: Yongqiang Sun <yongqiang.sun@amd.com>
+Date: Wed, 10 Feb 2016 14:29:59 -0500
+Subject: [PATCH 0793/1110] drm/amd/dal: implement ipp opp bypass.
+
+If gamma pointer in surface is null, it means
+no gamma setting needed, in that case, set regamma_control
+mode to bypass.
+
+Signed-off-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc_target.c        | 16 +++++------
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 15 +++++++----
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c     |  3 ++-
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h     |  7 +++--
+ .../gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma.c | 31 +++++++++++++---------
+ .../drm/amd/dal/dc/dce110/dce110_opp_regamma_v.c   |  2 +-
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c   |  2 +-
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.h   |  2 +-
+ drivers/gpu/drm/amd/dal/dc/inc/opp.h               | 12 ++++-----
+ 9 files changed, 49 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+index f00b5af..6b778d8 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+@@ -258,6 +258,7 @@ bool dc_commit_surfaces_to_target(
+ 						DC_SURFACE_TO_CORE(dc_surface);
+ 			struct pipe_ctx *pipe_ctx =
+ 						&context->res_ctx.pipe_ctx[j];
++			struct core_gamma *gamma = NULL;
+ 
+ 			if (pipe_ctx->surface !=
+ 					DC_SURFACE_TO_CORE(new_surfaces[i]))
+@@ -279,15 +280,14 @@ bool dc_commit_surfaces_to_target(
+ 						dc_surface->dst_rect.width,
+ 						dc_surface->dst_rect.height);
+ 
+-			if (dc_surface->gamma_correction) {
+-				struct core_gamma *gamma = DC_GAMMA_TO_CORE(
+-						dc_surface->gamma_correction);
++		if (surface->public.gamma_correction)
++			gamma = DC_GAMMA_TO_CORE(
++					surface->public.gamma_correction);
+ 
+-				dc->hwss.set_gamma_correction(
+-							pipe_ctx->ipp,
+-							pipe_ctx->opp,
+-							gamma, surface);
+-			}
++		dc->hwss.set_gamma_correction(
++				pipe_ctx->ipp,
++				pipe_ctx->opp,
++			gamma, surface);
+ 
+ 			dc->hwss.set_plane_config(dc, surface, pipe_ctx);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 70349a0..810f6d5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -525,11 +525,16 @@ static bool set_gamma_ramp(
+ 
+ 	ipp->funcs->ipp_program_prescale(ipp, prescale_params);
+ 
+-	ipp->funcs->ipp_set_degamma(ipp, IPP_DEGAMMA_MODE_sRGB);
+-
+-	calculate_regamma_params(regamma_params, temp_params, ramp, surface);
+-
+-	opp->funcs->opp_set_regamma(opp, regamma_params);
++	if (ramp) {
++		calculate_regamma_params(regamma_params,
++				temp_params, ramp, surface);
++		opp->funcs->opp_program_regamma_pwl(opp, regamma_params);
++		ipp->funcs->ipp_set_degamma(ipp, IPP_DEGAMMA_MODE_sRGB);
++		opp->funcs->opp_set_regamma_mode(opp, OPP_REGAMMA_USER);
++	} else {
++		ipp->funcs->ipp_set_degamma(ipp, IPP_DEGAMMA_MODE_BYPASS);
++		opp->funcs->opp_set_regamma_mode(opp, OPP_REGAMMA_BYPASS);
++	}
+ 
+ 	opp->funcs->opp_power_on_regamma_lut(opp, false);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
+index 86bf8c0..c06cf38 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
+@@ -49,7 +49,8 @@ struct opp_funcs funcs = {
+ 		.opp_set_csc_adjustment = dce110_opp_set_csc_adjustment,
+ 		.opp_set_csc_default = dce110_opp_set_csc_default,
+ 		.opp_set_dyn_expansion = dce110_opp_set_dyn_expansion,
+-		.opp_set_regamma = dce110_opp_set_regamma,
++		.opp_program_regamma_pwl = dce110_opp_program_regamma_pwl,
++		.opp_set_regamma_mode = dce110_opp_set_regamma_mode,
+ 		.opp_destroy = dce110_opp_destroy,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h
+index 3460e18..a19e744 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h
+@@ -107,13 +107,12 @@ void dce110_opp_power_on_regamma_lut(
+ 	struct output_pixel_processor *opp,
+ 	bool power_on);
+ 
+-bool dce110_opp_set_regamma(
++bool dce110_opp_program_regamma_pwl(
+ 	struct output_pixel_processor *opp,
+ 	const struct regamma_params *params);
+ 
+-void dce110_opp_power_on_regamma_lut(
+-	struct output_pixel_processor *opp,
+-	bool power_on);
++void dce110_opp_set_regamma_mode(struct output_pixel_processor *opp,
++		enum opp_regamma mode);
+ 
+ void dce110_opp_set_csc_adjustment(
+ 	struct output_pixel_processor *opp,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma.c
+index f7a4bc2..88803eb 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma.c
+@@ -393,18 +393,6 @@ static void program_pwl(
+ 		uint8_t max_tries = 10;
+ 		uint8_t counter = 0;
+ 
+-		value = dm_read_reg(opp110->base.ctx,
+-				DCP_REG(mmREGAMMA_CONTROL));
+-
+-		set_reg_field_value(
+-			value,
+-			3,
+-			REGAMMA_CONTROL,
+-			GRPH_REGAMMA_MODE);
+-
+-		dm_write_reg(opp110->base.ctx, DCP_REG(mmREGAMMA_CONTROL),
+-				value);
+-
+ 		/* Power on LUT memory */
+ 		value = dm_read_reg(opp110->base.ctx,
+ 				DCFE_REG(mmDCFE_MEM_PWR_CTRL));
+@@ -495,7 +483,7 @@ static void program_pwl(
+ }
+ 
+ 
+-bool dce110_opp_set_regamma(
++bool dce110_opp_program_regamma_pwl(
+ 	struct output_pixel_processor *opp,
+ 	const struct regamma_params *params)
+ {
+@@ -533,3 +521,20 @@ void dce110_opp_power_on_regamma_lut(
+ 
+ 	dm_write_reg(opp->ctx, DCFE_REG(mmDCFE_MEM_PWR_CTRL), value);
+ }
++
++void dce110_opp_set_regamma_mode(struct output_pixel_processor *opp,
++		enum opp_regamma mode)
++{
++	struct dce110_opp *opp110 = TO_DCE110_OPP(opp);
++	uint32_t value = dm_read_reg(opp110->base.ctx,
++				DCP_REG(mmREGAMMA_CONTROL));
++
++	set_reg_field_value(
++		value,
++		mode,
++		REGAMMA_CONTROL,
++		GRPH_REGAMMA_MODE);
++
++	dm_write_reg(opp110->base.ctx, DCP_REG(mmREGAMMA_CONTROL),
++			value);
++}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma_v.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma_v.c
+index 4f6cc9c..b9d7eda 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma_v.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma_v.c
+@@ -491,7 +491,7 @@ static void program_pwl(struct dce110_opp *opp110,
+ 	}
+ }
+ 
+-bool dce110_opp_set_regamma_v(
++bool dce110_opp_program_regamma_pwl_v(
+ 	struct output_pixel_processor *opp,
+ 	const struct regamma_params *params)
+ {
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c
+index 9764940..367325f 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c
+@@ -39,7 +39,7 @@
+ /*****************************************/
+ 
+ struct opp_funcs funcs = {
+-		.opp_set_regamma = dce110_opp_set_regamma_v,
++		.opp_program_regamma_pwl = dce110_opp_program_regamma_pwl_v,
+ 
+ 		.opp_set_csc_default = dce110_opp_v_set_csc_default,
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.h
+index 56365aa..3f2ed4a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.h
+@@ -47,7 +47,7 @@ void dce110_opp_v_set_csc_adjustment(
+ 	struct output_pixel_processor *opp,
+ 	const struct grph_csc_adjustment *adjust);
+ 
+-bool dce110_opp_set_regamma_v(
++bool dce110_opp_program_regamma_pwl_v(
+ 	struct output_pixel_processor *opp,
+ 	const struct regamma_params *params);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/opp.h b/drivers/gpu/drm/amd/dal/dc/inc/opp.h
+index 74dbea9..4924874 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/opp.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/opp.h
+@@ -36,7 +36,6 @@ struct fixed31_32;
+ struct gamma_parameters;
+ 
+ /* TODO: Need cleanup */
+-
+ enum clamping_range {
+ 	CLAMPING_FULL_RANGE = 0,	   /* No Clamping */
+ 	CLAMPING_LIMITED_RANGE_8BPC,   /* 8  bpc: Clamping 1  to FE */
+@@ -243,14 +242,11 @@ struct pwl_float_data {
+ 	struct fixed31_32 b;
+ };
+ 
+-
+-/* TODO: Use when we redefine the OPP interface */
+ enum opp_regamma {
+ 	OPP_REGAMMA_BYPASS = 0,
+ 	OPP_REGAMMA_SRGB,
+ 	OPP_REGAMMA_3_6,
+-	OPP_REGAMMA_PQ,
+-	OPP_REGAMMA_PQ_INTERIM,
++	OPP_REGAMMA_USER,
+ };
+ 
+ struct output_pixel_processor {
+@@ -278,10 +274,13 @@ struct opp_funcs {
+ 		struct output_pixel_processor *opp,
+ 		bool power_on);
+ 
+-	bool (*opp_set_regamma)(
++	bool (*opp_program_regamma_pwl)(
+ 		struct output_pixel_processor *opp,
+ 		const struct regamma_params *params);
+ 
++	void (*opp_set_regamma_mode)(struct output_pixel_processor *opp,
++			enum opp_regamma mode);
++
+ 	void (*opp_set_csc_adjustment)(
+ 		struct output_pixel_processor *opp,
+ 		const struct grph_csc_adjustment *adjust);
+@@ -299,7 +298,6 @@ struct opp_funcs {
+ 		struct output_pixel_processor *opp,
+ 		const struct clamping_and_pixel_encoding_params *params);
+ 
+-
+ 	void (*opp_set_dyn_expansion)(
+ 		struct output_pixel_processor *opp,
+ 		enum color_space color_sp,
+-- 
+2.7.4
+

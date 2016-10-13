@@ -1,0 +1,147 @@
+From 93e9aeba60043dc107c2a58e6b2d8a9a59cb603e Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Wed, 23 Dec 2015 11:25:43 -0500
+Subject: [PATCH 0165/1110] drm/amdgpu/cgs: add an interface to access PCI
+ resources
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This provides an interface to get access to the base address
+of PCI resources (MMIO, DOORBELL, etc.).  Only MMIO and
+DOORBELL are implemented right now.  This is necessary to
+properly utilize shared drivers on platform devices.  IP
+modules can use this interface to get the base address
+of the resource and add any additional offset and set the
+size when setting up the platform driver(s).
+
+Acked-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c  | 36 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/include/cgs_common.h | 34 ++++++++++++++++++++++++++++++
+ 2 files changed, 70 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c
+index 59485d0..a081dda 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c
+@@ -398,6 +398,41 @@ static void amdgpu_cgs_write_pci_config_dword(void *cgs_device, unsigned addr,
+ 	WARN(ret, "pci_write_config_dword error");
+ }
+ 
++
++static int amdgpu_cgs_get_pci_resource(void *cgs_device,
++				       enum cgs_resource_type resource_type,
++				       uint64_t size,
++				       uint64_t offset,
++				       uint64_t *resource_base)
++{
++	CGS_FUNC_ADEV;
++
++	if (resource_base == NULL)
++		return -EINVAL;
++
++	switch (resource_type) {
++	case CGS_RESOURCE_TYPE_MMIO:
++		if (adev->rmmio_size == 0)
++			return -ENOENT;
++		if ((offset + size) > adev->rmmio_size)
++			return -EINVAL;
++		*resource_base = adev->rmmio_base;
++		return 0;
++	case CGS_RESOURCE_TYPE_DOORBELL:
++		if (adev->doorbell.size == 0)
++			return -ENOENT;
++		if ((offset + size) > adev->doorbell.size)
++			return -EINVAL;
++		*resource_base = adev->doorbell.base;
++		return 0;
++	case CGS_RESOURCE_TYPE_FB:
++	case CGS_RESOURCE_TYPE_IO:
++	case CGS_RESOURCE_TYPE_ROM:
++	default:
++		return -EINVAL;
++	}
++}
++
+ static const void *amdgpu_cgs_atom_get_data_table(void *cgs_device,
+ 						  unsigned table, uint16_t *size,
+ 						  uint8_t *frev, uint8_t *crev)
+@@ -1041,6 +1076,7 @@ static const struct cgs_ops amdgpu_cgs_ops = {
+ 	amdgpu_cgs_write_pci_config_byte,
+ 	amdgpu_cgs_write_pci_config_word,
+ 	amdgpu_cgs_write_pci_config_dword,
++	amdgpu_cgs_get_pci_resource,
+ 	amdgpu_cgs_atom_get_data_table,
+ 	amdgpu_cgs_atom_get_cmd_table_revs,
+ 	amdgpu_cgs_atom_exec_cmd_table,
+diff --git a/drivers/gpu/drm/amd/include/cgs_common.h b/drivers/gpu/drm/amd/include/cgs_common.h
+index 03affb3..713aec9 100644
+--- a/drivers/gpu/drm/amd/include/cgs_common.h
++++ b/drivers/gpu/drm/amd/include/cgs_common.h
+@@ -122,6 +122,17 @@ struct cgs_system_info {
+ 	uint64_t               padding[13];
+ };
+ 
++/*
++ * enum cgs_resource_type - GPU resource type
++ */
++enum cgs_resource_type {
++	CGS_RESOURCE_TYPE_MMIO = 0,
++	CGS_RESOURCE_TYPE_FB,
++	CGS_RESOURCE_TYPE_IO,
++	CGS_RESOURCE_TYPE_DOORBELL,
++	CGS_RESOURCE_TYPE_ROM,
++};
++
+ /**
+  * struct cgs_clock_limits - Clock limits
+  *
+@@ -417,6 +428,23 @@ typedef void (*cgs_write_pci_config_word_t)(void *cgs_device, unsigned addr,
+ typedef void (*cgs_write_pci_config_dword_t)(void *cgs_device, unsigned addr,
+ 					     uint32_t value);
+ 
++
++/**
++ * cgs_get_pci_resource() - provide access to a device resource (PCI BAR)
++ * @cgs_device:	opaque device handle
++ * @resource_type:	Type of Resource (MMIO, IO, ROM, FB, DOORBELL)
++ * @size:	size of the region
++ * @offset:	offset from the start of the region
++ * @resource_base:	base address (not including offset) returned
++ *
++ * Return: 0 on success, -errno otherwise
++ */
++typedef int (*cgs_get_pci_resource_t)(void *cgs_device,
++				      enum cgs_resource_type resource_type,
++				      uint64_t size,
++				      uint64_t offset,
++				      uint64_t *resource_base);
++
+ /**
+  * cgs_atom_get_data_table() - Get a pointer to an ATOM BIOS data table
+  * @cgs_device:	opaque device handle
+@@ -593,6 +621,8 @@ struct cgs_ops {
+ 	cgs_write_pci_config_byte_t write_pci_config_byte;
+ 	cgs_write_pci_config_word_t write_pci_config_word;
+ 	cgs_write_pci_config_dword_t write_pci_config_dword;
++	/* PCI resources */
++	cgs_get_pci_resource_t get_pci_resource;
+ 	/* ATOM BIOS */
+ 	cgs_atom_get_data_table_t atom_get_data_table;
+ 	cgs_atom_get_cmd_table_revs_t atom_get_cmd_table_revs;
+@@ -708,5 +738,9 @@ struct cgs_device
+ 	CGS_CALL(call_acpi_method, dev, acpi_method, acpi_function, pintput, poutput, output_count, input_size, output_size)
+ #define cgs_query_system_info(dev, sys_info)	\
+ 	CGS_CALL(query_system_info, dev, sys_info)
++#define cgs_get_pci_resource(cgs_device, resource_type, size, offset, \
++	resource_base) \
++	CGS_CALL(get_pci_resource, cgs_device, resource_type, size, offset, \
++	resource_base)
+ 
+ #endif /* _CGS_COMMON_H */
+-- 
+2.7.4
+

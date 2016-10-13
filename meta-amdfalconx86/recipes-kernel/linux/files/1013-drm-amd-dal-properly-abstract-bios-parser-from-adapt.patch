@@ -1,0 +1,290 @@
+From 7c6ae82ece0599ff9cb5f06ba6d4c265ac500544 Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Mon, 11 Apr 2016 17:16:19 +1000
+Subject: [PATCH 1013/1110] drm/amd/dal: properly abstract bios parser from
+ adapter service.
+
+The adapter service is only used in one place in this code, so
+pass it into the API rather than storing it for ever.
+
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/dal/dc/adapter/adapter_service.c   |  6 +--
+ drivers/gpu/drm/amd/dal/dc/bios/bios_parser.c      | 56 ++++++++++------------
+ drivers/gpu/drm/amd/dal/dc/bios/bios_parser.h      |  1 -
+ drivers/gpu/drm/amd/dal/dc/dc_bios_types.h         |  3 +-
+ .../drm/amd/dal/include/bios_parser_interface.h    |  2 +-
+ 5 files changed, 32 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c b/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c
+index 810776b..b4f9750 100644
+--- a/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c
++++ b/drivers/gpu/drm/amd/dal/dc/adapter/adapter_service.c
+@@ -749,6 +749,7 @@ static bool adapter_service_construct(
+ 	}
+ 
+ 	as->dce_environment = init_data->dce_environment;
++	dce_version = dal_adapter_service_get_dce_version(as);
+ 
+ 	if (init_data->vbios_override)
+ 		as->dcb_override = init_data->vbios_override;
+@@ -757,7 +758,7 @@ static bool adapter_service_construct(
+ 		init_data->bp_init_data.ctx = init_data->ctx;
+ 
+ 		as->dcb_internal = dal_bios_parser_create(
+-				&init_data->bp_init_data, as);
++				&init_data->bp_init_data, dce_version);
+ 
+ 		if (!as->dcb_internal) {
+ 			ASSERT_CRITICAL(false);
+@@ -767,7 +768,6 @@ static bool adapter_service_construct(
+ 
+ 	dcb = dal_adapter_service_get_bios_parser(as);
+ 
+-	dce_version = dal_adapter_service_get_dce_version(as);
+ 
+ 	/* Create GPIO service */
+ 	as->gpio_service = dal_gpio_service_create(
+@@ -804,7 +804,7 @@ static bool adapter_service_construct(
+ 	/* Integrated info is not provided on discrete ASIC. NULL is allowed */
+ 	as->integrated_info = dc_bios_create_integrated_info(dcb);
+ 
+-	dc_bios_post_init(dcb);
++	dc_bios_post_init(dcb, as);
+ 
+ 	/* Generate backlight translation table and initializes
+ 			  other brightness properties */
+diff --git a/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.c b/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.c
+index 8bb5454..cdf674d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.c
++++ b/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.c
+@@ -94,7 +94,6 @@ static uint32_t get_support_mask_for_device_id(struct device_id device_id);
+ static ATOM_ENCODER_CAP_RECORD *get_encoder_cap_record(
+ 	struct bios_parser *bp,
+ 	ATOM_OBJECT *object);
+-static void process_ext_display_connection_info(struct bios_parser *bp);
+ 
+ #define BIOS_IMAGE_SIZE_OFFSET 2
+ #define BIOS_IMAGE_SIZE_UNIT 512
+@@ -103,7 +102,7 @@ static void process_ext_display_connection_info(struct bios_parser *bp);
+ static bool bios_parser_construct(
+ 	struct bios_parser *bp,
+ 	struct bp_init_data *init,
+-	struct adapter_service *as);
++	enum dce_version dce_version);
+ 
+ enum bp_result dc_bios_get_embedded_panel_info(struct dc_bios *dcb,
+ 					       struct embedded_panel_info *info);
+@@ -111,7 +110,8 @@ enum bp_result dc_bios_get_embedded_panel_info(struct dc_bios *dcb,
+ /*****************************************************************************/
+ 
+ struct dc_bios *dal_bios_parser_create(
+-	struct bp_init_data *init, struct adapter_service *as)
++	struct bp_init_data *init,
++	enum dce_version dce_version)
+ {
+ 	struct bios_parser *bp = NULL;
+ 
+@@ -119,7 +119,7 @@ struct dc_bios *dal_bios_parser_create(
+ 	if (!bp)
+ 		return NULL;
+ 
+-	if (bios_parser_construct(bp, init, as))
++	if (bios_parser_construct(bp, init, dce_version))
+ 		return (struct dc_bios *)bp;
+ 
+ 	dm_free(bp);
+@@ -3369,7 +3369,7 @@ static uint32_t get_support_mask_for_device_id(struct device_id device_id)
+  */
+ 
+ static bool i2c_read(
+-	struct bios_parser *bp,
++	struct adapter_service *as,
+ 	struct graphics_object_i2c_info *i2c_info,
+ 	uint8_t *buffer,
+ 	uint32_t length)
+@@ -3379,14 +3379,14 @@ static bool i2c_read(
+ 	bool result = false;
+ 	struct i2c_command cmd;
+ 
+-	ddc = dal_adapter_service_obtain_ddc_from_i2c_info(bp->as, i2c_info);
++	ddc = dal_adapter_service_obtain_ddc_from_i2c_info(as, i2c_info);
+ 
+ 	if (!ddc)
+ 		return result;
+ 
+ 	/*Using SW engine */
+ 	cmd.engine = I2C_COMMAND_ENGINE_SW;
+-	cmd.speed = dal_adapter_service_get_sw_i2c_speed(bp->as);
++	cmd.speed = dal_adapter_service_get_sw_i2c_speed(as);
+ 
+ 	{
+ 		struct i2c_payload payloads[] = {
+@@ -3409,12 +3409,12 @@ static bool i2c_read(
+ 
+ 		/* TODO route this through drm i2c_adapter */
+ 		result = dal_i2caux_submit_i2c_command(
+-				dal_adapter_service_get_i2caux(bp->as),
++				dal_adapter_service_get_i2caux(as),
+ 				ddc,
+ 				&cmd);
+ 	}
+ 
+-	dal_adapter_service_release_ddc(bp->as, ddc);
++	dal_adapter_service_release_ddc(as, ddc);
+ 
+ 	return result;
+ }
+@@ -3427,6 +3427,7 @@ static bool i2c_read(
+  */
+ static enum bp_result get_ext_display_connection_info(
+ 	struct bios_parser *bp,
++	struct adapter_service *as,
+ 	ATOM_OBJECT *opm_object,
+ 	ATOM_EXTERNAL_DISPLAY_CONNECTION_INFO *ext_display_connection_info_tbl)
+ {
+@@ -3453,11 +3454,10 @@ static enum bp_result get_ext_display_connection_info(
+ 				BP_RESULT_OK)
+ 			return BP_RESULT_BADBIOSTABLE;
+ 
+-		if (i2c_read(
+-				bp,
+-				&i2c_info,
+-				(uint8_t *)ext_display_connection_info_tbl,
+-				sizeof(ATOM_EXTERNAL_DISPLAY_CONNECTION_INFO))) {
++		if (i2c_read(as,
++			     &i2c_info,
++			     (uint8_t *)ext_display_connection_info_tbl,
++			     sizeof(ATOM_EXTERNAL_DISPLAY_CONNECTION_INFO))) {
+ 			config_tbl_present = true;
+ 		}
+ 	}
+@@ -3774,7 +3774,8 @@ static ATOM_CONNECTOR_HPDPIN_LUT_RECORD *get_ext_connector_hpd_pin_lut_record(
+  *
+  */
+ static enum bp_result patch_bios_image_from_ext_display_connection_info(
+-	struct bios_parser *bp)
++	struct bios_parser *bp,
++	struct adapter_service *as)
+ {
+ 	ATOM_OBJECT_TABLE *connector_tbl;
+ 	uint32_t connector_tbl_offset;
+@@ -3814,10 +3815,9 @@ static enum bp_result patch_bios_image_from_ext_display_connection_info(
+ 	connector_tbl = GET_IMAGE(ATOM_OBJECT_TABLE, connector_tbl_offset);
+ 
+ 	/* Read Connector info table from EEPROM through i2c */
+-	if (get_ext_display_connection_info(
+-			bp,
+-			opm_object,
+-			&ext_display_connection_info_tbl) != BP_RESULT_OK) {
++	if (get_ext_display_connection_info(bp, as,
++					    opm_object,
++					    &ext_display_connection_info_tbl) != BP_RESULT_OK) {
+ 		if (bp->headless_no_opm) {
+ 			/* Failed to read OPM, remove all non-CF connectors. */
+ 			for (i = 0; i < connector_tbl->ucNumberOfObjects; ++i) {
+@@ -4025,7 +4025,8 @@ static enum bp_result patch_bios_image_from_ext_display_connection_info(
+  *
+  */
+ 
+-static void process_ext_display_connection_info(struct bios_parser *bp)
++static void process_ext_display_connection_info(struct bios_parser *bp,
++						struct adapter_service *as)
+ {
+ 	ATOM_OBJECT_TABLE *connector_tbl;
+ 	uint32_t connector_tbl_offset;
+@@ -4080,7 +4081,7 @@ static void process_ext_display_connection_info(struct bios_parser *bp)
+ 		/* Step 2: (only if MXM connector found) Patch BIOS image with
+ 		 * info from external module */
+ 		if (mxm_connector_found &&
+-				patch_bios_image_from_ext_display_connection_info(bp) !=
++		    patch_bios_image_from_ext_display_connection_info(bp, as) !=
+ 						BP_RESULT_OK) {
+ 			/* Patching the bios image has failed. We will copy
+ 			 * again original image provided and afterwards
+@@ -4114,11 +4115,12 @@ static void process_ext_display_connection_info(struct bios_parser *bp)
+ 	}
+ }
+ 
+-void dc_bios_post_init(struct dc_bios *dcb)
++void dc_bios_post_init(struct dc_bios *dcb,
++		       struct adapter_service *as)
+ {
+ 	struct bios_parser *bp = BP_FROM_DCB(dcb);
+ 
+-	process_ext_display_connection_info(bp);
++	process_ext_display_connection_info(bp, as);
+ }
+ 
+ bool dc_bios_is_accelerated_mode(struct dc_bios *dcb)
+@@ -4765,15 +4767,11 @@ static uint32_t get_embedded_display_refresh_rate(
+ static bool bios_parser_construct(
+ 	struct bios_parser *bp,
+ 	struct bp_init_data *init,
+-	struct adapter_service *as)
++	enum dce_version dce_version)
+ {
+ 	uint16_t *rom_header_offset = NULL;
+ 	ATOM_ROM_HEADER *rom_header = NULL;
+ 	ATOM_OBJECT_HEADER *object_info_tbl;
+-	enum dce_version dce_version;
+-
+-	if (!as)
+-		return false;
+ 
+ 	if (!init)
+ 		return false;
+@@ -4781,9 +4779,7 @@ static bool bios_parser_construct(
+ 	if (!init->bios)
+ 		return false;
+ 
+-	dce_version = dal_adapter_service_get_dce_version(as);
+ 	bp->ctx = init->ctx;
+-	bp->as = as;
+ 	bp->bios = init->bios;
+ 	bp->bios_size = bp->bios[BIOS_IMAGE_SIZE_OFFSET] * BIOS_IMAGE_SIZE_UNIT;
+ 	bp->bios_local_image = NULL;
+diff --git a/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.h b/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.h
+index 2133a59..1db3eee 100644
+--- a/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.h
++++ b/drivers/gpu/drm/amd/dal/dc/bios/bios_parser.h
+@@ -52,7 +52,6 @@ enum spread_spectrum_id {
+ 
+ struct bios_parser {
+ 	struct dc_context *ctx;
+-	struct adapter_service *as;
+ 
+ 	struct object_info_table object_info_tbl;
+ 	uint32_t object_info_tbl_offset;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_bios_types.h b/drivers/gpu/drm/amd/dal/dc/dc_bios_types.h
+index f17702d..fa7b1fe 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc_bios_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc_bios_types.h
+@@ -208,7 +208,8 @@ enum bp_result dc_bios_enable_disp_power_gating(struct dc_bios *bios,
+ 						enum bp_pipe_control_action action);
+ 
+ 
+-void dc_bios_post_init(struct dc_bios *bios);
++void dc_bios_post_init(struct dc_bios *bios,
++		       struct adapter_service *as);
+ 
+ struct integrated_info *dc_bios_create_integrated_info(struct dc_bios *bios);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/include/bios_parser_interface.h b/drivers/gpu/drm/amd/dal/include/bios_parser_interface.h
+index d589e8d..a8f313a 100644
+--- a/drivers/gpu/drm/amd/dal/include/bios_parser_interface.h
++++ b/drivers/gpu/drm/amd/dal/include/bios_parser_interface.h
+@@ -38,7 +38,7 @@ struct bp_init_data {
+ 
+ struct dc_bios *dal_bios_parser_create(
+ 	struct bp_init_data *init,
+-	struct adapter_service *as);
++	enum dce_version dce_version);
+ 
+ void dal_bios_parser_destroy(
+ 	struct dc_bios **dcb);
+-- 
+2.7.4
+

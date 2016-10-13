@@ -1,0 +1,172 @@
+From a0e3903311121fd5cd9e37ffe67bdf22ae77764d Mon Sep 17 00:00:00 2001
+From: Jordan Lazare <Jordan.Lazare@amd.com>
+Date: Tue, 22 Mar 2016 16:22:20 -0400
+Subject: [PATCH 0980/1110] drm/amd/dal: Implement retreiving crtc scanoutpos
+ for drm
+
+This got missed in the DAL3 rewrite.
+
+Signed-off-by: Jordan Lazare <Jordan.Lazare@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      | 13 ++++++++---
+ drivers/gpu/drm/amd/dal/dc/core/dc_target.c        | 26 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/dal/dc/dc.h                    | 10 +++++++++
+ .../amd/dal/dc/dce110/dce110_timing_generator.c    |  5 +++--
+ .../amd/dal/dc/dce110/dce110_timing_generator.h    |  4 ++--
+ .../drm/amd/dal/dc/dce80/dce80_timing_generator.c  |  1 +
+ .../gpu/drm/amd/dal/dc/inc/hw/timing_generator.h   |  4 ++++
+ 7 files changed, 56 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index 5626402..5b92771 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -98,10 +98,17 @@ static int dm_crtc_get_scanoutpos(struct amdgpu_device *adev, int crtc,
+ {
+ 	if ((crtc < 0) || (crtc >= adev->mode_info.num_crtc))
+ 		return -EINVAL;
++	else {
++		struct amdgpu_crtc *acrtc = adev->mode_info.crtcs[crtc];
++
++		if (NULL == acrtc->target) {
++			DRM_ERROR("dc_target is NULL for crtc '%d'!\n", crtc);
++			return 0;
++		}
++
++		return dc_target_get_scanoutpos(acrtc->target, vbl, position);
++	}
+ 
+-/* TODO: #DAL3 Implement scanoutpos
+-	dal_get_crtc_scanoutpos(adev->dm.dal, crtc, vbl, position);
+-*/
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+index 53bb64b..4b5504c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+@@ -257,6 +257,32 @@ uint32_t dc_target_get_vblank_counter(const struct dc_target *dc_target)
+ 	return 0;
+ }
+ 
++uint32_t dc_target_get_scanoutpos(
++		const struct dc_target *dc_target,
++		uint32_t *vbl,
++		uint32_t *position)
++{
++	uint8_t i, j;
++	struct core_target *target = DC_TARGET_TO_CORE(dc_target);
++	struct core_dc *core_dc = DC_TO_CORE(target->ctx->dc);
++	struct resource_context *res_ctx =
++		&core_dc->current_context.res_ctx;
++
++	for (i = 0; i < target->public.stream_count; i++) {
++		for (j = 0; j < MAX_PIPES; j++) {
++			struct timing_generator *tg = res_ctx->pipe_ctx[j].tg;
++
++			if (res_ctx->pipe_ctx[j].stream !=
++				DC_STREAM_TO_CORE(target->public.streams[i]))
++				continue;
++
++			return tg->funcs->get_scanoutpos(tg, vbl, position);
++		}
++	}
++
++	return 0;
++}
++
+ enum dc_irq_source dc_target_get_irq_src(
+ 	const struct dc *dc,
+ 	const struct dc_target *dc_target,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index 348bb0d..5c2fe6d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -242,6 +242,16 @@ bool dc_target_is_connected_to_sink(
+ uint8_t dc_target_get_controller_id(const struct dc_target *dc_target);
+ 
+ uint32_t dc_target_get_vblank_counter(const struct dc_target *dc_target);
++
++/* TODO: Return parsed values rather than direct register read
++ * This has a dependency on the caller (amdgpu_get_crtc_scanoutpos)
++ * being refactored properly to be dce-specific
++ */
++uint32_t dc_target_get_scanoutpos(
++		const struct dc_target *dc_target,
++		uint32_t *vbl,
++		uint32_t *position);
++
+ enum dc_irq_source dc_target_get_irq_src(
+ 	const struct dc *dc,
+ 	const struct dc_target *dc_target,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
+index a9ef65d..e4fe49a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
+@@ -130,6 +130,7 @@ static struct timing_generator_funcs dce110_tg_funcs = {
+ 		.is_counter_moving = dce110_timing_generator_is_counter_moving,
+ 		.get_position = dce110_timing_generator_get_crtc_positions,
+ 		.get_frame_count = dce110_timing_generator_get_vblank_counter,
++		.get_scanoutpos = dce110_timing_generator_get_crtc_scanoutpos,
+ 		.set_early_control = dce110_timing_generator_set_early_control,
+ 		.wait_for_state = dce110_tg_wait_for_state,
+ 		.set_blank = dce110_tg_set_blank,
+@@ -819,8 +820,8 @@ void dce110_timing_generator_get_crtc_positions(
+  */
+ uint32_t dce110_timing_generator_get_crtc_scanoutpos(
+ 	struct timing_generator *tg,
+-	int32_t *vbl,
+-	int32_t *position)
++	uint32_t *vbl,
++	uint32_t *position)
+ {
+ 	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	/* TODO 1: Update the implementation once caller is updated
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+index 005f22b..7e01bde 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+@@ -193,8 +193,8 @@ void dce110_timing_generator_program_drr(
+ 
+ uint32_t dce110_timing_generator_get_crtc_scanoutpos(
+ 	struct timing_generator *tg,
+-	int32_t *vbl,
+-	int32_t *position);
++	uint32_t *vbl,
++	uint32_t *position);
+ 
+ void dce110_timing_generator_enable_advanced_request(
+ 	struct timing_generator *tg,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_timing_generator.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_timing_generator.c
+index 24c1832..e44e131 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_timing_generator.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_timing_generator.c
+@@ -124,6 +124,7 @@ static struct timing_generator_funcs dce80_tg_funcs = {
+ 		.is_counter_moving = dce110_timing_generator_is_counter_moving,
+ 		.get_position = dce110_timing_generator_get_crtc_positions,
+ 		.get_frame_count = dce110_timing_generator_get_vblank_counter,
++		.get_scanoutpos = dce110_timing_generator_get_crtc_scanoutpos,
+ 		.set_early_control = dce110_timing_generator_set_early_control,
+ 		.wait_for_state = dce110_tg_wait_for_state,
+ 		.set_blank = dce110_tg_set_blank,
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h b/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h
+index 25f2417..9347310 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h
+@@ -124,6 +124,10 @@ struct timing_generator_funcs {
+ 								int32_t *h_position,
+ 								int32_t *v_position);
+ 	uint32_t (*get_frame_count)(struct timing_generator *tg);
++	uint32_t (*get_scanoutpos)(
++		struct timing_generator *tg,
++		uint32_t *vbl,
++		uint32_t *position);
+ 	void (*set_early_control)(struct timing_generator *tg,
+ 							   uint32_t early_cntl);
+ 	void (*wait_for_state)(struct timing_generator *tg,
+-- 
+2.7.4
+

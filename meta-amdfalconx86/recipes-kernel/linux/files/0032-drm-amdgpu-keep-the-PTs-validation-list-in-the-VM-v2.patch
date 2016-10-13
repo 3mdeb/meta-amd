@@ -1,0 +1,240 @@
+From 7e593951bf930179ca0d28269536c58361f5fa34 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 11 Dec 2015 21:01:23 +0100
+Subject: [PATCH 0032/1110] drm/amdgpu: keep the PTs validation list in the VM
+ v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This avoids allocating it on the fly.
+
+v2: fix grammar in comment
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  9 +++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  |  7 +---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c |  9 +-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c  | 57 +++++++++++++++------------------
+ 4 files changed, 31 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 638b089..41bee9e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -916,8 +916,9 @@ struct amdgpu_ring {
+ #define AMDGPU_VM_FAULT_STOP_ALWAYS	2
+ 
+ struct amdgpu_vm_pt {
+-	struct amdgpu_bo	*bo;
+-	uint64_t		addr;
++        struct amdgpu_bo_list_entry     entry;
++        uint64_t                        addr;
++
+ };
+ 
+ struct amdgpu_vm_id {
+@@ -989,8 +990,7 @@ struct amdgpu_bo_list_entry *amdgpu_vm_get_bos(struct amdgpu_device *adev,
+ void amdgpu_vm_get_pd_bo(struct amdgpu_vm *vm,
+                          struct list_head *validated,
+                          struct amdgpu_bo_list_entry *entry);
+-struct amdgpu_bo_list_entry *amdgpu_vm_get_pt_bos(struct amdgpu_vm *vm,
+-                                                  struct list_head *duplicates);
++void amdgpu_vm_get_pt_bos(struct amdgpu_vm *vm, struct list_head *duplicates);
+ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 		      struct amdgpu_sync *sync);
+ void amdgpu_vm_flush(struct amdgpu_ring *ring,
+@@ -1261,7 +1261,6 @@ struct amdgpu_cs_parser {
+ 	struct amdgpu_cs_chunk	*chunks;
+ 	/* relocations */
+         struct amdgpu_bo_list_entry     vm_pd;
+-	struct amdgpu_bo_list_entry	*vm_bos;
+ 	struct list_head	validated;
+ 	struct fence		*fence;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 1ff138e..850f2ab 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -419,11 +419,7 @@ static int amdgpu_cs_parser_relocs(struct amdgpu_cs_parser *p)
+ 	if (unlikely(r != 0))
+ 		goto error_reserve;
+ 
+-        p->vm_bos = amdgpu_vm_get_pt_bos(&fpriv->vm, &duplicates);
+-        if (!p->vm_bos) {
+-                r = -ENOMEM;
+-                goto error_validate;
+-        }
++        amdgpu_vm_get_pt_bos(&fpriv->vm, &duplicates);
+ 
+ 	r = amdgpu_cs_list_validate(p->adev, &fpriv->vm, &p->validated);
+ 	if (r)
+@@ -506,7 +502,6 @@ static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser, int error, bo
+ 	if (parser->bo_list)
+ 		amdgpu_bo_list_put(parser->bo_list);
+ 
+-	drm_free_large(parser->vm_bos);
+ 	for (i = 0; i < parser->nchunks; i++)
+ 		drm_free_large(parser->chunks[i].kdata);
+ 	kfree(parser->chunks);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index b1d44ce..8eb4b68 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -448,7 +448,6 @@ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
+ 				    struct amdgpu_bo_va *bo_va, uint32_t operation)
+ {
+ 	struct ttm_validate_buffer tv, *entry;
+-	struct amdgpu_bo_list_entry *vm_bos;
+         struct amdgpu_bo_list_entry vm_pd;
+ 	struct ww_acquire_ctx ticket;
+ 	struct list_head list, duplicates;
+@@ -469,12 +468,7 @@ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
+ 	if (r)
+                 goto error_print;
+  
+-        vm_bos = amdgpu_vm_get_pt_bos(bo_va->vm, &duplicates);
+-        if (!vm_bos) {
+-                r = -ENOMEM;
+-                goto error_unreserve;
+-        }
+-
++        amdgpu_vm_get_pt_bos(bo_va->vm, &duplicates);
+ 	list_for_each_entry(entry, &list, head) {
+ 		domain = amdgpu_mem_type_to_domain(entry->bo->mem.mem_type);
+ 		/* if anything is swapped out don't swap it in here,
+@@ -503,7 +497,6 @@ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
+ 
+ error_unreserve:
+ 	ttm_eu_backoff_reservation(&ticket, &list);
+-	drm_free_large(vm_bos);
+ 
+ error_print:
+ 	if (r && r != -ERESTARTSYS)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 396ab85..e83d4f1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -97,26 +97,18 @@ void amdgpu_vm_get_pd_bo(struct amdgpu_vm *vm,
+ }
+ 
+ /**
+-+ * amdgpu_vm_get_bos - add the vm BOs to a validation list
+-+ *
+-+ * @vm: vm providing the BOs
++ * amdgpu_vm_get_bos - add the vm BOs to a duplicates list
++ *
++ * @vm: vm providing the BOs
+  * @duplicates: head of duplicates list
+ 
+- * Add the page directory to the list of BOs to
+- * validate for command submission (cayman+).
+- */
+-struct amdgpu_bo_list_entry *amdgpu_vm_get_pt_bos(struct amdgpu_vm *vm,
+-                                                  struct list_head *duplicates)
++ * Add the page directory to the BO duplicates list
++ * for command submission.
+ 
++ */
++void amdgpu_vm_get_pt_bos(struct amdgpu_vm *vm, struct list_head *duplicates)
+ {
+-	struct amdgpu_bo_list_entry *list;
+-	unsigned i, idx;
+-
+-        list = drm_malloc_ab(vm->max_pde_used + 1,
+-			     sizeof(struct amdgpu_bo_list_entry));
+-        if (!list)
+-		return NULL;
+-	}
++        unsigned i;
+ 
+ 	/* add the vm page table to the list */
+ 	list[0].robj = vm->page_directory;
+@@ -127,20 +119,14 @@ struct amdgpu_bo_list_entry *amdgpu_vm_get_pt_bos(struct amdgpu_vm *vm,
+ 	list[0].tv.shared = true;
+         list_add(&list[0].tv.head, validated);
+ 
+-        for (i = 0, idx = 0; i <= vm->max_pde_used; i++) {
+-		if (!vm->page_tables[i].bo)
++        for (i = 0; i <= vm->max_pde_used; ++i) {
++                struct amdgpu_bo_list_entry *entry = &vm->page_tables[i].entry;
++ 
++                if (!entry->robj)
+ 			continue;
+ 
+-		list[idx].robj = vm->page_tables[i].bo;
+-		list[idx].prefered_domains = AMDGPU_GEM_DOMAIN_VRAM;
+-		list[idx].allowed_domains = AMDGPU_GEM_DOMAIN_VRAM;
+-		list[idx].priority = 0;
+-		list[idx].tv.bo = &list[idx].robj->tbo;
+-		list[idx].tv.shared = true;
+-                list_add(&list[idx++].tv.head, duplicates);
++                list_add(&entry->tv.head, duplicates);
+ 	}
+-
+-	return list;
+ }
+ 
+ /**
+@@ -483,7 +469,7 @@ int amdgpu_vm_update_page_directory(struct amdgpu_device *adev,
+ 
+ 	/* walk over the address space and update the page directory */
+ 	for (pt_idx = 0; pt_idx <= vm->max_pde_used; ++pt_idx) {
+-		struct amdgpu_bo *bo = vm->page_tables[pt_idx].bo;
++                struct amdgpu_bo *bo = vm->page_tables[pt_idx].entry.robj;
+ 		uint64_t pde, pt;
+ 
+ 		if (bo == NULL)
+@@ -660,7 +646,7 @@ static int amdgpu_vm_update_ptes(struct amdgpu_device *adev,
+ 	/* walk over the address space and update the page tables */
+ 	for (addr = start; addr < end; ) {
+ 		uint64_t pt_idx = addr >> amdgpu_vm_block_size;
+-		struct amdgpu_bo *pt = vm->page_tables[pt_idx].bo;
++                struct amdgpu_bo *pt = vm->page_tables[pt_idx].entry.robj;
+ 		unsigned nptes;
+ 		uint64_t pte;
+ 		int r;
+@@ -1092,9 +1078,11 @@ int amdgpu_vm_bo_map(struct amdgpu_device *adev,
+ 	/* walk over the address space and allocate the page tables */
+ 	for (pt_idx = saddr; pt_idx <= eaddr; ++pt_idx) {
+ 		struct reservation_object *resv = vm->page_directory->tbo.resv;
++                struct amdgpu_bo_list_entry *entry;
+ 		struct amdgpu_bo *pt;
+ 
+-		if (vm->page_tables[pt_idx].bo)
++                entry = &vm->page_tables[pt_idx].entry;
++                if (entry->robj)
+ 			continue;
+ 
+ 		r = amdgpu_bo_create(adev, AMDGPU_VM_PTE_COUNT * 8,
+@@ -1116,8 +1104,13 @@ int amdgpu_vm_bo_map(struct amdgpu_device *adev,
+ 			goto error_free;
+ 		}
+ 
++                entry->robj = pt;
++                entry->prefered_domains = AMDGPU_GEM_DOMAIN_VRAM;
++                entry->allowed_domains = AMDGPU_GEM_DOMAIN_VRAM;
++                entry->priority = 0;
++                entry->tv.bo = &entry->robj->tbo;
++                entry->tv.shared = true;
+ 		vm->page_tables[pt_idx].addr = 0;
+-		vm->page_tables[pt_idx].bo = pt;
+ 	}
+ 
+ 	return 0;
+@@ -1347,7 +1340,7 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ 	}
+ 
+ 	for (i = 0; i < amdgpu_vm_num_pdes(adev); i++)
+-		amdgpu_bo_unref(&vm->page_tables[i].bo);
++                amdgpu_bo_unref(&vm->page_tables[i].entry.robj);
+ 	drm_free_large(vm->page_tables);
+ 
+ 	amdgpu_bo_unref(&vm->page_directory);
+-- 
+2.7.4
+

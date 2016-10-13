@@ -1,0 +1,188 @@
+From 3c7852bb487f519596c4ac96c4a5c40fd2e66984 Mon Sep 17 00:00:00 2001
+From: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Date: Thu, 3 Dec 2015 19:17:12 +0800
+Subject: [PATCH 0571/1110] drm/amd/dal: fix hotplug of HDMI display with DP
+ MST
+
+Segfault happens in the following case:
+we are about to get set mode for connector who's only
+possible crtc (in encoder crtc mask) is already used by
+MST connector, that is why DRM will try to
+re-assing crtcs in order to make configuration
+supported. For our implementation we need to make all
+encoders support all crtcs (added function to initilize mask properly),
+then this issue will never arise again.
+
+Added sanity check for non NULL connector state. This check
+should be needed when used with actual drm_atomic_commit ioctl in future.
+
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ .../drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c    | 16 +---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    | 86 ++++++++++++++++------
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.h    |  2 +
+ 3 files changed, 65 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+index 86c17e6..9e41114 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -228,21 +228,7 @@ dm_dp_create_fake_mst_encoder(struct amdgpu_connector *connector)
+ 		return NULL;
+ 
+ 	encoder = &amdgpu_encoder->base;
+-	switch (adev->mode_info.num_crtc) {
+-	case 1:
+-		encoder->possible_crtcs = 0x1;
+-		break;
+-	case 2:
+-	default:
+-		encoder->possible_crtcs = 0x3;
+-		break;
+-	case 4:
+-		encoder->possible_crtcs = 0xf;
+-		break;
+-	case 6:
+-		encoder->possible_crtcs = 0x3f;
+-		break;
+-	}
++	encoder->possible_crtcs = amdgpu_dm_get_encoder_crtc_mask(adev);
+ 
+ 	drm_encoder_init(
+ 		dev,
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index 3b64ffe..6dc7ead 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -1860,19 +1860,40 @@ int amdgpu_dm_connector_init(
+ 	return 0;
+ }
+ 
++int amdgpu_dm_get_encoder_crtc_mask(struct amdgpu_device *adev)
++{
++	switch (adev->mode_info.num_crtc) {
++	case 1:
++		return 0x1;
++	case 2:
++		return 0x3;
++	case 3:
++		return 0x7;
++	case 4:
++		return 0xf;
++	case 5:
++		return 0x1f;
++	case 6:
++	default:
++		return 0x3f;
++	}
++}
++
+ int amdgpu_dm_encoder_init(
+ 	struct drm_device *dev,
+ 	struct amdgpu_encoder *aencoder,
+ 	uint32_t link_index,
+ 	struct amdgpu_crtc *acrtc)
+ {
++	struct amdgpu_device *adev = dev->dev_private;
++
+ 	int res = drm_encoder_init(dev,
+ 				   &aencoder->base,
+ 				   &amdgpu_dm_encoder_funcs,
+ 				   DRM_MODE_ENCODER_TMDS,
+ 				   NULL);
+ 
+-	aencoder->base.possible_crtcs = 1 << link_index;
++	aencoder->base.possible_crtcs = amdgpu_dm_get_encoder_crtc_mask(adev);
+ 
+ 	if (!res)
+ 		aencoder->encoder_id = link_index;
+@@ -2204,32 +2225,49 @@ int amdgpu_dm_atomic_commit(
+ 		struct drm_crtc *crtc = plane_state->crtc;
+ 		struct drm_framebuffer *fb = plane_state->fb;
+ 		struct drm_connector *connector;
++		struct dm_connector_state *dm_state = NULL;
+ 
+-		if (fb && crtc && crtc->state->planes_changed) {
+-			struct dm_connector_state *dm_state = NULL;
+-
+-			if (page_flip_needed(
+-				plane_state,
+-				old_plane_state))
+-				amdgpu_crtc_page_flip(
+-					crtc,
+-					fb,
+-					crtc->state->event,
+-					0);
+-			else {
+-				list_for_each_entry(connector,
+-						&dev->mode_config.connector_list, head)	{
+-					if (connector->state->crtc == crtc) {
+-						dm_state = to_dm_connector_state(connector->state);
+-						break;
+-					}
+-				}
++		if (!fb || !crtc || !crtc->state->planes_changed)
++			continue;
+ 
+-				dm_dc_surface_commit(
+-					dm->dc,
+-					crtc,
+-					dm_state);
++		if (page_flip_needed(
++			plane_state,
++			old_plane_state))
++			amdgpu_crtc_page_flip(
++				crtc,
++				fb,
++				crtc->state->event,
++				0);
++		else {
++			list_for_each_entry(connector,
++				&dev->mode_config.connector_list, head)	{
++				if (connector->state->crtc == crtc) {
++					dm_state = to_dm_connector_state(connector->state);
++					break;
++				}
+ 			}
++
++			/*
++			 * This situation happens in the following case:
++			 * we are about to get set mode for connector who's only
++			 * possible crtc (in encoder crtc mask) is used by
++			 * another connector, that is why it will try to
++			 * re-assing crtcs in order to make configuration
++			 * supported. For our implementation we need to make all
++			 * encoders support all crtcs, then this issue will
++			 * never arise again. But to guard code from this issue
++			 * check is left.
++			 *
++			 * Also it should be needed when used with actual
++			 * drm_atomic_commit ioctl in future
++			 */
++			if (!dm_state)
++				continue;
++
++			dm_dc_surface_commit(
++				dm->dc,
++				crtc,
++				dm_state);
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.h b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.h
+index 0df4636..0639732 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.h
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.h
+@@ -83,6 +83,8 @@ int amdgpu_dm_connector_atomic_set_property(
+ 	struct drm_property *property,
+ 	uint64_t val);
+ 
++int amdgpu_dm_get_encoder_crtc_mask(struct amdgpu_device *adev);
++
+ extern const struct drm_encoder_helper_funcs amdgpu_dm_encoder_helper_funcs;
+ 
+ #endif		/* __AMDGPU_DM_TYPES_H__ */
+-- 
+2.7.4
+

@@ -1,0 +1,799 @@
+From fd5a57c67269301e7441f4e3acff12bd42d1bf2f Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Thu, 21 Jan 2016 11:38:21 -0500
+Subject: [PATCH 0715/1110] drm/amd/dal: add virtual link and stream encoders
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/Makefile                |   2 +-
+ .../gpu/drm/amd/dal/dc/bios/command_table_helper.c |   1 +
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |  37 ++++--
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          |   7 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      |  13 +-
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |   2 +-
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |  20 ++--
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    |  18 ++-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.h    |   1 +
+ drivers/gpu/drm/amd/dal/dc/inc/core_types.h        |   4 +-
+ drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h      |   1 +
+ drivers/gpu/drm/amd/dal/dc/virtual/Makefile        |   9 ++
+ .../drm/amd/dal/dc/virtual/virtual_link_encoder.c  | 131 +++++++++++++++++++++
+ .../drm/amd/dal/dc/virtual/virtual_link_encoder.h  |  35 ++++++
+ .../amd/dal/dc/virtual/virtual_stream_encoder.c    | 124 +++++++++++++++++++
+ .../amd/dal/dc/virtual/virtual_stream_encoder.h    |  39 ++++++
+ drivers/gpu/drm/amd/dal/include/grph_object_id.h   |   6 +-
+ 17 files changed, 406 insertions(+), 44 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/virtual/Makefile
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/virtual/virtual_link_encoder.c
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/virtual/virtual_link_encoder.h
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/virtual/virtual_stream_encoder.c
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/virtual/virtual_stream_encoder.h
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/Makefile b/drivers/gpu/drm/amd/dal/dc/Makefile
+index 05d8ce7..4396203 100644
+--- a/drivers/gpu/drm/amd/dal/dc/Makefile
++++ b/drivers/gpu/drm/amd/dal/dc/Makefile
+@@ -3,7 +3,7 @@
+ #
+ 
+ DC_LIBS = adapter asic_capability audio basics bios calcs \
+-dcs gpio gpu i2caux irq
++dcs gpio gpu i2caux irq virtual
+ 
+ ifdef CONFIG_DRM_AMD_DAL_DCE11_0
+ DC_LIBS += dce110
+diff --git a/drivers/gpu/drm/amd/dal/dc/bios/command_table_helper.c b/drivers/gpu/drm/amd/dal/dc/bios/command_table_helper.c
+index e0407f4..83a80d5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/bios/command_table_helper.c
++++ b/drivers/gpu/drm/amd/dal/dc/bios/command_table_helper.c
+@@ -311,6 +311,7 @@ uint8_t dal_cmd_table_helper_encoder_id_to_atom(
+ 		return ENCODER_OBJECT_ID_INTERNAL_VCE;
+ 	case ENCODER_ID_EXTERNAL_GENERIC_DVO:
+ 		return ENCODER_OBJECT_ID_GENERAL_EXTERNAL_DVO;
++	case ENCODER_ID_INTERNAL_VIRTUAL:
+ 	case ENCODER_ID_UNKNOWN:
+ 		return ENCODER_OBJECT_ID_NONE;
+ 	default:
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index d953784..71df979 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -40,6 +40,7 @@
+ #include "bandwidth_calcs.h"
+ #include "include/irq_service_interface.h"
+ #include "inc/transform.h"
++#include "../virtual/virtual_link_encoder.h"
+ 
+ #include "link_hwss.h"
+ #include "link_encoder.h"
+@@ -125,6 +126,7 @@ static bool create_links(struct dc *dc, const struct dc_init_data *init_params)
+ 	for (i = 0; i < init_params->num_virtual_links; i++) {
+ 		struct core_link *link =
+ 			dc_service_alloc(dc->ctx, sizeof(*link));
++		struct encoder_init_data enc_init = { 0 };
+ 
+ 		if (link == NULL) {
+ 			BREAK_TO_DEBUGGER();
+@@ -135,6 +137,22 @@ static bool create_links(struct dc *dc, const struct dc_init_data *init_params)
+ 		link->ctx = init_params->ctx;
+ 		link->dc = dc;
+ 		link->public.connector_signal = SIGNAL_TYPE_VIRTUAL;
++		link->link_id.type = OBJECT_TYPE_CONNECTOR;
++		link->link_id.id = CONNECTOR_ID_VIRTUAL;
++		link->link_id.enum_id = ENUM_ID_1;
++		link->link_enc =
++			dc_service_alloc(dc->ctx, sizeof(*link->link_enc));
++
++		enc_init.adapter_service = init_params->adapter_srv;
++		enc_init.ctx = init_params->ctx;
++		enc_init.channel = CHANNEL_ID_UNKNOWN;
++		enc_init.hpd_source = HPD_SOURCEID_UNKNOWN;
++		enc_init.transmitter = TRANSMITTER_UNKNOWN;
++		enc_init.connector = link->link_id;
++		enc_init.encoder.type = OBJECT_TYPE_ENCODER;
++		enc_init.encoder.id = ENCODER_ID_INTERNAL_VIRTUAL;
++		enc_init.encoder.enum_id = ENUM_ID_1;
++		virtual_link_encoder_construct(link->link_enc, &enc_init);
+ 
+ 		link->public.link_index = dc->link_count;
+ 		dc->links[dc->link_count] = link;
+@@ -180,8 +198,7 @@ static void init_hw(struct dc *dc)
+ 		 * required signal (which may be different from the
+ 		 * default signal on connector). */
+ 		struct core_link *link = dc->links[i];
+-		if (link->public.connector_signal != SIGNAL_TYPE_VIRTUAL)
+-			link->link_enc->funcs->hw_init(link->link_enc);
++		link->link_enc->funcs->hw_init(link->link_enc);
+ 	}
+ 
+ 	for(i = 0; i < dc->res_pool.controller_count; i++) {
+@@ -355,6 +372,7 @@ static bool construct(struct dc *dc, const struct dal_init_data *init_params)
+ 
+ 	if (!dc->hwss.construct_resource_pool(
+ 			dc_init_data.adapter_srv,
++			dc_init_data.num_virtual_links,
+ 			dc,
+ 			&dc->res_pool))
+ 		goto construct_resource_fail;
+@@ -866,23 +884,24 @@ bool dc_link_add_remote_sink(const struct dc_link *link, struct dc_sink *sink)
+ 
+ 	dc_link->remote_sinks[link->sink_count] = sink;
+ 	dc_link->sink_count++;
+-	if (sink->sink_signal == SIGNAL_TYPE_VIRTUAL
+-		&& link->connector_signal == SIGNAL_TYPE_VIRTUAL)
+-		dc_link->type = dc_connection_single;
+ 
+ 	return true;
+ }
+ 
+-void dc_link_add_sink(const struct dc_link *link, struct dc_sink *sink)
++void dc_link_set_sink(const struct dc_link *link, struct dc_sink *sink)
+ {
+ 	struct core_link *core_link = DC_LINK_TO_LINK(link);
+ 	struct dc_link *dc_link = &core_link->public;
+ 
+ 	dc_link->local_sink = sink;
+-	dc_link->sink_count = 1;
+-	if (sink->sink_signal == SIGNAL_TYPE_VIRTUAL
+-		&& link->connector_signal == SIGNAL_TYPE_VIRTUAL)
++
++	if (sink == NULL) {
++		dc_link->sink_count = 0;
++		dc_link->type = dc_connection_none;
++	} else {
++		dc_link->sink_count = 1;
+ 		dc_link->type = dc_connection_single;
++	}
+ }
+ 
+ void dc_link_remove_remote_sink(const struct dc_link *link, const struct dc_sink *sink)
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 3f6a7bb..912f3fe 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -1228,7 +1228,7 @@ static void enable_link_hdmi(struct core_stream *stream)
+ /****************************enable_link***********************************/
+ static enum dc_status enable_link(struct core_stream *stream)
+ {
+-	enum dc_status status;
++	enum dc_status status = DC_ERROR_UNEXPECTED;
+ 	switch (stream->signal) {
+ 	case SIGNAL_TYPE_DISPLAY_PORT:
+ 	case SIGNAL_TYPE_EDP:
+@@ -1244,9 +1244,10 @@ static enum dc_status enable_link(struct core_stream *stream)
+ 		enable_link_hdmi(stream);
+ 		status = DC_OK;
+ 		break;
+-
++	case SIGNAL_TYPE_VIRTUAL:
++		status = DC_OK;
++		break;
+ 	default:
+-		status = DC_ERROR_UNEXPECTED;
+ 		break;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index 7cc4ed2..c52a1e2 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -457,11 +457,8 @@ static void fill_display_configs(
+ 			cfg->src_width = stream->public.src.width;
+ 			cfg->ddi_channel_mapping =
+ 				stream->sink->link->ddi_channel_mapping.raw;
+-			if (stream->signal != SIGNAL_TYPE_VIRTUAL)
+-				cfg->transmitter =
++			cfg->transmitter =
+ 				stream->sink->link->link_enc->transmitter;
+-			else
+-				cfg->transmitter = TRANSMITTER_UNKNOWN;
+ 			cfg->link_settings =
+ 					stream->sink->link->cur_link_settings;
+ 			cfg->sym_clock = stream->public.timing.pix_clk_khz;
+@@ -745,14 +742,6 @@ enum dc_status map_resources(
+ 			.flags.timing_changed =
+ 				check_timing_change(curr_stream, stream);
+ 
+-			/*
+-			 * we do not need stream encoder or audio resources
+-			 * when connecting to virtual link
+-			 */
+-			if (stream->sink->link->public.connector_signal ==
+-							SIGNAL_TYPE_VIRTUAL)
+-				continue;
+-
+ 			stream->stream_enc =
+ 				find_first_free_match_stream_enc_for_link(
+ 					&context->res_ctx,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index c541ecf..a06a8a7 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -318,7 +318,7 @@ void dc_link_remove_remote_sink(
+ 	const struct dc_sink *sink);
+ 
+ /* Used by diagnostics for virtual link at the moment */
+-void dc_link_add_sink(const struct dc_link *link, struct dc_sink *sink);
++void dc_link_set_sink(const struct dc_link *link, struct dc_sink *sink);
+ 
+ /*******************************************************************************
+  * Sink Interfaces - A sink corresponds to a display output device
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 24b8824..44ad5a2 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -806,8 +806,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 		 */
+ 		stream->tg->funcs->set_blank(stream->tg, true);
+ 
+-		if (stream->signal != SIGNAL_TYPE_VIRTUAL)
+-			core_link_disable_stream(stream->sink->link, stream);
++		core_link_disable_stream(stream->sink->link, stream);
+ 
+ 		/*TODO: AUTO check if timing changed*/
+ 		if (false == dal_clock_source_program_pix_clk(
+@@ -818,7 +817,6 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 			return DC_ERROR_UNEXPECTED;
+ 		}
+ 
+-
+ 		stream->tg->funcs->program_timing(
+ 				stream->tg,
+ 				&stream->public.timing,
+@@ -839,6 +837,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 		}
+ 	}
+ 
++	/* TODO: move to stream encoder */
+ 	if (stream->signal != SIGNAL_TYPE_VIRTUAL)
+ 		if (DC_OK != bios_parser_crtc_source_select(stream)) {
+ 			BREAK_TO_DEBUGGER();
+@@ -853,10 +852,9 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 
+ 	program_fmt(opp, &stream->fmt_bit_depth, &stream->clamping);
+ 
+-	if (stream->signal != SIGNAL_TYPE_VIRTUAL)
+-		stream->sink->link->link_enc->funcs->setup(
+-			stream->sink->link->link_enc,
+-			stream->signal);
++	stream->sink->link->link_enc->funcs->setup(
++		stream->sink->link->link_enc,
++		stream->signal);
+ 
+ 	if (dc_is_dp_signal(stream->signal))
+ 		stream->stream_enc->funcs->dp_set_stream_attribute(
+@@ -900,7 +898,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 			context->res_ctx.pool.timing_generators[controller_idx],
+ 			color_space);
+ 
+-	if (timing_changed && stream->signal != SIGNAL_TYPE_VIRTUAL) {
++	if (timing_changed) {
+ 		core_link_enable_stream(stream->sink->link, stream);
+ 	} else {
+ 		core_link_update_stream(stream->sink->link, stream);
+@@ -920,8 +918,7 @@ static void power_down_encoders(struct dc *dc)
+ 	int i;
+ 
+ 	for (i = 0; i < dc->link_count; i++) {
+-		if (dc->links[i]->public.connector_signal != SIGNAL_TYPE_VIRTUAL)
+-			dc->links[i]->link_enc->funcs->disable_output(
++		dc->links[i]->link_enc->funcs->disable_output(
+ 				dc->links[i]->link_enc, SIGNAL_TYPE_NONE);
+ 	}
+ }
+@@ -1575,8 +1572,7 @@ static void reset_single_stream_hw_ctx(struct core_stream *stream,
+ 		stream->audio = NULL;
+ 	}
+ 
+-	if (stream->signal != SIGNAL_TYPE_VIRTUAL)
+-		core_link_disable_stream(stream->sink->link, stream);
++	core_link_disable_stream(stream->sink->link, stream);
+ 
+ 	stream->tg->funcs->set_blank(stream->tg, true);
+ 	stream->tg->funcs->disable_crtc(stream->tg);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index 96f4423..fd8a928 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -30,6 +30,7 @@
+ #include "resource.h"
+ #include "include/irq_service_interface.h"
+ #include "include/timing_generator_interface.h"
++#include "../virtual/virtual_stream_encoder.h"
+ 
+ #include "dce110/dce110_timing_generator.h"
+ #include "dce110/dce110_link_encoder.h"
+@@ -304,6 +305,7 @@ void dce110_link_encoder_destroy(struct link_encoder **enc)
+ 
+ bool dce110_construct_resource_pool(
+ 	struct adapter_service *adapter_serv,
++	uint8_t num_virtual_links,
+ 	struct dc *dc,
+ 	struct resource_pool *pool)
+ {
+@@ -459,6 +461,19 @@ bool dce110_construct_resource_pool(
+ 		}
+ 	}
+ 
++	for (i = 0; i < num_virtual_links; i++) {
++		pool->stream_enc[pool->stream_enc_count] =
++			virtual_stream_encoder_create(
++				dc->ctx, dal_adapter_service_get_bios_parser(
++								adapter_serv));
++		if (pool->stream_enc[pool->stream_enc_count] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error("DC: failed to create stream_encoder!\n");
++			goto stream_enc_create_fail;
++		}
++		pool->stream_enc_count++;
++	}
++
+ 	return true;
+ 
+ stream_enc_create_fail:
+@@ -726,9 +741,6 @@ static enum dc_status validate_mapped_resource(
+ 					stream->tg, &stream->public.timing))
+ 				return DC_FAIL_CONTROLLER_VALIDATE;
+ 
+-			if (stream->signal == SIGNAL_TYPE_VIRTUAL)
+-				return status;
+-
+ 			status = build_stream_hw_param(stream);
+ 
+ 			if (status != DC_OK)
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
+index e47b19d..5f00a3c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
+@@ -36,6 +36,7 @@ struct dc_validation_set;
+ 
+ bool dce110_construct_resource_pool(
+ 	struct adapter_service *adapter_serv,
++	uint8_t num_virtual_links,
+ 	struct dc *dc,
+ 	struct resource_pool *pool);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+index 192399b..f31ee42 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+@@ -263,7 +263,7 @@ struct resource_pool {
+ 	struct transform *transforms[MAX_PIPES];
+ 	struct output_pixel_processor *opps[MAX_PIPES];
+ 	struct timing_generator *timing_generators[MAX_STREAMS];
+-	struct stream_encoder *stream_enc[MAX_STREAMS];
++	struct stream_encoder *stream_enc[MAX_PIPES * 2];
+ 
+ 	uint8_t controller_count;
+ 	uint8_t stream_enc_count;
+@@ -294,7 +294,7 @@ struct resource_context {
+ 	struct resource_pool pool;
+ 	struct controller_ctx controller_ctx[MAX_PIPES];
+ 	union supported_stream_engines used_stream_engines;
+-	bool is_stream_enc_acquired[MAX_STREAMS];
++	bool is_stream_enc_acquired[MAX_PIPES * 2];
+ 	bool is_audio_acquired[MAX_STREAMS];
+ 	uint8_t clock_source_ref_count[MAX_CLOCK_SOURCES];
+  };
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+index 46721cd..0bbf9b5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+@@ -106,6 +106,7 @@ struct hw_sequencer_funcs {
+ 	/* resource management and validation*/
+ 	bool (*construct_resource_pool)(
+ 					struct adapter_service *adapter_serv,
++					uint8_t num_virtual_links,
+ 					struct dc *dc,
+ 					struct resource_pool *pool);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/virtual/Makefile b/drivers/gpu/drm/amd/dal/dc/virtual/Makefile
+new file mode 100644
+index 0000000..0e2cbc0
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/virtual/Makefile
+@@ -0,0 +1,9 @@
++#
++# Makefile for the virtual sub-component of DAL.
++# It provides the control and status of HW CRTC block.
++
++VIRTUAL = virtual_link_encoder.o virtual_stream_encoder.o
++
++AMD_DAL_VIRTUAL = $(addprefix $(AMDDALPATH)/dc/virtual/,$(VIRTUAL))
++
++AMD_DAL_FILES += $(AMD_DAL_VIRTUAL)
+diff --git a/drivers/gpu/drm/amd/dal/dc/virtual/virtual_link_encoder.c b/drivers/gpu/drm/amd/dal/dc/virtual/virtual_link_encoder.c
+new file mode 100644
+index 0000000..5fa9af8
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/virtual/virtual_link_encoder.c
+@@ -0,0 +1,131 @@
++/*
++ * Copyright 2012-15 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#include "virtual_link_encoder.h"
++
++#define VIRTUAL_MAX_PIXEL_CLK_IN_KHZ 600000
++
++static bool virtual_link_encoder_validate_output_with_stream(
++	struct link_encoder *enc,
++	struct core_stream *stream) { return true; }
++
++static void virtual_link_encoder_hw_init(struct link_encoder *enc) {}
++
++static void virtual_link_encoder_setup(
++	struct link_encoder *enc,
++	enum signal_type signal) {}
++
++static void virtual_link_encoder_enable_tmds_output(
++	struct link_encoder *enc,
++	enum clock_source_id clock_source,
++	enum dc_color_depth color_depth,
++	bool hdmi,
++	bool dual_link,
++	uint32_t pixel_clock) {}
++
++static void virtual_link_encoder_enable_dp_output(
++	struct link_encoder *enc,
++	const struct link_settings *link_settings,
++	enum clock_source_id clock_source) {}
++
++static void virtual_link_encoder_enable_dp_mst_output(
++	struct link_encoder *enc,
++	const struct link_settings *link_settings,
++	enum clock_source_id clock_source) {}
++
++static void virtual_link_encoder_disable_output(
++	struct link_encoder *link_enc,
++	enum signal_type signal) {}
++
++static void virtual_link_encoder_dp_set_lane_settings(
++	struct link_encoder *enc,
++	const struct link_training_settings *link_settings) {}
++
++static void virtual_link_encoder_dp_set_phy_pattern(
++	struct link_encoder *enc,
++	const struct encoder_set_dp_phy_pattern_param *param) {}
++
++static void virtual_link_encoder_update_mst_stream_allocation_table(
++	struct link_encoder *enc,
++	const struct dp_mst_stream_allocation_table *table) {}
++
++static void virtual_link_encoder_set_lcd_backlight_level(
++	struct link_encoder *enc,
++	uint32_t level) {}
++
++static void virtual_link_encoder_edp_backlight_control(
++	struct link_encoder *enc,
++	bool enable) {}
++
++static void virtual_link_encoder_edp_power_control(
++	struct link_encoder *enc,
++	bool power_up) {}
++
++static void virtual_link_encoder_connect_dig_be_to_fe(
++	struct link_encoder *enc,
++	enum engine_id engine,
++	bool connect) {}
++
++static struct link_encoder_funcs virtual_lnk_enc_funcs = {
++	.validate_output_with_stream =
++		virtual_link_encoder_validate_output_with_stream,
++	.hw_init = virtual_link_encoder_hw_init,
++	.setup = virtual_link_encoder_setup,
++	.enable_tmds_output = virtual_link_encoder_enable_tmds_output,
++	.enable_dp_output = virtual_link_encoder_enable_dp_output,
++	.enable_dp_mst_output = virtual_link_encoder_enable_dp_mst_output,
++	.disable_output = virtual_link_encoder_disable_output,
++	.dp_set_lane_settings = virtual_link_encoder_dp_set_lane_settings,
++	.dp_set_phy_pattern = virtual_link_encoder_dp_set_phy_pattern,
++	.update_mst_stream_allocation_table =
++		virtual_link_encoder_update_mst_stream_allocation_table,
++	.set_lcd_backlight_level = virtual_link_encoder_set_lcd_backlight_level,
++	.backlight_control = virtual_link_encoder_edp_backlight_control,
++	.power_control = virtual_link_encoder_edp_power_control,
++	.connect_dig_be_to_fe = virtual_link_encoder_connect_dig_be_to_fe
++};
++
++bool virtual_link_encoder_construct(
++	struct link_encoder *enc, const struct encoder_init_data *init_data)
++{
++	enc->funcs = &virtual_lnk_enc_funcs;
++	enc->ctx = init_data->ctx;
++	enc->id = init_data->encoder;
++
++	enc->hpd_source = init_data->hpd_source;
++	enc->connector = init_data->connector;
++
++	enc->adapter_service = init_data->adapter_service;
++
++	enc->transmitter = init_data->transmitter;
++
++	enc->features.max_pixel_clock = VIRTUAL_MAX_PIXEL_CLK_IN_KHZ;
++
++	enc->output_signals = SIGNAL_TYPE_VIRTUAL;
++
++	enc->preferred_engine = ENGINE_ID_VIRTUAL;
++
++	return true;
++}
+diff --git a/drivers/gpu/drm/amd/dal/dc/virtual/virtual_link_encoder.h b/drivers/gpu/drm/amd/dal/dc/virtual/virtual_link_encoder.h
+new file mode 100644
+index 0000000..c34bd04
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/virtual/virtual_link_encoder.h
+@@ -0,0 +1,35 @@
++/*
++ * Copyright 2012-15 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#ifndef __DC_VIRTUAL_LINK_ENCODER_H__
++#define __DC_VIRTUAL_LINK_ENCODER_H__
++
++#include "inc/link_encoder.h"
++
++bool virtual_link_encoder_construct(
++	struct link_encoder *enc, const struct encoder_init_data *init_data);
++
++
++#endif /* __DC_VIRTUAL_LINK_ENCODER_H__ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/virtual/virtual_stream_encoder.c b/drivers/gpu/drm/amd/dal/dc/virtual/virtual_stream_encoder.c
+new file mode 100644
+index 0000000..dcfda67
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/virtual/virtual_stream_encoder.c
+@@ -0,0 +1,124 @@
++/*
++ * Copyright 2012-15 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#include "virtual_stream_encoder.h"
++#include "dc_services.h"
++
++static void virtual_stream_encoder_dp_set_stream_attribute(
++	struct stream_encoder *enc,
++	struct dc_crtc_timing *crtc_timing) {}
++
++static void virtual_stream_encoder_hdmi_set_stream_attribute(
++	struct stream_encoder *enc,
++	struct dc_crtc_timing *crtc_timing,
++	bool enable_audio) {}
++
++static void virtual_stream_encoder_dvi_set_stream_attribute(
++	struct stream_encoder *enc,
++	struct dc_crtc_timing *crtc_timing,
++	bool is_dual_link) {}
++
++static void virtual_stream_encoder_set_mst_bandwidth(
++	struct stream_encoder *enc,
++	struct fixed31_32 avg_time_slots_per_mtp) {}
++
++static void virtual_stream_encoder_update_hdmi_info_packets(
++	struct stream_encoder *enc,
++	const struct encoder_info_frame *info_frame) {}
++
++static void virtual_stream_encoder_stop_hdmi_info_packets(
++	struct stream_encoder *enc) {}
++
++static void virtual_stream_encoder_update_dp_info_packets(
++	struct stream_encoder *enc,
++	const struct encoder_info_frame *info_frame) {}
++
++static void virtual_stream_encoder_stop_dp_info_packets(
++	struct stream_encoder *enc) {}
++
++static void virtual_stream_encoder_dp_blank(
++	struct stream_encoder *enc) {}
++
++static void virtual_stream_encoder_dp_unblank(
++	struct stream_encoder *enc,
++	const struct encoder_unblank_param *param) {}
++
++static struct stream_encoder_funcs virtual_str_enc_funcs = {
++	.dp_set_stream_attribute =
++		virtual_stream_encoder_dp_set_stream_attribute,
++	.hdmi_set_stream_attribute =
++		virtual_stream_encoder_hdmi_set_stream_attribute,
++	.dvi_set_stream_attribute =
++		virtual_stream_encoder_dvi_set_stream_attribute,
++	.set_mst_bandwidth =
++		virtual_stream_encoder_set_mst_bandwidth,
++	.update_hdmi_info_packets =
++		virtual_stream_encoder_update_hdmi_info_packets,
++	.stop_hdmi_info_packets =
++		virtual_stream_encoder_stop_hdmi_info_packets,
++	.update_dp_info_packets =
++		virtual_stream_encoder_update_dp_info_packets,
++	.stop_dp_info_packets =
++		virtual_stream_encoder_stop_dp_info_packets,
++	.dp_blank =
++		virtual_stream_encoder_dp_blank,
++	.dp_unblank =
++		virtual_stream_encoder_dp_unblank,
++};
++
++bool virtual_stream_encoder_construct(
++	struct stream_encoder *enc,
++	struct dc_context *ctx,
++	struct dc_bios *bp)
++{
++	if (!enc)
++		return false;
++	if (!bp)
++		return false;
++
++	enc->funcs = &virtual_str_enc_funcs;
++	enc->ctx = ctx;
++	enc->id = ENGINE_ID_VIRTUAL;
++	enc->bp = bp;
++
++	return true;
++}
++
++struct stream_encoder *virtual_stream_encoder_create(
++	struct dc_context *ctx, struct dc_bios *bp)
++{
++	struct stream_encoder *enc = dc_service_alloc(ctx, sizeof(*enc));
++
++	if (!enc)
++		return NULL;
++
++	if (virtual_stream_encoder_construct(enc, ctx, bp))
++		return enc;
++
++	BREAK_TO_DEBUGGER();
++	dc_service_free(ctx, enc);
++	return NULL;
++}
++
+diff --git a/drivers/gpu/drm/amd/dal/dc/virtual/virtual_stream_encoder.h b/drivers/gpu/drm/amd/dal/dc/virtual/virtual_stream_encoder.h
+new file mode 100644
+index 0000000..dce8425
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/virtual/virtual_stream_encoder.h
+@@ -0,0 +1,39 @@
++/*
++ * Copyright 2012-15 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#ifndef __DC_VIRTUAL_STREAM_ENCODER_H__
++#define __DC_VIRTUAL_STREAM_ENCODER_H__
++
++#include "inc/stream_encoder.h"
++
++struct stream_encoder *virtual_stream_encoder_create(
++	struct dc_context *ctx, struct dc_bios *bp);
++
++bool virtual_stream_encoder_construct(
++	struct stream_encoder *enc,
++	struct dc_context *ctx,
++	struct dc_bios *bp);
++
++#endif /* __DC_VIRTUAL_STREAM_ENCODER_H__ */
+diff --git a/drivers/gpu/drm/amd/dal/include/grph_object_id.h b/drivers/gpu/drm/amd/dal/include/grph_object_id.h
+index 1eafe7c..2f73797 100644
+--- a/drivers/gpu/drm/amd/dal/include/grph_object_id.h
++++ b/drivers/gpu/drm/amd/dal/include/grph_object_id.h
+@@ -26,6 +26,8 @@
+ #ifndef __DAL_GRPH_OBJECT_ID_H__
+ #define __DAL_GRPH_OBJECT_ID_H__
+ 
++#include "dal_services_types.h"
++
+ /* Types of graphics objects */
+ enum object_type {
+ 	OBJECT_TYPE_UNKNOWN  = 0,
+@@ -160,6 +162,7 @@ enum encoder_id {
+ 
+ 	ENCODER_ID_INTERNAL_WIRELESS,	/* Internal wireless display encoder */
+ 	ENCODER_ID_INTERNAL_UNIPHY3,
++	ENCODER_ID_INTERNAL_VIRTUAL,
+ 
+ 	ENCODER_ID_EXTERNAL_GENERIC_DVO = 0xFF
+ };
+@@ -183,7 +186,7 @@ enum connector_id {
+ 	CONNECTOR_ID_WIRELESS = 22,
+ 	CONNECTOR_ID_MIRACAST = 23,
+ 
+-	CONNECTOR_ID_COUNT
++	CONNECTOR_ID_VIRTUAL = 100
+ };
+ 
+ 
+@@ -207,6 +210,7 @@ enum engine_id {
+ 	ENGINE_ID_DACA,
+ 	ENGINE_ID_DACB,
+ 	ENGINE_ID_VCE,	/* wireless display pseudo-encoder */
++	ENGINE_ID_VIRTUAL,
+ 
+ 	ENGINE_ID_COUNT,
+ 	ENGINE_ID_UNKNOWN = (-1L)
+-- 
+2.7.4
+

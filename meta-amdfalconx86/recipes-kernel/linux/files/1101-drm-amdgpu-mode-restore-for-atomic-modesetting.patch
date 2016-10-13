@@ -1,0 +1,310 @@
+From 46e8daa3ae37d593134460c2a31f8e080cf89b34 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <David1.Zhou@amd.com>
+Date: Wed, 8 Jun 2016 14:01:24 +0800
+Subject: [PATCH 1101/1110] drm/amdgpu: mode restore for atomic modesetting
+
+Change-Id: If6eade28208053e549af0e839124f1bc46c1a81b
+Signed-off-by: Chunming Zhou <David1.Zhou@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |   8 +-
+ drivers/gpu/drm/drm_atomic.c               |   2 +-
+ drivers/gpu/drm/drm_atomic_helper.c        | 156 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/drm_modeset_lock.c         |  10 +-
+ include/drm/drm_atomic_helper.h            |   6 +-
+ include/drm/drm_modeset_lock.h             |   2 +-
+ 6 files changed, 176 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index a92189a..9c892b9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -30,6 +30,7 @@
+ #include <linux/debugfs.h>
+ #include <drm/drmP.h>
+ #include <drm/drm_crtc_helper.h>
++#include <drm/drm_atomic_helper.h>
+ #include <drm/amdgpu_drm.h>
+ #include <linux/vgaarb.h>
+ #include <linux/vga_switcheroo.h>
+@@ -1898,6 +1899,7 @@ int amdgpu_resume_kms(struct drm_device *dev, bool resume, bool fbcon)
+  */
+ int amdgpu_gpu_reset(struct amdgpu_device *adev)
+ {
++	struct drm_atomic_state *state = NULL;
+ 	unsigned ring_sizes[AMDGPU_MAX_RINGS];
+ 	uint32_t *ring_data[AMDGPU_MAX_RINGS];
+ 
+@@ -1910,6 +1912,9 @@ int amdgpu_gpu_reset(struct amdgpu_device *adev)
+ 
+ 	/* block TTM */
+ 	resched = ttm_bo_lock_delayed_workqueue(&adev->mman.bdev);
++	/* store modesetting */
++	if (amdgpu_device_has_dal_support(adev))
++		state = drm_atomic_helper_suspend(adev->ddev);
+ 
+ 	r = amdgpu_suspend(adev);
+ 
+@@ -1965,8 +1970,7 @@ retry:
+ 	}
+ 
+ 	if (amdgpu_device_has_dal_support(adev))
+-		/* TODO needed from DAL, otherwise the mode cannot be back */
+-		;
++		r = drm_atomic_helper_resume(adev->ddev, state);
+ 	else
+ 		drm_helper_resume_force_mode(adev->ddev);
+ 
+diff --git a/drivers/gpu/drm/drm_atomic.c b/drivers/gpu/drm/drm_atomic.c
+index aeee083..993a25f 100644
+--- a/drivers/gpu/drm/drm_atomic.c
++++ b/drivers/gpu/drm/drm_atomic.c
+@@ -1195,7 +1195,7 @@ retry:
+ 			       state->acquire_ctx);
+ 	if (ret)
+ 		goto retry;
+-	ret = drm_modeset_lock_all_crtcs(state->dev,
++	ret = drm_modeset_lock_all_ctx(state->dev,
+ 					 state->acquire_ctx);
+ 	if (ret)
+ 		goto retry;
+diff --git a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_helper.c
+index e5aec45..6691755 100644
+--- a/drivers/gpu/drm/drm_atomic_helper.c
++++ b/drivers/gpu/drm/drm_atomic_helper.c
+@@ -1817,6 +1817,162 @@ commit:
+ 	return 0;
+ }
+ 
++/*
++ * drm_atomic_helper_disable_all - disable all currently active outputs
++ * @dev: DRM device
++ * @ctx: lock acquisition context
++ *
++ * Loops through all connectors, finding those that aren't turned off and then
++ * turns them off by setting their DPMS mode to OFF and deactivating the CRTC
++ * that they are connected to.
++ *
++ * This is used for example in suspend/resume to disable all currently active
++ * functions when suspending.
++ *
++ * Note that if callers haven't already acquired all modeset locks this might
++ * return -EDEADLK, which must be handled by calling drm_modeset_backoff().
++ *
++ * Returns:
++ * 0 on success or a negative error code on failure.
++ *
++ * See also:
++ * drm_atomic_helper_suspend(), drm_atomic_helper_resume()
++ */
++int drm_atomic_helper_disable_all(struct drm_device *dev,
++                                  struct drm_modeset_acquire_ctx *ctx)
++{
++         struct drm_atomic_state *state;
++         struct drm_connector *conn;
++         int err;
++ 
++         state = drm_atomic_state_alloc(dev);
++         if (!state)
++                 return -ENOMEM;
++ 
++         state->acquire_ctx = ctx;
++ 
++         drm_for_each_connector(conn, dev) {
++                 struct drm_crtc *crtc = conn->state->crtc;
++                 struct drm_crtc_state *crtc_state;
++ 
++                 if (!crtc || conn->dpms != DRM_MODE_DPMS_ON)
++                         continue;
++ 
++                 crtc_state = drm_atomic_get_crtc_state(state, crtc);
++                 if (IS_ERR(crtc_state)) {
++                         err = PTR_ERR(crtc_state);
++                         goto free;
++                 }
++ 
++                 crtc_state->active = false;
++         }
++ 
++         err = drm_atomic_commit(state);
++
++free:
++         if (err < 0)
++                 drm_atomic_state_free(state);
++ 
++         return err;
++}
++EXPORT_SYMBOL(drm_atomic_helper_disable_all);
++
++
++/**
++ * drm_atomic_helper_suspend - subsystem-level suspend helper
++ * @dev: DRM device
++ *
++ * Duplicates the current atomic state, disables all active outputs and then
++ * returns a pointer to the original atomic state to the caller. Drivers can
++ * pass this pointer to the drm_atomic_helper_resume() helper upon resume to
++ * restore the output configuration that was active at the time the system
++ * entered suspend.
++ *
++ * Note that it is potentially unsafe to use this. The atomic state object
++ * returned by this function is assumed to be persistent. Drivers must ensure
++ * that this holds true. Before calling this function, drivers must make sure
++ * to suspend fbdev emulation so that nothing can be using the device.
++ *
++ * Returns:
++ * A pointer to a copy of the state before suspend on success or an ERR_PTR()-
++ * encoded error code on failure. Drivers should store the returned atomic
++ * state object and pass it to the drm_atomic_helper_resume() helper upon
++ * resume.
++ *
++ * See also:
++ * drm_atomic_helper_duplicate_state(), drm_atomic_helper_disable_all(),
++ * drm_atomic_helper_resume()
++ */
++struct drm_atomic_state *drm_atomic_helper_suspend(struct drm_device *dev)
++{
++         struct drm_modeset_acquire_ctx ctx;
++         struct drm_atomic_state *state;
++         int err;
++ 
++         drm_modeset_acquire_init(&ctx, 0);
++ 
++retry:
++         err = drm_modeset_lock_all_ctx(dev, &ctx);
++         if (err < 0) {
++                 state = ERR_PTR(err);
++                 goto unlock;
++         }
++ 
++         state = drm_atomic_helper_duplicate_state(dev, &ctx);
++         if (IS_ERR(state))
++                 goto unlock;
++ 
++         err = drm_atomic_helper_disable_all(dev, &ctx);
++         if (err < 0) {
++                 drm_atomic_state_free(state);
++                 state = ERR_PTR(err);
++                 goto unlock;
++         }
++ 
++unlock:
++         if (PTR_ERR(state) == -EDEADLK) {
++                 drm_modeset_backoff(&ctx);
++                 goto retry;
++         }
++ 
++         drm_modeset_drop_locks(&ctx);
++         drm_modeset_acquire_fini(&ctx);
++         return state;
++}
++EXPORT_SYMBOL(drm_atomic_helper_suspend);
++
++/**
++ * drm_atomic_helper_resume - subsystem-level resume helper
++ * @dev: DRM device
++ * @state: atomic state to resume to
++ *
++ * Calls drm_mode_config_reset() to synchronize hardware and software states,
++ * grabs all modeset locks and commits the atomic state object. This can be
++ * used in conjunction with the drm_atomic_helper_suspend() helper to
++ * implement suspend/resume for drivers that support atomic mode-setting.
++ *
++ * Returns:
++ * 0 on success or a negative error code on failure.
++ *
++ * See also:
++ * drm_atomic_helper_suspend()
++ */
++int drm_atomic_helper_resume(struct drm_device *dev,
++                             struct drm_atomic_state *state)
++{
++         struct drm_mode_config *config = &dev->mode_config;
++         int err;
++ 
++         drm_mode_config_reset(dev);
++         drm_modeset_lock_all(dev);
++         state->acquire_ctx = config->acquire_ctx;
++         err = drm_atomic_commit(state);
++         drm_modeset_unlock_all(dev);
++ 
++         return err;
++}
++EXPORT_SYMBOL(drm_atomic_helper_resume);
++
+ /**
+  * drm_atomic_helper_crtc_set_property - helper for crtc properties
+  * @crtc: DRM crtc
+diff --git a/drivers/gpu/drm/drm_modeset_lock.c b/drivers/gpu/drm/drm_modeset_lock.c
+index 6675b14..8c09b92 100644
+--- a/drivers/gpu/drm/drm_modeset_lock.c
++++ b/drivers/gpu/drm/drm_modeset_lock.c
+@@ -81,7 +81,7 @@ retry:
+ 	ret = drm_modeset_lock(&config->connection_mutex, ctx);
+ 	if (ret)
+ 		goto fail;
+-	ret = drm_modeset_lock_all_crtcs(dev, ctx);
++	ret = drm_modeset_lock_all_ctx(dev, ctx);
+ 	if (ret)
+ 		goto fail;
+ 
+@@ -433,13 +433,17 @@ EXPORT_SYMBOL(drm_modeset_unlock);
+ 
+ /* In some legacy codepaths it's convenient to just grab all the crtc and plane
+  * related locks. */
+-int drm_modeset_lock_all_crtcs(struct drm_device *dev,
++int drm_modeset_lock_all_ctx(struct drm_device *dev,
+ 		struct drm_modeset_acquire_ctx *ctx)
+ {
+ 	struct drm_crtc *crtc;
+ 	struct drm_plane *plane;
+ 	int ret = 0;
+ 
++	ret = drm_modeset_lock(&dev->mode_config.connection_mutex, ctx);
++	if (ret)
++		return ret;
++
+ 	drm_for_each_crtc(crtc, dev) {
+ 		ret = drm_modeset_lock(&crtc->mutex, ctx);
+ 		if (ret)
+@@ -454,4 +458,4 @@ int drm_modeset_lock_all_crtcs(struct drm_device *dev,
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL(drm_modeset_lock_all_crtcs);
++EXPORT_SYMBOL(drm_modeset_lock_all_ctx);
+diff --git a/include/drm/drm_atomic_helper.h b/include/drm/drm_atomic_helper.h
+index 8cba54a..d70b295 100644
+--- a/include/drm/drm_atomic_helper.h
++++ b/include/drm/drm_atomic_helper.h
+@@ -80,7 +80,11 @@ int __drm_atomic_helper_disable_plane(struct drm_plane *plane,
+ int drm_atomic_helper_set_config(struct drm_mode_set *set);
+ int __drm_atomic_helper_set_config(struct drm_mode_set *set,
+ 		struct drm_atomic_state *state);
+-
++int drm_atomic_helper_disable_all(struct drm_device *dev,
++                                  struct drm_modeset_acquire_ctx *ctx);
++struct drm_atomic_state *drm_atomic_helper_suspend(struct drm_device *dev);
++int drm_atomic_helper_resume(struct drm_device *dev,
++                             struct drm_atomic_state *state);
+ int drm_atomic_helper_crtc_set_property(struct drm_crtc *crtc,
+ 					struct drm_property *property,
+ 					uint64_t val);
+diff --git a/include/drm/drm_modeset_lock.h b/include/drm/drm_modeset_lock.h
+index 94938d8..1e70a67 100644
+--- a/include/drm/drm_modeset_lock.h
++++ b/include/drm/drm_modeset_lock.h
+@@ -138,7 +138,7 @@ void drm_warn_on_modeset_not_all_locked(struct drm_device *dev);
+ struct drm_modeset_acquire_ctx *
+ drm_modeset_legacy_acquire_ctx(struct drm_crtc *crtc);
+ 
+-int drm_modeset_lock_all_crtcs(struct drm_device *dev,
++int drm_modeset_lock_all_ctx(struct drm_device *dev,
+ 		struct drm_modeset_acquire_ctx *ctx);
+ 
+ #endif /* DRM_MODESET_LOCK_H_ */
+-- 
+2.7.4
+

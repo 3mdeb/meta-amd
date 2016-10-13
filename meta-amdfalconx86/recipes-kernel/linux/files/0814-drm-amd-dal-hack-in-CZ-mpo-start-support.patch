@@ -1,0 +1,2506 @@
+From 0c751063ee32626b7bc5f3b7ab45914cb046dacc Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Wed, 10 Feb 2016 17:03:10 -0500
+Subject: [PATCH 0814/1110] drm/amd/dal: hack in CZ mpo start support
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |  21 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      | 142 ++++-----
+ drivers/gpu/drm/amd/dal/dc/core/dc_target.c        | 128 +++++----
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 156 +++++-----
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c   |  10 +-
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.h   |   4 +-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    |  88 ++++--
+ .../gpu/drm/amd/dal/dc/dce110/dce110_transform.c   |   2 -
+ .../drm/amd/dal/dc/dce110/dce110_transform_scl.c   | 230 ++++-----------
+ .../gpu/drm/amd/dal/dc/dce110/dce110_transform_v.c | 316 ++++++++-------------
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c  |  16 +-
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform.c |   2 -
+ .../gpu/drm/amd/dal/dc/dce80/dce80_transform_scl.c | 132 +--------
+ drivers/gpu/drm/amd/dal/dc/inc/core_status.h       |   1 +
+ drivers/gpu/drm/amd/dal/dc/inc/core_types.h        |   8 +-
+ drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h      |   9 +-
+ drivers/gpu/drm/amd/dal/dc/inc/resource.h          |   3 +
+ drivers/gpu/drm/amd/dal/dc/inc/transform.h         |   5 -
+ drivers/gpu/drm/amd/dal/include/scaler_types.h     | 149 +---------
+ 19 files changed, 521 insertions(+), 901 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index bcc6f68..1d1cd89 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -175,13 +175,14 @@ static void init_hw(struct dc *dc)
+ 	for (i = 0; i < dc->res_pool.pipe_count; i++) {
+ 		xfm = dc->res_pool.transforms[i];
+ 
+-		dc->hwss.enable_display_power_gating(
+-				dc->ctx, i, bp,
+-				PIPE_GATING_CONTROL_INIT);
+-		dc->hwss.enable_display_power_gating(
+-				dc->ctx, i, bp,
+-				PIPE_GATING_CONTROL_DISABLE);
+-
++		if (i != DCE110_UNDERLAY_IDX) {
++			dc->hwss.enable_display_power_gating(
++					dc->ctx, i, bp,
++					PIPE_GATING_CONTROL_INIT);
++			dc->hwss.enable_display_power_gating(
++					dc->ctx, i, bp,
++					PIPE_GATING_CONTROL_DISABLE);
++		}
+ 		xfm->funcs->transform_power_up(xfm);
+ 		dc->hwss.enable_display_pipe_clock_gating(
+ 			dc->ctx,
+@@ -392,6 +393,7 @@ ctx_fail:
+ 
+ static void destruct(struct dc *dc)
+ {
++	destruct_val_ctx(&dc->current_context);
+ 	destroy_links(dc);
+ 	dc->res_pool.funcs->destruct(&dc->res_pool);
+ 	dal_logger_destroy(&dc->ctx->logger);
+@@ -452,6 +454,7 @@ bool dc_validate_resources(
+ 	result = dc->res_pool.funcs->validate_with_context(
+ 						dc, set, set_count, context);
+ 
++	destruct_val_ctx(context);
+ 	dm_free(dc->ctx, context);
+ context_alloc_fail:
+ 
+@@ -678,10 +681,8 @@ void dc_flip_surface_addrs(
+ 		 */
+ 		surface->public.address = flip_addrs[i].address;
+ 		surface->public.flip_immediate = flip_addrs[i].flip_immediate;
+-
+-		dc->hwss.update_plane_addrs(
+-				dc, &dc->current_context.res_ctx, surface);
+ 	}
++	dc->hwss.update_plane_addrs(dc, &dc->current_context.res_ctx);
+ }
+ 
+ enum dc_irq_source dc_interrupt_to_irq_source(
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index 18cddfd..e7a4b3e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -243,17 +243,17 @@ static void calculate_viewport(
+ 	/* offset = src.ofs + (clip.ofs - dst.ofs) * scl_ratio
+ 	 * num_pixels = clip.num_pix * scl_ratio
+ 	 */
+-	pipe_ctx->viewport.x = src.x + (clip.x - dst.x) * src.width / dst.width;
+-	pipe_ctx->viewport.width = clip.width * src.width / dst.width;
++	pipe_ctx->scl_data.viewport.x = src.x + (clip.x - dst.x) * src.width / dst.width;
++	pipe_ctx->scl_data.viewport.width = clip.width * src.width / dst.width;
+ 
+-	pipe_ctx->viewport.y = src.y + (clip.y - dst.y) * src.height / dst.height;
+-	pipe_ctx->viewport.height = clip.height * src.height / dst.height;
++	pipe_ctx->scl_data.viewport.y = src.y + (clip.y - dst.y) * src.height / dst.height;
++	pipe_ctx->scl_data.viewport.height = clip.height * src.height / dst.height;
+ 
+ 	/* Minimum viewport such that 420/422 chroma vp is non 0 */
+-	if (pipe_ctx->viewport.width < 2)
+-		pipe_ctx->viewport.width = 2;
+-	if (pipe_ctx->viewport.height < 2)
+-		pipe_ctx->viewport.height = 2;
++	if (pipe_ctx->scl_data.viewport.width < 2)
++		pipe_ctx->scl_data.viewport.width = 2;
++	if (pipe_ctx->scl_data.viewport.height < 2)
++		pipe_ctx->scl_data.viewport.height = 2;
+ }
+ 
+ static void calculate_overscan(
+@@ -262,40 +262,40 @@ static void calculate_overscan(
+ {
+ 	struct core_stream *stream = pipe_ctx->stream;
+ 
+-	pipe_ctx->overscan.left = stream->public.dst.x;
++	pipe_ctx->scl_data.overscan.left = stream->public.dst.x;
+ 	if (stream->public.src.x < surface->clip_rect.x)
+-		pipe_ctx->overscan.left += (surface->clip_rect.x
++		pipe_ctx->scl_data.overscan.left += (surface->clip_rect.x
+ 			- stream->public.src.x) * stream->public.dst.width
+ 			/ stream->public.src.width;
+ 
+-	pipe_ctx->overscan.right = stream->public.timing.h_addressable
++	pipe_ctx->scl_data.overscan.right = stream->public.timing.h_addressable
+ 		- stream->public.dst.x - stream->public.dst.width;
+ 	if (stream->public.src.x + stream->public.src.width
+ 		> surface->clip_rect.x + surface->clip_rect.width)
+-		pipe_ctx->overscan.right = stream->public.timing.h_addressable -
++		pipe_ctx->scl_data.overscan.right = stream->public.timing.h_addressable -
+ 			dal_fixed31_32_floor(dal_fixed31_32_div(
+ 				dal_fixed31_32_from_int(
+-						pipe_ctx->viewport.width),
+-						pipe_ctx->ratios.horz)) -
+-						pipe_ctx->overscan.left;
++						pipe_ctx->scl_data.viewport.width),
++						pipe_ctx->scl_data.ratios.horz)) -
++						pipe_ctx->scl_data.overscan.left;
+ 
+ 
+-	pipe_ctx->overscan.top = stream->public.dst.y;
++	pipe_ctx->scl_data.overscan.top = stream->public.dst.y;
+ 	if (stream->public.src.y < surface->clip_rect.y)
+-		pipe_ctx->overscan.top += (surface->clip_rect.y
++		pipe_ctx->scl_data.overscan.top += (surface->clip_rect.y
+ 			- stream->public.src.y) * stream->public.dst.height
+ 			/ stream->public.src.height;
+ 
+-	pipe_ctx->overscan.bottom = stream->public.timing.v_addressable
++	pipe_ctx->scl_data.overscan.bottom = stream->public.timing.v_addressable
+ 		- stream->public.dst.y - stream->public.dst.height;
+ 	if (stream->public.src.y + stream->public.src.height
+ 		> surface->clip_rect.y + surface->clip_rect.height)
+-		pipe_ctx->overscan.bottom = stream->public.timing.v_addressable -
++		pipe_ctx->scl_data.overscan.bottom = stream->public.timing.v_addressable -
+ 			dal_fixed31_32_floor(dal_fixed31_32_div(
+ 				dal_fixed31_32_from_int(
+-						pipe_ctx->viewport.height),
+-						pipe_ctx->ratios.vert)) -
+-						pipe_ctx->overscan.top;
++						pipe_ctx->scl_data.viewport.height),
++						pipe_ctx->scl_data.ratios.vert)) -
++						pipe_ctx->scl_data.overscan.top;
+ 
+ 
+ 	/* TODO: Add timing overscan to finalize overscan calculation*/
+@@ -311,32 +311,32 @@ static void calculate_scaling_ratios(
+ 	const uint32_t out_w = stream->public.dst.width;
+ 	const uint32_t out_h = stream->public.dst.height;
+ 
+-	pipe_ctx->ratios.horz = dal_fixed31_32_from_fraction(
++	pipe_ctx->scl_data.ratios.horz = dal_fixed31_32_from_fraction(
+ 					surface->src_rect.width,
+ 					surface->dst_rect.width);
+-	pipe_ctx->ratios.vert = dal_fixed31_32_from_fraction(
++	pipe_ctx->scl_data.ratios.vert = dal_fixed31_32_from_fraction(
+ 					surface->src_rect.height,
+ 					surface->dst_rect.height);
+ 
+ 	if (surface->stereo_format == PLANE_STEREO_FORMAT_SIDE_BY_SIDE)
+-		pipe_ctx->ratios.horz.value *= 2;
++		pipe_ctx->scl_data.ratios.horz.value *= 2;
+ 	else if (surface->stereo_format
+ 					== PLANE_STEREO_FORMAT_TOP_AND_BOTTOM)
+-		pipe_ctx->ratios.vert.value *= 2;
++		pipe_ctx->scl_data.ratios.vert.value *= 2;
+ 
+-	pipe_ctx->ratios.vert.value = div64_s64(pipe_ctx->ratios.vert.value * in_h,
++	pipe_ctx->scl_data.ratios.vert.value = div64_s64(pipe_ctx->scl_data.ratios.vert.value * in_h,
+ 			out_h);
+-	pipe_ctx->ratios.horz.value = div64_s64(pipe_ctx->ratios.horz.value * in_w,
++	pipe_ctx->scl_data.ratios.horz.value = div64_s64(pipe_ctx->scl_data.ratios.horz.value * in_w,
+ 			out_w);
+ 
+-	pipe_ctx->ratios.horz_c = pipe_ctx->ratios.horz;
+-	pipe_ctx->ratios.vert_c = pipe_ctx->ratios.vert;
++	pipe_ctx->scl_data.ratios.horz_c = pipe_ctx->scl_data.ratios.horz;
++	pipe_ctx->scl_data.ratios.vert_c = pipe_ctx->scl_data.ratios.vert;
+ 
+-	if (pipe_ctx->format == PIXEL_FORMAT_420BPP12) {
+-		pipe_ctx->ratios.horz_c.value /= 2;
+-		pipe_ctx->ratios.vert_c.value /= 2;
+-	} else if (pipe_ctx->format == PIXEL_FORMAT_422BPP16) {
+-		pipe_ctx->ratios.horz_c.value /= 2;
++	if (pipe_ctx->scl_data.format == PIXEL_FORMAT_420BPP12) {
++		pipe_ctx->scl_data.ratios.horz_c.value /= 2;
++		pipe_ctx->scl_data.ratios.vert_c.value /= 2;
++	} else if (pipe_ctx->scl_data.format == PIXEL_FORMAT_422BPP16) {
++		pipe_ctx->scl_data.ratios.horz_c.value /= 2;
+ 	}
+ }
+ 
+@@ -348,7 +348,7 @@ void build_scaling_params(
+ 	 * overscan calculation requires scaling ratios and viewport
+ 	 * and lb depth/taps calculation requires overscan. Call sequence
+ 	 * is therefore important */
+-	pipe_ctx->format = convert_pixel_format_to_dalsurface(surface->format);
++	pipe_ctx->scl_data.format = convert_pixel_format_to_dalsurface(surface->format);
+ 
+ 	calculate_viewport(surface, pipe_ctx);
+ 
+@@ -357,25 +357,25 @@ void build_scaling_params(
+ 	calculate_overscan(surface, pipe_ctx);
+ 
+ 	/* Check if scaling is required update taps if not */
+-	if (dal_fixed31_32_u2d19(pipe_ctx->ratios.horz) == 1 << 19)
+-		pipe_ctx->taps.h_taps = 1;
++	if (dal_fixed31_32_u2d19(pipe_ctx->scl_data.ratios.horz) == 1 << 19)
++		pipe_ctx->scl_data.taps.h_taps = 1;
+ 	else
+-		pipe_ctx->taps.h_taps = surface->scaling_quality.h_taps;
++		pipe_ctx->scl_data.taps.h_taps = surface->scaling_quality.h_taps;
+ 
+-	if (dal_fixed31_32_u2d19(pipe_ctx->ratios.horz_c) == 1 << 19)
+-		pipe_ctx->taps.h_taps_c = 1;
++	if (dal_fixed31_32_u2d19(pipe_ctx->scl_data.ratios.horz_c) == 1 << 19)
++		pipe_ctx->scl_data.taps.h_taps_c = 1;
+ 	else
+-		pipe_ctx->taps.h_taps_c = surface->scaling_quality.h_taps_c;
++		pipe_ctx->scl_data.taps.h_taps_c = surface->scaling_quality.h_taps_c;
+ 
+-	if (dal_fixed31_32_u2d19(pipe_ctx->ratios.vert) == 1 << 19)
+-		pipe_ctx->taps.v_taps = 1;
++	if (dal_fixed31_32_u2d19(pipe_ctx->scl_data.ratios.vert) == 1 << 19)
++		pipe_ctx->scl_data.taps.v_taps = 1;
+ 	else
+-		pipe_ctx->taps.v_taps = surface->scaling_quality.v_taps;
++		pipe_ctx->scl_data.taps.v_taps = surface->scaling_quality.v_taps;
+ 
+-	if (dal_fixed31_32_u2d19(pipe_ctx->ratios.vert_c) == 1 << 19)
+-		pipe_ctx->taps.v_taps_c = 1;
++	if (dal_fixed31_32_u2d19(pipe_ctx->scl_data.ratios.vert_c) == 1 << 19)
++		pipe_ctx->scl_data.taps.v_taps_c = 1;
+ 	else
+-		pipe_ctx->taps.v_taps_c = surface->scaling_quality.v_taps_c;
++		pipe_ctx->scl_data.taps.v_taps_c = surface->scaling_quality.v_taps_c;
+ 
+ 	dal_logger_write(pipe_ctx->stream->ctx->logger,
+ 				LOG_MAJOR_DCP,
+@@ -385,14 +385,14 @@ void build_scaling_params(
+ 				"y:%d\n dst_rect:\nheight:%d width:%d x:%d "
+ 				"y:%d\n",
+ 				__func__,
+-				pipe_ctx->overscan.bottom,
+-				pipe_ctx->overscan.left,
+-				pipe_ctx->overscan.right,
+-				pipe_ctx->overscan.top,
+-				pipe_ctx->viewport.height,
+-				pipe_ctx->viewport.width,
+-				pipe_ctx->viewport.x,
+-				pipe_ctx->viewport.y,
++				pipe_ctx->scl_data.overscan.bottom,
++				pipe_ctx->scl_data.overscan.left,
++				pipe_ctx->scl_data.overscan.right,
++				pipe_ctx->scl_data.overscan.top,
++				pipe_ctx->scl_data.viewport.height,
++				pipe_ctx->scl_data.viewport.width,
++				pipe_ctx->scl_data.viewport.x,
++				pipe_ctx->scl_data.viewport.y,
+ 				surface->dst_rect.height,
+ 				surface->dst_rect.width,
+ 				surface->dst_rect.x,
+@@ -439,13 +439,15 @@ bool attach_surfaces_to_context(
+ 		return false;
+ 	}
+ 
++
++	for (i = 0; i < surface_count; i++)
++		dc_surface_retain(surfaces[i]);
++	/* Release after retain to account for surfaces remaining the same */
+ 	for (i = 0; i < target_status->surface_count; i++)
+ 		dc_surface_release(target_status->surfaces[i]);
+-
+-	for (i = 0; i < surface_count; i++) {
++	for (i = 0; i < surface_count; i++)
+ 		target_status->surfaces[i] = surfaces[i];
+-		dc_surface_retain(target_status->surfaces[i]);
+-	}
++
+ 	target_status->surface_count = surface_count;
+ 
+ 	for (i = 0; i < dc_target->stream_count; i++) {
+@@ -503,7 +505,7 @@ static void fill_display_configs(
+ 	const struct validate_context *context,
+ 	struct dc_pp_display_configuration *pp_display_cfg)
+ {
+-	uint8_t i, j;
++	uint8_t i, j, k;
+ 	uint8_t num_cfgs = 0;
+ 
+ 	for (i = 0; i < context->target_count; i++) {
+@@ -516,10 +518,10 @@ static void fill_display_configs(
+ 					&pp_display_cfg->disp_configs[num_cfgs];
+ 			const struct pipe_ctx *pipe_ctx = NULL;
+ 
+-			for (j = 0; j < MAX_PIPES; j++)
++			for (k = 0; k < MAX_PIPES; k++)
+ 				if (stream ==
+-					context->res_ctx.pipe_ctx[j].stream) {
+-					pipe_ctx = &context->res_ctx.pipe_ctx[j];
++					context->res_ctx.pipe_ctx[k].stream) {
++					pipe_ctx = &context->res_ctx.pipe_ctx[k];
+ 					break;
+ 				}
+ 
+@@ -1272,6 +1274,18 @@ static void set_vendor_info_packet(struct core_stream *stream,
+ 	info_packet->valid = true;
+ }
+ 
++void destruct_val_ctx(struct validate_context *context)
++{
++	int i, j;
++
++	for (i = 0; i < context->target_count; i++) {
++		for (j = 0; j < context->target_status[i].surface_count; j++)
++			dc_surface_release(
++				context->target_status[i].surfaces[j]);
++		context->target_status[i].surface_count = 0;
++	}
++}
++
+ void build_info_frame(struct pipe_ctx *pipe_ctx)
+ {
+ 	enum signal_type signal = SIGNAL_TYPE_NONE;
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+index 6b778d8..dc9f157 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+@@ -65,19 +65,7 @@ static void construct(
+ 
+ static void destruct(struct core_target *core_target)
+ {
+-	int i, j;
+-	struct validate_context *context =
+-				&core_target->ctx->dc->current_context;
+-
+-	for (i = 0; i < context->target_count; i++) {
+-		if (context->targets[i] != core_target)
+-			continue;
+-		for (j = 0; j < context->target_status[i].surface_count; j++)
+-			dc_surface_release(
+-				context->target_status[i].surfaces[j]);
+-		context->target_status[i].surface_count = 0;
+-		break;
+-	}
++	int i;
+ 
+ 	for (i = 0; i < core_target->public.stream_count; i++) {
+ 		dc_stream_release(
+@@ -148,30 +136,45 @@ target_alloc_fail:
+ 	return NULL;
+ }
+ 
+-static bool validate_surface_address(
+-		struct dc_plane_address address)
++static int8_t acquire_first_free_underlay(
++		struct resource_context *res_ctx,
++		struct core_stream *stream)
+ {
+-	bool is_valid_address = false;
+-
+-	switch (address.type) {
+-	case PLN_ADDR_TYPE_GRAPHICS:
+-		if (address.grph.addr.quad_part != 0)
+-			is_valid_address = true;
+-		break;
+-	case PLN_ADDR_TYPE_GRPH_STEREO:
+-		if ((address.grph_stereo.left_addr.quad_part != 0) &&
+-			(address.grph_stereo.right_addr.quad_part != 0)) {
+-			is_valid_address = true;
++	BREAK_TO_DEBUGGER();
++	if (!res_ctx->pipe_ctx[3].stream) {
++		struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[DCE110_UNDERLAY_IDX];
++
++		pipe_ctx->tg = res_ctx->pool.timing_generators[DCE110_UNDERLAY_IDX];
++		pipe_ctx->mi = res_ctx->pool.mis[DCE110_UNDERLAY_IDX];
++		/*pipe_ctx->ipp = res_ctx->pool.ipps[DCE110_UNDERLAY_IDX];*/
++		pipe_ctx->xfm = res_ctx->pool.transforms[DCE110_UNDERLAY_IDX];
++		pipe_ctx->opp = res_ctx->pool.opps[DCE110_UNDERLAY_IDX];
++		pipe_ctx->dis_clk = res_ctx->pool.display_clock;
++		pipe_ctx->pipe_idx = DCE110_UNDERLAY_IDX;
++
++		if (!pipe_ctx->tg->funcs->set_blank(pipe_ctx->tg, true)) {
++			dm_error("DC: failed to blank crtc!\n");
++			BREAK_TO_DEBUGGER();
++		} else
++			pipe_ctx->flags.blanked = true;
++
++		pipe_ctx->tg->funcs->program_timing(
++				pipe_ctx->tg,
++				&stream->public.timing,
++				true);
++
++		if (!pipe_ctx->tg->funcs->enable_crtc(pipe_ctx->tg)) {
++			BREAK_TO_DEBUGGER();
+ 		}
+-		break;
+-	case PLN_ADDR_TYPE_VIDEO_PROGRESSIVE:
+-	default:
+-		/* not supported */
+-		BREAK_TO_DEBUGGER();
+-		break;
+-	}
+ 
+-	return is_valid_address;
++		pipe_ctx->tg->funcs->set_blank_color(
++				pipe_ctx->tg,
++				COLOR_SPACE_SRGB_FULL_RANGE);/* TODO unhardcode*/
++
++		pipe_ctx->stream = stream;
++		return DCE110_UNDERLAY_IDX;
++	}
++	return -1;
+ }
+ 
+ bool dc_commit_surfaces_to_target(
+@@ -184,7 +187,7 @@ bool dc_commit_surfaces_to_target(
+ 	int i, j;
+ 	uint32_t prev_disp_clk = dc->current_context.bw_results.dispclk_khz;
+ 	struct core_target *target = DC_TARGET_TO_CORE(dc_target);
+-	struct dc_target_status *status = NULL;
++	struct dc_target_status *target_status = NULL;
+ 	struct validate_context *context;
+ 	int current_enabled_surface_count = 0;
+ 	int new_enabled_surface_count = 0;
+@@ -196,7 +199,7 @@ bool dc_commit_surfaces_to_target(
+ 	for (i = 0; i < context->target_count; i++)
+ 		if (target == context->targets[i])
+ 			break;
+-	status = &context->target_status[i];
++	target_status = &context->target_status[i];
+ 	if (!dal_adapter_service_is_in_accelerated_mode(
+ 						dc->res_pool.adapter_srv)
+ 		|| i == context->target_count) {
+@@ -204,14 +207,23 @@ bool dc_commit_surfaces_to_target(
+ 		goto unexpected_fail;
+ 	}
+ 
+-	for (i = 0; i < status->surface_count; i++)
+-		if (status->surfaces[i]->visible)
++	for (i = 0; i < target_status->surface_count; i++)
++		if (target_status->surfaces[i]->visible)
+ 			current_enabled_surface_count++;
+ 
+ 	for (i = 0; i < new_surface_count; i++)
+ 		if (new_surfaces[i]->visible)
+ 			new_enabled_surface_count++;
+ 
++	/* TODO unhack mpo */
++	if (new_surface_count == 2 && target_status->surface_count < 2)
++		acquire_first_free_underlay(&context->res_ctx,
++				DC_STREAM_TO_CORE(dc_target->streams[0]));
++	else if (new_surface_count < 2 && target_status->surface_count == 2) {
++		context->res_ctx.pipe_ctx[DCE110_UNDERLAY_IDX].stream = NULL;
++		context->res_ctx.pipe_ctx[DCE110_UNDERLAY_IDX].surface = NULL;
++	}
++
+ 	dal_logger_write(dc->ctx->logger,
+ 				LOG_MAJOR_INTERFACE_TRACE,
+ 				LOG_MINOR_COMPONENT_DC,
+@@ -280,24 +292,20 @@ bool dc_commit_surfaces_to_target(
+ 						dc_surface->dst_rect.width,
+ 						dc_surface->dst_rect.height);
+ 
+-		if (surface->public.gamma_correction)
+-			gamma = DC_GAMMA_TO_CORE(
++			if (surface->public.gamma_correction)
++				gamma = DC_GAMMA_TO_CORE(
+ 					surface->public.gamma_correction);
+ 
+-		dc->hwss.set_gamma_correction(
+-				pipe_ctx->ipp,
+-				pipe_ctx->opp,
+-			gamma, surface);
+-
+-			dc->hwss.set_plane_config(dc, surface, pipe_ctx);
++			dc->hwss.set_gamma_correction(
++					pipe_ctx->ipp,
++					pipe_ctx->opp,
++					gamma, surface);
+ 
+-			if (validate_surface_address(dc_surface->address))
+-				dc->hwss.update_plane_addrs(
+-					dc, &context->res_ctx, surface);
++			dc->hwss.set_plane_config(
++				dc, pipe_ctx, &context->res_ctx);
+ 		}
+ 
+-	if (current_enabled_surface_count == 0 && new_enabled_surface_count > 0)
+-		dc_target_enable_memory_requests(dc_target);
++	dc->hwss.update_plane_addrs(dc, &context->res_ctx);
+ 
+ 	/* Lower display clock if necessary */
+ 	if (prev_disp_clk > context->bw_results.dispclk_khz) {
+@@ -311,11 +319,9 @@ bool dc_commit_surfaces_to_target(
+ 	return true;
+ 
+ unexpected_fail:
+-	for (i = 0; i < new_surface_count; i++) {
+-		status->surfaces[i] = NULL;
+-	}
+-	status->surface_count = 0;
+ 
++	destruct_val_ctx(context);
++	dm_free(dc->ctx, context);
+ 	return false;
+ }
+ 
+@@ -350,7 +356,8 @@ void dc_target_enable_memory_requests(struct dc_target *dc_target)
+ 			if (!tg->funcs->set_blank(tg, false)) {
+ 				dm_error("DC: failed to unblank crtc!\n");
+ 				BREAK_TO_DEBUGGER();
+-			}
++			} else
++				res_ctx->pipe_ctx[j].flags.blanked = false;
+ 		}
+ 	}
+ }
+@@ -373,7 +380,8 @@ void dc_target_disable_memory_requests(struct dc_target *dc_target)
+ 			if (!tg->funcs->set_blank(tg, true)) {
+ 				dm_error("DC: failed to blank crtc!\n");
+ 				BREAK_TO_DEBUGGER();
+-			}
++			} else
++				res_ctx->pipe_ctx[j].flags.blanked = true;
+ 		}
+ 	}
+ }
+@@ -408,6 +416,9 @@ bool dc_target_set_cursor_attributes(
+ 			struct input_pixel_processor *ipp =
+ 						res_ctx->pipe_ctx[j].ipp;
+ 
++			if (j == DCE110_UNDERLAY_IDX)
++				continue;
++
+ 			if (res_ctx->pipe_ctx[j].stream !=
+ 				DC_STREAM_TO_CORE(target->public.streams[i]))
+ 				continue;
+@@ -451,6 +462,9 @@ bool dc_target_set_cursor_position(
+ 			struct input_pixel_processor *ipp =
+ 						res_ctx->pipe_ctx[j].ipp;
+ 
++			if (j == DCE110_UNDERLAY_IDX)
++				continue;
++
+ 			if (res_ctx->pipe_ctx[j].stream !=
+ 				DC_STREAM_TO_CORE(target->public.streams[i]))
+ 				continue;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 4e73ad1..d01a116 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -86,7 +86,7 @@ static const struct dce110_hw_seq_reg_offsets reg_offsets[] = {
+ 	.crtc = (mmCRTC2_CRTC_GSL_CONTROL - mmCRTC_GSL_CONTROL),
+ },
+ {
+-	.dcfe = (mmDCFEV_MEM_PWR_CTRL - mmDCFE_MEM_PWR_CTRL),
++	.dcfe = (mmDCFEV_CLOCK_CONTROL - mmDCFE_CLOCK_CONTROL),
+ 	.blnd = (mmBLNDV_CONTROL - mmBLND_CONTROL),
+ 	.crtc = (mmCRTCV_GSL_CONTROL - mmCRTC_GSL_CONTROL),
+ }
+@@ -375,7 +375,10 @@ static void dce110_set_blender_mode(
+ 		break;
+ 	case BLENDER_MODE_CURRENT_PIPE:
+ 	default:
+-		feedthrough = 1;
++		if (controller_id == DCE110_UNDERLAY_IDX)
++			feedthrough = 0;
++		else
++			feedthrough = 1;
+ 		blnd_mode = 0;
+ 		break;
+ 	}
+@@ -453,7 +456,7 @@ static bool dce110_enable_display_power_gating(
+ 	else
+ 		cntl = ASIC_PIPE_DISABLE;
+ 
+-	if (!(power_gating == PIPE_GATING_CONTROL_INIT && controller_id != 0))
++	if (power_gating != PIPE_GATING_CONTROL_INIT || controller_id == 0)
+ 		bp_result = dcb->funcs->enable_disp_power_gating(
+ 						dcb, controller_id + 1, cntl);
+ 
+@@ -523,16 +526,19 @@ static bool set_gamma_ramp(
+ 
+ 	build_prescale_params(prescale_params, surface);
+ 
+-	ipp->funcs->ipp_program_prescale(ipp, prescale_params);
++	if (ipp)
++		ipp->funcs->ipp_program_prescale(ipp, prescale_params);
+ 
+ 	if (ramp) {
+ 		calculate_regamma_params(regamma_params,
+ 				temp_params, ramp, surface);
+ 		opp->funcs->opp_program_regamma_pwl(opp, regamma_params);
+-		ipp->funcs->ipp_set_degamma(ipp, IPP_DEGAMMA_MODE_sRGB);
++		if (ipp)
++			ipp->funcs->ipp_set_degamma(ipp, IPP_DEGAMMA_MODE_sRGB);
+ 		opp->funcs->opp_set_regamma_mode(opp, OPP_REGAMMA_USER);
+ 	} else {
+-		ipp->funcs->ipp_set_degamma(ipp, IPP_DEGAMMA_MODE_BYPASS);
++		if (ipp)
++			ipp->funcs->ipp_set_degamma(ipp, IPP_DEGAMMA_MODE_BYPASS);
+ 		opp->funcs->opp_set_regamma_mode(opp, OPP_REGAMMA_BYPASS);
+ 	}
+ 
+@@ -772,6 +778,8 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 		 * programming, otherwise CRTC will be hung in bad state
+ 		 */
+ 		pipe_ctx->tg->funcs->set_blank(pipe_ctx->tg, true);
++		pipe_ctx->flags.blanked = true;
++
+ 
+ 		/*
+ 		 * only disable stream in case it was ever enabled
+@@ -949,6 +957,8 @@ static void disable_vga_and_power_gate_all_controllers(
+ 		 * powergating. */
+ 		enable_display_pipe_clock_gating(ctx,
+ 				true);
++		if (i == DCE110_UNDERLAY_IDX)
++			continue;
+ 		dc->hwss.enable_display_power_gating(ctx, i, dcb,
+ 				PIPE_GATING_CONTROL_ENABLE);
+ 	}
+@@ -1138,7 +1148,8 @@ static void set_displaymarks(
+ 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
+ 		uint32_t total_dest_line_time_ns;
+ 
+-		if (pipe_ctx->stream == NULL)
++		if (pipe_ctx->stream == NULL
++			|| pipe_ctx->pipe_idx == DCE110_UNDERLAY_IDX)
+ 			continue;
+ 
+ 		total_dest_line_time_ns = compute_pstate_blackout_duration(
+@@ -1304,38 +1315,6 @@ static bool setup_line_buffer_pixel_depth(
+ 	return false;
+ }
+ 
+-static void hw_sequencer_build_scaler_parameter_plane(
+-		const struct pipe_ctx *pipe_ctx,
+-		struct scaler_data *scaler_data)
+-{
+-	/*TODO: per pipe not per stream*/
+-	/*TODO: get from feature from adapterservice*/
+-	scaler_data->flags.bits.SHOW_COLOURED_BORDER = false;
+-
+-	scaler_data->flags.bits.SHOULD_PROGRAM_ALPHA = 1;
+-
+-	scaler_data->flags.bits.SHOULD_PROGRAM_VIEWPORT = 0;
+-
+-	scaler_data->flags.bits.SHOULD_UNLOCK = 0;
+-
+-	scaler_data->flags.bits.INTERLACED = 0;
+-
+-	scaler_data->dal_pixel_format = pipe_ctx->format;
+-
+-	scaler_data->taps = pipe_ctx->taps;
+-
+-	scaler_data->viewport = pipe_ctx->viewport;
+-
+-	scaler_data->overscan = pipe_ctx->overscan;
+-
+-	scaler_data->ratios = &pipe_ctx->ratios;
+-
+-	/*TODO rotation and adjustment */
+-	scaler_data->h_sharpness = 0;
+-	scaler_data->v_sharpness = 0;
+-
+-}
+-
+ static void set_default_colors(struct pipe_ctx *pipe_ctx)
+ {
+ 	struct default_adjustment default_adjust = { 0 };
+@@ -1344,7 +1323,7 @@ static void set_default_colors(struct pipe_ctx *pipe_ctx)
+ 	default_adjust.color_space = get_output_color_space(
+ 					&pipe_ctx->stream->public.timing);
+ 	default_adjust.csc_adjust_type = GRAPHICS_CSC_ADJUST_TYPE_SW;
+-	default_adjust.surface_pixel_format = pipe_ctx->format;
++	default_adjust.surface_pixel_format = pipe_ctx->scl_data.format;
+ 
+ 	/* display color depth */
+ 	default_adjust.color_depth =
+@@ -1360,28 +1339,17 @@ static void set_default_colors(struct pipe_ctx *pipe_ctx)
+ 					pipe_ctx->opp, &default_adjust);
+ }
+ 
+-static void program_scaler(
+-	const struct core_surface *surface,
+-	const struct pipe_ctx *pipe_ctx)
++static void program_scaler(const struct pipe_ctx *pipe_ctx)
+ {
+-	struct scaler_data scaler_data = { { 0 } };
+-
+-	hw_sequencer_build_scaler_parameter_plane(
+-		pipe_ctx,
+-		&scaler_data);
+-
+ 	setup_line_buffer_pixel_depth(
+ 		pipe_ctx,
+ 		LB_PIXEL_DEPTH_24BPP,
+ 		false);
+ 
+ 	pipe_ctx->tg->funcs->set_overscan_blank_color(
+-		pipe_ctx->tg, surface->public.color_space);
+-
+-	pipe_ctx->xfm->funcs->transform_set_scaler(pipe_ctx->xfm, &scaler_data);
++		pipe_ctx->tg, pipe_ctx->surface->public.color_space);
+ 
+-	pipe_ctx->xfm->funcs->transform_update_viewport(
+-			pipe_ctx->xfm, &scaler_data.viewport, false);
++	pipe_ctx->xfm->funcs->transform_set_scaler(pipe_ctx->xfm, &pipe_ctx->scl_data);
+ }
+ 
+ /**
+@@ -1390,14 +1358,17 @@ static void program_scaler(
+  */
+ static void set_plane_config(
+ 	const struct dc *dc,
+-	struct core_surface *surface,
+-	struct pipe_ctx *pipe_ctx)
++	struct pipe_ctx *pipe_ctx,
++	struct resource_context *res_ctx)
+ {
++	int i;
+ 	const struct dc_crtc_timing *crtc_timing =
+ 				&pipe_ctx->stream->public.timing;
+ 	struct mem_input *mi = pipe_ctx->mi;
+ 	struct timing_generator *tg = pipe_ctx->tg;
+ 	struct dc_context *ctx = pipe_ctx->stream->ctx;
++	struct core_surface *surface = pipe_ctx->surface;
++	enum blender_mode blender_mode = BLENDER_MODE_CURRENT_PIPE;
+ 
+ 	dc->hwss.pipe_control_lock(
+ 		ctx, pipe_ctx->pipe_idx, PIPE_LOCK_CONTROL_MODE, false);
+@@ -1419,11 +1390,19 @@ static void set_plane_config(
+ 
+ 	set_default_colors(pipe_ctx);
+ 
+-	/* program Scaler */
+-	program_scaler(surface, pipe_ctx);
++	program_scaler(pipe_ctx);
++
++	for (i = pipe_ctx->pipe_idx + 1; i < MAX_PIPES; i++)
++		if (res_ctx->pipe_ctx[i].stream == pipe_ctx->stream) {
++			if (surface->public.visible)
++				blender_mode = BLENDER_MODE_BLENDING;
++			else
++				blender_mode = BLENDER_MODE_OTHER_PIPE;
++			break;
++		}
+ 
+ 	dc->hwss.set_blender_mode(
+-		ctx, pipe_ctx->pipe_idx, BLENDER_MODE_CURRENT_PIPE);
++		ctx, pipe_ctx->pipe_idx, blender_mode);
+ 
+ 	mi->funcs->mem_input_program_surface_config(
+ 			mi,
+@@ -1431,28 +1410,20 @@ static void set_plane_config(
+ 			&surface->public.tiling_info,
+ 			&surface->public.plane_size,
+ 			surface->public.rotation);
+-
+-	dc->hwss.pipe_control_lock(
+-			ctx,
+-			pipe_ctx->pipe_idx,
+-			PIPE_LOCK_CONTROL_GRAPHICS |
+-			PIPE_LOCK_CONTROL_SCL |
+-			PIPE_LOCK_CONTROL_BLENDER |
+-			PIPE_LOCK_CONTROL_SURFACE,
+-			false);
+ }
+ 
+-static void update_plane_addrs(
+-	struct dc *dc,
+-	struct resource_context *res_ctx,
+-	const struct core_surface *surface)
++static void update_plane_addrs(struct dc *dc, struct resource_context *res_ctx)
+ {
+-	uint8_t j;
++	int j;
+ 
+-	for (j = 0; j < MAX_PIPES; j++) {
++	/* Go through pipes in reverse order to avoid underflow on unlock */
++	for (j = MAX_PIPES - 1; j >= 0; j--) {
+ 		struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[j];
++		struct core_surface *surface = pipe_ctx->surface;
+ 
+-		if (pipe_ctx->surface != surface)
++		if (surface == NULL ||
++			surface->status.requested_address.grph.addr.quad_part
++			== surface->public.address.grph.addr.quad_part)
+ 			continue;
+ 
+ 		dc->hwss.pipe_control_lock(
+@@ -1466,13 +1437,24 @@ static void update_plane_addrs(
+ 			&surface->public.address,
+ 			surface->public.flip_immediate);
+ 
+-		dc->hwss.pipe_control_lock(
+-			dc->ctx,
+-			j,
+-			PIPE_LOCK_CONTROL_SURFACE,
+-			false);
++		surface->status.requested_address = surface->public.address;
+ 
+-		break;
++		dc->hwss.pipe_control_lock(
++					dc->ctx,
++					pipe_ctx->pipe_idx,
++					PIPE_LOCK_CONTROL_GRAPHICS |
++					PIPE_LOCK_CONTROL_SCL |
++					PIPE_LOCK_CONTROL_BLENDER |
++					PIPE_LOCK_CONTROL_SURFACE,
++					false);
++
++		if (pipe_ctx->flags.blanked) {
++			if (!pipe_ctx->tg->funcs->set_blank(pipe_ctx->tg, false)) {
++				dm_error("DC: failed to unblank crtc!\n");
++				BREAK_TO_DEBUGGER();
++			} else
++				pipe_ctx->flags.blanked = false;
++		}
+ 	}
+ }
+ 
+@@ -1483,6 +1465,9 @@ static void reset_single_pipe_hw_ctx(
+ {
+ 	struct dc_bios *dcb;
+ 
++	if (pipe_ctx->pipe_idx == DCE110_UNDERLAY_IDX)
++		return;
++
+ 	dcb = dal_adapter_service_get_bios_parser(
+ 			context->res_ctx.pool.adapter_srv);
+ 	if (pipe_ctx->audio) {
+@@ -1493,8 +1478,13 @@ static void reset_single_pipe_hw_ctx(
+ 	}
+ 
+ 	core_link_disable_stream(pipe_ctx);
+-
+-	pipe_ctx->tg->funcs->set_blank(pipe_ctx->tg, true);
++	if (!pipe_ctx->flags.blanked) {
++		if (!pipe_ctx->tg->funcs->set_blank(pipe_ctx->tg, true)) {
++			dm_error("DC: failed to blank crtc!\n");
++			BREAK_TO_DEBUGGER();
++		} else
++			pipe_ctx->flags.blanked = true;
++	}
+ 	pipe_ctx->tg->funcs->disable_crtc(pipe_ctx->tg);
+ 	pipe_ctx->mi->funcs->free_mem_input(
+ 				pipe_ctx->mi, context->target_count);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c
+index 4b9042f..8babd01 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c
+@@ -57,22 +57,16 @@ struct opp_funcs funcs = {
+ 
+ 		.opp_set_regamma_mode = dce110_opp_set_regamma_mode,
+ 
+-		.opp_destroy = dce110_opp_destroy,
++		.opp_destroy = dce110_opp_destroy
+ };
+ 
+ bool dce110_opp_v_construct(struct dce110_opp *opp110,
+-	struct dc_context *ctx,
+-	uint32_t inst,
+-	const struct dce110_opp_reg_offsets *offsets)
++	struct dc_context *ctx)
+ {
+ 	opp110->base.funcs = &funcs;
+ 
+ 	opp110->base.ctx = ctx;
+ 
+-	opp110->base.inst = inst;
+-
+-	opp110->offsets = *offsets;
+-
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.h
+index 9543a70..1936ba4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.h
+@@ -34,9 +34,7 @@
+ struct gamma_parameters;
+ 
+ bool dce110_opp_v_construct(struct dce110_opp *opp110,
+-	struct dc_context *ctx,
+-	uint32_t inst,
+-	const struct dce110_opp_reg_offsets *offsets);
++	struct dc_context *ctx);
+ 
+ /* underlay callbacks */
+ void dce110_opp_v_set_csc_default(
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index 26fc104..26e9df5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -35,11 +35,13 @@
+ #include "dce110/dce110_timing_generator_v.h"
+ #include "dce110/dce110_link_encoder.h"
+ #include "dce110/dce110_mem_input.h"
++#include "dce110/dce110_mem_input_v.h"
+ #include "dce110/dce110_ipp.h"
+ #include "dce110/dce110_transform.h"
+ #include "dce110/dce110_transform_v.h"
+ #include "dce110/dce110_stream_encoder.h"
+ #include "dce110/dce110_opp.h"
++#include "dce110/dce110_opp_v.h"
+ #include "dce110/dce110_clock_source.h"
+ 
+ #include "dce/dce_11_0_d.h"
+@@ -307,14 +309,8 @@ static struct timing_generator *dce110_timing_generator_create(
+ 	if (!tg110)
+ 		return NULL;
+ 
+-	if (instance == 3) {
+-		/* This is the Underlay instance. */
+-		if (dce110_timing_generator_v_construct(tg110, as, ctx))
+-			return &tg110->base;
+-	} else {
+-		if (dce110_timing_generator_construct(tg110, as, ctx, instance, offsets))
+-			return &tg110->base;
+-	}
++	if (dce110_timing_generator_construct(tg110, as, ctx, instance, offsets))
++		return &tg110->base;
+ 
+ 	BREAK_TO_DEBUGGER();
+ 	dm_free(ctx, tg110);
+@@ -378,14 +374,8 @@ static struct transform *dce110_transform_create(
+ 	if (!transform)
+ 		return NULL;
+ 
+-	if (inst == 3) {
+-		/* Underlay */
+-		if (dce110_transform_v_construct(transform, ctx))
+-			return &transform->base;
+-	} else {
+-		if (dce110_transform_construct(transform, ctx, inst, offsets))
+-			return &transform->base;
+-	}
++	if (dce110_transform_construct(transform, ctx, inst, offsets))
++		return &transform->base;
+ 
+ 	BREAK_TO_DEBUGGER();
+ 	dm_free(ctx, transform);
+@@ -683,6 +673,18 @@ static enum dc_status build_pipe_hw_param(struct pipe_ctx *pipe_ctx)
+ 	return DC_OK;
+ }
+ 
++static bool is_surface_pixel_format_supported(struct pipe_ctx *pipe_ctx)
++{
++	if (pipe_ctx->pipe_idx != DCE110_UNDERLAY_IDX)
++		return true;
++	if (pipe_ctx->surface && pipe_ctx->surface->public.format <
++					SURFACE_PIXEL_FORMAT_VIDEO_BEGIN)
++		return false;
++	if (!pipe_ctx->surface)
++		return false;
++	return true;
++}
++
+ static enum dc_status validate_mapped_resource(
+ 		const struct dc *dc,
+ 		struct validate_context *context)
+@@ -706,8 +708,11 @@ static enum dc_status validate_mapped_resource(
+ 				if (context->res_ctx.pipe_ctx[k].stream != stream)
+ 					continue;
+ 
++				if (!is_surface_pixel_format_supported(pipe_ctx))
++					return DC_SURFACE_PIXEL_FORMAT_UNSUPPORTED;
++
+ 				if (!pipe_ctx->tg->funcs->validate_timing(
+-						pipe_ctx->tg, &stream->public.timing))
++					pipe_ctx->tg, &stream->public.timing))
+ 					return DC_FAIL_CONTROLLER_VALIDATE;
+ 
+ 				status = build_pipe_hw_param(pipe_ctx);
+@@ -762,7 +767,7 @@ enum dc_status dce110_validate_bandwidth(
+ 		if (pipe_ctx->stream == NULL)
+ 			continue;
+ 
+-		if (pipe_ctx->ratios.vert.value == 0) {
++		if (pipe_ctx->scl_data.ratios.vert.value == 0) {
+ 			disp->graphics_scale_ratio = bw_int_to_fixed(1);
+ 			disp->graphics_h_taps = 2;
+ 			disp->graphics_v_taps = 2;
+@@ -778,17 +783,17 @@ enum dc_status dce110_validate_bandwidth(
+ 		} else {
+ 			disp->graphics_scale_ratio =
+ 				fixed31_32_to_bw_fixed(
+-					pipe_ctx->ratios.vert.value);
+-			disp->graphics_h_taps = pipe_ctx->taps.h_taps;
+-			disp->graphics_v_taps = pipe_ctx->taps.v_taps;
++					pipe_ctx->scl_data.ratios.vert.value);
++			disp->graphics_h_taps = pipe_ctx->scl_data.taps.h_taps;
++			disp->graphics_v_taps = pipe_ctx->scl_data.taps.v_taps;
+ 
+ 			/* TODO: remove when bw formula accepts taps per
+ 			 * display
+ 			 */
+-			if (max_vtaps < pipe_ctx->taps.v_taps)
+-				max_vtaps = pipe_ctx->taps.v_taps;
+-			if (max_htaps < pipe_ctx->taps.h_taps)
+-				max_htaps = pipe_ctx->taps.h_taps;
++			if (max_vtaps < pipe_ctx->scl_data.taps.v_taps)
++				max_vtaps = pipe_ctx->scl_data.taps.v_taps;
++			if (max_htaps < pipe_ctx->scl_data.taps.h_taps)
++				max_htaps = pipe_ctx->scl_data.taps.h_taps;
+ 		}
+ 
+ 		disp->graphics_src_width =
+@@ -1004,10 +1009,16 @@ enum dc_status dce110_validate_with_context(
+ 						== context->targets[i]) {
+ 				unchanged = true;
+ 				set_target_unchanged(context, i);
++				attach_surfaces_to_context(
++					(struct dc_surface **)dc->current_context.
++						target_status[j].surfaces,
++					dc->current_context.target_status[j].surface_count,
++					&context->targets[i]->public,
++					context);
+ 				context->target_status[i] =
+ 					dc->current_context.target_status[j];
+ 			}
+-		if (!unchanged)
++		if (!unchanged || set[i].surface_count != 0)
+ 			if (!attach_surfaces_to_context(
+ 					(struct dc_surface **)set[i].surfaces,
+ 					set[i].surface_count,
+@@ -1045,6 +1056,29 @@ static struct resource_funcs dce110_res_pool_funcs = {
+ 	.validate_bandwidth = dce110_validate_bandwidth
+ };
+ 
++static void underlay_create(struct dc_context *ctx, struct resource_pool *pool)
++{
++	struct dce110_timing_generator *dce110_tgv = dm_alloc(ctx, sizeof (*dce110_tgv));
++	struct dce110_transform *dce110_xfmv = dm_alloc(ctx, sizeof (*dce110_xfmv));
++	struct dce110_mem_input *dce110_miv = dm_alloc(ctx, sizeof (*dce110_miv));
++	struct dce110_opp *dce110_oppv = dm_alloc(ctx, sizeof (*dce110_oppv));
++
++	dce110_opp_v_construct(dce110_oppv, ctx);
++	dce110_timing_generator_v_construct(dce110_tgv, pool->adapter_srv, ctx);
++	dce110_mem_input_v_construct(dce110_miv, ctx);
++	dce110_transform_v_construct(dce110_xfmv, ctx);
++
++	pool->opps[pool->pipe_count] = &dce110_oppv->base;
++	pool->timing_generators[pool->pipe_count] = &dce110_tgv->base;
++	pool->mis[pool->pipe_count] = &dce110_miv->base;
++	pool->transforms[pool->pipe_count] = &dce110_xfmv->base;
++
++	pool->transforms[pool->pipe_count]->funcs->transform_set_scaler_filter(
++			pool->transforms[pool->pipe_count],
++			pool->scaler_filter);
++	pool->pipe_count++;
++}
++
+ bool dce110_construct_resource_pool(
+ 	struct adapter_service *as,
+ 	uint8_t num_virtual_links,
+@@ -1177,6 +1211,8 @@ bool dce110_construct_resource_pool(
+ 			goto controller_create_fail;
+ 		}
+ 	}
++	/* TODO: failure? */
++	underlay_create(ctx, pool);
+ 
+ 	audio_init_data.as = as;
+ 	audio_init_data.ctx = ctx;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c
+index 2654a96..dba972f 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.c
+@@ -47,8 +47,6 @@ static struct transform_funcs dce110_transform_funcs = {
+ 		dce110_transform_set_scaler,
+ 	.transform_set_scaler_bypass =
+ 		dce110_transform_set_scaler_bypass,
+-	.transform_update_viewport =
+-		dce110_transform_update_viewport,
+ 	.transform_set_scaler_filter =
+ 		dce110_transform_set_scaler_filter,
+ 	.transform_set_gamut_remap =
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_scl.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_scl.c
+index 7c15a13..4a5d54c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_scl.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_scl.c
+@@ -64,16 +64,14 @@ static void disable_enhanced_sharpness(struct dce110_transform *xfm110)
+ 			SCL_REG(mmSCL_F_SHARP_CONTROL), value);
+ }
+ 
+-/**
+-* Function:
+-* void setup_scaling_configuration
+-*
+-* Purpose: setup scaling mode : bypass, RGb, YCbCr and nummber of taps
+-* Input:   data
+-*
+-* Output:
+-   void
+-*/
++/*
++ *	@Function:
++ *		void setup_scaling_configuration
++ *	@Purpose: setup scaling mode : bypass, RGb, YCbCr and number of taps
++ *	@Input:   data
++ *
++ *	@Output: void
++ */
+ static bool setup_scaling_configuration(
+ 	struct dce110_transform *xfm110,
+ 	const struct scaler_data *data)
+@@ -82,45 +80,44 @@ static bool setup_scaling_configuration(
+ 	uint32_t addr;
+ 	uint32_t value;
+ 
++	addr = SCL_REG(mmSCL_BYPASS_CONTROL);
++	value = dm_read_reg(ctx, addr);
++	set_reg_field_value(
++		value,
++		0,
++		SCL_BYPASS_CONTROL,
++		SCL_BYPASS_MODE);
++	dm_write_reg(ctx, addr, value);
++
+ 	if (data->taps.h_taps + data->taps.v_taps <= 2) {
+ 		dce110_transform_set_scaler_bypass(&xfm110->base);
+ 		return false;
+ 	}
+ 
+-	{
+-		addr = SCL_REG(mmSCL_MODE);
+-		value = dm_read_reg(ctx, addr);
+-
+-		if (data->dal_pixel_format <= PIXEL_FORMAT_GRPH_END)
+-			set_reg_field_value(value, 1, SCL_MODE, SCL_MODE);
+-		else
+-			set_reg_field_value(value, 2, SCL_MODE, SCL_MODE);
+-
+-		set_reg_field_value(value, 1, SCL_MODE, SCL_PSCL_EN);
++	addr = SCL_REG(mmSCL_MODE);
++	value = dm_read_reg(ctx, addr);
++	if (data->format <= PIXEL_FORMAT_GRPH_END)
++		set_reg_field_value(value, 1, SCL_MODE, SCL_MODE);
++	else
++		set_reg_field_value(value, 2, SCL_MODE, SCL_MODE);
++	set_reg_field_value(value, 1, SCL_MODE, SCL_PSCL_EN);
++	dm_write_reg(ctx, addr, value);
+ 
+-		dm_write_reg(ctx, addr, value);
+-	}
+-	{
+-		addr = SCL_REG(mmSCL_TAP_CONTROL);
+-		value = dm_read_reg(ctx, addr);
+ 
+-		set_reg_field_value(value, data->taps.h_taps - 1,
+-				SCL_TAP_CONTROL, SCL_H_NUM_OF_TAPS);
++	addr = SCL_REG(mmSCL_TAP_CONTROL);
++	value = dm_read_reg(ctx, addr);
++	set_reg_field_value(value, data->taps.h_taps - 1,
++			SCL_TAP_CONTROL, SCL_H_NUM_OF_TAPS);
++	set_reg_field_value(value, data->taps.v_taps - 1,
++			SCL_TAP_CONTROL, SCL_V_NUM_OF_TAPS);
++	dm_write_reg(ctx, addr, value);
+ 
+-		set_reg_field_value(value, data->taps.v_taps - 1,
+-				SCL_TAP_CONTROL, SCL_V_NUM_OF_TAPS);
+ 
+-		dm_write_reg(ctx, addr, value);
+-	}
+-	{
+-		addr = SCL_REG(mmSCL_CONTROL);
+-		value = dm_read_reg(ctx, addr);
+-		 /* 1 - Replaced out of bound pixels with edge */
+-		set_reg_field_value(value, 1, SCL_CONTROL, SCL_BOUNDARY_MODE);
+-
+-		/* 1 - Replaced out of bound pixels with the edge pixel. */
+-		dm_write_reg(ctx, addr, value);
+-	}
++	addr = SCL_REG(mmSCL_CONTROL);
++	value = dm_read_reg(ctx, addr);
++	 /* 1 - Replaced out of bound pixels with edge */
++	set_reg_field_value(value, 1, SCL_CONTROL, SCL_BOUNDARY_MODE);
++	dm_write_reg(ctx, addr, value);
+ 
+ 	return true;
+ }
+@@ -425,7 +422,7 @@ static bool program_multi_taps_filter(
+ 
+ 	if (horizontal) {
+ 		filter_params.taps = data->taps.h_taps;
+-		filter_params.sharpness = data->h_sharpness;
++		filter_params.sharpness = 0; /* TODO */
+ 		filter_params.flags.bits.HORIZONTAL = 1;
+ 
+ 		src_size = data->viewport.width;
+@@ -434,12 +431,12 @@ static bool program_multi_taps_filter(
+ 				dal_fixed31_32_div(
+ 					dal_fixed31_32_from_int(
+ 						data->viewport.width),
+-					data->ratios->horz));
++					data->ratios.horz));
+ 
+ 		filter_type = FILTER_TYPE_RGB_Y_HORIZONTAL;
+ 	} else {
+ 		filter_params.taps = data->taps.v_taps;
+-		filter_params.sharpness = data->v_sharpness;
++		filter_params.sharpness = 0; /* TODO */
+ 		filter_params.flags.bits.HORIZONTAL = 0;
+ 
+ 		src_size = data->viewport.height;
+@@ -448,7 +445,7 @@ static bool program_multi_taps_filter(
+ 				dal_fixed31_32_div(
+ 					dal_fixed31_32_from_int(
+ 						data->viewport.height),
+-					data->ratios->vert));
++					data->ratios.vert));
+ 
+ 		filter_type = FILTER_TYPE_RGB_Y_VERTICAL;
+ 	}
+@@ -478,20 +475,18 @@ static bool program_multi_taps_filter(
+ 		filter_data,
+ 		filter_data_size);
+ 
+-	/* 4. Program the alpha if necessary */
+-	if (data->flags.bits.SHOULD_PROGRAM_ALPHA) {
+-		if (horizontal)
+-			filter_type = FILTER_TYPE_ALPHA_HORIZONTAL;
+-		else
+-			filter_type = FILTER_TYPE_ALPHA_VERTICAL;
+-
+-		program_filter(
+-			xfm110,
+-			filter_type,
+-			&filter_params,
+-			filter_data,
+-			filter_data_size);
+-	}
++	/* 4. Program the alpha*/
++	if (horizontal)
++		filter_type = FILTER_TYPE_ALPHA_HORIZONTAL;
++	else
++		filter_type = FILTER_TYPE_ALPHA_VERTICAL;
++
++	program_filter(
++		xfm110,
++		filter_type,
++		&filter_params,
++		filter_data,
++		filter_data_size);
+ 
+ 	return true;
+ }
+@@ -542,18 +537,16 @@ static void calculate_inits(
+ {
+ 	struct fixed31_32 h_init;
+ 	struct fixed31_32 v_init;
+-	struct fixed31_32 v_init_bot;
+ 
+-	inits->bottom_enable = 0;
+ 	inits->h_int_scale_ratio =
+-		dal_fixed31_32_u2d19(data->ratios->horz) << 5;
++		dal_fixed31_32_u2d19(data->ratios.horz) << 5;
+ 	inits->v_int_scale_ratio =
+-		dal_fixed31_32_u2d19(data->ratios->vert) << 5;
++		dal_fixed31_32_u2d19(data->ratios.vert) << 5;
+ 
+ 	h_init =
+ 		dal_fixed31_32_div_int(
+ 			dal_fixed31_32_add(
+-				data->ratios->horz,
++				data->ratios.horz,
+ 				dal_fixed31_32_from_int(data->taps.h_taps + 1)),
+ 				2);
+ 	inits->h_init.integer = dal_fixed31_32_floor(h_init);
+@@ -562,28 +555,11 @@ static void calculate_inits(
+ 	v_init =
+ 		dal_fixed31_32_div_int(
+ 			dal_fixed31_32_add(
+-				data->ratios->vert,
++				data->ratios.vert,
+ 				dal_fixed31_32_from_int(data->taps.v_taps + 1)),
+ 				2);
+ 	inits->v_init.integer = dal_fixed31_32_floor(v_init);
+ 	inits->v_init.fraction = dal_fixed31_32_u0d19(v_init) << 5;
+-
+-	if (data->flags.bits.INTERLACED) {
+-		v_init_bot =
+-			dal_fixed31_32_add(
+-				dal_fixed31_32_div_int(
+-					dal_fixed31_32_add(
+-						data->ratios->vert,
+-						dal_fixed31_32_from_int(
+-							data->taps.v_taps + 1)),
+-					2),
+-				data->ratios->vert);
+-		inits->v_init_bottom.integer = dal_fixed31_32_floor(v_init_bot);
+-		inits->v_init_bottom.fraction =
+-			dal_fixed31_32_u0d19(v_init_bot) << 5;
+-
+-		inits->bottom_enable = 1;
+-	}
+ }
+ 
+ static void program_scl_ratios_inits(
+@@ -637,22 +613,6 @@ static void program_scl_ratios_inits(
+ 		SCL_V_INIT_FRAC);
+ 	dm_write_reg(xfm110->base.ctx, addr, value);
+ 
+-	if (inits->bottom_enable) {
+-		addr = SCL_REG(mmSCL_VERT_FILTER_INIT_BOT);
+-		value = 0;
+-		set_reg_field_value(
+-			value,
+-			inits->v_init_bottom.integer,
+-			SCL_VERT_FILTER_INIT_BOT,
+-			SCL_V_INIT_INT_BOT);
+-		set_reg_field_value(
+-			value,
+-			inits->v_init_bottom.fraction,
+-			SCL_VERT_FILTER_INIT_BOT,
+-			SCL_V_INIT_FRAC_BOT);
+-		dm_write_reg(xfm110->base.ctx, addr, value);
+-	}
+-
+ 	addr = SCL_REG(mmSCL_AUTOMATIC_MODE_CONTROL);
+ 	value = 0;
+ 	set_reg_field_value(
+@@ -668,38 +628,6 @@ static void program_scl_ratios_inits(
+ 	dm_write_reg(xfm110->base.ctx, addr, value);
+ }
+ 
+-static void get_viewport(
+-		struct dce110_transform *xfm110,
+-		struct rect *current_view_port)
+-{
+-	uint32_t value_start;
+-	uint32_t value_size;
+-
+-	if (current_view_port == NULL)
+-		return;
+-
+-	value_start = dm_read_reg(xfm110->base.ctx, SCL_REG(mmVIEWPORT_START));
+-	value_size = dm_read_reg(xfm110->base.ctx, SCL_REG(mmVIEWPORT_SIZE));
+-
+-	current_view_port->x = get_reg_field_value(
+-			value_start,
+-			VIEWPORT_START,
+-			VIEWPORT_X_START);
+-	current_view_port->y = get_reg_field_value(
+-			value_start,
+-			VIEWPORT_START,
+-			VIEWPORT_Y_START);
+-	current_view_port->height = get_reg_field_value(
+-			value_size,
+-			VIEWPORT_SIZE,
+-			VIEWPORT_HEIGHT);
+-	current_view_port->width = get_reg_field_value(
+-			value_size,
+-			VIEWPORT_SIZE,
+-			VIEWPORT_WIDTH);
+-}
+-
+-
+ bool dce110_transform_set_scaler(
+ 	struct transform *xfm,
+ 	const struct scaler_data *data)
+@@ -708,18 +636,6 @@ bool dce110_transform_set_scaler(
+ 	bool is_scaling_required;
+ 	struct dc_context *ctx = xfm->ctx;
+ 
+-	{
+-		uint32_t addr = SCL_REG(mmSCL_BYPASS_CONTROL);
+-		uint32_t value = dm_read_reg(xfm->ctx, addr);
+-
+-		set_reg_field_value(
+-			value,
+-			0,
+-			SCL_BYPASS_CONTROL,
+-			SCL_BYPASS_MODE);
+-		dm_write_reg(xfm->ctx, addr, value);
+-	}
+-
+ 	disable_enhanced_sharpness(xfm110);
+ 
+ 	/* 3. Program overscan */
+@@ -764,6 +680,9 @@ bool dce110_transform_set_scaler(
+ 			program_two_taps_filter(xfm110, true, false);
+ 	}
+ 
++	/* 7. Program the viewport */
++	program_viewport(xfm110, &data->viewport);
++
+ 	return true;
+ }
+ 
+@@ -780,35 +699,6 @@ void dce110_transform_set_scaler_bypass(struct transform *xfm)
+ 	dm_write_reg(xfm->ctx, SCL_REG(mmSCL_MODE), sclv_mode);
+ }
+ 
+-bool dce110_transform_update_viewport(
+-	struct transform *xfm,
+-	const struct rect *view_port,
+-	bool is_fbc_attached)
+-{
+-	struct dce110_transform *xfm110 = TO_DCE110_TRANSFORM(xfm);
+-	bool program_req = false;
+-	struct rect current_view_port;
+-
+-	if (view_port == NULL)
+-		return program_req;
+-
+-	get_viewport(xfm110, &current_view_port);
+-
+-	if (current_view_port.x != view_port->x ||
+-			current_view_port.y != view_port->y ||
+-			current_view_port.height != view_port->height ||
+-			current_view_port.width != view_port->width)
+-		program_req = true;
+-
+-	if (program_req) {
+-		/*underlay viewport is programmed with scaler
+-		 *program_viewport function pointer is not exposed*/
+-		program_viewport(xfm110, view_port);
+-	}
+-
+-	return program_req;
+-}
+-
+ void dce110_transform_set_scaler_filter(
+ 	struct transform *xfm,
+ 	struct scaler_filter *filter)
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_v.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_v.c
+index 6491435..aef17b3 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_v.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_v.c
+@@ -39,7 +39,6 @@
+ 
+ 
+ struct sclv_ratios_inits {
+-	uint32_t chroma_enable;
+ 	uint32_t h_int_scale_ratio_luma;
+ 	uint32_t h_int_scale_ratio_chroma;
+ 	uint32_t v_int_scale_ratio_luma;
+@@ -48,10 +47,6 @@ struct sclv_ratios_inits {
+ 	struct init_int_and_frac h_init_chroma;
+ 	struct init_int_and_frac v_init_luma;
+ 	struct init_int_and_frac v_init_chroma;
+-	struct init_int_and_frac h_init_lumabottom;
+-	struct init_int_and_frac h_init_chromabottom;
+-	struct init_int_and_frac v_init_lumabottom;
+-	struct init_int_and_frac v_init_chromabottom;
+ };
+ 
+ /*
+@@ -80,14 +75,13 @@ static void calculate_viewport(
+ 		scl_data->viewport.width - scl_data->viewport.width % 2;
+ 	luma_viewport->height =
+ 		scl_data->viewport.height - scl_data->viewport.height % 2;
++	chroma_viewport->x = luma_viewport->x;
++	chroma_viewport->y = luma_viewport->y;
++	chroma_viewport->height = luma_viewport->height;
++	chroma_viewport->width = luma_viewport->width;
+ 
+ 
+-	if (scl_data->dal_pixel_format == PIXEL_FORMAT_422BPP16) {
+-		luma_viewport->width += luma_viewport->width % 2;
+-
+-		chroma_viewport->x = luma_viewport->x / 2;
+-		chroma_viewport->width = luma_viewport->width / 2;
+-	} else if (scl_data->dal_pixel_format == PIXEL_FORMAT_420BPP12) {
++	if (scl_data->format == PIXEL_FORMAT_420BPP12) {
+ 		luma_viewport->height += luma_viewport->height % 2;
+ 		luma_viewport->width += luma_viewport->width % 2;
+ 		/*for 420 video chroma is 1/4 the area of luma, scaled
+@@ -169,24 +163,8 @@ static void program_viewport(
+ 			VIEWPORT_WIDTH_C);
+ 		dm_write_reg(ctx, addr, value);
+ 	}
+-	/* TODO: add stereo support */
+ }
+ 
+-
+-/*
+- * Until and For MPO video play story, to reduce time for implementation,
+- * below limits are applied for now: 2_TAPS only
+- * Use auto-calculated filter values
+- * Following routines will be empty for now:
+- *
+- * programSclRatiosInits -- calcualate scaler ratio manually
+- * calculateInits --- calcualate scaler ratio manually
+- * programFilter -- multi-taps
+- * GetOptimalNumberOfTaps -- will hard coded to 2 TAPS
+- * GetNextLowerNumberOfTaps -- will hard coded to 2TAPS
+- * validateRequestedScaleRatio - used by GetOptimalNumberOfTaps internally
+- */
+-
+ /*
+  * Function:
+  * void setup_scaling_configuration
+@@ -218,8 +196,8 @@ static bool setup_scaling_configuration(
+ 		set_reg_field_value(value, 1, SCLV_MODE, SCL_MODE_C);
+ 		set_reg_field_value(value, 1, SCLV_MODE, SCL_PSCL_EN_C);
+ 		is_scaling_needed = true;
+-	} else if (data->dal_pixel_format != PIXEL_FORMAT_420BPP12 &&
+-		data->dal_pixel_format != PIXEL_FORMAT_422BPP16) {
++	} else if (data->format != PIXEL_FORMAT_420BPP12 &&
++		data->format != PIXEL_FORMAT_422BPP16) {
+ 		set_reg_field_value(
+ 			value,
+ 			get_reg_field_value(value, SCLV_MODE, SCL_MODE),
+@@ -236,39 +214,25 @@ static bool setup_scaling_configuration(
+ 	}
+ 	dm_write_reg(ctx, mmSCLV_MODE, value);
+ 
+-	{
+-		value = dm_read_reg(ctx, mmSCLV_TAP_CONTROL);
+-
+-		set_reg_field_value(value, data->taps.h_taps - 1,
+-				SCLV_TAP_CONTROL, SCL_H_NUM_OF_TAPS);
+-
+-		set_reg_field_value(value, data->taps.v_taps - 1,
+-				SCLV_TAP_CONTROL, SCL_V_NUM_OF_TAPS);
+-
+-		set_reg_field_value(value, data->taps.h_taps_c - 1,
+-				SCLV_TAP_CONTROL, SCL_H_NUM_OF_TAPS_C);
+-
+-		set_reg_field_value(value, data->taps.v_taps_c - 1,
+-				SCLV_TAP_CONTROL, SCL_V_NUM_OF_TAPS_C);
+-
+-		dm_write_reg(ctx, mmSCLV_TAP_CONTROL, value);
+-	}
+-
+-	{
+-		/*
+-		 * we can ignore this register because we are ok with hw
+-		 * default 0 -- change to 1 according to dal2 code
+-		 */
+-		value = dm_read_reg(ctx, mmSCLV_CONTROL);
+-		 /*
+-		  * 0 - Replaced out of bound pixels with black pixel
+-		  * (or any other required color)
+-		  */
+-		set_reg_field_value(value, 1, SCLV_CONTROL, SCL_BOUNDARY_MODE);
+-
+-		/* 1 - Replaced out of bound pixels with the edge pixel. */
+-		dm_write_reg(ctx, mmSCLV_CONTROL, value);
+-	}
++	value = 0;
++	set_reg_field_value(value, data->taps.h_taps - 1,
++			SCLV_TAP_CONTROL, SCL_H_NUM_OF_TAPS);
++	set_reg_field_value(value, data->taps.v_taps - 1,
++			SCLV_TAP_CONTROL, SCL_V_NUM_OF_TAPS);
++	set_reg_field_value(value, data->taps.h_taps_c - 1,
++			SCLV_TAP_CONTROL, SCL_H_NUM_OF_TAPS_C);
++	set_reg_field_value(value, data->taps.v_taps_c - 1,
++			SCLV_TAP_CONTROL, SCL_V_NUM_OF_TAPS_C);
++	dm_write_reg(ctx, mmSCLV_TAP_CONTROL, value);
++
++	value = 0;
++	/*
++	 * 0 - Replaced out of bound pixels with black pixel
++	 * (or any other required color)
++	 * 1 - Replaced out of bound pixels with the edge pixel
++	 */
++	set_reg_field_value(value, 1, SCLV_CONTROL, SCL_BOUNDARY_MODE);
++	dm_write_reg(ctx, mmSCLV_CONTROL, value);
+ 
+ 	return is_scaling_needed;
+ }
+@@ -379,17 +343,20 @@ static void calculate_inits(
+ 	struct rect *luma_viewport,
+ 	struct rect *chroma_viewport)
+ {
+-	if (data->dal_pixel_format == PIXEL_FORMAT_420BPP12 ||
+-		data->dal_pixel_format == PIXEL_FORMAT_422BPP16)
+-		inits->chroma_enable = true;
+-
+-	/* TODO: implement rest of this function properly */
+-	if (inits->chroma_enable) {
+-		inits->h_int_scale_ratio_luma = 0x1000000;
+-		inits->v_int_scale_ratio_luma = 0x1000000;
+-		inits->h_int_scale_ratio_chroma = 0x800000;
+-		inits->v_int_scale_ratio_chroma = 0x800000;
+-	}
++	inits->h_int_scale_ratio_luma =
++		dal_fixed31_32_u2d19(data->ratios.horz) << 5;
++	inits->v_int_scale_ratio_luma =
++		dal_fixed31_32_u2d19(data->ratios.vert) << 5;
++	inits->h_int_scale_ratio_chroma =
++		dal_fixed31_32_u2d19(data->ratios.horz_c) << 5;
++	inits->v_int_scale_ratio_chroma =
++		dal_fixed31_32_u2d19(data->ratios.vert_c) << 5;
++
++	inits->h_init_luma.integer = 1;
++	inits->v_init_luma.integer = 1;
++	inits->h_init_chroma.integer = 1;
++	inits->v_init_chroma.integer = 1;
++
+ }
+ 
+ static void program_scl_ratios_inits(
+@@ -398,7 +365,7 @@ static void program_scl_ratios_inits(
+ {
+ 	struct dc_context *ctx = xfm110->base.ctx;
+ 	uint32_t addr = mmSCLV_HORZ_FILTER_SCALE_RATIO;
+-	uint32_t value = dm_read_reg(ctx, addr);
++	uint32_t value = 0;
+ 
+ 	set_reg_field_value(
+ 		value,
+@@ -408,7 +375,7 @@ static void program_scl_ratios_inits(
+ 	dm_write_reg(ctx, addr, value);
+ 
+ 	addr = mmSCLV_VERT_FILTER_SCALE_RATIO;
+-	value = dm_read_reg(ctx, addr);
++	value = 0;
+ 	set_reg_field_value(
+ 		value,
+ 		inits->v_int_scale_ratio_luma,
+@@ -416,8 +383,9 @@ static void program_scl_ratios_inits(
+ 		SCL_V_SCALE_RATIO);
+ 	dm_write_reg(ctx, addr, value);
+ 
++
+ 	addr = mmSCLV_HORZ_FILTER_SCALE_RATIO_C;
+-	value = dm_read_reg(ctx, addr);
++	value = 0;
+ 	set_reg_field_value(
+ 		value,
+ 		inits->h_int_scale_ratio_chroma,
+@@ -426,13 +394,71 @@ static void program_scl_ratios_inits(
+ 	dm_write_reg(ctx, addr, value);
+ 
+ 	addr = mmSCLV_VERT_FILTER_SCALE_RATIO_C;
+-	value = dm_read_reg(ctx, addr);
++	value = 0;
+ 	set_reg_field_value(
+ 		value,
+ 		inits->v_int_scale_ratio_chroma,
+ 		SCLV_VERT_FILTER_SCALE_RATIO_C,
+ 		SCL_V_SCALE_RATIO_C);
+ 	dm_write_reg(ctx, addr, value);
++
++
++	addr = mmSCLV_HORZ_FILTER_INIT;
++	value = 0;
++	set_reg_field_value(
++		value,
++		inits->h_init_luma.fraction,
++		SCLV_HORZ_FILTER_INIT,
++		SCL_H_INIT_FRAC);
++	set_reg_field_value(
++		value,
++		inits->h_init_luma.integer,
++		SCLV_HORZ_FILTER_INIT,
++		SCL_H_INIT_INT);
++	dm_write_reg(ctx, addr, value);
++
++	addr = mmSCLV_VERT_FILTER_INIT;
++	value = 0;
++	set_reg_field_value(
++		value,
++		inits->v_init_luma.fraction,
++		SCLV_VERT_FILTER_INIT,
++		SCL_V_INIT_FRAC);
++	set_reg_field_value(
++		value,
++		inits->v_init_luma.integer,
++		SCLV_VERT_FILTER_INIT,
++		SCL_V_INIT_INT);
++	dm_write_reg(ctx, addr, value);
++
++
++	addr = mmSCLV_HORZ_FILTER_INIT_C;
++	value = 0;
++	set_reg_field_value(
++		value,
++		inits->h_init_chroma.fraction,
++		SCLV_HORZ_FILTER_INIT_C,
++		SCL_H_INIT_FRAC_C);
++	set_reg_field_value(
++		value,
++		inits->h_init_chroma.integer,
++		SCLV_HORZ_FILTER_INIT_C,
++		SCL_H_INIT_INT_C);
++	dm_write_reg(ctx, addr, value);
++
++	addr = mmSCLV_VERT_FILTER_INIT_C;
++	value = 0;
++	set_reg_field_value(
++		value,
++		inits->v_init_chroma.fraction,
++		SCLV_VERT_FILTER_INIT_C,
++		SCL_V_INIT_FRAC_C);
++	set_reg_field_value(
++		value,
++		inits->v_init_chroma.integer,
++		SCLV_VERT_FILTER_INIT_C,
++		SCL_V_INIT_INT_C);
++	dm_write_reg(ctx, addr, value);
+ }
+ 
+ static void dce110_transform_v_set_scalerv_bypass(struct transform *xfm)
+@@ -447,34 +473,32 @@ static void dce110_transform_v_set_scalerv_bypass(struct transform *xfm)
+ 	dm_write_reg(xfm->ctx, addr, value);
+ }
+ 
+-/* TODO: sync this one with DAL2 */
+ static bool dce110_transform_v_set_scaler(
+ 	struct transform *xfm,
+ 	const struct scaler_data *data)
+ {
+ 	struct dce110_transform *xfm110 = TO_DCE110_TRANSFORM(xfm);
+-	bool is_scaling_required;
++	bool is_scaling_required = false;
++	bool filter_updated = false;
+ 	struct rect luma_viewport = {0};
+ 	struct rect chroma_viewport = {0};
+ 	struct dc_context *ctx = xfm->ctx;
+ 
+-	/* 1. Lock Scaler TODO: enable?*/
+-	/*set_scaler_update_lock(xfm, true);*/
+ 
+-	/* 2. Calculate viewport, viewport programming should happen after init
++	/* 1. Calculate viewport, viewport programming should happen after init
+ 	 * calculations as they may require an adjustment in the viewport.
+ 	 */
+ 
+ 	calculate_viewport(data, &luma_viewport, &chroma_viewport);
+ 
+-	/* 3. Program overscan */
++	/* 2. Program overscan */
+ 	program_overscan(xfm110, &data->overscan);
+ 
+-	/* 4. Program taps and configuration */
++	/* 3. Program taps and configuration */
+ 	is_scaling_required = setup_scaling_configuration(xfm110, data);
+ 
+ 	if (is_scaling_required) {
+-		/* 5. Calculate and program ratio, filter initialization */
++		/* 4. Calculate and program ratio, filter initialization */
+ 
+ 		struct sclv_ratios_inits inits = { 0 };
+ 
+@@ -489,7 +513,7 @@ static bool dce110_transform_v_set_scaler(
+ 
+ 		/*scaler coeff of 2-TAPS use hardware auto calculated value*/
+ 
+-		/* 6. Program vertical filters */
++		/* 5. Program vertical filters */
+ 		if (data->taps.v_taps > 2) {
+ 			program_two_taps_filter_vert(xfm110, false);
+ 
+@@ -500,10 +524,11 @@ static bool dce110_transform_v_set_scaler(
+ 					"Failed vertical taps programming\n");
+ 				return false;
+ 			}
++			filter_updated = true;
+ 		} else
+ 			program_two_taps_filter_vert(xfm110, true);
+ 
+-		/* 7. Program horizontal filters */
++		/* 6. Program horizontal filters */
+ 		if (data->taps.h_taps > 2) {
+ 			program_two_taps_filter_horz(xfm110, false);
+ 
+@@ -514,23 +539,16 @@ static bool dce110_transform_v_set_scaler(
+ 					"Failed horizontal taps programming\n");
+ 				return false;
+ 			}
++			filter_updated = true;
+ 		} else
+ 			program_two_taps_filter_horz(xfm110, true);
+ 	}
+ 
+-	/* 8. Program the viewport */
+-	if (data->flags.bits.SHOULD_PROGRAM_VIEWPORT)
+-		program_viewport(xfm110, &luma_viewport, &chroma_viewport);
+-
+-	/* 9. Unlock the Scaler TODO: enable?
+-	 * Every call to "set_scaler_update_lock(xfm, TRUE)"
+-	 * must have a corresponding call to
+-	 * "set_scaler_update_lock(xfm, FALSE)" */
+-
+-	/*set_scaler_update_lock(xfm, false);*/
++	/* 7. Program the viewport */
++	program_viewport(xfm110, &luma_viewport, &chroma_viewport);
+ 
+-	/* TODO: investigate purpose/need of SHOULD_UNLOCK */
+-	if (data->flags.bits.SHOULD_UNLOCK == false)
++	/* 8. Set bit to flip to new coefficient memory */
++	if (filter_updated)
+ 		set_coeff_update_complete(xfm110);
+ 
+ 	return true;
+@@ -554,104 +572,6 @@ static bool dce110_transform_v_power_up_line_buffer(struct transform *xfm)
+ 	return true;
+ }
+ 
+-static void get_viewport(
+-		struct dce110_transform *xfm110,
+-		struct rect *current_view_port)
+-{
+-	uint32_t value_start;
+-	uint32_t value_size;
+-
+-	if (current_view_port == NULL)
+-		return;
+-
+-	value_start = dm_read_reg(xfm110->base.ctx, mmSCLV_VIEWPORT_START);
+-	value_size = dm_read_reg(xfm110->base.ctx, mmSCLV_VIEWPORT_SIZE);
+-
+-	current_view_port->x = get_reg_field_value(
+-			value_start,
+-			SCLV_VIEWPORT_START,
+-			VIEWPORT_X_START);
+-	current_view_port->y = get_reg_field_value(
+-			value_start,
+-			SCLV_VIEWPORT_START,
+-			VIEWPORT_Y_START);
+-	current_view_port->height = get_reg_field_value(
+-			value_size,
+-			SCLV_VIEWPORT_SIZE,
+-			VIEWPORT_HEIGHT);
+-	current_view_port->width = get_reg_field_value(
+-			value_size,
+-			SCLV_VIEWPORT_SIZE,
+-			VIEWPORT_WIDTH);
+-}
+-
+-static void program_luma_viewport(
+-	struct dce110_transform *xfm110,
+-	const struct rect *view_port)
+-{
+-	struct dc_context *ctx = xfm110->base.ctx;
+-	uint32_t value = 0;
+-	uint32_t addr = 0;
+-
+-	addr = mmSCLV_VIEWPORT_START;
+-	value = dm_read_reg(ctx, addr);
+-	set_reg_field_value(
+-		value,
+-		view_port->x,
+-		SCLV_VIEWPORT_START,
+-		VIEWPORT_X_START);
+-	set_reg_field_value(
+-		value,
+-		view_port->y,
+-		SCLV_VIEWPORT_START,
+-		VIEWPORT_Y_START);
+-	dm_write_reg(ctx, addr, value);
+-
+-	addr = mmSCLV_VIEWPORT_SIZE;
+-	value = dm_read_reg(ctx, addr);
+-	set_reg_field_value(
+-		value,
+-		view_port->height,
+-		SCLV_VIEWPORT_SIZE,
+-		VIEWPORT_HEIGHT);
+-	set_reg_field_value(
+-		value,
+-		view_port->width,
+-		SCLV_VIEWPORT_SIZE,
+-		VIEWPORT_WIDTH);
+-	dm_write_reg(ctx, addr, value);
+-
+-	/* TODO: add stereo support */
+-}
+-
+-static bool dce110_transform_v_update_viewport(
+-	struct transform *xfm,
+-	const struct rect *view_port,
+-	bool is_fbc_attached)
+-{
+-	struct dce110_transform *xfm110 = TO_DCE110_TRANSFORM(xfm);
+-	bool program_req = false;
+-	struct rect current_view_port;
+-
+-	if (view_port == NULL)
+-		return program_req;
+-
+-	get_viewport(xfm110, &current_view_port);
+-
+-	if (current_view_port.x != view_port->x ||
+-			current_view_port.y != view_port->y ||
+-			current_view_port.height != view_port->height ||
+-			current_view_port.width != view_port->width)
+-		program_req = true;
+-
+-	if (program_req) {
+-		/*underlay viewport is programmed with scaler
+-		 *program_viewport function pointer is not exposed*/
+-		program_luma_viewport(xfm110, view_port);
+-	}
+-
+-	return program_req;
+-}
+ 
+ static struct transform_funcs dce110_transform_v_funcs = {
+ 	.transform_power_up =
+@@ -660,8 +580,6 @@ static struct transform_funcs dce110_transform_v_funcs = {
+ 		dce110_transform_v_set_scaler,
+ 	.transform_set_scaler_bypass =
+ 		dce110_transform_v_set_scalerv_bypass,
+-	.transform_update_viewport =
+-		dce110_transform_v_update_viewport,
+ 	.transform_set_scaler_filter =
+ 		dce110_transform_set_scaler_filter,
+ 	.transform_set_gamut_remap =
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+index c7bfa28..ed143f4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+@@ -764,7 +764,7 @@ enum dc_status dce80_validate_bandwidth(
+ 		if (pipe_ctx->stream == NULL)
+ 			continue;
+ 
+-		if (pipe_ctx->ratios.vert.value == 0) {
++		if (pipe_ctx->scl_data.ratios.vert.value == 0) {
+ 			disp->graphics_scale_ratio = bw_int_to_fixed(1);
+ 			disp->graphics_h_taps = 2;
+ 			disp->graphics_v_taps = 2;
+@@ -780,17 +780,17 @@ enum dc_status dce80_validate_bandwidth(
+ 		} else {
+ 			disp->graphics_scale_ratio =
+ 				fixed31_32_to_bw_fixed(
+-					pipe_ctx->ratios.vert.value);
+-			disp->graphics_h_taps = pipe_ctx->taps.h_taps;
+-			disp->graphics_v_taps = pipe_ctx->taps.v_taps;
++					pipe_ctx->scl_data.ratios.vert.value);
++			disp->graphics_h_taps = pipe_ctx->scl_data.taps.h_taps;
++			disp->graphics_v_taps = pipe_ctx->scl_data.taps.v_taps;
+ 
+ 			/* TODO: remove when bw formula accepts taps per
+ 			 * display
+ 			 */
+-			if (max_vtaps < pipe_ctx->taps.v_taps)
+-				max_vtaps = pipe_ctx->taps.v_taps;
+-			if (max_htaps < pipe_ctx->taps.h_taps)
+-				max_htaps = pipe_ctx->taps.h_taps;
++			if (max_vtaps < pipe_ctx->scl_data.taps.v_taps)
++				max_vtaps = pipe_ctx->scl_data.taps.v_taps;
++			if (max_htaps < pipe_ctx->scl_data.taps.h_taps)
++				max_htaps = pipe_ctx->scl_data.taps.h_taps;
+ 		}
+ 
+ 		disp->graphics_src_width =
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform.c
+index 5654738..204893e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform.c
+@@ -47,8 +47,6 @@ static struct transform_funcs dce80_transform_funcs = {
+ 		dce80_transform_set_scaler,
+ 	.transform_set_scaler_bypass =
+ 		dce80_transform_set_scaler_bypass,
+-	.transform_update_viewport =
+-		dce80_transform_update_viewport,
+ 	.transform_set_scaler_filter =
+ 		dce80_transform_set_scaler_filter,
+ 	.transform_set_gamut_remap =
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_scl.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_scl.c
+index 62a3a04..c9b3af5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_scl.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_scl.c
+@@ -91,7 +91,7 @@ static bool setup_scaling_configuration(
+ 		addr = SCL_REG(mmSCL_MODE);
+ 		value = dm_read_reg(ctx, addr);
+ 
+-		if (data->dal_pixel_format <= PIXEL_FORMAT_GRPH_END)
++		if (data->format <= PIXEL_FORMAT_GRPH_END)
+ 			set_reg_field_value(value, 1, SCL_MODE, SCL_MODE);
+ 		else
+ 			set_reg_field_value(value, 2, SCL_MODE, SCL_MODE);
+@@ -422,7 +422,7 @@ static bool program_multi_taps_filter(
+ 
+ 	if (horizontal) {
+ 		filter_params.taps = data->taps.h_taps;
+-		filter_params.sharpness = data->h_sharpness;
++		filter_params.sharpness = 0; /* TODO */
+ 		filter_params.flags.bits.HORIZONTAL = 1;
+ 
+ 		src_size = data->viewport.width;
+@@ -431,12 +431,12 @@ static bool program_multi_taps_filter(
+ 				dal_fixed31_32_div(
+ 					dal_fixed31_32_from_int(
+ 						data->viewport.width),
+-					data->ratios->horz));
++					data->ratios.horz));
+ 
+ 		filter_type = FILTER_TYPE_RGB_Y_HORIZONTAL;
+ 	} else {
+ 		filter_params.taps = data->taps.v_taps;
+-		filter_params.sharpness = data->v_sharpness;
++		filter_params.sharpness = 0; /* TODO */
+ 		filter_params.flags.bits.HORIZONTAL = 0;
+ 
+ 		src_size = data->viewport.height;
+@@ -445,7 +445,7 @@ static bool program_multi_taps_filter(
+ 				dal_fixed31_32_div(
+ 					dal_fixed31_32_from_int(
+ 						data->viewport.height),
+-					data->ratios->vert));
++					data->ratios.vert));
+ 
+ 		filter_type = FILTER_TYPE_RGB_Y_VERTICAL;
+ 	}
+@@ -475,21 +475,6 @@ static bool program_multi_taps_filter(
+ 		filter_data,
+ 		filter_data_size);
+ 
+-	/* 4. Program the alpha if necessary */
+-	if (data->flags.bits.SHOULD_PROGRAM_ALPHA) {
+-		if (horizontal)
+-			filter_type = FILTER_TYPE_ALPHA_HORIZONTAL;
+-		else
+-			filter_type = FILTER_TYPE_ALPHA_VERTICAL;
+-
+-		program_filter(
+-			xfm80,
+-			filter_type,
+-			&filter_params,
+-			filter_data,
+-			filter_data_size);
+-	}
+-
+ 	return true;
+ }
+ 
+@@ -539,18 +524,16 @@ static void calculate_inits(
+ {
+ 	struct fixed31_32 h_init;
+ 	struct fixed31_32 v_init;
+-	struct fixed31_32 v_init_bot;
+ 
+-	inits->bottom_enable = 0;
+ 	inits->h_int_scale_ratio =
+-		dal_fixed31_32_u2d19(data->ratios->horz) << 5;
++		dal_fixed31_32_u2d19(data->ratios.horz) << 5;
+ 	inits->v_int_scale_ratio =
+-		dal_fixed31_32_u2d19(data->ratios->vert) << 5;
++		dal_fixed31_32_u2d19(data->ratios.vert) << 5;
+ 
+ 	h_init =
+ 		dal_fixed31_32_div_int(
+ 			dal_fixed31_32_add(
+-				data->ratios->horz,
++				data->ratios.horz,
+ 				dal_fixed31_32_from_int(data->taps.h_taps + 1)),
+ 				2);
+ 	inits->h_init.integer = dal_fixed31_32_floor(h_init);
+@@ -559,28 +542,11 @@ static void calculate_inits(
+ 	v_init =
+ 		dal_fixed31_32_div_int(
+ 			dal_fixed31_32_add(
+-				data->ratios->vert,
++				data->ratios.vert,
+ 				dal_fixed31_32_from_int(data->taps.v_taps + 1)),
+ 				2);
+ 	inits->v_init.integer = dal_fixed31_32_floor(v_init);
+ 	inits->v_init.fraction = dal_fixed31_32_u0d19(v_init) << 5;
+-
+-	if (data->flags.bits.INTERLACED) {
+-		v_init_bot =
+-			dal_fixed31_32_add(
+-				dal_fixed31_32_div_int(
+-					dal_fixed31_32_add(
+-						data->ratios->vert,
+-						dal_fixed31_32_from_int(
+-							data->taps.v_taps + 1)),
+-					2),
+-				data->ratios->vert);
+-		inits->v_init_bottom.integer = dal_fixed31_32_floor(v_init_bot);
+-		inits->v_init_bottom.fraction =
+-			dal_fixed31_32_u0d19(v_init_bot) << 5;
+-
+-		inits->bottom_enable = 1;
+-	}
+ }
+ 
+ static void program_scl_ratios_inits(
+@@ -634,22 +600,6 @@ static void program_scl_ratios_inits(
+ 		SCL_V_INIT_FRAC);
+ 	dm_write_reg(xfm80->base.ctx, addr, value);
+ 
+-	if (inits->bottom_enable) {
+-		addr = SCL_REG(mmSCL_VERT_FILTER_INIT_BOT);
+-		value = 0;
+-		set_reg_field_value(
+-			value,
+-			inits->v_init_bottom.integer,
+-			SCL_VERT_FILTER_INIT_BOT,
+-			SCL_V_INIT_INT_BOT);
+-		set_reg_field_value(
+-			value,
+-			inits->v_init_bottom.fraction,
+-			SCL_VERT_FILTER_INIT_BOT,
+-			SCL_V_INIT_FRAC_BOT);
+-		dm_write_reg(xfm80->base.ctx, addr, value);
+-	}
+-
+ 	addr = SCL_REG(mmSCL_AUTOMATIC_MODE_CONTROL);
+ 	value = 0;
+ 	set_reg_field_value(
+@@ -665,38 +615,6 @@ static void program_scl_ratios_inits(
+ 	dm_write_reg(xfm80->base.ctx, addr, value);
+ }
+ 
+-static void get_viewport(
+-		struct dce80_transform *xfm80,
+-		struct rect *current_view_port)
+-{
+-	uint32_t value_start;
+-	uint32_t value_size;
+-
+-	if (current_view_port == NULL)
+-		return;
+-
+-	value_start = dm_read_reg(xfm80->base.ctx, SCL_REG(mmVIEWPORT_START));
+-	value_size = dm_read_reg(xfm80->base.ctx, SCL_REG(mmVIEWPORT_SIZE));
+-
+-	current_view_port->x = get_reg_field_value(
+-			value_start,
+-			VIEWPORT_START,
+-			VIEWPORT_X_START);
+-	current_view_port->y = get_reg_field_value(
+-			value_start,
+-			VIEWPORT_START,
+-			VIEWPORT_Y_START);
+-	current_view_port->height = get_reg_field_value(
+-			value_size,
+-			VIEWPORT_SIZE,
+-			VIEWPORT_HEIGHT);
+-	current_view_port->width = get_reg_field_value(
+-			value_size,
+-			VIEWPORT_SIZE,
+-			VIEWPORT_WIDTH);
+-}
+-
+-
+ bool dce80_transform_set_scaler(
+ 	struct transform *xfm,
+ 	const struct scaler_data *data)
+@@ -761,6 +679,9 @@ bool dce80_transform_set_scaler(
+ 			program_two_taps_filter(xfm80, true, false);
+ 	}
+ 
++	/* 7. Program the viewport */
++	program_viewport(xfm80, &data->viewport);
++
+ 	return true;
+ }
+ 
+@@ -776,35 +697,6 @@ void dce80_transform_set_scaler_bypass(struct transform *xfm)
+ 	dm_write_reg(xfm->ctx, SCL_REG(mmSCL_MODE), sclv_mode);
+ }
+ 
+-bool dce80_transform_update_viewport(
+-	struct transform *xfm,
+-	const struct rect *view_port,
+-	bool is_fbc_attached)
+-{
+-	struct dce80_transform *xfm80 = TO_DCE80_TRANSFORM(xfm);
+-	bool program_req = false;
+-	struct rect current_view_port;
+-
+-	if (view_port == NULL)
+-		return program_req;
+-
+-	get_viewport(xfm80, &current_view_port);
+-
+-	if (current_view_port.x != view_port->x ||
+-			current_view_port.y != view_port->y ||
+-			current_view_port.height != view_port->height ||
+-			current_view_port.width != view_port->width)
+-		program_req = true;
+-
+-	if (program_req) {
+-		/*underlay viewport is programmed with scaler
+-		 *program_viewport function pointer is not exposed*/
+-		program_viewport(xfm80, view_port);
+-	}
+-
+-	return program_req;
+-}
+-
+ void dce80_transform_set_scaler_filter(
+ 	struct transform *xfm,
+ 	struct scaler_filter *filter)
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_status.h b/drivers/gpu/drm/amd/dal/dc/inc/core_status.h
+index b395ae5..f6621f6 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_status.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_status.h
+@@ -37,6 +37,7 @@ enum dc_status {
+ 	DC_FAIL_ATTACH_SURFACES,
+ 	DC_NO_DP_LINK_BANDWIDTH,
+ 	DC_EXCEED_DONGLE_MAX_CLK,
++	DC_SURFACE_PIXEL_FORMAT_UNSUPPORTED,
+ 	DC_FAIL_BANDWIDTH_VALIDATE, /* BW and Watermark validation */
+ 
+ 	DC_ERROR_UNEXPECTED = -1
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+index 18bd2da..d638054 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+@@ -29,6 +29,7 @@
+ #include "dc.h"
+ #include "bandwidth_calcs.h"
+ #include "ddc_service_types.h"
++#include "scaler_types.h"
+ 
+ struct core_stream;
+ /********* core_target *************/
+@@ -288,11 +289,7 @@ struct pipe_ctx {
+ 	struct output_pixel_processor *opp;
+ 	struct timing_generator *tg;
+ 
+-	struct overscan_info overscan;
+-	struct scaling_ratios ratios;
+-	struct rect viewport;
+-	struct scaling_taps taps;
+-	enum pixel_format format;
++	struct scaler_data scl_data;
+ 
+ 	struct stream_encoder *stream_enc;
+ 	struct display_clock *dis_clk;
+@@ -319,6 +316,7 @@ struct pipe_ctx {
+ 	uint8_t pipe_idx;
+ 
+ 	struct flags {
++		bool blanked;
+ 		bool unchanged;
+ 		bool timing_changed;
+ 	} flags;
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+index 8b0afe1..014e83f 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+@@ -44,14 +44,13 @@ struct hw_sequencer_funcs {
+ 	void (*reset_hw_ctx)(struct dc *dc, struct validate_context *context);
+ 
+ 	void (*set_plane_config)(
+-				const struct dc *dc,
+-				struct core_surface *surface,
+-				struct pipe_ctx *pipe_ctx);
++			const struct dc *dc,
++			struct pipe_ctx *pipe_ctx,
++			struct resource_context *res_ctx);
+ 
+ 	void (*update_plane_addrs)(
+ 		struct dc *dc,
+-		struct resource_context *res_ctx,
+-		const struct core_surface *surface);
++		struct resource_context *res_ctx);
+ 
+ 	bool (*set_gamma_correction)(
+ 				struct input_pixel_processor *ipp,
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/resource.h b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+index a7b0032..c2d6011 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+@@ -31,6 +31,7 @@
+ 
+ /* TODO unhardcode, 4 for CZ*/
+ #define MEMORY_TYPE_MULTIPLIER 4
++#define DCE110_UNDERLAY_IDX 3
+ 
+ bool dc_construct_resource_pool(struct adapter_service *adapter_serv,
+ 				struct dc *dc,
+@@ -79,4 +80,6 @@ enum dc_status map_resources(
+ 	const struct dc *dc,
+ 	struct validate_context *context);
+ 
++void destruct_val_ctx(struct validate_context *context);
++
+ #endif /* DRIVERS_GPU_DRM_AMD_DAL_DEV_DC_INC_RESOURCE_H_ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/transform.h b/drivers/gpu/drm/amd/dal/dc/inc/transform.h
+index 1e5467c..efefedb 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/transform.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/transform.h
+@@ -133,11 +133,6 @@ struct transform_funcs {
+ 	void (*transform_set_scaler_bypass)(
+ 		struct transform *xfm);
+ 
+-	bool (*transform_update_viewport)(
+-		struct transform *xfm,
+-		const struct rect *view_port,
+-		bool is_fbc_attached);
+-
+ 	void (*transform_set_scaler_filter)(
+ 		struct transform *xfm,
+ 		struct scaler_filter *filter);
+diff --git a/drivers/gpu/drm/amd/dal/include/scaler_types.h b/drivers/gpu/drm/amd/dal/include/scaler_types.h
+index db52dbc..3947776 100644
+--- a/drivers/gpu/drm/amd/dal/include/scaler_types.h
++++ b/drivers/gpu/drm/amd/dal/include/scaler_types.h
+@@ -26,15 +26,8 @@
+ #ifndef __DAL_SCALER_TYPES_H__
+ #define __DAL_SCALER_TYPES_H__
+ 
+-#include "signal_types.h"
+-#include "fixed31_32.h"
+ #include "dc_types.h"
+ 
+-enum pixel_type {
+-	PIXEL_TYPE_30BPP = 1,
+-	PIXEL_TYPE_20BPP
+-};
+-
+ /*overscan or window*/
+ struct overscan_info {
+ 	uint32_t left;
+@@ -43,154 +36,42 @@ struct overscan_info {
+ 	uint32_t bottom;
+ };
+ 
+-struct mp_scaling_data {
+-	struct rect viewport;
+-	struct view dst_res;
++struct scaler_data {
+ 	struct overscan_info overscan;
+ 	struct scaling_taps taps;
++	struct rect viewport;
+ 	struct scaling_ratios ratios;
+-};
+ 
+-struct scaler_validation_params {
+-	uint32_t INTERLACED:1;
+-	uint32_t CHROMA_SUB_SAMPLING:1;
+-
+-	uint32_t line_buffer_size;
+-	uint32_t display_clock; /* in KHz */
+-	uint32_t actual_pixel_clock; /* in KHz */
+-	struct view source_view;
+-	struct view dest_view;
+-	enum signal_type signal_type;
+-
+-	struct scaling_taps taps_requested;
+-	enum pixel_format pixel_format;
+-	enum dc_rotation_angle rotation;
++	enum pixel_format format;
+ };
+ 
+-struct adjustment_factor {
+-	int32_t adjust;	 /* Actual adjustment value * lDivider */
+-	uint32_t divider;
+-};
+-
+-struct sharpness_adjustment {
+-	int32_t sharpness;
+-	bool enable_sharpening;
+-};
+-
+-enum scaling_options {
+-	SCALING_BYPASS = 0,
+-	SCALING_ENABLE
+-};
+-
+-/* same as Hw register */
+-enum filter_type {
+-	FILTER_TYPE_V_LOW_PASS = 0x0,
+-	FILTER_TYPE_V_HIGH_PASS = 0x1,
+-	FILTER_TYPE_H_LUMA = 0x2,
+-	FILTER_TYPE_H_CHROMA = 0x3
+-};
+-
+-/* Validation Result enumeration */
+-enum scaler_validation_code {
+-	SCALER_VALIDATION_OK = 0,
+-	SCALER_VALIDATION_INVALID_INPUT_PARAMETERS,
+-	SCALER_VALIDATION_SCALING_RATIO_NOT_SUPPORTED,
+-	SCALER_VALIDATION_SOURCE_VIEW_WIDTH_EXCEEDING_LIMIT,
+-	SCALER_VALIDATION_DISPLAY_CLOCK_BELOW_PIXEL_CLOCK,
+-	SCALER_VALIDATION_FAILURE_PREDEFINED_TAPS_NUMBER
+-};
+-
+-
+-#define FILTER_TYPE_MASK 0x0000000FL
+-#define TWO_TAPS 2
+-
+ struct init_int_and_frac {
+ 	uint32_t integer;
+ 	uint32_t fraction;
+ };
+ 
+ struct scl_ratios_inits {
+-	uint32_t bottom_enable;
+ 	uint32_t h_int_scale_ratio;
+ 	uint32_t v_int_scale_ratio;
+ 	struct init_int_and_frac h_init;
+ 	struct init_int_and_frac v_init;
+-	struct init_int_and_frac v_init_bottom;
+-};
+-
+-union scaler_flags {
+-	uint32_t raw;
+-	struct {
+-		uint32_t INTERLACED:1;
+-		uint32_t DOUBLE_SCAN_MODE:1;
+-		/* this one is legacy flag only used in DCE80 */
+-		uint32_t RGB_COLOR_SPACE:1;
+-		uint32_t PIPE_LOCK_REQ:1;
+-		/* 4 */
+-		uint32_t WIDE_DISPLAY:1;
+-		uint32_t OTHER_PIPE:1;
+-		uint32_t SHOULD_PROGRAM_VIEWPORT:1;
+-		uint32_t SHOULD_UNLOCK:1;
+-		/* 8 */
+-		uint32_t SHOULD_PROGRAM_ALPHA:1;
+-		uint32_t SHOW_COLOURED_BORDER:1;
+-
+-		uint32_t  RESERVED:22;
+-	} bits;
+-};
+-
+-struct scaler_data {
+-	struct view src_res;
+-	struct view dst_res;
+-	struct overscan_info overscan;
+-	struct scaling_taps taps;
+-	struct adjustment_factor scale_ratio_hp_factor;
+-	struct adjustment_factor scale_ratio_lp_factor;
+-	enum pixel_type pixel_type; /*legacy*/
+-	struct sharpness_adjustment sharp_gain;
+-
+-	union scaler_flags flags;
+-	int32_t h_sharpness;
+-	int32_t v_sharpness;
+-
+-	struct view src_res_wide_display;
+-	struct view dst_res_wide_display;
+-
+-	/* it is here because of the HW bug in NI (UBTS #269539)
+-	causes glitches in this VBI signal. It shouldn't change after
+-	initialization, kind of a const */
+-	const struct hw_crtc_timing *hw_crtc_timing;
+-
+-	struct rect viewport;
+-
+-	enum pixel_format dal_pixel_format;/*plane concept*/
+-	/*stereoformat TODO*/
+-	/*hwtotation TODO*/
+-
+-	const struct scaling_ratios *ratios;
+-};
+-
+-enum bypass_type {
+-	/* 00 - 00 - Manual Centering, Manual Replication */
+-	BYPASS_TYPE_MANUAL = 0,
+-	/* 01 - 01 - Auto-Centering, No Replication */
+-	BYPASS_TYPE_AUTO_CENTER = 1,
+-	/* 02 - 10 - Auto-Centering, Auto-Replication */
+-	BYPASS_TYPE_AUTO_REPLICATION = 3
+ };
+ 
+-struct replication_factor {
+-	uint32_t h_manual;
+-	uint32_t v_manual;
++/* same as Hw register */
++enum filter_type {
++	FILTER_TYPE_V_LOW_PASS	= 0x0,
++	FILTER_TYPE_V_HIGH_PASS	= 0x1,
++	FILTER_TYPE_H_LUMA	= 0x2,
++	FILTER_TYPE_H_CHROMA	= 0x3
+ };
+ 
+ enum ram_filter_type {
+-	FILTER_TYPE_RGB_Y_VERTICAL = 0,	/* 0 - RGB/Y Vertical filter */
+-	FILTER_TYPE_CBCR_VERTICAL = 1,	/* 1 - CbCr  Vertical filter */
+-	FILTER_TYPE_RGB_Y_HORIZONTAL   = 2, /* 1 - RGB/Y Horizontal filter */
+-	FILTER_TYPE_CBCR_HORIZONTAL   = 3, /* 3 - CbCr  Horizontal filter */
+-	FILTER_TYPE_ALPHA_VERTICAL    = 4, /* 4 - Alpha Vertical filter. */
+-	FILTER_TYPE_ALPHA_HORIZONTAL  = 5, /* 5 - Alpha Horizontal filter. */
++	FILTER_TYPE_RGB_Y_VERTICAL	= 0, /* 0 - RGB/Y Vertical filter */
++	FILTER_TYPE_CBCR_VERTICAL	= 1, /* 1 - CbCr  Vertical filter */
++	FILTER_TYPE_RGB_Y_HORIZONTAL	= 2, /* 1 - RGB/Y Horizontal filter */
++	FILTER_TYPE_CBCR_HORIZONTAL	= 3, /* 3 - CbCr  Horizontal filter */
++	FILTER_TYPE_ALPHA_VERTICAL	= 4, /* 4 - Alpha Vertical filter. */
++	FILTER_TYPE_ALPHA_HORIZONTAL	= 5, /* 5 - Alpha Horizontal filter. */
+ };
+ 
+ #endif
+-- 
+2.7.4
+

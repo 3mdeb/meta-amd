@@ -1,0 +1,155 @@
+From b0d5d1dd7c190c9a20369c4ef0880a1ffdfa95f9 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <David1.Zhou@amd.com>
+Date: Thu, 5 Nov 2015 15:23:09 +0800
+Subject: [PATCH 0012/1110] drm/amd: abstract kernel rq and normal rq to
+ priority of run queue
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Allows us to set priorities in the scheduler.
+
+Signed-off-by: Chunming Zhou <David1.Zhou@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Junwei Zhang <Jerry.Zhang@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c       | 11 +++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c    |  2 +-
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 14 +++++++++-----
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  9 +++++++--
+ 5 files changed, 23 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index d313225..e85ed1b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1045,7 +1045,7 @@ struct amdgpu_ctx_mgr {
+ 	struct idr		ctx_handles;
+ };
+ 
+-int amdgpu_ctx_init(struct amdgpu_device *adev, bool kernel,
++int amdgpu_ctx_init(struct amdgpu_device *adev, enum amd_sched_priority pri,
+ 		    struct amdgpu_ctx *ctx);
+ void amdgpu_ctx_fini(struct amdgpu_ctx *ctx);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index fec65f0..c1f2308 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -25,7 +25,7 @@
+ #include <drm/drmP.h>
+ #include "amdgpu.h"
+ 
+-int amdgpu_ctx_init(struct amdgpu_device *adev, bool kernel,
++int amdgpu_ctx_init(struct amdgpu_device *adev, enum amd_sched_priority pri,
+ 		    struct amdgpu_ctx *ctx)
+ {
+ 	unsigned i, j;
+@@ -42,10 +42,9 @@ int amdgpu_ctx_init(struct amdgpu_device *adev, bool kernel,
+ 		/* create context entity for each ring */
+ 		for (i = 0; i < adev->num_rings; i++) {
+ 			struct amd_sched_rq *rq;
+-			if (kernel)
+-				rq = &adev->rings[i]->sched.kernel_rq;
+-			else
+-				rq = &adev->rings[i]->sched.sched_rq;
++			if (pri >= AMD_SCHED_MAX_PRIORITY)
++				return -EINVAL;
++			rq = &adev->rings[i]->sched.sched_rq[pri];
+ 			r = amd_sched_entity_init(&adev->rings[i]->sched,
+ 						  &ctx->rings[i].entity,
+ 						  rq, amdgpu_sched_jobs);
+@@ -103,7 +102,7 @@ static int amdgpu_ctx_alloc(struct amdgpu_device *adev,
+ 		return r;
+ 	}
+ 	*id = (uint32_t)r;
+-	r = amdgpu_ctx_init(adev, false, ctx);
++	r = amdgpu_ctx_init(adev, AMD_SCHED_PRIORITY_NORMAL, ctx);
+ 	mutex_unlock(&mgr->lock);
+ 
+ 	return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index c961fe0..c5206fd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1528,7 +1528,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 		return r;
+ 	}
+ 
+-	r = amdgpu_ctx_init(adev, true, &adev->kernel_ctx);
++	r = amdgpu_ctx_init(adev, AMD_SCHED_PRIORITY_KERNEL, &adev->kernel_ctx);
+ 	if (r) {
+ 		dev_err(adev->dev, "failed to create kernel context (%d).\n", r);
+ 		return r;
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index 3a4820e..5ace1a7 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -349,14 +349,17 @@ static struct amd_sched_entity *
+ amd_sched_select_entity(struct amd_gpu_scheduler *sched)
+ {
+ 	struct amd_sched_entity *entity;
++	int i;
+ 
+ 	if (!amd_sched_ready(sched))
+ 		return NULL;
+ 
+ 	/* Kernel run queue has higher priority than normal run queue*/
+-	entity = amd_sched_rq_select_entity(&sched->kernel_rq);
+-	if (entity == NULL)
+-		entity = amd_sched_rq_select_entity(&sched->sched_rq);
++	for (i = 0; i < AMD_SCHED_MAX_PRIORITY; i++) {
++		entity = amd_sched_rq_select_entity(&sched->sched_rq[i]);
++		if (entity)
++			break;
++	}
+ 
+ 	return entity;
+ }
+@@ -478,12 +481,13 @@ int amd_sched_init(struct amd_gpu_scheduler *sched,
+ 		   struct amd_sched_backend_ops *ops,
+ 		   unsigned hw_submission, long timeout, const char *name)
+ {
++	int i;
+ 	sched->ops = ops;
+ 	sched->hw_submission_limit = hw_submission;
+ 	sched->name = name;
+ 	sched->timeout = timeout;
+-	amd_sched_rq_init(&sched->sched_rq);
+-	amd_sched_rq_init(&sched->kernel_rq);
++	for (i = 0; i < AMD_SCHED_MAX_PRIORITY; i++)
++		amd_sched_rq_init(&sched->sched_rq[i]);
+ 
+ 	init_waitqueue_head(&sched->wake_up_worker);
+ 	init_waitqueue_head(&sched->job_scheduled);
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index a0f0ae5..9403145 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -104,6 +104,12 @@ struct amd_sched_backend_ops {
+ 	struct fence *(*run_job)(struct amd_sched_job *sched_job);
+ };
+ 
++enum amd_sched_priority {
++	AMD_SCHED_PRIORITY_KERNEL = 0,
++	AMD_SCHED_PRIORITY_NORMAL,
++	AMD_SCHED_MAX_PRIORITY
++};
++
+ /**
+  * One scheduler is implemented for each hardware ring
+ */
+@@ -112,8 +118,7 @@ struct amd_gpu_scheduler {
+ 	uint32_t			hw_submission_limit;
+ 	long				timeout;
+ 	const char			*name;
+-	struct amd_sched_rq		sched_rq;
+-	struct amd_sched_rq		kernel_rq;
++	struct amd_sched_rq		sched_rq[AMD_SCHED_MAX_PRIORITY];
+ 	wait_queue_head_t		wake_up_worker;
+ 	wait_queue_head_t		job_scheduled;
+ 	atomic_t			hw_rq_count;
+-- 
+2.7.4
+

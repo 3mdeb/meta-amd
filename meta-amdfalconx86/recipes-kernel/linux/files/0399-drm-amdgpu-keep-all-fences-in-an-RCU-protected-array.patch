@@ -1,0 +1,113 @@
+From 7d2083232b7c288ba4a6c440d5382c010d8a12e9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Sun, 13 Mar 2016 19:19:48 +0100
+Subject: [PATCH 0399/1110] drm/amdgpu: keep all fences in an RCU protected
+ array v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Just keep all HW fences in a RCU protected array as a
+first step to replace the wait queue.
+
+v2: update commit message, move fixes into separate patch.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c | 32 ++++++++++++++++++++++++++++---
+ 2 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index bd556b4..43c948d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -354,6 +354,8 @@ struct amdgpu_fence_driver {
+ 	unsigned			irq_type;
+ 	struct timer_list		fallback_timer;
+ 	wait_queue_head_t		fence_queue;
++	unsigned			num_fences_mask;
++	struct fence			**fences;
+ };
+ 
+ /* some special values for the owner field */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index 4654113..44eac91 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -124,6 +124,8 @@ int amdgpu_fence_emit(struct amdgpu_ring *ring, struct fence **f)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_fence *fence;
++	struct fence *old, **ptr;
++	unsigned idx;
+ 
+ 	fence = kmem_cache_alloc(amdgpu_fence_slab, GFP_KERNEL);
+ 	if (fence == NULL)
+@@ -137,7 +139,21 @@ int amdgpu_fence_emit(struct amdgpu_ring *ring, struct fence **f)
+ 		   fence->seq);
+ 	amdgpu_ring_emit_fence(ring, ring->fence_drv.gpu_addr,
+ 			       fence->seq, AMDGPU_FENCE_FLAG_INT);
++
++	idx = fence->seq & ring->fence_drv.num_fences_mask;
++	ptr = &ring->fence_drv.fences[idx];
++	/* This function can't be called concurrently anyway, otherwise
++	 * emitting the fence would mess up the hardware ring buffer.
++	 */
++	old = rcu_dereference_protected(*ptr, 1);
++
++	rcu_assign_pointer(*ptr, fence_get(&fence->base));
++
++	BUG_ON(old && !fence_is_signaled(old));
++	fence_put(old);
++
+ 	*f = &fence->base;
++
+ 	return 0;
+ }
+ 
+@@ -380,6 +396,11 @@ int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring,
+ 		    (unsigned long)ring);
+ 
+ 	init_waitqueue_head(&ring->fence_drv.fence_queue);
++	ring->fence_drv.num_fences_mask = num_hw_submission - 1;
++	ring->fence_drv.fences = kcalloc(num_hw_submission, sizeof(void *),
++					 GFP_KERNEL);
++	if (!ring->fence_drv.fences)
++		return -ENOMEM;
+ 
+ 	timeout = msecs_to_jiffies(amdgpu_lockup_timeout);
+ 	if (timeout == 0) {
+@@ -441,10 +462,9 @@ int amdgpu_fence_driver_init(struct amdgpu_device *adev)
+  */
+ void amdgpu_fence_driver_fini(struct amdgpu_device *adev)
+ {
+-	int i, r;
++	unsigned i, j;
++	int r;
+ 
+-	if (atomic_dec_and_test(&amdgpu_fence_slab_ref))
+-		kmem_cache_destroy(amdgpu_fence_slab);
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; i++) {
+ 		struct amdgpu_ring *ring = adev->rings[i];
+ 
+@@ -460,8 +480,14 @@ void amdgpu_fence_driver_fini(struct amdgpu_device *adev)
+ 			       ring->fence_drv.irq_type);
+ 		amd_sched_fini(&ring->sched);
+ 		del_timer_sync(&ring->fence_drv.fallback_timer);
++		for (j = 0; j <= ring->fence_drv.num_fences_mask; ++j)
++			fence_put(ring->fence_drv.fences[i]);
++		kfree(ring->fence_drv.fences);
+ 		ring->fence_drv.initialized = false;
+ 	}
++
++	if (atomic_dec_and_test(&amdgpu_fence_slab_ref))
++		kmem_cache_destroy(amdgpu_fence_slab);
+ }
+ 
+ /**
+-- 
+2.7.4
+

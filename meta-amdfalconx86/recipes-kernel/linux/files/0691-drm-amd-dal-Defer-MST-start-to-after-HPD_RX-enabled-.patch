@@ -1,0 +1,207 @@
+From 067bb023f9fef32a30c1ca1974a38f97ab4ea338 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Wed, 13 Jan 2016 14:49:57 -0500
+Subject: [PATCH 0691/1110] drm/amd/dal: Defer MST start to after HPD_RX
+ enabled on boot.
+
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Acked-by: Jordan Lazare <Jordan.Lazare@amd.com>
+---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c  | 13 +++++---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      | 37 +++++++++++++++++++---
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          |  9 +++---
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |  3 +-
+ drivers/gpu/drm/amd/dal/dc/dc_helpers.h            |  3 +-
+ 5 files changed, 51 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
+index ff9b5c1..855f9f9 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
+@@ -431,18 +431,23 @@ void dc_helpers_dp_mst_handle_mst_hpd_rx_irq(void *param)
+ 
+ bool dc_helpers_dp_mst_start_top_mgr(
+ 		struct dc_context *ctx,
+-		const struct dc_link *link)
++		const struct dc_link *link,
++		bool boot)
+ {
+ 	struct amdgpu_device *adev = ctx->driver_context;
+ 	struct drm_device *dev = adev->ddev;
+ 	struct amdgpu_connector *aconnector = get_connector_for_link(dev, link);
+ 
++	if (boot) {
++		DRM_INFO("DM_MST: Differing MST start on aconnector: %p [id: %d]\n",
++					aconnector, aconnector->base.base.id);
++		return true;
++	}
++
+ 	DRM_INFO("DM_MST: starting TM on aconnector: %p [id: %d]\n",
+ 			aconnector, aconnector->base.base.id);
+ 
+-	drm_dp_mst_topology_mgr_set_mst(&aconnector->mst_mgr, true);
+-
+-	return true;
++	return (drm_dp_mst_topology_mgr_set_mst(&aconnector->mst_mgr, true) == 0);
+ }
+ 
+ void dc_helpers_dp_mst_stop_top_mgr(
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index cee507c..0f281b6 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -461,7 +461,7 @@ static void detect_on_all_dc_links(struct amdgpu_display_manager *dm)
+ 
+ 	for (i = 0; i < caps.max_links; i++) {
+ 		dc_link = dc_get_link_at_index(dm->dc, i);
+-		dc_link_detect(dc_link);
++		dc_link_detect(dc_link, false);
+ 	}
+ }
+ 
+@@ -612,6 +612,31 @@ static int dm_sw_fini(void *handle)
+ 	return 0;
+ }
+ 
++
++static void detect_link_for_all_connectors(struct drm_device *dev)
++{
++	struct amdgpu_connector *aconnector;
++	struct drm_connector *connector;
++
++	drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
++
++	drm_for_each_connector(connector, dev) {
++		   aconnector = to_amdgpu_connector(connector);
++		   if (aconnector->dc_link->type == dc_connection_mst_branch) {
++			   DRM_INFO("DM_MST: starting TM on aconnector: %p [id: %d]\n",
++						aconnector, aconnector->base.base.id);
++
++				if (drm_dp_mst_topology_mgr_set_mst(&aconnector->mst_mgr, true) < 0) {
++					DRM_ERROR("DM_MST: Failed to start MST\n");
++					((struct dc_link *)aconnector->dc_link)->type = dc_connection_single;
++				}
++		   }
++	}
++
++	drm_modeset_unlock(&dev->mode_config.connection_mutex);
++}
++
++
+ static int dm_hw_init(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+@@ -620,6 +645,10 @@ static int dm_hw_init(void *handle)
+ 
+ 	amdgpu_dm_hpd_init(adev);
+ 
++	detect_link_for_all_connectors(adev->ddev);
++
++
++
+ 	return 0;
+ }
+ 
+@@ -765,7 +794,7 @@ static void handle_hpd_irq(void *param)
+ 	/* In case of failure or MST no need to update connector status or notify the OS
+ 	 * since (for MST case) MST does this in it's own context.
+ 	 */
+-	if (dc_link_detect(aconnector->dc_link)) {
++	if (dc_link_detect(aconnector->dc_link, false)) {
+ 		amdgpu_dm_update_connector_after_detect(aconnector);
+ 		drm_kms_helper_hotplug_event(dev);
+ 	}
+@@ -781,7 +810,7 @@ static void handle_hpd_rx_irq(void *param)
+ 	if (dc_link_handle_hpd_rx_irq(aconnector->dc_link) &&
+ 			!is_mst_root_connector) {
+ 		/* Downstream Port status changed. */
+-		if (dc_link_detect(aconnector->dc_link)) {
++		if (dc_link_detect(aconnector->dc_link, false)) {
+ 			amdgpu_dm_update_connector_after_detect(aconnector);
+ 			drm_kms_helper_hotplug_event(dev);
+ 		}
+@@ -1057,7 +1086,7 @@ int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
+ 			goto fail_free_connector;
+ 		}
+ 
+-		if (dc_link_detect(dc_get_link_at_index(dm->dc, i)))
++		if (dc_link_detect(dc_get_link_at_index(dm->dc, i), true))
+ 			amdgpu_dm_update_connector_after_detect(
+ 				aconnector);
+ 	}
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index a994a4c..b034c2f 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -469,7 +469,8 @@ static void detect_dp(
+ 	struct core_link *link,
+ 	struct display_sink_capability *sink_caps,
+ 	bool *converter_disable_audio,
+-	union audio_support *audio_support)
++	union audio_support *audio_support,
++	bool boot)
+ {
+ 	sink_caps->signal = link_detect_sink(link);
+ 	sink_caps->transaction_type =
+@@ -525,7 +526,7 @@ static void detect_dp(
+ 
+ 			if (dc_helpers_dp_mst_start_top_mgr(
+ 				link->ctx,
+-				&link->public)) {
++				&link->public, boot)) {
+ 				link->public.type = dc_connection_mst_branch;
+ 			} else {
+ 				/* MST not supported */
+@@ -540,7 +541,7 @@ static void detect_dp(
+ 	}
+ }
+ 
+-bool dc_link_detect(const struct dc_link *dc_link)
++bool dc_link_detect(const struct dc_link *dc_link, bool boot)
+ {
+ 	struct core_link *link = DC_LINK_TO_LINK(dc_link);
+ 	struct dc_sink_init_data sink_init_data = { 0 };
+@@ -605,7 +606,7 @@ bool dc_link_detect(const struct dc_link *dc_link)
+ 				link,
+ 				&sink_caps,
+ 				&converter_disable_audio,
+-				&audio_support);
++				&audio_support, boot);
+ 
+ 			if (link->public.type == dc_connection_mst_branch)
+ 				return false;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index a2f26cb..f86ddb0 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -297,11 +297,12 @@ const struct graphics_object_id dc_get_link_id_at_index(
+ bool dc_link_set_backlight_level(const struct dc_link *dc_link, uint32_t level);
+ 
+ /* Request DC to detect if there is a Panel connected.
++ * boot - If this call is during initial boot.
+  * Return false for any type of detection failure or MST detection
+  * true otherwise. True meaning further action is required (status update
+  * and OS notification).
+  */
+-bool dc_link_detect(const struct dc_link *dc_link);
++bool dc_link_detect(const struct dc_link *dc_link, bool boot);
+ 
+ /* Notify DC about DP RX Interrupt (aka Short Pulse Interrupt).
+  * Return:
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_helpers.h b/drivers/gpu/drm/amd/dal/dc/dc_helpers.h
+index b4c338a..7a14300 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc_helpers.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc_helpers.h
+@@ -67,7 +67,8 @@ void dc_helpers_dp_mst_handle_mst_hpd_rx_irq(
+ 
+ bool dc_helpers_dp_mst_start_top_mgr(
+ 		struct dc_context *ctx,
+-		const struct dc_link *link);
++		const struct dc_link *link,
++		bool boot);
+ 
+ void dc_helpers_dp_mst_stop_top_mgr(
+ 		struct dc_context *ctx,
+-- 
+2.7.4
+

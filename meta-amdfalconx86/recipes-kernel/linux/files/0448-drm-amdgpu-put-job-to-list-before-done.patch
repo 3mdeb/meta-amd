@@ -1,0 +1,126 @@
+From dd722c4f3c4a31f7980aee3c738907d7fba184d7 Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Fri, 4 Mar 2016 14:33:44 +0800
+Subject: [PATCH 0448/1110] drm/amdgpu:put job to list before done
+
+the mirror_list will be used for later time out detect
+feature.
+
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 12 ++++++++++++
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  6 ++++++
+ drivers/gpu/drm/amd/scheduler/sched_fence.c   |  9 +++++++++
+ 3 files changed, 27 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index 8d49ea2..af846f2 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -349,12 +349,15 @@ int amd_sched_job_init(struct amd_sched_job *job,
+ 						struct amd_sched_entity *entity,
+ 						void *owner, struct fence **fence)
+ {
++	INIT_LIST_HEAD(&job->node);
+ 	job->sched = sched;
+ 	job->s_entity = entity;
+ 	job->s_fence = amd_sched_fence_create(entity, owner);
+ 	if (!job->s_fence)
+ 		return -ENOMEM;
+ 
++	job->s_fence->s_job = job;
++
+ 	if (fence)
+ 		*fence = &job->s_fence->base;
+ 	return 0;
+@@ -408,6 +411,12 @@ static void amd_sched_process_job(struct fence *f, struct fence_cb *cb)
+ 	unsigned long flags;
+ 
+ 	atomic_dec(&sched->hw_rq_count);
++
++	/* remove job from ring_mirror_list */
++	spin_lock_irqsave(&sched->job_list_lock, flags);
++	list_del_init(&s_fence->s_job->node);
++	spin_unlock_irqrestore(&sched->job_list_lock, flags);
++
+ 	amd_sched_fence_signal(s_fence);
+ 	if (sched->timeout != MAX_SCHEDULE_TIMEOUT) {
+ 		cancel_delayed_work(&s_fence->dwork);
+@@ -480,6 +489,7 @@ static int amd_sched_main(void *param)
+ 		}
+ 
+ 		atomic_inc(&sched->hw_rq_count);
++		amd_sched_job_pre_schedule(sched, sched_job);
+ 		fence = sched->ops->run_job(sched_job);
+ 		amd_sched_fence_scheduled(s_fence);
+ 		if (fence) {
+@@ -527,6 +537,8 @@ int amd_sched_init(struct amd_gpu_scheduler *sched,
+ 
+ 	init_waitqueue_head(&sched->wake_up_worker);
+ 	init_waitqueue_head(&sched->job_scheduled);
++	INIT_LIST_HEAD(&sched->ring_mirror_list);
++	spin_lock_init(&sched->job_list_lock);
+ 	atomic_set(&sched->hw_rq_count, 0);
+ 	if (atomic_inc_return(&sched_fence_slab_ref) == 1) {
+ 		sched_fence_slab = kmem_cache_create(
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index ee1e812..2e3b830 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -76,6 +76,7 @@ struct amd_sched_fence {
+ 	void                            *owner;
+ 	struct delayed_work		dwork;
+ 	struct list_head		list;
++	struct amd_sched_job 	*s_job;
+ };
+ 
+ struct amd_sched_job {
+@@ -85,6 +86,7 @@ struct amd_sched_job {
+ 	bool	use_sched;	/* true if the job goes to scheduler */
+ 	struct fence_cb                cb_free_job;
+ 	struct work_struct             work_free_job;
++	struct list_head			   node;
+ };
+ 
+ extern const struct fence_ops amd_sched_fence_ops;
+@@ -128,6 +130,8 @@ struct amd_gpu_scheduler {
+ 	struct list_head		fence_list;
+ 	spinlock_t			fence_list_lock;
+ 	struct task_struct		*thread;
++	struct list_head	ring_mirror_list;
++	spinlock_t			job_list_lock;
+ };
+ 
+ int amd_sched_init(struct amd_gpu_scheduler *sched,
+@@ -151,4 +155,6 @@ int amd_sched_job_init(struct amd_sched_job *job,
+ 					struct amd_gpu_scheduler *sched,
+ 					struct amd_sched_entity *entity,
+ 					void *owner, struct fence **fence);
++void amd_sched_job_pre_schedule(struct amd_gpu_scheduler *sched ,
++								struct amd_sched_job *s_job);
+ #endif
+diff --git a/drivers/gpu/drm/amd/scheduler/sched_fence.c b/drivers/gpu/drm/amd/scheduler/sched_fence.c
+index dc115ae..33ddd38 100644
+--- a/drivers/gpu/drm/amd/scheduler/sched_fence.c
++++ b/drivers/gpu/drm/amd/scheduler/sched_fence.c
+@@ -57,6 +57,15 @@ void amd_sched_fence_signal(struct amd_sched_fence *fence)
+ 		FENCE_TRACE(&fence->base, "was already signaled\n");
+ }
+ 
++void amd_sched_job_pre_schedule(struct amd_gpu_scheduler *sched ,
++				struct amd_sched_job *s_job)
++{
++	unsigned long flags;
++	spin_lock_irqsave(&sched->job_list_lock, flags);
++	list_add_tail(&s_job->node, &sched->ring_mirror_list);
++	spin_unlock_irqrestore(&sched->job_list_lock, flags);
++}
++
+ void amd_sched_fence_scheduled(struct amd_sched_fence *s_fence)
+ {
+ 	struct fence_cb *cur, *tmp;
+-- 
+2.7.4
+

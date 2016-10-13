@@ -1,0 +1,206 @@
+From 4c480f494dfd11d9a8677eaa5f05b2f214ae1571 Mon Sep 17 00:00:00 2001
+From: Aric Cyr <aric.cyr@amd.com>
+Date: Sat, 27 Feb 2016 18:22:23 -0500
+Subject: [PATCH 0867/1110] drm/amd/dal: Fix surface flip pending polling
+
+Surface flips were waiting for surface pending bit to be cleared
+while the pipe was locked resulting in an infinite loop.
+
+Signed-off-by: Aric Cyr <aric.cyr@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c                  | 19 +++++++++++--------
+ .../gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c   |  3 +++
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c  | 16 ++++++----------
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.h  | 10 ++++++++++
+ .../gpu/drm/amd/dal/dc/dce110/dce110_mem_input_v.c    | 17 +++++++----------
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_mem_input.c    |  2 ++
+ drivers/gpu/drm/amd/dal/dc/inc/hw/mem_input.h         |  2 ++
+ 7 files changed, 41 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 339c82f..0ccf1d1 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -923,17 +923,20 @@ void dc_flip_surface_addrs(
+ 		uint32_t count)
+ {
+ 	struct core_dc *core_dc = DC_TO_CORE(dc);
++	int i, j;
+ 
+-	uint8_t i;
+ 	for (i = 0; i < count; i++) {
+-		struct core_surface *surface = DC_SURFACE_TO_CORE(surfaces[i]);
+-		/*
+-		 * TODO figure out a good way to keep track of address. Until
+-		 * then we'll have to awkwardly bypass the "const" surface.
+-		 */
+-		surface->public.address = flip_addrs[i].address;
+-		surface->public.flip_immediate = flip_addrs[i].flip_immediate;
++		for (j = 0; j < MAX_PIPES; j++) {
++			struct core_surface *ctx_surface =
++				core_dc->current_context.res_ctx.pipe_ctx[j].surface;
++			if (DC_SURFACE_TO_CORE(surfaces[i]) == ctx_surface) {
++				ctx_surface->public.address = flip_addrs[i].address;
++				ctx_surface->public.flip_immediate = flip_addrs[i].flip_immediate;
++				break;
++			}
++		}
+ 	}
++
+ 	core_dc->hwss.update_plane_addrs(core_dc, &core_dc->current_context.res_ctx);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 4e4ada8..0513731 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -1434,6 +1434,9 @@ static void update_plane_addrs(struct core_dc *dc, struct resource_context *res_
+ 					false);
+ 
+ 
++		if (surface->public.flip_immediate)
++			pipe_ctx->mi->funcs->wait_for_no_surface_update_pending(pipe_ctx->mi);
++
+ 		if (!pipe_ctx->tg->funcs->set_blank(pipe_ctx->tg, false)) {
+ 			dm_error("DC: failed to unblank crtc!\n");
+ 			BREAK_TO_DEBUGGER();
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
+index b1f1135..30c6048 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
+@@ -422,17 +422,14 @@ static void program_pixel_format(
+ 	}
+ }
+ 
+-static void wait_for_no_surface_update_pending(
+-				struct dce110_mem_input *mem_input110)
++void dce110_mem_input_wait_for_no_surface_update_pending(struct mem_input *mem_input)
+ {
++	struct dce110_mem_input *mem_input110 = TO_DCE110_MEM_INPUT(mem_input);
+ 	uint32_t value;
+ 
+ 	do  {
+-		value = dm_read_reg(mem_input110->base.ctx,
+-				DCP_REG(mmGRPH_UPDATE));
+-
+-	} while (get_reg_field_value(value, GRPH_UPDATE,
+-			GRPH_SURFACE_UPDATE_PENDING));
++		value = dm_read_reg(mem_input110->base.ctx,	DCP_REG(mmGRPH_UPDATE));
++	} while (get_reg_field_value(value, GRPH_UPDATE, GRPH_SURFACE_UPDATE_PENDING));
+ }
+ 
+ bool dce110_mem_input_program_surface_flip_and_addr(
+@@ -446,9 +443,6 @@ bool dce110_mem_input_program_surface_flip_and_addr(
+ 	program_addr(mem_input110,
+ 		address);
+ 
+-	if (flip_immediate)
+-		wait_for_no_surface_update_pending(mem_input110);
+-
+ 	return true;
+ }
+ 
+@@ -922,6 +916,8 @@ static struct mem_input_funcs dce110_mem_input_funcs = {
+ 			dce110_mem_input_program_surface_flip_and_addr,
+ 	.mem_input_program_surface_config =
+ 			dce110_mem_input_program_surface_config,
++	.wait_for_no_surface_update_pending =
++			dce110_mem_input_wait_for_no_surface_update_pending
+ };
+ /*****************************************/
+ /* Constructor, Destructor               */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.h
+index 32ee571..a42e06a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.h
+@@ -128,4 +128,14 @@ bool  dce110_mem_input_program_surface_config(
+ 	union plane_size *plane_size,
+ 	enum dc_rotation_angle rotation);
+ 
++/*
++ * dce110_mem_input_wait_for_no_surface_update_pending
++ *
++ * This function will wait until the surface update-pending bit is cleared.
++ * This is necessary when a flip immediate call is requested as we shouldn't
++ * return until the flip has actually occurred.
++ */
++void dce110_mem_input_wait_for_no_surface_update_pending(
++	struct mem_input *mem_input);
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input_v.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input_v.c
+index acfbd08..5f819de 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input_v.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input_v.c
+@@ -492,17 +492,15 @@ static void program_pixel_format(
+ 	}
+ }
+ 
+-static void wait_for_no_surface_update_pending(
+-				struct dce110_mem_input *mem_input110)
++void dce110_mem_input_v_wait_for_no_surface_update_pending(
++				struct mem_input *mem_input)
+ {
++	struct dce110_mem_input *mem_input110 = TO_DCE110_MEM_INPUT(mem_input);
+ 	uint32_t value;
+ 
+ 	do  {
+-		value = dm_read_reg(mem_input110->base.ctx,
+-				DCP_REG(mmUNP_GRPH_UPDATE));
+-
+-	} while (get_reg_field_value(value, UNP_GRPH_UPDATE,
+-			GRPH_SURFACE_UPDATE_PENDING));
++		value = dm_read_reg(mem_input110->base.ctx, DCP_REG(mmUNP_GRPH_UPDATE));
++	} while (get_reg_field_value(value, UNP_GRPH_UPDATE, GRPH_SURFACE_UPDATE_PENDING));
+ }
+ 
+ bool dce110_mem_input_v_program_surface_flip_and_addr(
+@@ -516,9 +514,6 @@ bool dce110_mem_input_v_program_surface_flip_and_addr(
+ 	program_addr(mem_input110,
+ 		address);
+ 
+-	if (flip_immediate)
+-		wait_for_no_surface_update_pending(mem_input110);
+-
+ 	return true;
+ }
+ 
+@@ -867,6 +862,8 @@ static struct mem_input_funcs dce110_mem_input_v_funcs = {
+ 			dce110_mem_input_v_program_surface_flip_and_addr,
+ 	.mem_input_program_surface_config =
+ 			dce110_mem_input_v_program_surface_config,
++	.wait_for_no_surface_update_pending =
++			dce110_mem_input_v_wait_for_no_surface_update_pending
+ };
+ /*****************************************/
+ /* Constructor, Destructor               */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_mem_input.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_mem_input.c
+index 27533bb..d9bc223 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_mem_input.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_mem_input.c
+@@ -181,6 +181,8 @@ static struct mem_input_funcs dce80_mem_input_funcs = {
+ 			dce110_mem_input_program_surface_flip_and_addr,
+ 	.mem_input_program_surface_config =
+ 			dce110_mem_input_program_surface_config,
++	.wait_for_no_surface_update_pending =
++			dce110_mem_input_wait_for_no_surface_update_pending
+ };
+ 
+ /*****************************************/
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw/mem_input.h b/drivers/gpu/drm/amd/dal/dc/inc/hw/mem_input.h
+index 8339d61..3829694 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw/mem_input.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw/mem_input.h
+@@ -64,6 +64,8 @@ struct mem_input_funcs {
+ 		struct dc_tiling_info *tiling_info,
+ 		union plane_size *plane_size,
+ 		enum dc_rotation_angle rotation);
++
++	void (*wait_for_no_surface_update_pending)(struct mem_input *mem_input);
+ };
+ 
+ #endif
+-- 
+2.7.4
+

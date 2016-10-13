@@ -1,0 +1,130 @@
+From 3100e9cd025b2fc77dde2b6cd0cd8a7f6faf33ad Mon Sep 17 00:00:00 2001
+From: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Date: Tue, 15 Mar 2016 06:04:01 -0400
+Subject: [PATCH 0976/1110] drm/amd/dal: adjust flip clean-up sequence to the
+ new code
+
+- This change fixes possible intermittent kernel exceptions
+during hotplug
+- It also fixes a segfault while changing modes with a
+DP-DVI active dongle on CZ
+- It also resolves an issue when resuming from S3 with MST
+
+Signed-off-by: Jordan Lazare <Jordan.Lazare@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      | 42 ----------------------
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h      |  4 ---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    | 22 ++++--------
+ 3 files changed, 6 insertions(+), 62 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index 5b3edb8..5626402 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -1072,48 +1072,6 @@ static u8 dm_get_backlight_level(struct amdgpu_encoder *amdgpu_encoder)
+  * Page Flip functions
+  ******************************************************************************/
+ 
+-void amdgpu_dm_flip_cleanup(
+-	struct amdgpu_device *adev,
+-	struct amdgpu_crtc *acrtc)
+-{
+-	int r;
+-	unsigned long flags;
+-	struct amdgpu_flip_work *works = NULL;
+-
+-	spin_lock_irqsave(&adev->ddev->event_lock, flags);
+-	if (acrtc->pflip_status != AMDGPU_FLIP_NONE) {
+-		works = acrtc->pflip_works;
+-		acrtc->pflip_works = NULL;
+-		acrtc->pflip_status = AMDGPU_FLIP_NONE;
+-
+-		if (works && works->event) {
+-			drm_send_vblank_event(
+-				adev->ddev,
+-				acrtc->crtc_id,
+-				works->event);
+-		}
+-		spin_unlock_irqrestore(&adev->ddev->event_lock, flags);
+-
+-		if (works) {
+-			r = amdgpu_bo_reserve(works->old_rbo, false);
+-			if (likely(r == 0)) {
+-				r = amdgpu_bo_unpin(works->old_rbo);
+-				if (unlikely(r != 0)) {
+-					DRM_ERROR("failed to unpin buffer after flip\n");
+-				}
+-				amdgpu_bo_unreserve(works->old_rbo);
+-			} else
+-				DRM_ERROR("failed to reserve buffer after flip\n");
+-
+-			amdgpu_bo_unref(&works->old_rbo);
+-			kfree(works->shared);
+-			kfree(works);
+-		}
+-	} else {
+-		spin_unlock_irqrestore(&adev->ddev->event_lock, flags);
+-	}
+-}
+-
+ /**
+  * dm_page_flip - called by amdgpu_flip_work_func(), which is triggered
+  * 			via DRM IOCTL, by user mode.
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h
+index 5674a82..34f1f9f 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.h
+@@ -156,10 +156,6 @@ bool amdgpu_dm_release_dal_lock(struct amdgpu_display_manager *dm);
+ /* Register "Backlight device" accessible by user-mode. */
+ void amdgpu_dm_register_backlight_device(struct amdgpu_display_manager *dm);
+ 
+-void amdgpu_dm_flip_cleanup(
+-	struct amdgpu_device *adev,
+-	struct amdgpu_crtc *acrtc);
+-
+ extern const struct amd_ip_funcs amdgpu_dm_funcs;
+ 
+ void amdgpu_dm_update_connector_after_detect(
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index 8e7c491..80bf0f2 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -2071,27 +2071,17 @@ static void manage_dm_interrupts(
+ 			&adev->pageflip_irq,
+ 			irq_type);
+ 	} else {
++		while (acrtc->pflip_status != AMDGPU_FLIP_NONE) {
++			/* Spin Wait*/
++
++			/* Todo: Use periodic polling rather than busy wait */
++		}
++
+ 		amdgpu_irq_put(
+ 			adev,
+ 			&adev->pageflip_irq,
+ 			irq_type);
+ 		drm_crtc_vblank_off(&acrtc->base);
+-
+-		/*
+-		 * should be called here, to guarantee no works left in queue.
+-		 * As this function sleeps it was bug to call it inside the
+-		 * amdgpu_dm_flip_cleanup function under locked event_lock
+-		 */
+-		if (acrtc->pflip_works) {
+-			flush_work(&acrtc->pflip_works->flip_work);
+-			flush_work(&acrtc->pflip_works->unpin_work);
+-		}
+-
+-		/*
+-		 * this is the case when on reset, last pending pflip
+-		 * interrupt did not not occur. Clean-up
+-		 */
+-		amdgpu_dm_flip_cleanup(adev, acrtc);
+ 	}
+ }
+ 
+-- 
+2.7.4
+

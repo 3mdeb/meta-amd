@@ -1,0 +1,243 @@
+From bfdbc4f9e5d7bdaed2b60978d944c190cd729dee Mon Sep 17 00:00:00 2001
+From: Arindam Nath <arindam.nath@amd.com>
+Date: Tue, 12 Apr 2016 13:46:15 +0200
+Subject: [PATCH 0477/1110] drm/amdgpu: handle more than 10 UVD sessions (v2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Change History
+--------------
+
+v2:
+- Make firmware version check correctly. Firmware
+  versions >= 1.80 should all support 40 UVD
+  instances.
+- Replace AMDGPU_MAX_UVD_HANDLES with max_handles
+  variable.
+
+v1:
+- The firmware can handle upto 40 UVD sessions.
+
+Signed-off-by: Arindam Nath <arindam.nath@amd.com>
+Signed-off-by: Ayyappa Chandolu <ayyappa.chandolu@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h                | 11 +++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c            | 30 ++++++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c              |  5 ++--
+ drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c              |  5 ++--
+ drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c              |  7 +++--
+ .../gpu/drm/amd/include/asic_reg/uvd/uvd_6_0_d.h   |  1 +
+ 6 files changed, 41 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 7fe432d..bd80ea5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1596,16 +1596,19 @@ void amdgpu_get_pcie_info(struct amdgpu_device *adev);
+ /*
+  * UVD
+  */
+-#define AMDGPU_MAX_UVD_HANDLES	10
+-#define AMDGPU_UVD_STACK_SIZE	(1024*1024)
+-#define AMDGPU_UVD_HEAP_SIZE	(1024*1024)
+-#define AMDGPU_UVD_FIRMWARE_OFFSET 256
++#define AMDGPU_DEFAULT_UVD_HANDLES     10
++#define AMDGPU_MAX_UVD_HANDLES         40
++#define AMDGPU_UVD_STACK_SIZE          (200*1024)
++#define AMDGPU_UVD_HEAP_SIZE           (256*1024)
++#define AMDGPU_UVD_SESSION_SIZE                (50*1024)
++#define AMDGPU_UVD_FIRMWARE_OFFSET     256
+ 
+ struct amdgpu_uvd {
+ 	struct amdgpu_bo	*vcpu_bo;
+ 	void			*cpu_addr;
+ 	uint64_t		gpu_addr;
+         void                    *saved_bo;
++        unsigned                max_handles;
+ 	unsigned		fw_version;
+ 	atomic_t		handles[AMDGPU_MAX_UVD_HANDLES];
+ 	struct drm_file		*filp[AMDGPU_MAX_UVD_HANDLES];
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+index 86dead7..cb6990a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+@@ -151,6 +151,9 @@ int amdgpu_uvd_sw_init(struct amdgpu_device *adev)
+ 		return r;
+ 	}
+ 
++	/* Set the default UVD handles that the firmware can handle */
++	adev->uvd.max_handles = AMDGPU_DEFAULT_UVD_HANDLES;
++
+ 	hdr = (const struct common_firmware_header *)adev->uvd.fw->data;
+ 	family_id = le32_to_cpu(hdr->ucode_version) & 0xff;
+ 	version_major = (le32_to_cpu(hdr->ucode_version) >> 24) & 0xff;
+@@ -161,8 +164,19 @@ int amdgpu_uvd_sw_init(struct amdgpu_device *adev)
+ 	adev->uvd.fw_version = ((version_major << 24) | (version_minor << 16) |
+ 				(family_id << 8));
+ 
++	/*
++	 * Limit the number of UVD handles depending on microcode major
++	 * and minor versions. The firmware version which has 40 UVD
++	 * instances support is 1.80. So all subsequent versions should
++	 * also have the same support.
++	 */
++	if ((version_major > 0x01) ||
++	    ((version_major == 0x01) && (version_minor >= 0x50)))
++		adev->uvd.max_handles = AMDGPU_MAX_UVD_HANDLES;
++
+ 	bo_size = AMDGPU_GPU_PAGE_ALIGN(le32_to_cpu(hdr->ucode_size_bytes) + 8)
+-		 +  AMDGPU_UVD_STACK_SIZE + AMDGPU_UVD_HEAP_SIZE;
++		  +  AMDGPU_UVD_STACK_SIZE + AMDGPU_UVD_HEAP_SIZE
++		  +  AMDGPU_UVD_SESSION_SIZE * adev->uvd.max_handles;
+ 	r = amdgpu_bo_create(adev, bo_size, PAGE_SIZE, true,
+ 			     AMDGPU_GEM_DOMAIN_VRAM,
+ 			     AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
+@@ -205,7 +219,7 @@ int amdgpu_uvd_sw_init(struct amdgpu_device *adev)
+                 return r;
+         }
+ 
+-	for (i = 0; i < AMDGPU_MAX_UVD_HANDLES; ++i) {
++	for (i = 0; i < adev->uvd.max_handles; ++i) {
+ 		atomic_set(&adev->uvd.handles[i], 0);
+ 		adev->uvd.filp[i] = NULL;
+ 	}
+@@ -250,7 +264,7 @@ int amdgpu_uvd_suspend(struct amdgpu_device *adev)
+ 	if (adev->uvd.vcpu_bo == NULL)
+ 		return 0;
+ 
+-        for (i = 0; i < AMDGPU_MAX_UVD_HANDLES; ++i)
++        for (i = 0; i < adev->uvd.max_handles; ++i)
+                 if (atomic_read(&adev->uvd.handles[i]))
+                         break;
+  
+@@ -307,7 +321,7 @@ void amdgpu_uvd_free_handles(struct amdgpu_device *adev, struct drm_file *filp)
+ 	struct amdgpu_ring *ring = &adev->uvd.ring;
+ 	int i, r;
+ 
+-	for (i = 0; i < AMDGPU_MAX_UVD_HANDLES; ++i) {
++        for (i = 0; i < adev->uvd.max_handles; ++i) {
+ 		uint32_t handle = atomic_read(&adev->uvd.handles[i]);
+ 		if (handle != 0 && adev->uvd.filp[i] == filp) {
+ 			struct fence *fence;
+@@ -567,7 +581,7 @@ static int amdgpu_uvd_cs_msg(struct amdgpu_uvd_cs_ctx *ctx,
+ 		amdgpu_bo_kunmap(bo);
+ 
+ 		/* try to alloc a new handle */
+-		for (i = 0; i < AMDGPU_MAX_UVD_HANDLES; ++i) {
++                for (i = 0; i < adev->uvd.max_handles; ++i) {
+ 			if (atomic_read(&adev->uvd.handles[i]) == handle) {
+ 				DRM_ERROR("Handle 0x%x already in use!\n", handle);
+ 				return -EINVAL;
+@@ -590,7 +604,7 @@ static int amdgpu_uvd_cs_msg(struct amdgpu_uvd_cs_ctx *ctx,
+ 			return r;
+ 
+ 		/* validate the handle */
+-		for (i = 0; i < AMDGPU_MAX_UVD_HANDLES; ++i) {
++                for (i = 0; i < adev->uvd.max_handles; ++i) {
+ 			if (atomic_read(&adev->uvd.handles[i]) == handle) {
+ 				if (adev->uvd.filp[i] != ctx->parser->filp) {
+ 					DRM_ERROR("UVD handle collision detected!\n");
+@@ -605,7 +619,7 @@ static int amdgpu_uvd_cs_msg(struct amdgpu_uvd_cs_ctx *ctx,
+ 
+ 	case 2:
+ 		/* it's a destroy msg, free the handle */
+-		for (i = 0; i < AMDGPU_MAX_UVD_HANDLES; ++i)
++                for (i = 0; i < adev->uvd.max_handles; ++i)
+ 			atomic_cmpxchg(&adev->uvd.handles[i], handle, 0);
+ 		amdgpu_bo_kunmap(bo);
+ 		return 0;
+@@ -1032,7 +1046,7 @@ static void amdgpu_uvd_idle_work_handler(struct work_struct *work)
+ 
+ 	fences = amdgpu_fence_count_emitted(&adev->uvd.ring);
+ 
+-	for (i = 0; i < AMDGPU_MAX_UVD_HANDLES; ++i)
++	for (i = 0; i < adev->uvd.max_handles; ++i)
+ 		if (atomic_read(&adev->uvd.handles[i]))
+ 			++handles;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+index cb46375..0d6b9e2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+@@ -559,12 +559,13 @@ static void uvd_v4_2_mc_resume(struct amdgpu_device *adev)
+ 	WREG32(mmUVD_VCPU_CACHE_SIZE0, size);
+ 
+ 	addr += size;
+-	size = AMDGPU_UVD_STACK_SIZE >> 3;
++	size = AMDGPU_UVD_HEAP_SIZE >> 3;
+ 	WREG32(mmUVD_VCPU_CACHE_OFFSET1, addr);
+ 	WREG32(mmUVD_VCPU_CACHE_SIZE1, size);
+ 
+ 	addr += size;
+-	size = AMDGPU_UVD_HEAP_SIZE >> 3;
++	size = (AMDGPU_UVD_STACK_SIZE +
++	       (AMDGPU_UVD_SESSION_SIZE * adev->uvd.max_handles)) >> 3;
+ 	WREG32(mmUVD_VCPU_CACHE_OFFSET2, addr);
+ 	WREG32(mmUVD_VCPU_CACHE_SIZE2, size);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+index de459c8..84abf89 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+@@ -272,12 +272,13 @@ static void uvd_v5_0_mc_resume(struct amdgpu_device *adev)
+ 	WREG32(mmUVD_VCPU_CACHE_SIZE0, size);
+ 
+ 	offset += size;
+-	size = AMDGPU_UVD_STACK_SIZE;
++	size = AMDGPU_UVD_HEAP_SIZE;
+ 	WREG32(mmUVD_VCPU_CACHE_OFFSET1, offset >> 3);
+ 	WREG32(mmUVD_VCPU_CACHE_SIZE1, size);
+ 
+ 	offset += size;
+-	size = AMDGPU_UVD_HEAP_SIZE;
++	size = AMDGPU_UVD_STACK_SIZE +
++	       (AMDGPU_UVD_SESSION_SIZE * adev->uvd.max_handles);
+ 	WREG32(mmUVD_VCPU_CACHE_OFFSET2, offset >> 3);
+ 	WREG32(mmUVD_VCPU_CACHE_SIZE2, size);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+index 372d70a..c633b1a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+@@ -272,18 +272,21 @@ static void uvd_v6_0_mc_resume(struct amdgpu_device *adev)
+ 	WREG32(mmUVD_VCPU_CACHE_SIZE0, size);
+ 
+ 	offset += size;
+-	size = AMDGPU_UVD_STACK_SIZE;
++	size = AMDGPU_UVD_HEAP_SIZE;
+ 	WREG32(mmUVD_VCPU_CACHE_OFFSET1, offset >> 3);
+ 	WREG32(mmUVD_VCPU_CACHE_SIZE1, size);
+ 
+ 	offset += size;
+-	size = AMDGPU_UVD_HEAP_SIZE;
++	size = AMDGPU_UVD_STACK_SIZE +
++	       (AMDGPU_UVD_SESSION_SIZE * adev->uvd.max_handles);
+ 	WREG32(mmUVD_VCPU_CACHE_OFFSET2, offset >> 3);
+ 	WREG32(mmUVD_VCPU_CACHE_SIZE2, size);
+ 
+ 	WREG32(mmUVD_UDEC_ADDR_CONFIG, adev->gfx.config.gb_addr_config);
+ 	WREG32(mmUVD_UDEC_DB_ADDR_CONFIG, adev->gfx.config.gb_addr_config);
+ 	WREG32(mmUVD_UDEC_DBW_ADDR_CONFIG, adev->gfx.config.gb_addr_config);
++
++	WREG32(mmUVD_GP_SCRATCH4, adev->uvd.max_handles);
+ }
+ 
+ #if 0
+diff --git a/drivers/gpu/drm/amd/include/asic_reg/uvd/uvd_6_0_d.h b/drivers/gpu/drm/amd/include/asic_reg/uvd/uvd_6_0_d.h
+index b2d4aaf..6f6fb34 100644
+--- a/drivers/gpu/drm/amd/include/asic_reg/uvd/uvd_6_0_d.h
++++ b/drivers/gpu/drm/amd/include/asic_reg/uvd/uvd_6_0_d.h
+@@ -111,5 +111,6 @@
+ #define mmUVD_MIF_RECON1_ADDR_CONFIG                                            0x39c5
+ #define ixUVD_MIF_SCLR_ADDR_CONFIG                                              0x4
+ #define mmUVD_JPEG_ADDR_CONFIG                                                  0x3a1f
++#define mmUVD_GP_SCRATCH4                                                       0x3d38
+ 
+ #endif /* UVD_6_0_D_H */
+-- 
+2.7.4
+

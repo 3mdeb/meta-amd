@@ -1,0 +1,144 @@
+From ff51765a186b834ac7459306ac2e8bede060dfeb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 1 Feb 2016 11:20:37 +0100
+Subject: [PATCH 0274/1110] drm/amdgpu: cleanup user fence handling in the CS
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Don't keep that around twice.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    |  1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c | 28 +++++++++++++---------------
+ 2 files changed, 13 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 1dbd2d7..dba07d8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1197,7 +1197,6 @@ struct amdgpu_cs_parser {
+          uint64_t                        bytes_moved;
+ 
+ 	/* user fence */
+-	struct amdgpu_user_fence	uf;
+ 	struct amdgpu_bo_list_entry	uf_entry;
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index f1fd4ed..a4805aa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -128,6 +128,7 @@ int amdgpu_cs_get_ring(struct amdgpu_device *adev, u32 ip_type,
+ }
+ 
+ static int amdgpu_cs_user_fence_chunk(struct amdgpu_cs_parser *p,
++                                      struct amdgpu_user_fence *uf,
+ 				      struct drm_amdgpu_cs_chunk_fence *fence_data)
+ {
+ 	struct drm_gem_object *gobj;
+@@ -139,15 +140,15 @@ static int amdgpu_cs_user_fence_chunk(struct amdgpu_cs_parser *p,
+ 	if (gobj == NULL)
+ 		return -EINVAL;
+ 
+-	p->uf.bo = amdgpu_bo_ref(gem_to_amdgpu_bo(gobj));
+-	p->uf.offset = fence_data->offset;
++        uf->bo = amdgpu_bo_ref(gem_to_amdgpu_bo(gobj));
++        uf->offset = fence_data->offset;
+ 
+-        if (amdgpu_ttm_tt_get_usermm(p->uf.bo->tbo.ttm)) {
++        if (amdgpu_ttm_tt_get_usermm(uf->bo->tbo.ttm)) {
+ 		drm_gem_object_unreference_unlocked(gobj);
+ 		return -EINVAL;
+ 	}
+ 
+-	p->uf_entry.robj = amdgpu_bo_ref(p->uf.bo);
++        p->uf_entry.robj = amdgpu_bo_ref(uf->bo);
+ 	p->uf_entry.priority = 0;
+ 	p->uf_entry.tv.bo = &p->uf_entry.robj->tbo;
+ 	p->uf_entry.tv.shared = true;
+@@ -158,10 +159,11 @@ static int amdgpu_cs_user_fence_chunk(struct amdgpu_cs_parser *p,
+ 
+ int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
+ {
++        struct amdgpu_fpriv *fpriv = p->filp->driver_priv;
+ 	union drm_amdgpu_cs *cs = data;
+ 	uint64_t *chunk_array_user;
+ 	uint64_t *chunk_array;
+-	struct amdgpu_fpriv *fpriv = p->filp->driver_priv;
++        struct amdgpu_user_fence uf = {};
+ 	unsigned size;
+         unsigned size, num_ibs = 0;
+ 	int i;
+@@ -241,7 +243,7 @@ int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
+ 				goto free_partial_kdata;
+ 			}
+ 
+-			ret = amdgpu_cs_user_fence_chunk(p, (void *)p->chunks[i].kdata);
++                        ret = amdgpu_cs_user_fence_chunk(p, &uf, (void *)p->chunks[i].kdata);
+ 			if (ret)
+ 				goto free_partial_kdata;
+ 
+@@ -260,6 +262,8 @@ int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
+         if (ret)
+                 goto free_all_kdata;
+ 
++        p->job->uf = uf;
++
+ 	kfree(chunk_array);
+ 	return 0;
+ 
+@@ -403,6 +407,7 @@ static int amdgpu_cs_parser_relocs(struct amdgpu_cs_parser *p)
+         INIT_LIST_HEAD(&duplicates);
+         amdgpu_vm_get_pd_bo(&fpriv->vm, &p->validated, &p->vm_pd);
+ 
++        if (p->job->uf.bo)
+ 		list_add(&p->uf_entry.tv.head, &p->validated);
+ 
+ 	if (need_mmap_lock)
+@@ -516,7 +521,6 @@ static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser, int error, bo
+ 	kfree(parser->chunks);
+         if (parser->job)
+                 amdgpu_job_free(parser->job);
+-	amdgpu_bo_unref(&parser->uf.bo);
+ 	amdgpu_bo_unref(&parser->uf_entry.robj);
+ }
+ 
+@@ -717,7 +721,7 @@ static int amdgpu_cs_ib_fill(struct amdgpu_device *adev,
+ 		}
+ 	}
+ 	/* wrap the last IB with user fence */
+-	if (parser->uf.bo) {
++        if (parser->job->uf.bo) {
+                 struct amdgpu_ib *ib = &parser->job->ibs[parser->job->num_ibs - 1];
+ 
+ 		/* UVD & VCE fw doesn't support user fences */
+@@ -725,7 +729,7 @@ static int amdgpu_cs_ib_fill(struct amdgpu_device *adev,
+ 		    ib->ring->type == AMDGPU_RING_TYPE_VCE)
+ 			return -EINVAL;
+ 
+-		ib->user = &parser->uf;
++                ib->user = &parser->job->uf;
+ 	}
+ 
+ 	return 0;
+@@ -812,12 +816,6 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ 	job->owner = p->filp;
+ 	job->free_job = amdgpu_cs_free_job;
+ 
+-	if (job->ibs[job->num_ibs - 1].user) {
+-		job->uf = p->uf;
+-		job->ibs[job->num_ibs - 1].user = &job->uf;
+-		p->uf.bo = NULL;
+-	}
+-
+ 	fence = amd_sched_fence_create(job->base.s_entity, p->filp);
+ 	if (!fence) {
+ 		amdgpu_cs_free_job(job);
+-- 
+2.7.4
+

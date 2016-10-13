@@ -1,0 +1,106 @@
+From 15bb77b919b01ed6db2ed65e2da92a1c4df6b4a0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 10 Jun 2016 19:30:51 +0530
+Subject: [PATCH 0217/1110] drm/amdgpu: cleanup amdgpu_cs_list_validate
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No need to actually check the current placement. Just use the allowed domains
+when the threshold is reached.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c | 66 ++++++++++++++++------------------
+ 1 file changed, 31 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 9212787..c4b4290 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -342,48 +342,44 @@ int amdgpu_cs_list_validate(struct amdgpu_cs_parser *p,
+         struct amdgpu_fpriv *fpriv = p->filp->driver_priv;
+         struct amdgpu_vm *vm = &fpriv->vm;
+ 	struct amdgpu_bo_list_entry *lobj;
+-	struct amdgpu_bo *bo;
+         u64 initial_bytes_moved;
+ 	int r;
+ 
+ 	list_for_each_entry(lobj, validated, tv.head) {
+-		bo = lobj->robj;
+-		if (!bo->pin_count) {
+-			u32 domain = lobj->prefered_domains;
+-			u32 current_domain =
+-				amdgpu_mem_type_to_domain(bo->tbo.mem.mem_type);
+-
+-			/* Check if this buffer will be moved and don't move it
+-			 * if we have moved too many buffers for this IB already.
+-			 *
+-			 * Note that this allows moving at least one buffer of
+-			 * any size, because it doesn't take the current "bo"
+-			 * into account. We don't want to disallow buffer moves
+-			 * completely.
+-			 */
+-			if ((lobj->allowed_domains & current_domain) != 0 &&
+-			    (domain & current_domain) == 0 && /* will be moved */
+-                            p->bytes_moved > p->bytes_moved_threshold) {
+-				/* don't move it */
+-				domain = current_domain;
+-			}
++                struct amdgpu_bo *bo = lobj->robj;
++                uint32_t domain;
++
++                lobj->bo_va = amdgpu_vm_bo_find(vm, bo);
++                if (bo->pin_count)
++                        continue;
++
++               /* Avoid moving this one if we have moved too many buffers
++                * for this IB already.
++                *
++                * Note that this allows moving at least one buffer of
++                * any size, because it doesn't take the current "bo"
++                * into account. We don't want to disallow buffer moves
++                * completely.
++                */
++                if (p->bytes_moved <= p->bytes_moved_threshold)
++                        domain = lobj->prefered_domains;
++                else
++                        domain = lobj->allowed_domains;
++ 
++        retry:
++                amdgpu_ttm_placement_from_domain(bo, domain);
++                initial_bytes_moved = atomic64_read(&bo->adev->num_bytes_moved);
++                r = ttm_bo_validate(&bo->tbo, &bo->placement, true, false);
++                p->bytes_moved += atomic64_read(&bo->adev->num_bytes_moved) -
++                               initial_bytes_moved;
++ 
++                if (unlikely(r)) {
++                        if (r != -ERESTARTSYS && domain != lobj->allowed_domains) {
++                                domain = lobj->allowed_domains;
++                                goto retry;
+ 
+-		retry:
+-			amdgpu_ttm_placement_from_domain(bo, domain);
+-                        initial_bytes_moved = atomic64_read(&bo->adev->num_bytes_moved);
+-			r = ttm_bo_validate(&bo->tbo, &bo->placement, true, false);
+-                        p->bytes_moved += atomic64_read(&bo->adev->num_bytes_moved) -
+-				       initial_bytes_moved;
+-
+-			if (unlikely(r)) {
+-				if (r != -ERESTARTSYS && domain != lobj->allowed_domains) {
+-					domain = lobj->allowed_domains;
+-					goto retry;
+-				}
+-				return r;
+ 			}
+ 		}
+-		lobj->bo_va = amdgpu_vm_bo_find(vm, bo);
+ 	}
+ 	return 0;
+ }
+-- 
+2.7.4
+

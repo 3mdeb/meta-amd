@@ -1,0 +1,136 @@
+From 735b5a7c29412ae29eeedf41513d70c115c480e8 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Tue, 1 Dec 2015 16:25:04 -0500
+Subject: [PATCH 0562/1110] drm/amd/dal: expand pplib_post_set_mode to more
+ closely mirror NotifyMultiDisplayConfig
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/calcs/bandwidth_calcs.c |  9 ++++
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 56 ++++++++++++++++++++--
+ drivers/gpu/drm/amd/dal/dc/inc/bandwidth_calcs.h   |  3 ++
+ 3 files changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/calcs/bandwidth_calcs.c b/drivers/gpu/drm/amd/dal/dc/calcs/bandwidth_calcs.c
+index 346028a..742c4ec 100644
+--- a/drivers/gpu/drm/amd/dal/dc/calcs/bandwidth_calcs.c
++++ b/drivers/gpu/drm/amd/dal/dc/calcs/bandwidth_calcs.c
+@@ -3460,9 +3460,18 @@ bool bw_calcs(struct dc_context *ctx, const struct bw_calcs_input_dceip *dceip,
+ 		calcs_output->dispclk_khz =
+ 				mul(bw_results_internal->dispclk,
+ 					int_to_fixed(1000)).value >> 24;
++		calcs_output->blackout_recovery_time_us =
++			mul(bw_results_internal->blackout_recovery_time,
++					int_to_fixed(1000)).value >> 24;
+ 		calcs_output->required_sclk =
+ 			mul(bw_results_internal->required_sclk,
+ 					int_to_fixed(1000)).value >> 24;
++		calcs_output->required_sclk_deep_sleep =
++			mul(bw_results_internal->sclk_deep_sleep,
++					int_to_fixed(1000)).value >> 24;
++		/*TODO:fix formula to unhardcode*/
++		calcs_output->required_yclk =
++				mul(high_yclk, int_to_fixed(1000)).value >> 24;
+ 
+ 		((struct bw_calcs_input_vbios *)vbios)->low_yclk = low_yclk;
+ 		((struct bw_calcs_input_vbios *)vbios)->high_yclk = high_yclk;
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 14e10b9..b7aa85d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -465,23 +465,71 @@ static bool targets_changed(
+ 	return false;
+ }
+ 
++
++static uint32_t get_min_vblank_time_us(const struct validate_context *context)
++{
++	uint8_t i, j;
++	uint32_t min_vertical_blank_time = -1;
++	for (i = 0; i < context->target_count; i++) {
++		const struct core_target *target = context->targets[i];
++		for (j = 0; j < target->public.stream_count; j++) {
++			const struct dc_stream *stream =
++						target->public.streams[j];
++			uint32_t vertical_blank_in_pixels = 0;
++			uint32_t vertical_blank_time = 0;
++
++			vertical_blank_in_pixels = stream->timing.h_total *
++				(stream->timing.v_total
++				- stream->timing.v_addressable);
++			/*TODO: - vertical timing overscan if we still support*/
++			vertical_blank_time = vertical_blank_in_pixels * 1000
++				/ stream->timing.pix_clk_khz;
++			/*TODO: doublescan doubles, pixel repetition mults*/
++
++			if (min_vertical_blank_time > vertical_blank_time)
++				min_vertical_blank_time = vertical_blank_time;
++		}
++	}
++
++	return min_vertical_blank_time;
++}
++
+ static void pplib_post_set_mode(
+ 	struct dc *dc,
+ 	const struct validate_context *context)
+ {
++	uint8_t i;
+ 	struct dc_pp_display_configuration pp_display_cfg = { 0 };
+ 
+ 	pp_display_cfg.nb_pstate_switch_disable =
+ 			context->bw_results.nbp_state_change_enable == false;
+-
+ 	pp_display_cfg.cpu_cc6_disable =
+ 			context->bw_results.cpuc_state_change_enable == false;
+-
+ 	pp_display_cfg.cpu_pstate_disable =
+ 			context->bw_results.cpup_state_change_enable == false;
++	pp_display_cfg.cpu_pstate_separation_time =
++			context->bw_results.blackout_recovery_time_us;
++
++	pp_display_cfg.max_displays = dc->link_count;
++	for (i = 0; i < context->target_count; i++)
++		pp_display_cfg.active_displays +=
++				context->targets[i]->public.stream_count;
++
++	pp_display_cfg.min_memory_clock_khz = context->bw_results.required_yclk;
++	pp_display_cfg.min_engine_clock_khz = context->bw_results.required_sclk;
++	pp_display_cfg.min_engine_clock_deep_sleep_khz
++			= context->bw_results.required_sclk_deep_sleep;
++
++	pp_display_cfg.avail_mclk_switch_time_us =
++						get_min_vblank_time_us(context);
++	/* TODO: dce11.2*/
++	pp_display_cfg.avail_mclk_switch_time_in_disp_active_us = 0;
++
++	pp_display_cfg.disp_clk_khz = context->bw_results.dispclk_khz;
+ 
+-	/* TODO: get cpu_pstate_separation_time from BW Calcs. */
+-	pp_display_cfg.cpu_pstate_separation_time = 0;
++	/* TODO: unhardcode, is this still applicable?*/
++	pp_display_cfg.crtc_index = 0;
++	pp_display_cfg.line_time_in_us = 0;
+ 
+ 	dc_service_pp_post_dce_clock_change(dc->ctx, &pp_display_cfg);
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/bandwidth_calcs.h b/drivers/gpu/drm/amd/dal/dc/inc/bandwidth_calcs.h
+index a0c0fef..a304ce8 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/bandwidth_calcs.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/bandwidth_calcs.h
+@@ -434,7 +434,10 @@ struct bw_calcs_output {
+ 	struct bw_watermarks stutter_exit_watermark[4];
+ 	struct bw_watermarks nbp_state_change_watermark[4];
+ 	uint32_t required_sclk;
++	uint32_t required_sclk_deep_sleep;
++	uint32_t required_yclk;
+ 	uint32_t dispclk_khz;
++	uint32_t blackout_recovery_time_us;
+ };
+ 
+ 
+-- 
+2.7.4
+

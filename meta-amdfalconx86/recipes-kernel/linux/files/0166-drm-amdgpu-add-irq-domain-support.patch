@@ -1,0 +1,296 @@
+From 217188dcdf9dd0d228954f3b7379a1172d0cf0ff Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Fri, 6 Nov 2015 01:29:08 -0500
+Subject: [PATCH 0166/1110] drm/amdgpu: add irq domain support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Hardware blocks on the GPU like ACP generate interrupts in
+the GPU interrupt controller, but are driven by a separate
+driver.  Add an irq domain to the GPU driver so that
+blocks like ACP can register a Linux interrupt.
+
+Acked-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c | 108 +++++++++++++++++++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h |   9 +++
+ drivers/gpu/drm/amd/amdgpu/cik_ih.c     |   6 ++
+ drivers/gpu/drm/amd/amdgpu/cz_ih.c      |   7 +++
+ drivers/gpu/drm/amd/amdgpu/iceland_ih.c |   7 +++
+ drivers/gpu/drm/amd/amdgpu/tonga_ih.c   |   7 +++
+ 6 files changed, 136 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+index 7c42ff6..3006182 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+@@ -312,6 +312,7 @@ int amdgpu_irq_add_id(struct amdgpu_device *adev, unsigned src_id,
+ 	}
+ 
+ 	adev->irq.sources[src_id] = source;
++
+ 	return 0;
+ }
+ 
+@@ -335,15 +336,19 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
+ 		return;
+ 	}
+ 
+-	src = adev->irq.sources[src_id];
+-	if (!src) {
+-		DRM_DEBUG("Unhandled interrupt src_id: %d\n", src_id);
+-		return;
+-	}
++	if (adev->irq.virq[src_id]) {
++		generic_handle_irq(irq_find_mapping(adev->irq.domain, src_id));
++	} else {
++		src = adev->irq.sources[src_id];
++		if (!src) {
++			DRM_DEBUG("Unhandled interrupt src_id: %d\n", src_id);
++			return;
++		}
+ 
+-	r = src->funcs->process(adev, src, entry);
+-	if (r)
+-		DRM_ERROR("error processing interrupt (%d)\n", r);
++		r = src->funcs->process(adev, src, entry);
++		if (r)
++			DRM_ERROR("error processing interrupt (%d)\n", r);
++	}
+ }
+ 
+ /**
+@@ -461,3 +466,90 @@ bool amdgpu_irq_enabled(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+ 
+ 	return !!atomic_read(&src->enabled_types[type]);
+ }
++
++/* gen irq */
++static void amdgpu_irq_mask(struct irq_data *irqd)
++{
++	/* XXX */
++}
++
++static void amdgpu_irq_unmask(struct irq_data *irqd)
++{
++	/* XXX */
++}
++
++static struct irq_chip amdgpu_irq_chip = {
++	.name = "amdgpu-ih",
++	.irq_mask = amdgpu_irq_mask,
++	.irq_unmask = amdgpu_irq_unmask,
++};
++
++static int amdgpu_irqdomain_map(struct irq_domain *d,
++				unsigned int irq, irq_hw_number_t hwirq)
++{
++	if (hwirq >= AMDGPU_MAX_IRQ_SRC_ID)
++		return -EPERM;
++
++	irq_set_chip_and_handler(irq,
++				 &amdgpu_irq_chip, handle_simple_irq);
++	return 0;
++}
++
++static struct irq_domain_ops amdgpu_hw_irqdomain_ops = {
++	.map = amdgpu_irqdomain_map,
++};
++
++/**
++ * amdgpu_irq_add_domain - create a linear irq domain
++ *
++ * @adev: amdgpu device pointer
++ *
++ * Create an irq domain for GPU interrupt sources
++ * that may be driven by another driver (e.g., ACP).
++ */
++int amdgpu_irq_add_domain(struct amdgpu_device *adev)
++{
++	adev->irq.domain = irq_domain_add_linear(NULL, AMDGPU_MAX_IRQ_SRC_ID,
++						 &amdgpu_hw_irqdomain_ops, adev);
++	if (!adev->irq.domain) {
++		DRM_ERROR("GPU irq add domain failed\n");
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
++/**
++ * amdgpu_irq_remove_domain - remove the irq domain
++ *
++ * @adev: amdgpu device pointer
++ *
++ * Remove the irq domain for GPU interrupt sources
++ * that may be driven by another driver (e.g., ACP).
++ */
++void amdgpu_irq_remove_domain(struct amdgpu_device *adev)
++{
++	if (adev->irq.domain) {
++		irq_domain_remove(adev->irq.domain);
++		adev->irq.domain = NULL;
++	}
++}
++
++/**
++ * amdgpu_irq_create_mapping - create a mapping between a domain irq and a
++ *                             Linux irq
++ *
++ * @adev: amdgpu device pointer
++ * @src_id: IH source id
++ *
++ * Create a mapping between a domain irq (GPU IH src id) and a Linux irq
++ * Use this for components that generate a GPU interrupt, but are driven
++ * by a different driver (e.g., ACP).
++ * Returns the Linux irq.
++ */
++unsigned amdgpu_irq_create_mapping(struct amdgpu_device *adev, unsigned src_id)
++{
++	adev->irq.virq[src_id] = irq_create_mapping(adev->irq.domain, src_id);
++
++	return adev->irq.virq[src_id];
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
+index 17b01ae..e124b59 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
+@@ -24,6 +24,7 @@
+ #ifndef __AMDGPU_IRQ_H__
+ #define __AMDGPU_IRQ_H__
+ 
++#include <linux/irqdomain.h>
+ #include "amdgpu_ih.h"
+ 
+ #define AMDGPU_MAX_IRQ_SRC_ID	0x100
+@@ -65,6 +66,10 @@ struct amdgpu_irq {
+ 	/* interrupt ring */
+ 	struct amdgpu_ih_ring		ih;
+ 	const struct amdgpu_ih_funcs	*ih_funcs;
++
++	/* gen irq stuff */
++	struct irq_domain		*domain; /* GPU irq controller domain */
++	unsigned			virq[AMDGPU_MAX_IRQ_SRC_ID];
+ };
+ 
+ void amdgpu_irq_preinstall(struct drm_device *dev);
+@@ -90,4 +95,8 @@ int amdgpu_irq_put(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+ bool amdgpu_irq_enabled(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+ 			unsigned type);
+ 
++int amdgpu_irq_add_domain(struct amdgpu_device *adev);
++void amdgpu_irq_remove_domain(struct amdgpu_device *adev);
++unsigned amdgpu_irq_create_mapping(struct amdgpu_device *adev, unsigned src_id);
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_ih.c b/drivers/gpu/drm/amd/amdgpu/cik_ih.c
+index 8993c50..30c9b3b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_ih.c
+@@ -274,6 +274,11 @@ static void cik_ih_set_rptr(struct amdgpu_device *adev)
+ static int cik_ih_early_init(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++	int ret;
++
++	ret = amdgpu_irq_add_domain(adev);
++	if (ret)
++		return ret;
+ 
+ 	cik_ih_set_interrupt_funcs(adev);
+ 
+@@ -300,6 +305,7 @@ static int cik_ih_sw_fini(void *handle)
+ 
+ 	amdgpu_irq_fini(adev);
+ 	amdgpu_ih_ring_fini(adev);
++	amdgpu_irq_remove_domain(adev);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/cz_ih.c b/drivers/gpu/drm/amd/amdgpu/cz_ih.c
+index bc751bf..c79638f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cz_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/cz_ih.c
+@@ -253,8 +253,14 @@ static void cz_ih_set_rptr(struct amdgpu_device *adev)
+ static int cz_ih_early_init(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++	int ret;
++
++	ret = amdgpu_irq_add_domain(adev);
++	if (ret)
++		return ret;
+ 
+ 	cz_ih_set_interrupt_funcs(adev);
++
+ 	return 0;
+ }
+ 
+@@ -278,6 +284,7 @@ static int cz_ih_sw_fini(void *handle)
+ 
+ 	amdgpu_irq_fini(adev);
+ 	amdgpu_ih_ring_fini(adev);
++	amdgpu_irq_remove_domain(adev);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/iceland_ih.c b/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
+index 779532d..679e739 100644
+--- a/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
+@@ -253,8 +253,14 @@ static void iceland_ih_set_rptr(struct amdgpu_device *adev)
+ static int iceland_ih_early_init(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++	int ret;
++
++	ret = amdgpu_irq_add_domain(adev);
++	if (ret)
++		return ret;
+ 
+ 	iceland_ih_set_interrupt_funcs(adev);
++
+ 	return 0;
+ }
+ 
+@@ -278,6 +284,7 @@ static int iceland_ih_sw_fini(void *handle)
+ 
+ 	amdgpu_irq_fini(adev);
+ 	amdgpu_ih_ring_fini(adev);
++	amdgpu_irq_remove_domain(adev);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/tonga_ih.c b/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
+index 743c372..b6f7d7b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
+@@ -273,8 +273,14 @@ static void tonga_ih_set_rptr(struct amdgpu_device *adev)
+ static int tonga_ih_early_init(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++	int ret;
++
++	ret = amdgpu_irq_add_domain(adev);
++	if (ret)
++		return ret;
+ 
+ 	tonga_ih_set_interrupt_funcs(adev);
++
+ 	return 0;
+ }
+ 
+@@ -301,6 +307,7 @@ static int tonga_ih_sw_fini(void *handle)
+ 
+ 	amdgpu_irq_fini(adev);
+ 	amdgpu_ih_ring_fini(adev);
++	amdgpu_irq_add_domain(adev);
+ 
+ 	return 0;
+ }
+-- 
+2.7.4
+

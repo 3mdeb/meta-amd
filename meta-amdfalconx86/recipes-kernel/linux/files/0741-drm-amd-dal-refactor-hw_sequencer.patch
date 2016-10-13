@@ -1,0 +1,3195 @@
+From 8aa635d8c08f9736593d3e8896094481c6da174a Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Wed, 27 Jan 2016 16:03:57 -0500
+Subject: [PATCH 0741/1110] drm/amd/dal: refactor hw_sequencer
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |  65 +--
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          |  12 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      |  28 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_target.c        |  16 +-
+ .../drm/amd/dal/dc/dce100/dce100_hw_sequencer.c    | 326 ++++++++++-
+ .../drm/amd/dal/dc/dce100/dce100_hw_sequencer.h    |   2 +-
+ .../gpu/drm/amd/dal/dc/dce100/dce100_resource.c    | 445 ++++++++-------
+ .../drm/amd/dal/dc/dce110/dce110_clock_source.c    |   1 -
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 630 +++++++++------------
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    | 452 +++++++--------
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.h    |  15 -
+ .../amd/dal/dc/dce110/dce110_timing_generator.c    |   2 +-
+ .../amd/dal/dc/dce110/dce110_timing_generator.h    |   2 +-
+ drivers/gpu/drm/amd/dal/dc/inc/core_dc.h           |   2 -
+ drivers/gpu/drm/amd/dal/dc/inc/core_types.h        |  21 +
+ drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h      | 110 ++--
+ drivers/gpu/drm/amd/dal/dc/inc/resource.h          |   4 +
+ drivers/gpu/drm/amd/dal/dc/inc/timing_generator.h  | 155 +++++
+ .../drm/amd/dal/dc/inc/timing_generator_types.h    | 155 -----
+ 19 files changed, 1333 insertions(+), 1110 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/inc/timing_generator.h
+ delete mode 100644 drivers/gpu/drm/amd/dal/dc/inc/timing_generator_types.h
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 1a17090..b3c919c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -38,8 +38,9 @@
+ 
+ #include "bandwidth_calcs.h"
+ #include "include/irq_service_interface.h"
+-#include "inc/transform.h"
+-#include "../virtual/virtual_link_encoder.h"
++#include "transform.h"
++#include "timing_generator.h"
++#include "virtual/virtual_link_encoder.h"
+ 
+ #include "link_hwss.h"
+ #include "link_encoder.h"
+@@ -63,13 +64,11 @@ static void destroy_links(struct dc *dc)
+ 	uint32_t i;
+ 
+ 	for (i = 0; i < dc->link_count; i++) {
+-
+ 		if (NULL != dc->links[i])
+ 			link_destroy(&dc->links[i]);
+ 	}
+ }
+ 
+-
+ static bool create_links(struct dc *dc, const struct dc_init_data *init_params)
+ {
+ 	int i;
+@@ -83,8 +82,10 @@ static bool create_links(struct dc *dc, const struct dc_init_data *init_params)
+ 	connectors_num = dcb->funcs->get_connectors_number(dcb);
+ 
+ 	if (connectors_num > ENUM_ID_COUNT) {
+-		dal_error("DC: Number of connectors %d exceeds maximum of %d!\n",
+-				connectors_num, ENUM_ID_COUNT);
++		dal_error(
++			"DC: Number of connectors %d exceeds maximum of %d!\n",
++			connectors_num,
++			ENUM_ID_COUNT);
+ 		return false;
+ 	}
+ 
+@@ -93,8 +94,11 @@ static bool create_links(struct dc *dc, const struct dc_init_data *init_params)
+ 		return false;
+ 	}
+ 
+-	dal_output_to_console("DC: %s: connectors_num: physical:%d, virtual:%d\n",
+-			__func__, connectors_num, init_params->num_virtual_links);
++	dal_output_to_console(
++		"DC: %s: connectors_num: physical:%d, virtual:%d\n",
++		__func__,
++		connectors_num,
++		init_params->num_virtual_links);
+ 
+ 	for (i = 0; i < connectors_num; i++) {
+ 		struct link_init_data link_init_params = {0};
+@@ -105,22 +109,22 @@ static bool create_links(struct dc *dc, const struct dc_init_data *init_params)
+ 		link_init_params.connector_index = i;
+ 		link_init_params.link_index = dc->link_count;
+ 		link_init_params.dc = dc;
+-		link =  link_create(&link_init_params);
++		link = link_create(&link_init_params);
+ 
+ 		if (link) {
+ 			dc->links[dc->link_count] = link;
+ 			link->dc = dc;
+ 			++dc->link_count;
+-		}
+-		else {
++		} else {
+ 			dal_error("DC: failed to create link!\n");
+ 		}
+ 	}
+ 
+ 	for (i = 0; i < init_params->num_virtual_links; i++) {
+-		struct core_link *link =
+-			dc_service_alloc(dc->ctx, sizeof(*link));
+-		struct encoder_init_data enc_init = { 0 };
++		struct core_link *link = dc_service_alloc(
++			dc->ctx,
++			sizeof(*link));
++		struct encoder_init_data enc_init = {0};
+ 
+ 		if (link == NULL) {
+ 			BREAK_TO_DEBUGGER();
+@@ -134,8 +138,9 @@ static bool create_links(struct dc *dc, const struct dc_init_data *init_params)
+ 		link->link_id.type = OBJECT_TYPE_CONNECTOR;
+ 		link->link_id.id = CONNECTOR_ID_VIRTUAL;
+ 		link->link_id.enum_id = ENUM_ID_1;
+-		link->link_enc =
+-			dc_service_alloc(dc->ctx, sizeof(*link->link_enc));
++		link->link_enc = dc_service_alloc(
++			dc->ctx,
++			sizeof(*link->link_enc));
+ 
+ 		enc_init.adapter_service = init_params->adapter_srv;
+ 		enc_init.ctx = init_params->ctx;
+@@ -159,6 +164,7 @@ failed_alloc:
+ 	return false;
+ }
+ 
++
+ static void init_hw(struct dc *dc)
+ {
+ 	int i;
+@@ -198,11 +204,11 @@ static void init_hw(struct dc *dc)
+ 	for(i = 0; i < dc->res_pool.controller_count; i++) {
+ 		struct timing_generator *tg = dc->res_pool.timing_generators[i];
+ 
+-		dc->hwss.disable_vga(tg);
++		tg->funcs->disable_vga(tg);
+ 
+ 		/* Blank controller using driver code instead of
+ 		 * command table. */
+-		dc->hwss.disable_memory_requests(tg);
++		tg->funcs->set_blank(tg, true);
+ 	}
+ 
+ 	for(i = 0; i < dc->res_pool.audio_count; i++) {
+@@ -359,18 +365,12 @@ static bool construct(struct dc *dc, const struct dal_init_data *init_params)
+ 	if (!dc_construct_hw_sequencer(dc_init_data.adapter_srv, dc))
+ 		goto hwss_fail;
+ 
+-
+-	/* TODO: create all the sub-objects of DC. */
+-	if (false == create_links(dc, &dc_init_data))
+-		goto create_links_fail;
+-
+-	if (!dc->hwss.construct_resource_pool(
+-			dc_init_data.adapter_srv,
+-			dc_init_data.num_virtual_links,
+-			dc,
+-			&dc->res_pool))
++	if (!dc_construct_resource_pool(
++		dc_init_data.adapter_srv, dc, dc_init_data.num_virtual_links))
+ 		goto construct_resource_fail;
+ 
++	if (!create_links(dc, &dc_init_data))
++		goto create_links_fail;
+ 
+ 	bw_calcs_init(&dc->bw_dceip, &dc->bw_vbios);
+ 
+@@ -393,7 +393,7 @@ ctx_fail:
+ static void destruct(struct dc *dc)
+ {
+ 	destroy_links(dc);
+-	dc->hwss.destruct_resource_pool(&dc->res_pool);
++	dc->res_pool.funcs->destruct(&dc->res_pool);
+ 	dal_logger_destroy(&dc->ctx->logger);
+ 	dc_service_free(dc->ctx, dc->ctx);
+ }
+@@ -449,7 +449,8 @@ bool dc_validate_resources(
+ 	if(context == NULL)
+ 		goto context_alloc_fail;
+ 
+-	result = dc->hwss.validate_with_context(dc, set, set_count, context);
++	result = dc->res_pool.funcs->validate_with_context(
++						dc, set, set_count, context);
+ 
+ 	dc_service_free(dc->ctx, context);
+ context_alloc_fail:
+@@ -559,7 +560,7 @@ bool dc_commit_targets(
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+ 
+-	result = dc->hwss.validate_with_context(dc, set, target_count, context);
++	result = dc->res_pool.funcs->validate_with_context(dc, set, target_count, context);
+ 	if (result != DC_OK){
+ 		BREAK_TO_DEBUGGER();
+ 		goto fail;
+@@ -679,6 +680,7 @@ void dc_flip_surface_addrs(struct dc* dc,
+ 		surface->public.flip_immediate = flip_addrs[i].flip_immediate;
+ 
+ 		dc->hwss.update_plane_address(
++			dc,
+ 			surface,
+ 			DC_TARGET_TO_CORE(surface->status.dc_target));
+ 	}
+@@ -789,7 +791,6 @@ void dc_resume(const struct dc *dc)
+ 		core_link_resume(dc->links[i]);
+ }
+ 
+-
+ bool dc_read_dpcd(
+ 		struct dc *dc,
+ 		uint32_t link_index,
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index a2879bb..c81f4a2 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -67,7 +67,7 @@ static void destruct(struct core_link *link)
+ 		dal_ddc_service_destroy(&link->ddc);
+ 
+ 	if(link->link_enc)
+-		link->ctx->dc->hwss.encoder_destroy(&link->link_enc);
++		link->ctx->dc->res_pool.funcs->link_enc_destroy(&link->link_enc);
+ }
+ 
+ /*
+@@ -988,7 +988,8 @@ static bool construct(
+ 	enc_init_data.hpd_source = get_hpd_line(link, as);
+ 	enc_init_data.transmitter =
+ 			translate_encoder_to_transmitter(enc_init_data.encoder);
+-	link->link_enc = dc_ctx->dc->hwss.encoder_create(&enc_init_data);
++	link->link_enc = dc_ctx->dc->res_pool.funcs->link_enc_create(
++								&enc_init_data);
+ 
+ 	if( link->link_enc == NULL) {
+ 		DC_ERROR("Failed to create link encoder!\n");
+@@ -1449,7 +1450,6 @@ static enum dc_status allocate_mst_payload(struct core_stream *stream)
+ 	struct stream_encoder *stream_encoder = stream->stream_enc;
+ 	struct dp_mst_stream_allocation_table proposed_table = {0};
+ 	struct fixed31_32 avg_time_slots_per_mtp;
+-	struct dc *dc = stream->ctx->dc;
+ 	struct fixed31_32 pbn;
+ 	struct fixed31_32 pbn_per_slot;
+ 	uint8_t i;
+@@ -1524,7 +1524,8 @@ static enum dc_status allocate_mst_payload(struct core_stream *stream)
+ 	avg_time_slots_per_mtp = dal_fixed31_32_div(pbn, pbn_per_slot);
+ 
+ 
+-	dc->hwss.set_mst_bandwidth(
++
++	stream_encoder->funcs->set_mst_bandwidth(
+ 		stream_encoder,
+ 		avg_time_slots_per_mtp);
+ 
+@@ -1539,7 +1540,6 @@ static enum dc_status deallocate_mst_payload(struct core_stream *stream)
+ 	struct stream_encoder *stream_encoder = stream->stream_enc;
+ 	struct dp_mst_stream_allocation_table proposed_table = {0};
+ 	struct fixed31_32 avg_time_slots_per_mtp = dal_fixed31_32_from_int(0);
+-	struct dc *dc = stream->ctx->dc;
+ 	uint8_t i;
+ 	bool mst_mode = (link->public.type == dc_connection_mst_branch);
+ 
+@@ -1551,7 +1551,7 @@ static enum dc_status deallocate_mst_payload(struct core_stream *stream)
+ 	 */
+ 
+ 	/* slot X.Y */
+-	dc->hwss.set_mst_bandwidth(
++	stream_encoder->funcs->set_mst_bandwidth(
+ 		stream_encoder,
+ 		avg_time_slots_per_mtp);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index 52307cb..fcda0cb 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -31,6 +31,33 @@
+ #include "opp.h"
+ #include "transform.h"
+ 
++#include "dce100/dce100_resource.h"
++#include "dce110/dce110_resource.h"
++
++bool dc_construct_resource_pool(struct adapter_service *adapter_serv,
++				struct dc *dc,
++				uint8_t num_virtual_links)
++{
++	enum dce_version dce_ver = dal_adapter_service_get_dce_version(adapter_serv);
++
++	switch (dce_ver) {
++#if defined(CONFIG_DRM_AMD_DAL_DCE10_0)
++	case DCE_VERSION_10_0:
++		return dce100_construct_resource_pool(
++			adapter_serv, num_virtual_links, dc, &dc->res_pool);
++#endif
++#if defined(CONFIG_DRM_AMD_DAL_DCE11_0)
++	case DCE_VERSION_11_0:
++		return dce110_construct_resource_pool(
++			adapter_serv, num_virtual_links, dc, &dc->res_pool);
++#endif
++	default:
++		break;
++	}
++
++	return false;
++}
++
+ void unreference_clock_source(
+ 		struct resource_context *res_ctx,
+ 		struct clock_source *clock_source)
+@@ -512,7 +539,6 @@ void pplib_apply_display_requirements(
+ 
+ 	pp_display_cfg.avail_mclk_switch_time_us =
+ 						get_min_vblank_time_us(context);
+-	/* TODO: dce11.2*/
+ 	pp_display_cfg.avail_mclk_switch_time_in_disp_active_us = 0;
+ 
+ 	pp_display_cfg.disp_clk_khz = context->bw_results.dispclk_khz;
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+index 8cb05b7..2756e7b 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+@@ -27,6 +27,7 @@
+ #include "hw_sequencer.h"
+ #include "resource.h"
+ #include "ipp.h"
++#include "timing_generator.h"
+ 
+ #define COEFF_RANGE	3
+ #define REGAMMA_COEFF_A0	31308
+@@ -280,7 +281,8 @@ bool dc_commit_surfaces_to_target(
+ 				new_surfaces[i],
+ 				DC_STREAM_TO_CORE(target->public.streams[j]));
+ 
+-	if (dc->hwss.validate_bandwidth(dc, &dc->current_context) != DC_OK) {
++	if (dc->res_pool.funcs->validate_bandwidth(dc, &dc->current_context)
++								!= DC_OK) {
+ 		BREAK_TO_DEBUGGER();
+ 		goto unexpected_fail;
+ 	}
+@@ -309,12 +311,10 @@ bool dc_commit_surfaces_to_target(
+ 			DC_STREAM_TO_CORE(target->public.streams[0])->ipp,
+ 			DC_STREAM_TO_CORE(target->public.streams[0])->opp);
+ 
+-		dc->hwss.set_plane_config(
+-			core_surface,
+-			target);
++		dc->hwss.set_plane_config(dc, core_surface, target);
+ 
+ 		if (is_valid_address)
+-			dc->hwss.update_plane_address(core_surface, target);
++			dc->hwss.update_plane_address(dc, core_surface, target);
+ 	}
+ 
+ 	if (current_enabled_surface_count == 0 && new_enabled_surface_count > 0)
+@@ -358,7 +358,7 @@ void dc_target_enable_memory_requests(struct dc_target *target)
+ 		struct timing_generator *tg =
+ 			DC_STREAM_TO_CORE(core_target->public.streams[i])->tg;
+ 
+-		if (!core_target->ctx->dc->hwss.enable_memory_requests(tg)) {
++		if (!tg->funcs->set_blank(tg, false)) {
+ 			dal_error("DC: failed to unblank crtc!\n");
+ 			BREAK_TO_DEBUGGER();
+ 		}
+@@ -379,7 +379,7 @@ void dc_target_disable_memory_requests(struct dc_target *target)
+ 			continue;
+ 		}
+ 
+-		if (false == core_target->ctx->dc->hwss.disable_memory_requests(tg)) {
++		if (false == tg->funcs->set_blank(tg, true)) {
+ 			dal_error("DC: failed to blank crtc!\n");
+ 			BREAK_TO_DEBUGGER();
+ 		}
+@@ -464,7 +464,7 @@ uint32_t dc_target_get_vblank_counter(const struct dc_target *dc_target)
+ 	struct timing_generator *tg =
+ 		DC_STREAM_TO_CORE(core_target->public.streams[0])->tg;
+ 
+-	return core_target->ctx->dc->hwss.get_vblank_counter(tg);
++	return tg->funcs->get_frame_count(tg);
+ }
+ 
+ enum dc_irq_source dc_target_get_irq_src(
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.c
+index b37df4a..b76c8ee 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.c
+@@ -22,20 +22,332 @@
+  * Authors: AMD
+  *
+  */
+-
+ #include "dc_services.h"
+-
++#include "dc.h"
++#include "core_dc.h"
++#include "core_types.h"
++#include "hw_sequencer.h"
++#include "dce100_hw_sequencer.h"
+ #include "dce110/dce110_hw_sequencer.h"
+ 
+-#include "resource.h"
+-#include "hw_sequencer.h"
+-#include "dce100_resource.h"
++/* include DCE10 register header files */
++#include "dce/dce_10_0_d.h"
++#include "dce/dce_10_0_sh_mask.h"
++
++struct dce100_hw_seq_reg_offsets {
++	uint32_t blnd;
++	uint32_t crtc;
++};
++
++enum pipe_lock_control {
++	PIPE_LOCK_CONTROL_GRAPHICS = 1 << 0,
++	PIPE_LOCK_CONTROL_BLENDER = 1 << 1,
++	PIPE_LOCK_CONTROL_SCL = 1 << 2,
++	PIPE_LOCK_CONTROL_SURFACE = 1 << 3,
++	PIPE_LOCK_CONTROL_MODE = 1 << 4
++};
++
++enum blender_mode {
++	BLENDER_MODE_CURRENT_PIPE = 0,/* Data from current pipe only */
++	BLENDER_MODE_OTHER_PIPE, /* Data from other pipe only */
++	BLENDER_MODE_BLENDING,/* Alpha blending - blend 'current' and 'other' */
++	BLENDER_MODE_STEREO
++};
++
++static const struct dce100_hw_seq_reg_offsets reg_offsets[] = {
++{
++	.blnd = (mmBLND0_BLND_CONTROL - mmBLND_CONTROL),
++	.crtc = (mmCRTC0_CRTC_GSL_CONTROL - mmCRTC_GSL_CONTROL),
++},
++{
++	.blnd = (mmBLND1_BLND_CONTROL - mmBLND_CONTROL),
++	.crtc = (mmCRTC1_CRTC_GSL_CONTROL - mmCRTC_GSL_CONTROL),
++},
++{
++	.blnd = (mmBLND2_BLND_CONTROL - mmBLND_CONTROL),
++	.crtc = (mmCRTC2_CRTC_GSL_CONTROL - mmCRTC_GSL_CONTROL),
++}
++};
++
++#define HW_REG_BLND(reg, id)\
++	(reg + reg_offsets[id].blnd)
++
++#define HW_REG_CRTC(reg, id)\
++	(reg + reg_offsets[id].crtc)
++
++
++/*******************************************************************************
++ * Private definitions
++ ******************************************************************************/
++/***************************PIPE_CONTROL***********************************/
++static void dce100_enable_fe_clock(
++	struct dc_context *ctx, uint8_t controller_id, bool enable)
++{
++	uint32_t value = 0;
++	uint32_t addr;
++
++	addr = HW_REG_CRTC(mmDCFE_CLOCK_CONTROL, controller_id);
++
++	value = dal_read_reg(ctx, addr);
++
++	set_reg_field_value(
++		value,
++		enable,
++		DCFE_CLOCK_CONTROL,
++		DCFE_CLOCK_ENABLE);
++
++	dal_write_reg(ctx, addr, value);
++}
++
++static bool dce100_pipe_control_lock(
++	struct dc_context *ctx,
++	uint8_t controller_idx,
++	uint32_t control_mask,
++	bool lock)
++{
++	uint32_t addr = HW_REG_BLND(mmBLND_V_UPDATE_LOCK, controller_idx);
++	uint32_t value = dal_read_reg(ctx, addr);
++	bool need_to_wait = false;
++
++	if (control_mask & PIPE_LOCK_CONTROL_GRAPHICS)
++		set_reg_field_value(
++			value,
++			lock,
++			BLND_V_UPDATE_LOCK,
++			BLND_DCP_GRPH_V_UPDATE_LOCK);
++
++	if (control_mask & PIPE_LOCK_CONTROL_SCL)
++		set_reg_field_value(
++			value,
++			lock,
++			BLND_V_UPDATE_LOCK,
++			BLND_SCL_V_UPDATE_LOCK);
++
++	if (control_mask & PIPE_LOCK_CONTROL_SURFACE)
++		set_reg_field_value(
++			value,
++			lock,
++			BLND_V_UPDATE_LOCK,
++			BLND_DCP_GRPH_SURF_V_UPDATE_LOCK);
++
++	if (control_mask & PIPE_LOCK_CONTROL_BLENDER) {
++		set_reg_field_value(
++			value,
++			lock,
++			BLND_V_UPDATE_LOCK,
++			BLND_BLND_V_UPDATE_LOCK);
++		need_to_wait = true;
++	}
++
++	if (control_mask & PIPE_LOCK_CONTROL_MODE)
++		set_reg_field_value(
++			value,
++			lock,
++			BLND_V_UPDATE_LOCK,
++			BLND_V_UPDATE_LOCK_MODE);
++
++	dal_write_reg(ctx, addr, value);
++
++	if (!lock && need_to_wait) {
++		uint8_t counter = 0;
++		const uint8_t counter_limit = 100;
++		const uint16_t delay_us = 1000;
++
++		uint8_t pipe_pending;
++
++		addr = HW_REG_BLND(mmBLND_REG_UPDATE_STATUS,
++				controller_idx);
++
++		while (counter < counter_limit) {
++			value = dal_read_reg(ctx, addr);
++
++			pipe_pending = 0;
++
++			if (control_mask & PIPE_LOCK_CONTROL_BLENDER) {
++				pipe_pending |=
++					get_reg_field_value(
++						value,
++						BLND_REG_UPDATE_STATUS,
++						BLND_BLNDC_UPDATE_PENDING);
++				pipe_pending |= get_reg_field_value(
++					value,
++					BLND_REG_UPDATE_STATUS,
++					BLND_BLNDO_UPDATE_PENDING);
++			}
++
++			if (control_mask & PIPE_LOCK_CONTROL_SCL) {
++				pipe_pending |=
++					get_reg_field_value(
++						value,
++						BLND_REG_UPDATE_STATUS,
++						SCL_BLNDC_UPDATE_PENDING);
++				pipe_pending |=
++					get_reg_field_value(
++						value,
++						BLND_REG_UPDATE_STATUS,
++						SCL_BLNDO_UPDATE_PENDING);
++			}
++			if (control_mask & PIPE_LOCK_CONTROL_GRAPHICS) {
++				pipe_pending |=
++					get_reg_field_value(
++						value,
++						BLND_REG_UPDATE_STATUS,
++						DCP_BLNDC_GRPH_UPDATE_PENDING);
++				pipe_pending |=
++					get_reg_field_value(
++						value,
++						BLND_REG_UPDATE_STATUS,
++						DCP_BLNDO_GRPH_UPDATE_PENDING);
++			}
++			if (control_mask & PIPE_LOCK_CONTROL_SURFACE) {
++				pipe_pending |= get_reg_field_value(
++					value,
++					BLND_REG_UPDATE_STATUS,
++					DCP_BLNDC_GRPH_SURF_UPDATE_PENDING);
++				pipe_pending |= get_reg_field_value(
++					value,
++					BLND_REG_UPDATE_STATUS,
++					DCP_BLNDO_GRPH_SURF_UPDATE_PENDING);
++			}
++
++			if (pipe_pending == 0)
++				break;
++
++			counter++;
++			dc_service_delay_in_microseconds(ctx, delay_us);
++		}
++
++		if (counter == counter_limit) {
++			dal_logger_write(
++				ctx->logger,
++				LOG_MAJOR_WARNING,
++				LOG_MINOR_COMPONENT_CONTROLLER,
++				"%s: wait for update exceeded (wait %d us)\n",
++				__func__,
++				counter * delay_us);
++			dal_logger_write(
++				ctx->logger,
++				LOG_MAJOR_WARNING,
++				LOG_MINOR_COMPONENT_CONTROLLER,
++				"%s: control %d, remain value %x\n",
++				__func__,
++				control_mask,
++				value);
++		} else {
++			/* OK. */
++		}
++	}
++
++	return true;
++}
++
++static void dce100_set_blender_mode(
++	struct dc_context *ctx,
++	uint8_t controller_id,
++	uint32_t mode)
++{
++	uint32_t value;
++	uint32_t addr = HW_REG_BLND(mmBLND_CONTROL, controller_id);
++	uint32_t blnd_mode;
++	uint32_t feedthrough = 0;
++
++	switch (mode) {
++	case BLENDER_MODE_OTHER_PIPE:
++		feedthrough = 0;
++		blnd_mode = 1;
++		break;
++	case BLENDER_MODE_BLENDING:
++		feedthrough = 0;
++		blnd_mode = 2;
++		break;
++	case BLENDER_MODE_CURRENT_PIPE:
++	default:
++		feedthrough = 1;
++		blnd_mode = 0;
++		break;
++	}
++
++	value = dal_read_reg(ctx, addr);
++
++	set_reg_field_value(
++		value,
++		feedthrough,
++		BLND_CONTROL,
++		BLND_FEEDTHROUGH_EN);
++
++	set_reg_field_value(
++		value,
++		blnd_mode,
++		BLND_CONTROL,
++		BLND_MODE);
++
++	dal_write_reg(ctx, addr, value);
++}
++
++static bool dce100_enable_display_power_gating(
++	struct dc_context *ctx,
++	uint8_t controller_id,
++	struct dc_bios *dcb,
++	enum pipe_gating_control power_gating)
++{
++	enum bp_result bp_result = BP_RESULT_OK;
++	enum bp_pipe_control_action cntl;
++
++	if (power_gating == PIPE_GATING_CONTROL_INIT)
++		cntl = ASIC_PIPE_INIT;
++	else if (power_gating == PIPE_GATING_CONTROL_ENABLE)
++		cntl = ASIC_PIPE_ENABLE;
++	else
++		cntl = ASIC_PIPE_DISABLE;
++
++	if (!(power_gating == PIPE_GATING_CONTROL_INIT && controller_id != 0))
++		bp_result = dcb->funcs->enable_disp_power_gating(
++						dcb, controller_id + 1, cntl);
++
++	if (bp_result == BP_RESULT_OK)
++		return true;
++	else
++		return false;
++}
++
++static void enable_hw_base_light_sleep(void)
++{
++	/* TODO: implement */
++}
++
++static void disable_sw_manual_control_light_sleep(void)
++{
++	/* TODO: implement */
++}
++
++static void enable_sw_manual_control_light_sleep(void)
++{
++	/* TODO: implement */
++}
++
++static void dal_dc_clock_gating_dce100_power_up(struct dc_context *ctx, bool enable)
++{
++	if (enable) {
++		enable_hw_base_light_sleep();
++		disable_sw_manual_control_light_sleep();
++	} else {
++		enable_sw_manual_control_light_sleep();
++	}
++}
++
++/**************************************************************************/
+ 
+ bool dce100_hw_sequencer_construct(struct dc *dc)
+ {
+ 	dce110_hw_sequencer_construct(dc);
+-	dc->hwss.construct_resource_pool = dce100_construct_resource_pool;
+-	dc->hwss.destruct_resource_pool = dce100_destruct_resource_pool;
++
++	/* TODO: dce80 is empty implementation at the moment*/
++	dc->hwss.clock_gating_power_up = dal_dc_clock_gating_dce100_power_up;
++
++	dc->hwss.enable_display_power_gating = dce100_enable_display_power_gating;
++	dc->hwss.enable_fe_clock = dce100_enable_fe_clock;
++	dc->hwss.pipe_control_lock = dce100_pipe_control_lock;
++	dc->hwss.set_blender_mode = dce100_set_blender_mode;
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.h
+index d52bfda..0ce637e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.h
+@@ -32,5 +32,5 @@ struct dc;
+ 
+ bool dce100_hw_sequencer_construct(struct dc *dc);
+ 
+-#endif /* __DC_HWSS_DCE110_H__ */
++#endif /* __DC_HWSS_DCE100_H__ */
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+index 4027547..0c1757b 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+@@ -30,6 +30,8 @@
+ #include "resource.h"
+ #include "include/irq_service_interface.h"
+ 
++#include "../virtual/virtual_stream_encoder.h"
++#include "dce110/dce110_resource.h"
+ #include "dce110/dce110_timing_generator.h"
+ #include "dce110/dce110_link_encoder.h"
+ #include "dce110/dce110_mem_input.h"
+@@ -41,7 +43,6 @@
+ 
+ #include "dce/dce_10_0_d.h"
+ 
+-/* TODO remove these defines */
+ #ifndef mmDP_DPHY_INTERNAL_CTRL
+ 	#define mmDP_DPHY_INTERNAL_CTRL 0x4aa7
+ 	#define mmDP0_DP_DPHY_INTERNAL_CTRL 0x4aa7
+@@ -524,215 +525,6 @@ void dce100_clock_source_destroy(struct clock_source **clk_src)
+ 	*clk_src = NULL;
+ }
+ 
+-bool dce100_construct_resource_pool(
+-	struct adapter_service *adapter_serv,
+-	uint8_t num_virtual_links,
+-	struct dc *dc,
+-	struct resource_pool *pool)
+-{
+-	unsigned int i;
+-	struct audio_init_data audio_init_data = { 0 };
+-	struct dc_context *ctx = dc->ctx;
+-
+-	pool->adapter_srv = adapter_serv;
+-
+-	pool->stream_engines.engine.ENGINE_ID_DIGA = 1;
+-	pool->stream_engines.engine.ENGINE_ID_DIGB = 1;
+-	pool->stream_engines.engine.ENGINE_ID_DIGC = 1;
+-	pool->stream_engines.engine.ENGINE_ID_DIGD = 1;
+-	pool->stream_engines.engine.ENGINE_ID_DIGE = 1;
+-	pool->stream_engines.engine.ENGINE_ID_DIGF = 1;
+-
+-	pool->clock_sources[DCE100_CLK_SRC_PLL0] = dce100_clock_source_create(
+-		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
+-		CLOCK_SOURCE_ID_PLL0, &dce100_clk_src_reg_offsets[0]);
+-	pool->clock_sources[DCE100_CLK_SRC_PLL1] = dce100_clock_source_create(
+-		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
+-		CLOCK_SOURCE_ID_PLL1, &dce100_clk_src_reg_offsets[1]);
+-	pool->clock_sources[DCE100_CLK_SRC_EXT] =  dce100_clock_source_create(
+-		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
+-		CLOCK_SOURCE_ID_EXTERNAL, &dce100_clk_src_reg_offsets[0]);
+-	pool->clk_src_count = DCE100_CLK_SRC_TOTAL;
+-
+-	for (i = 0; i < pool->clk_src_count; i++) {
+-		if (pool->clock_sources[i] == NULL) {
+-			dal_error("DC: failed to create clock sources!\n");
+-			BREAK_TO_DEBUGGER();
+-			goto clk_src_create_fail;
+-		}
+-	}
+-
+-	pool->display_clock = dal_display_clock_dce110_create(ctx, adapter_serv);
+-	if (pool->display_clock == NULL) {
+-		dal_error("DC: failed to create display clock!\n");
+-		BREAK_TO_DEBUGGER();
+-		goto disp_clk_create_fail;
+-	}
+-
+-	{
+-		struct irq_service_init_data init_data;
+-
+-		init_data.ctx = dc->ctx;
+-		pool->irqs = dal_irq_service_create(
+-				dal_adapter_service_get_dce_version(
+-					dc->res_pool.adapter_srv),
+-				&init_data);
+-		if (!pool->irqs)
+-			goto irqs_create_fail;
+-
+-	}
+-
+-	pool->controller_count =
+-		dal_adapter_service_get_func_controllers_num(adapter_serv);
+-	pool->stream_enc_count = dal_adapter_service_get_stream_engines_num(
+-			adapter_serv);
+-	pool->scaler_filter = dal_scaler_filter_create(ctx);
+-	if (pool->scaler_filter == NULL) {
+-		BREAK_TO_DEBUGGER();
+-		dal_error("DC: failed to create filter!\n");
+-		goto filter_create_fail;
+-	}
+-
+-	for (i = 0; i < pool->controller_count; i++) {
+-		pool->timing_generators[i] = dce100_timing_generator_create(
+-				adapter_serv, ctx, i, &dce100_tg_offsets[i]);
+-		if (pool->timing_generators[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error("DC: failed to create tg!\n");
+-			goto controller_create_fail;
+-		}
+-
+-		pool->mis[i] = dce100_mem_input_create(ctx, i,
+-				&dce100_mi_reg_offsets[i]);
+-		if (pool->mis[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error(
+-				"DC: failed to create memory input!\n");
+-			goto controller_create_fail;
+-		}
+-
+-		pool->ipps[i] = dce100_ipp_create(ctx, i,
+-				&dce100_ipp_reg_offsets[i]);
+-		if (pool->ipps[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error(
+-				"DC: failed to create input pixel processor!\n");
+-			goto controller_create_fail;
+-		}
+-
+-		pool->transforms[i] = dce100_transform_create(
+-					ctx, i, &dce100_xfm_offsets[i]);
+-		if (pool->transforms[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error(
+-				"DC: failed to create transform!\n");
+-			goto controller_create_fail;
+-		}
+-		pool->transforms[i]->funcs->transform_set_scaler_filter(
+-				pool->transforms[i],
+-				pool->scaler_filter);
+-
+-		pool->opps[i] = dce100_opp_create(ctx, i, &dce100_opp_reg_offsets[i]);
+-		if (pool->opps[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error(
+-				"DC: failed to create output pixel processor!\n");
+-			goto controller_create_fail;
+-		}
+-	}
+-
+-	audio_init_data.as = adapter_serv;
+-	audio_init_data.ctx = ctx;
+-	pool->audio_count = 0;
+-	for (i = 0; i < pool->controller_count; i++) {
+-		struct graphics_object_id obj_id;
+-
+-		obj_id = dal_adapter_service_enum_audio_object(adapter_serv, i);
+-		if (false == dal_graphics_object_id_is_valid(obj_id)) {
+-			/* no more valid audio objects */
+-			break;
+-		}
+-
+-		audio_init_data.audio_stream_id = obj_id;
+-		pool->audios[i] = dal_audio_create(&audio_init_data);
+-		if (pool->audios[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error("DC: failed to create DPPs!\n");
+-			goto audio_create_fail;
+-		}
+-		pool->audio_count++;
+-	}
+-
+-	for (i = 0; i < pool->stream_enc_count; i++) {
+-		/* TODO: rework fragile code*/
+-		if (pool->stream_engines.u_all & 1 << i) {
+-			pool->stream_enc[i] = dce100_stream_encoder_create(
+-				i, dc->ctx,
+-				dal_adapter_service_get_bios_parser(
+-					adapter_serv),
+-				&stream_enc_regs[i]);
+-			if (pool->stream_enc[i] == NULL) {
+-				BREAK_TO_DEBUGGER();
+-				dal_error("DC: failed to create stream_encoder!\n");
+-				goto stream_enc_create_fail;
+-			}
+-		}
+-	}
+-
+-	return true;
+-
+-stream_enc_create_fail:
+-	for (i = 0; i < pool->stream_enc_count; i++) {
+-		if (pool->stream_enc[i] != NULL)
+-			dc_service_free(pool->stream_enc[i]->ctx,
+-				DCE110STRENC_FROM_STRENC(pool->stream_enc[i]));
+-	}
+-
+-audio_create_fail:
+-	for (i = 0; i < pool->controller_count; i++) {
+-		if (pool->audios[i] != NULL)
+-			dal_audio_destroy(&pool->audios[i]);
+-	}
+-
+-controller_create_fail:
+-	for (i = 0; i < pool->controller_count; i++) {
+-		if (pool->opps[i] != NULL)
+-			dce100_opp_destroy(&pool->opps[i]);
+-
+-		if (pool->transforms[i] != NULL)
+-			dce100_transform_destroy(&pool->transforms[i]);
+-
+-		if (pool->ipps[i] != NULL)
+-			dce110_ipp_destroy(&pool->ipps[i]);
+-
+-		if (pool->mis[i] != NULL) {
+-			dc_service_free(pool->mis[i]->ctx,
+-					TO_DCE110_MEM_INPUT(pool->mis[i]));
+-			pool->mis[i] = NULL;
+-		}
+-
+-		if (pool->timing_generators[i] != NULL)	{
+-			dc_service_free(pool->timing_generators[i]->ctx,
+-				DCE110TG_FROM_TG(pool->timing_generators[i]));
+-			pool->timing_generators[i] = NULL;
+-		}
+-	}
+-
+-filter_create_fail:
+-	dal_irq_service_destroy(&pool->irqs);
+-
+-irqs_create_fail:
+-	dal_display_clock_destroy(&pool->display_clock);
+-
+-disp_clk_create_fail:
+-clk_src_create_fail:
+-	for (i = 0; i < pool->clk_src_count; i++) {
+-		if (pool->clock_sources[i] != NULL)
+-			dce100_clock_source_destroy(&pool->clock_sources[i]);
+-	}
+-	return false;
+-}
+-
+ void dce100_destruct_resource_pool(struct resource_pool *pool)
+ {
+ 	unsigned int i;
+@@ -775,6 +567,7 @@ void dce100_destruct_resource_pool(struct resource_pool *pool)
+ 		if (pool->audios[i] != NULL)
+ 			dal_audio_destroy(&pool->audios[i]);
+ 	}
++
+ 	if (pool->display_clock != NULL)
+ 		dal_display_clock_destroy(&pool->display_clock);
+ 
+@@ -1273,3 +1066,235 @@ enum dc_status dce100_validate_with_context(
+ 
+ 	return result;
+ }
++
++static struct resource_funcs dce100_res_pool_funcs = {
++	.destruct = dce100_destruct_resource_pool,
++	.link_enc_create = dce100_link_encoder_create,
++	.link_enc_destroy = dce110_link_encoder_destroy,
++	.validate_with_context = dce100_validate_with_context,
++	.validate_bandwidth = dce100_validate_bandwidth
++};
++
++bool dce100_construct_resource_pool(
++	struct adapter_service *adapter_serv,
++	uint8_t num_virtual_links,
++	struct dc *dc,
++	struct resource_pool *pool)
++{
++	unsigned int i;
++	struct audio_init_data audio_init_data = { 0 };
++	struct dc_context *ctx = dc->ctx;
++
++	pool->adapter_srv = adapter_serv;
++	pool->funcs = &dce100_res_pool_funcs;
++
++	pool->stream_engines.engine.ENGINE_ID_DIGA = 1;
++	pool->stream_engines.engine.ENGINE_ID_DIGB = 1;
++	pool->stream_engines.engine.ENGINE_ID_DIGC = 1;
++	pool->stream_engines.engine.ENGINE_ID_DIGD = 1;
++	pool->stream_engines.engine.ENGINE_ID_DIGE = 1;
++	pool->stream_engines.engine.ENGINE_ID_DIGF = 1;
++
++	pool->clock_sources[DCE100_CLK_SRC_PLL0] = dce100_clock_source_create(
++		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
++		CLOCK_SOURCE_ID_PLL0, &dce100_clk_src_reg_offsets[0]);
++	pool->clock_sources[DCE100_CLK_SRC_PLL1] = dce100_clock_source_create(
++		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
++		CLOCK_SOURCE_ID_PLL1, &dce100_clk_src_reg_offsets[1]);
++	pool->clock_sources[DCE100_CLK_SRC_EXT] =  dce100_clock_source_create(
++		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
++		CLOCK_SOURCE_ID_EXTERNAL, &dce100_clk_src_reg_offsets[0]);
++	pool->clk_src_count = DCE100_CLK_SRC_TOTAL;
++
++	for (i = 0; i < pool->clk_src_count; i++) {
++		if (pool->clock_sources[i] == NULL) {
++			dal_error("DC: failed to create clock sources!\n");
++			BREAK_TO_DEBUGGER();
++			goto clk_src_create_fail;
++		}
++	}
++
++	pool->display_clock = dal_display_clock_dce110_create(ctx, adapter_serv);
++	if (pool->display_clock == NULL) {
++		dal_error("DC: failed to create display clock!\n");
++		BREAK_TO_DEBUGGER();
++		goto disp_clk_create_fail;
++	}
++
++	{
++		struct irq_service_init_data init_data;
++
++		init_data.ctx = dc->ctx;
++		pool->irqs = dal_irq_service_create(
++				dal_adapter_service_get_dce_version(
++					dc->res_pool.adapter_srv),
++				&init_data);
++		if (!pool->irqs)
++			goto irqs_create_fail;
++
++	}
++
++	pool->controller_count =
++		dal_adapter_service_get_func_controllers_num(adapter_serv);
++	pool->stream_enc_count = dal_adapter_service_get_stream_engines_num(
++			adapter_serv);
++	pool->scaler_filter = dal_scaler_filter_create(ctx);
++	if (pool->scaler_filter == NULL) {
++		BREAK_TO_DEBUGGER();
++		dal_error("DC: failed to create filter!\n");
++		goto filter_create_fail;
++	}
++
++	for (i = 0; i < pool->controller_count; i++) {
++		pool->timing_generators[i] = dce100_timing_generator_create(
++				adapter_serv, ctx, i, &dce100_tg_offsets[i]);
++		if (pool->timing_generators[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error("DC: failed to create tg!\n");
++			goto controller_create_fail;
++		}
++
++		pool->mis[i] = dce100_mem_input_create(ctx, i,
++				&dce100_mi_reg_offsets[i]);
++		if (pool->mis[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error(
++				"DC: failed to create memory input!\n");
++			goto controller_create_fail;
++		}
++
++		pool->ipps[i] = dce100_ipp_create(ctx, i,
++				&dce100_ipp_reg_offsets[i]);
++		if (pool->ipps[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error(
++				"DC: failed to create input pixel processor!\n");
++			goto controller_create_fail;
++		}
++
++		pool->transforms[i] = dce100_transform_create(
++					ctx, i, &dce100_xfm_offsets[i]);
++		if (pool->transforms[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error(
++				"DC: failed to create transform!\n");
++			goto controller_create_fail;
++		}
++		pool->transforms[i]->funcs->transform_set_scaler_filter(
++				pool->transforms[i],
++				pool->scaler_filter);
++
++		pool->opps[i] = dce100_opp_create(ctx, i, &dce100_opp_reg_offsets[i]);
++		if (pool->opps[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error(
++				"DC: failed to create output pixel processor!\n");
++			goto controller_create_fail;
++		}
++	}
++
++	audio_init_data.as = adapter_serv;
++	audio_init_data.ctx = ctx;
++	pool->audio_count = 0;
++	for (i = 0; i < pool->controller_count; i++) {
++		struct graphics_object_id obj_id;
++
++		obj_id = dal_adapter_service_enum_audio_object(adapter_serv, i);
++		if (false == dal_graphics_object_id_is_valid(obj_id)) {
++			/* no more valid audio objects */
++			break;
++		}
++
++		audio_init_data.audio_stream_id = obj_id;
++		pool->audios[i] = dal_audio_create(&audio_init_data);
++		if (pool->audios[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error("DC: failed to create DPPs!\n");
++			goto audio_create_fail;
++		}
++		pool->audio_count++;
++	}
++
++	for (i = 0; i < pool->stream_enc_count; i++) {
++		/* TODO: rework fragile code*/
++		if (pool->stream_engines.u_all & 1 << i) {
++			pool->stream_enc[i] = dce100_stream_encoder_create(
++				i, dc->ctx,
++				dal_adapter_service_get_bios_parser(
++					adapter_serv),
++				&stream_enc_regs[i]);
++			if (pool->stream_enc[i] == NULL) {
++				BREAK_TO_DEBUGGER();
++				dal_error("DC: failed to create stream_encoder!\n");
++				goto stream_enc_create_fail;
++			}
++		}
++	}
++
++	for (i = 0; i < num_virtual_links; i++) {
++		pool->stream_enc[pool->stream_enc_count] =
++			virtual_stream_encoder_create(
++				dc->ctx, dal_adapter_service_get_bios_parser(
++								adapter_serv));
++		if (pool->stream_enc[pool->stream_enc_count] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error("DC: failed to create stream_encoder!\n");
++			goto stream_enc_create_fail;
++		}
++		pool->stream_enc_count++;
++	}
++
++	return true;
++
++stream_enc_create_fail:
++	for (i = 0; i < pool->stream_enc_count; i++) {
++		if (pool->stream_enc[i] != NULL)
++			dc_service_free(pool->stream_enc[i]->ctx,
++				DCE110STRENC_FROM_STRENC(pool->stream_enc[i]));
++	}
++
++audio_create_fail:
++	for (i = 0; i < pool->controller_count; i++) {
++		if (pool->audios[i] != NULL)
++			dal_audio_destroy(&pool->audios[i]);
++	}
++
++controller_create_fail:
++	for (i = 0; i < pool->controller_count; i++) {
++		if (pool->opps[i] != NULL)
++			dce100_opp_destroy(&pool->opps[i]);
++
++		if (pool->transforms[i] != NULL)
++			dce100_transform_destroy(&pool->transforms[i]);
++
++		if (pool->ipps[i] != NULL)
++			dce110_ipp_destroy(&pool->ipps[i]);
++
++		if (pool->mis[i] != NULL) {
++			dc_service_free(pool->mis[i]->ctx,
++					TO_DCE110_MEM_INPUT(pool->mis[i]));
++			pool->mis[i] = NULL;
++		}
++
++		if (pool->timing_generators[i] != NULL)	{
++			dc_service_free(pool->timing_generators[i]->ctx,
++				DCE110TG_FROM_TG(pool->timing_generators[i]));
++			pool->timing_generators[i] = NULL;
++		}
++	}
++
++filter_create_fail:
++	dal_irq_service_destroy(&pool->irqs);
++
++irqs_create_fail:
++	dal_display_clock_destroy(&pool->display_clock);
++
++disp_clk_create_fail:
++clk_src_create_fail:
++	for (i = 0; i < pool->clk_src_count; i++) {
++		if (pool->clock_sources[i] != NULL)
++			dce100_clock_source_destroy(&pool->clock_sources[i]);
++	}
++
++	return false;
++}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_clock_source.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_clock_source.c
+index b096444..c5a081a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_clock_source.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_clock_source.c
+@@ -820,7 +820,6 @@ static bool dce110_clock_source_power_down(
+ 	return bp_result == BP_RESULT_OK;
+ }
+ 
+-
+ /*****************************************/
+ /* Constructor                           */
+ /*****************************************/
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 046a9a5..9158955 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -30,18 +30,18 @@
+ #include "resource.h"
+ #include "hw_sequencer.h"
+ #include "dc_helpers.h"
+-#include "gamma_types.h"
++#include "dce110_hw_sequencer.h"
+ 
+-#include "dce110/dce110_resource.h"
+-#include "dce110/dce110_timing_generator.h"
+-#include "dce110/dce110_mem_input.h"
+-#include "dce110/dce110_opp.h"
+ #include "gpu/dce110/dc_clock_gating_dce110.h"
++
++#include "timing_generator.h"
++#include "mem_input.h"
++#include "opp.h"
+ #include "ipp.h"
+ #include "transform.h"
+ #include "stream_encoder.h"
+ #include "link_encoder.h"
+-#include "inc/clock_source.h"
++#include "clock_source.h"
+ 
+ /* include DCE11 register header files */
+ #include "dce/dce_11_0_d.h"
+@@ -51,20 +51,6 @@ struct dce110_hw_seq_reg_offsets {
+ 	uint32_t dcfe;
+ 	uint32_t blnd;
+ 	uint32_t crtc;
+-	uint32_t dcp;
+-};
+-
+-enum crtc_stereo_mixer_mode {
+-	HW_STEREO_MIXER_MODE_INACTIVE,
+-	HW_STEREO_MIXER_MODE_ROW_INTERLEAVE,
+-	HW_STEREO_MIXER_MODE_COLUMN_INTERLEAVE,
+-	HW_STEREO_MIXER_MODE_PIXEL_INTERLEAVE,
+-	HW_STEREO_MIXER_MODE_BLENDER
+-};
+-
+-struct crtc_mixer_params {
+-	bool sub_sampling;
+-	enum crtc_stereo_mixer_mode mode;
+ };
+ 
+ enum pipe_lock_control {
+@@ -82,41 +68,21 @@ enum blender_mode {
+ 	BLENDER_MODE_STEREO
+ };
+ 
+-enum blender_type {
+-	BLENDER_TYPE_NON_SINGLE_PIPE = 0,
+-	BLENDER_TYPE_SB_SINGLE_PIPE,
+-	BLENDER_TYPE_TB_SINGLE_PIPE
+-};
+-
+-enum dc_memory_sleep_state {
+-	DC_MEMORY_SLEEP_DISABLE = 0,
+-	DC_MEMORY_LIGHT_SLEEP,
+-	DC_MEMORY_DEEP_SLEEP,
+-	DC_MEMORY_SHUTDOWN
+-};
+-enum {
+-	DCE110_PIPE_UPDATE_PENDING_DELAY = 1000,
+-	DCE110_PIPE_UPDATE_PENDING_CHECKCOUNT = 5000
+-};
+-
+ static const struct dce110_hw_seq_reg_offsets reg_offsets[] = {
+ {
+ 	.dcfe = (mmDCFE0_DCFE_MEM_PWR_CTRL - mmDCFE_MEM_PWR_CTRL),
+ 	.blnd = (mmBLND0_BLND_CONTROL - mmBLND_CONTROL),
+ 	.crtc = (mmCRTC0_CRTC_GSL_CONTROL - mmCRTC_GSL_CONTROL),
+-	.dcp = (mmDCP0_DVMM_PTE_CONTROL - mmDVMM_PTE_CONTROL),
+ },
+ {
+-	.dcfe = (mmDCFE1_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+-	.blnd = (mmBLND1_BLND_CONTROL - mmBLND0_BLND_CONTROL),
+-	.crtc = (mmCRTC1_CRTC_GSL_CONTROL - mmCRTC0_CRTC_GSL_CONTROL),
+-	.dcp = (mmDCP1_DVMM_PTE_CONTROL - mmDCP0_DVMM_PTE_CONTROL),
++	.dcfe = (mmDCFE1_DCFE_MEM_PWR_CTRL - mmDCFE_MEM_PWR_CTRL),
++	.blnd = (mmBLND1_BLND_CONTROL - mmBLND_CONTROL),
++	.crtc = (mmCRTC1_CRTC_GSL_CONTROL - mmCRTC_GSL_CONTROL),
+ },
+ {
+-	.dcfe = (mmDCFE2_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+-	.blnd = (mmBLND2_BLND_CONTROL - mmBLND0_BLND_CONTROL),
+-	.crtc = (mmCRTC2_CRTC_GSL_CONTROL - mmCRTC0_CRTC_GSL_CONTROL),
+-	.dcp = (mmDCP2_DVMM_PTE_CONTROL - mmDCP0_DVMM_PTE_CONTROL),
++	.dcfe = (mmDCFE2_DCFE_MEM_PWR_CTRL - mmDCFE_MEM_PWR_CTRL),
++	.blnd = (mmBLND2_BLND_CONTROL - mmBLND_CONTROL),
++	.crtc = (mmCRTC2_CRTC_GSL_CONTROL - mmCRTC_GSL_CONTROL),
+ }
+ };
+ 
+@@ -129,192 +95,12 @@ static const struct dce110_hw_seq_reg_offsets reg_offsets[] = {
+ #define HW_REG_CRTC(reg, id)\
+ 	(reg + reg_offsets[id].crtc)
+ 
+-#define HW_REG_DCP(reg, id)\
+-	(reg + reg_offsets[id].dcp)
+-
+-
+-static void init_pte(struct dc_context *ctx);
+ 
+ /*******************************************************************************
+  * Private definitions
+  ******************************************************************************/
+-
+-static void dce110_enable_display_pipe_clock_gating(
+-	struct dc_context *ctx,
+-	bool clock_gating)
+-{
+-	/*TODO*/
+-}
+-
+-static bool dce110_enable_display_power_gating(
+-	struct dc_context *ctx,
+-	uint8_t controller_id,
+-	struct dc_bios *dcb,
+-	enum pipe_gating_control power_gating)
+-{
+-	enum bp_result bp_result = BP_RESULT_OK;
+-	enum bp_pipe_control_action cntl;
+-
+-	if (power_gating == PIPE_GATING_CONTROL_INIT)
+-		cntl = ASIC_PIPE_INIT;
+-	else if (power_gating == PIPE_GATING_CONTROL_ENABLE)
+-		cntl = ASIC_PIPE_ENABLE;
+-	else
+-		cntl = ASIC_PIPE_DISABLE;
+-
+-	if (!(power_gating == PIPE_GATING_CONTROL_INIT &&
+-					(controller_id + 1) != CONTROLLER_ID_D0))
+-		bp_result = dcb->funcs->enable_disp_power_gating(
+-						dcb, controller_id + 1, cntl);
+-
+-	if (power_gating != PIPE_GATING_CONTROL_ENABLE)
+-		init_pte(ctx);
+-
+-	if (bp_result == BP_RESULT_OK)
+-		return true;
+-	else
+-		return false;
+-}
+-
+-
+-static bool set_gamma_ramp(
+-	struct input_pixel_processor *ipp,
+-	struct output_pixel_processor *opp,
+-	const struct gamma_ramp *ramp,
+-	const struct gamma_parameters *params)
+-{
+-	/*Power on LUT memory*/
+-	opp->funcs->opp_power_on_regamma_lut(opp, true);
+-
+-
+-	if (params->surface_pixel_format == PIXEL_FORMAT_INDEX8 ||
+-		params->selected_gamma_lut == GRAPHICS_GAMMA_LUT_LEGACY) {
+-		/* do legacy DCP for 256 colors if we are requested to do so */
+-		ipp->funcs->ipp_set_legacy_input_gamma_ramp(
+-			ipp, ramp, params);
+-
+-		ipp->funcs->ipp_set_legacy_input_gamma_mode(ipp, true);
+-
+-		/* set bypass */
+-		ipp->funcs->ipp_program_prescale(ipp, PIXEL_FORMAT_UNINITIALIZED);
+-
+-		ipp->funcs->ipp_set_degamma(ipp, params, true);
+-
+-		opp->funcs->opp_set_regamma(opp, ramp, params, true);
+-	} else if (params->selected_gamma_lut ==
+-			GRAPHICS_GAMMA_LUT_LEGACY_AND_REGAMMA) {
+-		if (!opp->funcs->opp_map_legacy_and_regamma_hw_to_x_user(
+-			opp, ramp, params)) {
+-			BREAK_TO_DEBUGGER();
+-			/* invalid parameters or bug */
+-			return false;
+-		}
+-
+-		/* do legacy DCP for 256 colors if we are requested to do so */
+-		ipp->funcs->ipp_set_legacy_input_gamma_ramp(
+-			ipp, ramp, params);
+-
+-		ipp->funcs->ipp_set_legacy_input_gamma_mode(ipp, true);
+-
+-		/* set bypass */
+-		ipp->funcs->ipp_program_prescale(ipp, PIXEL_FORMAT_UNINITIALIZED);
+-	} else {
+-		ipp->funcs->ipp_set_legacy_input_gamma_mode(ipp, false);
+-
+-		ipp->funcs->ipp_program_prescale(ipp, params->surface_pixel_format);
+-
+-		/* Do degamma step : remove the given gamma value from FB.
+-		 * For FP16 or no degamma do by pass */
+-		ipp->funcs->ipp_set_degamma(ipp, params, false);
+-
+-		opp->funcs->opp_set_regamma(opp, ramp, params, false);
+-	}
+-
+-	/*re-enable low power mode for LUT memory*/
+-	opp->funcs->opp_power_on_regamma_lut(opp, false);
+-
+-	return true;
+-}
+-
+-static enum dc_status bios_parser_crtc_source_select(
+-		struct core_stream *stream)
+-{
+-	struct dc_bios *dcb;
+-	/* call VBIOS table to set CRTC source for the HW
+-	 * encoder block
+-	 * note: video bios clears all FMT setting here. */
+-	struct bp_crtc_source_select crtc_source_select = {0};
+-	const struct core_sink *sink = stream->sink;
+-
+-	crtc_source_select.engine_id = stream->stream_enc->id;
+-	crtc_source_select.controller_id = stream->controller_idx + 1;
+-	/*TODO: Need to un-hardcode color depth, dp_audio and account for
+-	 * the case where signal and sink signal is different (translator
+-	 * encoder)*/
+-	crtc_source_select.signal = sink->public.sink_signal;
+-	crtc_source_select.enable_dp_audio = false;
+-	crtc_source_select.sink_signal = sink->public.sink_signal;
+-	crtc_source_select.display_output_bit_depth = PANEL_8BIT_COLOR;
+-
+-	dcb = dal_adapter_service_get_bios_parser(sink->link->adapter_srv);
+-
+-	if (BP_RESULT_OK != dcb->funcs->crtc_source_select(
+-		dcb,
+-		&crtc_source_select)) {
+-		return DC_ERROR_UNEXPECTED;
+-	}
+-
+-	return DC_OK;
+-}
+-
+-static enum color_space surface_color_to_color_space(
+-	struct plane_colorimetry *colorimetry)
+-{
+-	enum color_space color_space = COLOR_SPACE_UNKNOWN;
+-
+-	switch (colorimetry->color_space) {
+-	case SURFACE_COLOR_SPACE_SRGB:
+-	case SURFACE_COLOR_SPACE_XRRGB:
+-		if (colorimetry->limited_range)
+-			color_space = COLOR_SPACE_SRGB_LIMITED_RANGE;
+-		else
+-			color_space = COLOR_SPACE_SRGB_FULL_RANGE;
+-		break;
+-	case SURFACE_COLOR_SPACE_BT601:
+-	case SURFACE_COLOR_SPACE_XVYCC_BT601:
+-		color_space = COLOR_SPACE_YCBCR601;
+-		break;
+-	case SURFACE_COLOR_SPACE_BT709:
+-	case SURFACE_COLOR_SPACE_XVYCC_BT709:
+-		color_space = COLOR_SPACE_YCBCR709;
+-		break;
+-	}
+-
+-	return color_space;
+-}
+-
+-/*******************************FMT**************************************/
+-static void program_fmt(
+-		struct output_pixel_processor *opp,
+-		struct bit_depth_reduction_params *fmt_bit_depth,
+-		struct clamping_and_pixel_encoding_params *clamping)
+-{
+-	/* dithering is affected by <CrtcSourceSelect>, hence should be
+-	 * programmed afterwards */
+-
+-	opp->funcs->opp_program_bit_depth_reduction(
+-		opp,
+-		fmt_bit_depth);
+-
+-	opp->funcs->opp_program_clamping_and_pixel_encoding(
+-		opp,
+-		clamping);
+-
+-	return;
+-}
+-
+ /***************************PIPE_CONTROL***********************************/
+-static void enable_fe_clock(
++static void dce110_enable_fe_clock(
+ 	struct dc_context *ctx, uint8_t controller_id, bool enable)
+ {
+ 	uint32_t value = 0;
+@@ -333,21 +119,8 @@ static void enable_fe_clock(
+ 
+ 	dal_write_reg(ctx, addr, value);
+ }
+-/*
+-static void enable_stereo_mixer(
+-	struct dc_context *ctx,
+-	const struct crtc_mixer_params *params)
+-{
+-	TODO
+-}
+-*/
+-static void disable_stereo_mixer(
+-	struct dc_context *ctx)
+-{
+-	/*TODO*/
+-}
+ 
+-static void init_pte(struct dc_context *ctx)
++static void dce110_init_pte(struct dc_context *ctx)
+ {
+ 	uint32_t addr;
+ 	uint32_t value = 0;
+@@ -414,21 +187,7 @@ static void init_pte(struct dc_context *ctx)
+ 	}
+ }
+ 
+-/**
+- *****************************************************************************
+- *  Function: enable_disp_power_gating
+- *
+- *  @brief
+- *     enable or disable power gating
+- *
+- *  @param [in] enum pipe_gating_control power_gating true - power down,
+- *  false - power up
+- *****************************************************************************
+- */
+-
+-
+ /* this is a workaround for hw bug - it is a trigger on r/w */
+-
+ static void trigger_write_crtc_h_blank_start_end(
+ 	struct dc_context *ctx,
+ 	uint8_t controller_id)
+@@ -441,7 +200,7 @@ static void trigger_write_crtc_h_blank_start_end(
+ 	dal_write_reg(ctx, addr, value);
+ }
+ 
+-static bool pipe_control_lock(
++static bool dce110_pipe_control_lock(
+ 	struct dc_context *ctx,
+ 	uint8_t controller_idx,
+ 	uint32_t control_mask,
+@@ -586,10 +345,10 @@ static bool pipe_control_lock(
+ 	return true;
+ }
+ 
+-static void set_blender_mode(
++static void dce110_set_blender_mode(
+ 	struct dc_context *ctx,
+ 	uint8_t controller_id,
+-	enum blender_mode mode)
++	uint32_t mode)
+ {
+ 	uint32_t value;
+ 	uint32_t addr = HW_REG_BLND(mmBLND_CONTROL, controller_id);
+@@ -628,7 +387,209 @@ static void set_blender_mode(
+ 
+ 	dal_write_reg(ctx, addr, value);
+ }
++
++static void dce110_crtc_switch_to_clk_src(
++				struct clock_source *clk_src, uint8_t crtc_inst)
++{
++	uint32_t pixel_rate_cntl_value;
++	uint32_t addr;
++
++	addr = mmCRTC0_PIXEL_RATE_CNTL + crtc_inst *
++			(mmCRTC1_PIXEL_RATE_CNTL - mmCRTC0_PIXEL_RATE_CNTL);
++
++	pixel_rate_cntl_value = dal_read_reg(clk_src->ctx, addr);
++
++	if (clk_src->id == CLOCK_SOURCE_ID_EXTERNAL)
++		set_reg_field_value(pixel_rate_cntl_value, 1,
++			CRTC0_PIXEL_RATE_CNTL, DP_DTO0_ENABLE);
++	else {
++		set_reg_field_value(pixel_rate_cntl_value,
++				0,
++				CRTC0_PIXEL_RATE_CNTL,
++				DP_DTO0_ENABLE);
++
++		set_reg_field_value(pixel_rate_cntl_value,
++				clk_src->id - 1,
++				CRTC0_PIXEL_RATE_CNTL,
++				CRTC0_PIXEL_RATE_SOURCE);
++	}
++	dal_write_reg(clk_src->ctx, addr, pixel_rate_cntl_value);
++}
+ /**************************************************************************/
++
++static void enable_display_pipe_clock_gating(
++	struct dc_context *ctx,
++	bool clock_gating)
++{
++	/*TODO*/
++}
++
++static bool dce110_enable_display_power_gating(
++	struct dc_context *ctx,
++	uint8_t controller_id,
++	struct dc_bios *dcb,
++	enum pipe_gating_control power_gating)
++{
++	enum bp_result bp_result = BP_RESULT_OK;
++	enum bp_pipe_control_action cntl;
++
++	if (power_gating == PIPE_GATING_CONTROL_INIT)
++		cntl = ASIC_PIPE_INIT;
++	else if (power_gating == PIPE_GATING_CONTROL_ENABLE)
++		cntl = ASIC_PIPE_ENABLE;
++	else
++		cntl = ASIC_PIPE_DISABLE;
++
++	if (!(power_gating == PIPE_GATING_CONTROL_INIT && controller_id != 0))
++		bp_result = dcb->funcs->enable_disp_power_gating(
++						dcb, controller_id + 1, cntl);
++
++	if (power_gating != PIPE_GATING_CONTROL_ENABLE)
++		dce110_init_pte(ctx);
++
++	if (bp_result == BP_RESULT_OK)
++		return true;
++	else
++		return false;
++}
++
++
++static bool set_gamma_ramp(
++	struct input_pixel_processor *ipp,
++	struct output_pixel_processor *opp,
++	const struct gamma_ramp *ramp,
++	const struct gamma_parameters *params)
++{
++	/*Power on LUT memory*/
++	opp->funcs->opp_power_on_regamma_lut(opp, true);
++
++
++	if (params->surface_pixel_format == PIXEL_FORMAT_INDEX8 ||
++		params->selected_gamma_lut == GRAPHICS_GAMMA_LUT_LEGACY) {
++		/* do legacy DCP for 256 colors if we are requested to do so */
++		ipp->funcs->ipp_set_legacy_input_gamma_ramp(
++			ipp, ramp, params);
++
++		ipp->funcs->ipp_set_legacy_input_gamma_mode(ipp, true);
++
++		/* set bypass */
++		ipp->funcs->ipp_program_prescale(ipp, PIXEL_FORMAT_UNINITIALIZED);
++
++		ipp->funcs->ipp_set_degamma(ipp, params, true);
++
++		opp->funcs->opp_set_regamma(opp, ramp, params, true);
++	} else if (params->selected_gamma_lut ==
++			GRAPHICS_GAMMA_LUT_LEGACY_AND_REGAMMA) {
++		if (!opp->funcs->opp_map_legacy_and_regamma_hw_to_x_user(
++			opp, ramp, params)) {
++			BREAK_TO_DEBUGGER();
++			/* invalid parameters or bug */
++			return false;
++		}
++
++		/* do legacy DCP for 256 colors if we are requested to do so */
++		ipp->funcs->ipp_set_legacy_input_gamma_ramp(
++			ipp, ramp, params);
++
++		ipp->funcs->ipp_set_legacy_input_gamma_mode(ipp, true);
++
++		/* set bypass */
++		ipp->funcs->ipp_program_prescale(ipp, PIXEL_FORMAT_UNINITIALIZED);
++	} else {
++		ipp->funcs->ipp_set_legacy_input_gamma_mode(ipp, false);
++
++		ipp->funcs->ipp_program_prescale(ipp, params->surface_pixel_format);
++
++		/* Do degamma step : remove the given gamma value from FB.
++		 * For FP16 or no degamma do by pass */
++		ipp->funcs->ipp_set_degamma(ipp, params, false);
++
++		opp->funcs->opp_set_regamma(opp, ramp, params, false);
++	}
++
++	/*re-enable low power mode for LUT memory*/
++	opp->funcs->opp_power_on_regamma_lut(opp, false);
++
++	return true;
++}
++
++static enum dc_status bios_parser_crtc_source_select(
++		struct core_stream *stream)
++{
++	struct dc_bios *dcb;
++	/* call VBIOS table to set CRTC source for the HW
++	 * encoder block
++	 * note: video bios clears all FMT setting here. */
++	struct bp_crtc_source_select crtc_source_select = {0};
++	const struct core_sink *sink = stream->sink;
++
++	crtc_source_select.engine_id = stream->stream_enc->id;
++	crtc_source_select.controller_id = stream->controller_idx + 1;
++	/*TODO: Need to un-hardcode color depth, dp_audio and account for
++	 * the case where signal and sink signal is different (translator
++	 * encoder)*/
++	crtc_source_select.signal = sink->public.sink_signal;
++	crtc_source_select.enable_dp_audio = false;
++	crtc_source_select.sink_signal = sink->public.sink_signal;
++	crtc_source_select.display_output_bit_depth = PANEL_8BIT_COLOR;
++
++	dcb = dal_adapter_service_get_bios_parser(sink->link->adapter_srv);
++
++	if (BP_RESULT_OK != dcb->funcs->crtc_source_select(
++		dcb,
++		&crtc_source_select)) {
++		return DC_ERROR_UNEXPECTED;
++	}
++
++	return DC_OK;
++}
++
++static enum color_space surface_color_to_color_space(
++	struct plane_colorimetry *colorimetry)
++{
++	enum color_space color_space = COLOR_SPACE_UNKNOWN;
++
++	switch (colorimetry->color_space) {
++	case SURFACE_COLOR_SPACE_SRGB:
++	case SURFACE_COLOR_SPACE_XRRGB:
++		if (colorimetry->limited_range)
++			color_space = COLOR_SPACE_SRGB_LIMITED_RANGE;
++		else
++			color_space = COLOR_SPACE_SRGB_FULL_RANGE;
++		break;
++	case SURFACE_COLOR_SPACE_BT601:
++	case SURFACE_COLOR_SPACE_XVYCC_BT601:
++		color_space = COLOR_SPACE_YCBCR601;
++		break;
++	case SURFACE_COLOR_SPACE_BT709:
++	case SURFACE_COLOR_SPACE_XVYCC_BT709:
++		color_space = COLOR_SPACE_YCBCR709;
++		break;
++	}
++
++	return color_space;
++}
++
++/*******************************FMT**************************************/
++static void program_fmt(
++		struct output_pixel_processor *opp,
++		struct bit_depth_reduction_params *fmt_bit_depth,
++		struct clamping_and_pixel_encoding_params *clamping)
++{
++	/* dithering is affected by <CrtcSourceSelect>, hence should be
++	 * programmed afterwards */
++
++	opp->funcs->opp_program_bit_depth_reduction(
++		opp,
++		fmt_bit_depth);
++
++	opp->funcs->opp_program_clamping_and_pixel_encoding(
++		opp,
++		clamping);
++
++	return;
++}
++
+ static void update_bios_scratch_critical_state(struct adapter_service *as,
+ 		bool state)
+ {
+@@ -968,9 +929,9 @@ static void disable_vga_and_power_gate_all_controllers(
+ 
+ 		/* Enable CLOCK gating for each pipe BEFORE controller
+ 		 * powergating. */
+-		dce110_enable_display_pipe_clock_gating(ctx,
++		enable_display_pipe_clock_gating(ctx,
+ 				true);
+-		dce110_enable_display_power_gating(ctx, i, dcb,
++		dc->hwss.enable_display_power_gating(ctx, i, dcb,
+ 				PIPE_GATING_CONTROL_ENABLE);
+ 	}
+ }
+@@ -1181,7 +1142,7 @@ static void set_safe_displaymarks(struct validate_context *context)
+ 	}
+ }
+ 
+-static void dce110_program_bw(struct dc *dc, struct validate_context *context)
++static void program_bw(struct dc *dc, struct validate_context *context)
+ {
+ 	set_safe_displaymarks(context);
+ 	/*TODO: when pplib works*/
+@@ -1191,46 +1152,8 @@ static void dce110_program_bw(struct dc *dc, struct validate_context *context)
+ 	set_displaymarks(dc, context);
+ }
+ 
+-/*TODO: break out clock sources like timing gen/ encoder*/
+-static void dce110_switch_dp_clk_src(
+-	const struct dc_context *ctx,
+-	const struct core_stream *stream)
+-{
+-	uint32_t pixel_rate_cntl_value;
+-	uint32_t addr;
+-	enum clock_source_id id = stream->clock_source->id;
+-
+-	/*TODO: proper offset*/
+-	addr = mmCRTC0_PIXEL_RATE_CNTL + stream->controller_idx *
+-			(mmCRTC1_PIXEL_RATE_CNTL - mmCRTC0_PIXEL_RATE_CNTL);
+-
+-	pixel_rate_cntl_value = dal_read_reg(ctx, addr);
+-
+-	if (id == CLOCK_SOURCE_ID_EXTERNAL) {
+-
+-		if (!get_reg_field_value(pixel_rate_cntl_value,
+-				CRTC0_PIXEL_RATE_CNTL, DP_DTO0_ENABLE)) {
+-
+-			set_reg_field_value(pixel_rate_cntl_value, 1,
+-				CRTC0_PIXEL_RATE_CNTL, DP_DTO0_ENABLE);
+-		}
+-
+-	} else {
+-		set_reg_field_value(pixel_rate_cntl_value,
+-				0,
+-				CRTC0_PIXEL_RATE_CNTL,
+-				DP_DTO0_ENABLE);
+-
+-		set_reg_field_value(pixel_rate_cntl_value,
+-				id - 1,
+-				CRTC0_PIXEL_RATE_CNTL,
+-				CRTC0_PIXEL_RATE_SOURCE);
+-	}
+-	dal_write_reg(ctx, addr, pixel_rate_cntl_value);
+-}
+-
+ static void switch_dp_clock_sources(
+-	const struct dc_context *ctx,
++	const struct dc *dc,
+ 	struct validate_context *val_context)
+ {
+ 	uint8_t i, j;
+@@ -1253,7 +1176,8 @@ static void switch_dp_clock_sources(
+ 					stream->clock_source = clk_src;
+ 					reference_clock_source(
+ 						&val_context->res_ctx, clk_src);
+-					dce110_switch_dp_clk_src(ctx, stream);
++					dc->hwss.crtc_switch_to_clk_src(
++						clk_src, stream->opp->inst);
+ 				}
+ 			}
+ 		}
+@@ -1287,7 +1211,7 @@ static enum dc_status apply_ctx_to_hw(
+ 		dcb = dal_adapter_service_get_bios_parser(
+ 				context->res_ctx.pool.adapter_srv);
+ 
+-		dce110_enable_display_power_gating(
++		dc->hwss.enable_display_power_gating(
+ 				dc->ctx, i, dcb,
+ 				PIPE_GATING_CONTROL_DISABLE);
+ 	}
+@@ -1319,7 +1243,7 @@ static enum dc_status apply_ctx_to_hw(
+ 	update_bios_scratch_critical_state(context->res_ctx.pool.adapter_srv,
+ 			false);
+ 
+-	switch_dp_clock_sources(dc->ctx, context);
++	switch_dp_clock_sources(dc, context);
+ 
+ 	return DC_OK;
+ }
+@@ -1442,23 +1366,12 @@ static void program_scaler(
+ 			false);
+ }
+ 
+-static void configure_locking(struct dc_context *ctx, uint8_t controller_id)
+-{
+-	/* main controller should be in mode 0 (master pipe) */
+-	pipe_control_lock(
+-			ctx,
+-			controller_id,
+-			PIPE_LOCK_CONTROL_MODE,
+-			false);
+-
+-	/* TODO: for MPO finish the non-root controllers */
+-}
+-
+ /**
+  * Program the Front End of the Pipe.
+  * The Back End was already programmed by Set Mode.
+  */
+ static bool set_plane_config(
++	const struct dc *dc,
+ 	struct core_surface *surface,
+ 	struct core_target *target)
+ {
+@@ -1478,11 +1391,15 @@ static bool set_plane_config(
+ 	enum color_space input_color_space =
+ 					surface_color_to_color_space(&(surface->public.colorimetry));
+ 
+-	configure_locking(ctx, controller_idx);
++	dc->hwss.pipe_control_lock(
++			ctx,
++			controller_idx,
++			PIPE_LOCK_CONTROL_MODE,
++			false);
+ 
+ 	/* While a non-root controller is programmed we
+ 	 * have to lock the root controller. */
+-	pipe_control_lock(
++	dc->hwss.pipe_control_lock(
+ 			ctx,
+ 			controller_idx,
+ 			PIPE_LOCK_CONTROL_GRAPHICS |
+@@ -1493,7 +1410,7 @@ static bool set_plane_config(
+ 
+ 	tg->funcs->program_timing(tg, dc_crtc_timing, false);
+ 
+-	enable_fe_clock(ctx, controller_idx, true);
++	dc->hwss.enable_fe_clock(ctx, controller_idx, true);
+ 
+ 	set_default_colors(
+ 			ipp,
+@@ -1507,7 +1424,7 @@ static bool set_plane_config(
+ 	program_scaler(
+ 		controller_idx, tg, xfm, surface, core_stream);
+ 
+-	set_blender_mode(
++	dc->hwss.set_blender_mode(
+ 			ctx,
+ 			controller_idx,
+ 			BLENDER_MODE_CURRENT_PIPE);
+@@ -1519,7 +1436,7 @@ static bool set_plane_config(
+ 			&surface->public.plane_size,
+ 			surface->public.rotation);
+ 
+-	pipe_control_lock(
++	dc->hwss.pipe_control_lock(
+ 			ctx,
+ 			controller_idx,
+ 			PIPE_LOCK_CONTROL_GRAPHICS |
+@@ -1532,6 +1449,7 @@ static bool set_plane_config(
+ }
+ 
+ static bool update_plane_address(
++	const struct dc *dc,
+ 	const struct core_surface *surface,
+ 	struct core_target *target)
+ {
+@@ -1542,7 +1460,7 @@ static bool update_plane_address(
+ 	uint8_t controller_id = core_stream->controller_idx;
+ 
+ 	/* TODO: crtc should be per surface, NOT per-target */
+-	pipe_control_lock(
++	dc->hwss.pipe_control_lock(
+ 		ctx,
+ 		controller_id,
+ 		PIPE_LOCK_CONTROL_SURFACE,
+@@ -1553,7 +1471,7 @@ static bool update_plane_address(
+ 		mi, &surface->public.address, surface->public.flip_immediate))
+ 		return false;
+ 
+-	pipe_control_lock(
++	dc->hwss.pipe_control_lock(
+ 		ctx,
+ 		controller_id,
+ 		PIPE_LOCK_CONTROL_SURFACE,
+@@ -1562,7 +1480,9 @@ static bool update_plane_address(
+ 	return true;
+ }
+ 
+-static void reset_single_stream_hw_ctx(struct core_stream *stream,
++static void reset_single_stream_hw_ctx(
++		const struct dc *dc,
++		struct core_stream *stream,
+ 		struct validate_context *context)
+ {
+ 	struct dc_bios *dcb;
+@@ -1583,9 +1503,8 @@ static void reset_single_stream_hw_ctx(struct core_stream *stream,
+ 	stream->mi->funcs->mem_input_deallocate_dmif_buffer(
+ 			stream->mi, context->target_count);
+ 	stream->xfm->funcs->transform_set_scaler_bypass(stream->xfm);
+-	disable_stereo_mixer(stream->ctx);
+ 	unreference_clock_source(&context->res_ctx, stream->clock_source);
+-	dce110_enable_display_power_gating(
++	dc->hwss.enable_display_power_gating(
+ 			stream->ctx, stream->controller_idx, dcb,
+ 			PIPE_GATING_CONTROL_ENABLE);
+ }
+@@ -1608,7 +1527,7 @@ static void reset_hw_ctx(struct dc *dc,
+ 				.flags.timing_changed)
+ 			continue;
+ 
+-		reset_single_stream_hw_ctx(core_stream, &dc->current_context);
++		reset_single_stream_hw_ctx(dc, core_stream, &dc->current_context);
+ 	}
+ }
+ 
+@@ -1708,68 +1627,25 @@ static void enable_timing_synchronization(
+ 	DC_SYNC_INFO("GSL: Set-up complete.\n");
+ }
+ 
+-static void get_crtc_positions(struct timing_generator *tg,
+-		int32_t *h_position, int32_t *v_position)
+-{
+-	tg->funcs->get_position(tg, h_position, v_position);
+-}
+-
+-static bool enable_memory_request(struct timing_generator *tg)
+-{
+-	return tg->funcs->set_blank(tg, false);
+-}
+-
+-static bool disable_memory_requests(struct timing_generator *tg)
+-{
+-	return tg->funcs->set_blank(tg, true);
+-}
+-
+-static uint32_t get_vblank_counter(struct timing_generator *tg)
+-{
+-	return tg->funcs->get_frame_count(tg);
+-}
+-
+-static void disable_vga(struct timing_generator *tg)
+-{
+-	tg->funcs->disable_vga(tg);
+-}
+-
+-static void set_mst_bandwidth(struct stream_encoder *stream_enc,
+-	struct fixed31_32 avg_time_slots_per_mtp)
+-{
+-	stream_enc->funcs->set_mst_bandwidth(stream_enc,
+-		avg_time_slots_per_mtp);
+-}
+-
+-
+ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.apply_ctx_to_hw = apply_ctx_to_hw,
+ 	.reset_hw_ctx = reset_hw_ctx,
+ 	.set_plane_config = set_plane_config,
+ 	.update_plane_address = update_plane_address,
+-	.enable_memory_requests = enable_memory_request,
+-	.disable_memory_requests = disable_memory_requests,
+ 	.set_gamma_ramp = set_gamma_ramp,
+ 	.power_down = power_down,
+ 	.enable_accelerated_mode = enable_accelerated_mode,
+-	.get_crtc_positions = get_crtc_positions,
+-	.get_vblank_counter = get_vblank_counter,
+ 	.enable_timing_synchronization = enable_timing_synchronization,
+-	.disable_vga = disable_vga,
+-	.encoder_create = dce110_link_encoder_create,
+-	.encoder_destroy = dce110_link_encoder_destroy,
+-	.clock_gating_power_up = dal_dc_clock_gating_dce110_power_up,
+-	.construct_resource_pool = dce110_construct_resource_pool,
+-	.destruct_resource_pool = dce110_destruct_resource_pool,
+-	.validate_with_context = dce110_validate_with_context,
+-	.validate_bandwidth = dce110_validate_bandwidth,
+-	.enable_display_pipe_clock_gating =
+-		dce110_enable_display_pipe_clock_gating,
+-	.enable_display_power_gating = dce110_enable_display_power_gating,
+-	.program_bw = dce110_program_bw,
++	.program_bw = program_bw,
+ 	.enable_stream = enable_stream,
+ 	.disable_stream = disable_stream,
+-	.set_mst_bandwidth = set_mst_bandwidth,
++	.enable_display_pipe_clock_gating = enable_display_pipe_clock_gating,
++	.crtc_switch_to_clk_src = dce110_crtc_switch_to_clk_src,
++	.enable_display_power_gating = dce110_enable_display_power_gating,
++	.enable_fe_clock = dce110_enable_fe_clock,
++	.pipe_control_lock = dce110_pipe_control_lock,
++	.set_blender_mode = dce110_set_blender_mode,
++	.clock_gating_power_up = dal_dc_clock_gating_dce110_power_up,/*todo*/
+ };
+ 
+ bool dce110_hw_sequencer_construct(struct dc *dc)
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index 41717eb..8f5acbd 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -30,8 +30,6 @@
+ #include "resource.h"
+ #include "include/irq_service_interface.h"
+ #include "../virtual/virtual_stream_encoder.h"
+-#include "inc/timing_generator_types.h"
+-
+ #include "dce110/dce110_timing_generator.h"
+ #include "dce110/dce110_link_encoder.h"
+ #include "dce110/dce110_mem_input.h"
+@@ -43,7 +41,6 @@
+ 
+ #include "dce/dce_11_0_d.h"
+ 
+-/* TODO remove these defines */
+ #ifndef mmDP_DPHY_INTERNAL_CTRL
+ 	#define mmDP_DPHY_INTERNAL_CTRL 0x4aa7
+ 	#define mmDP0_DP_DPHY_INTERNAL_CTRL 0x4aa7
+@@ -475,225 +472,6 @@ void dce110_clock_source_destroy(struct clock_source **clk_src)
+ 	*clk_src = NULL;
+ }
+ 
+-bool dce110_construct_resource_pool(
+-	struct adapter_service *adapter_serv,
+-	uint8_t num_virtual_links,
+-	struct dc *dc,
+-	struct resource_pool *pool)
+-{
+-	unsigned int i;
+-	struct audio_init_data audio_init_data = { 0 };
+-	struct dc_context *ctx = dc->ctx;
+-	pool->adapter_srv = adapter_serv;
+-
+-	pool->stream_engines.engine.ENGINE_ID_DIGA = 1;
+-	pool->stream_engines.engine.ENGINE_ID_DIGB = 1;
+-	pool->stream_engines.engine.ENGINE_ID_DIGC = 1;
+-	pool->stream_engines.engine.ENGINE_ID_DIGD = 1;
+-	pool->stream_engines.engine.ENGINE_ID_DIGE = 1;
+-	pool->stream_engines.engine.ENGINE_ID_DIGF = 1;
+-
+-	pool->clock_sources[DCE110_CLK_SRC_PLL0] = dce110_clock_source_create(
+-		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
+-		CLOCK_SOURCE_ID_PLL0, &dce110_clk_src_reg_offsets[0]);
+-	pool->clock_sources[DCE110_CLK_SRC_PLL1] = dce110_clock_source_create(
+-		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
+-		CLOCK_SOURCE_ID_PLL1, &dce110_clk_src_reg_offsets[1]);
+-	pool->clock_sources[DCE110_CLK_SRC_EXT] =  dce110_clock_source_create(
+-		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
+-		CLOCK_SOURCE_ID_EXTERNAL, &dce110_clk_src_reg_offsets[0]);
+-	pool->clk_src_count = DCE110_CLK_SRC_TOTAL;
+-
+-	for (i = 0; i < pool->clk_src_count; i++) {
+-		if (pool->clock_sources[i] == NULL) {
+-			dal_error("DC: failed to create clock sources!\n");
+-			BREAK_TO_DEBUGGER();
+-			goto clk_src_create_fail;
+-		}
+-	}
+-
+-	pool->display_clock = dal_display_clock_dce110_create(ctx, adapter_serv);
+-	if (pool->display_clock == NULL) {
+-		dal_error("DC: failed to create display clock!\n");
+-		BREAK_TO_DEBUGGER();
+-		goto disp_clk_create_fail;
+-	}
+-
+-	{
+-		struct irq_service_init_data init_data;
+-		init_data.ctx = dc->ctx;
+-		pool->irqs = dal_irq_service_create(
+-				dal_adapter_service_get_dce_version(
+-					dc->res_pool.adapter_srv),
+-				&init_data);
+-		if (!pool->irqs)
+-			goto irqs_create_fail;
+-
+-	}
+-
+-	pool->controller_count =
+-		dal_adapter_service_get_func_controllers_num(adapter_serv);
+-	pool->stream_enc_count = dal_adapter_service_get_stream_engines_num(
+-			adapter_serv);
+-	pool->scaler_filter = dal_scaler_filter_create(ctx);
+-	if (pool->scaler_filter == NULL) {
+-		BREAK_TO_DEBUGGER();
+-		dal_error("DC: failed to create filter!\n");
+-		goto filter_create_fail;
+-	}
+-
+-	for (i = 0; i < pool->controller_count; i++) {
+-		pool->timing_generators[i] = dce110_timing_generator_create(
+-				adapter_serv, ctx, i, &dce110_tg_offsets[i]);
+-		if (pool->timing_generators[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error("DC: failed to create tg!\n");
+-			goto controller_create_fail;
+-		}
+-
+-		pool->mis[i] = dce110_mem_input_create(ctx, i,
+-				&dce110_mi_reg_offsets[i]);
+-		if (pool->mis[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error(
+-				"DC: failed to create memory input!\n");
+-			goto controller_create_fail;
+-		}
+-
+-		pool->ipps[i] = dce110_ipp_create(ctx, i, &dce110_ipp_reg_offsets[i]);
+-		if (pool->ipps[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error(
+-				"DC: failed to create input pixel processor!\n");
+-			goto controller_create_fail;
+-		}
+-
+-		pool->transforms[i] = dce110_transform_create(
+-					ctx, i, &dce110_xfm_offsets[i]);
+-		if (pool->transforms[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error(
+-				"DC: failed to create transform!\n");
+-			goto controller_create_fail;
+-		}
+-		pool->transforms[i]->funcs->transform_set_scaler_filter(
+-				pool->transforms[i],
+-				pool->scaler_filter);
+-
+-		pool->opps[i] = dce110_opp_create(ctx, i, &dce110_opp_reg_offsets[i]);
+-		if (pool->opps[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error(
+-				"DC: failed to create output pixel processor!\n");
+-			goto controller_create_fail;
+-		}
+-	}
+-
+-	audio_init_data.as = adapter_serv;
+-	audio_init_data.ctx = ctx;
+-	pool->audio_count = 0;
+-	for (i = 0; i < pool->controller_count; i++) {
+-		struct graphics_object_id obj_id;
+-
+-		obj_id = dal_adapter_service_enum_audio_object(adapter_serv, i);
+-		if (false == dal_graphics_object_id_is_valid(obj_id)) {
+-			/* no more valid audio objects */
+-			break;
+-		}
+-
+-		audio_init_data.audio_stream_id = obj_id;
+-		pool->audios[i] = dal_audio_create(&audio_init_data);
+-		if (pool->audios[i] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error("DC: failed to create DPPs!\n");
+-			goto audio_create_fail;
+-		}
+-		pool->audio_count++;
+-	}
+-
+-	for (i = 0; i < pool->stream_enc_count; i++) {
+-		/* TODO: rework fragile code*/
+-		if (pool->stream_engines.u_all & 1 << i) {
+-			pool->stream_enc[i] = dce110_stream_encoder_create(
+-				i, dc->ctx,
+-				dal_adapter_service_get_bios_parser(
+-					adapter_serv),
+-				&stream_enc_regs[i]);
+-			if (pool->stream_enc[i] == NULL) {
+-				BREAK_TO_DEBUGGER();
+-				dal_error("DC: failed to create stream_encoder!\n");
+-				goto stream_enc_create_fail;
+-			}
+-		}
+-	}
+-
+-	for (i = 0; i < num_virtual_links; i++) {
+-		pool->stream_enc[pool->stream_enc_count] =
+-			virtual_stream_encoder_create(
+-				dc->ctx, dal_adapter_service_get_bios_parser(
+-								adapter_serv));
+-		if (pool->stream_enc[pool->stream_enc_count] == NULL) {
+-			BREAK_TO_DEBUGGER();
+-			dal_error("DC: failed to create stream_encoder!\n");
+-			goto stream_enc_create_fail;
+-		}
+-		pool->stream_enc_count++;
+-	}
+-
+-	return true;
+-
+-stream_enc_create_fail:
+-	for (i = 0; i < pool->stream_enc_count; i++) {
+-		if (pool->stream_enc[i] != NULL)
+-			dc_service_free(pool->stream_enc[i]->ctx,
+-				DCE110STRENC_FROM_STRENC(pool->stream_enc[i]));
+-	}
+-
+-audio_create_fail:
+-	for (i = 0; i < pool->controller_count; i++) {
+-		if (pool->audios[i] != NULL)
+-			dal_audio_destroy(&pool->audios[i]);
+-	}
+-
+-controller_create_fail:
+-	for (i = 0; i < pool->controller_count; i++) {
+-		if (pool->opps[i] != NULL)
+-			dce110_opp_destroy(&pool->opps[i]);
+-
+-		if (pool->transforms[i] != NULL)
+-			dce110_transform_destroy(&pool->transforms[i]);
+-
+-		if (pool->ipps[i] != NULL)
+-			dce110_ipp_destroy(&pool->ipps[i]);
+-
+-		if (pool->mis[i] != NULL) {
+-			dc_service_free(pool->mis[i]->ctx,
+-					TO_DCE110_MEM_INPUT(pool->mis[i]));
+-			pool->mis[i] = NULL;
+-		}
+-
+-		if (pool->timing_generators[i] != NULL)	{
+-			dc_service_free(pool->timing_generators[i]->ctx,
+-				DCE110TG_FROM_TG(pool->timing_generators[i]));
+-			pool->timing_generators[i] = NULL;
+-		}
+-	}
+-
+-filter_create_fail:
+-	dal_irq_service_destroy(&pool->irqs);
+-
+-irqs_create_fail:
+-	dal_display_clock_destroy(&pool->display_clock);
+-
+-disp_clk_create_fail:
+-clk_src_create_fail:
+-	for (i = 0; i < pool->clk_src_count; i++) {
+-		if (pool->clock_sources[i] != NULL)
+-			dce110_clock_source_destroy(&pool->clock_sources[i]);
+-	}
+-	return false;
+-}
+-
+ void dce110_destruct_resource_pool(struct resource_pool *pool)
+ {
+ 	unsigned int i;
+@@ -737,6 +515,7 @@ void dce110_destruct_resource_pool(struct resource_pool *pool)
+ 			dal_audio_destroy(&pool->audios[i]);
+ 		}
+ 	}
++
+ 	if (pool->display_clock != NULL) {
+ 		dal_display_clock_destroy(&pool->display_clock);
+ 	}
+@@ -1227,3 +1006,232 @@ enum dc_status dce110_validate_with_context(
+ 
+ 	return result;
+ }
++
++static struct resource_funcs dce110_res_pool_funcs = {
++	.destruct = dce110_destruct_resource_pool,
++	.link_enc_create = dce110_link_encoder_create,
++	.link_enc_destroy = dce110_link_encoder_destroy,
++	.validate_with_context = dce110_validate_with_context,
++	.validate_bandwidth = dce110_validate_bandwidth
++};
++
++bool dce110_construct_resource_pool(
++	struct adapter_service *adapter_serv,
++	uint8_t num_virtual_links,
++	struct dc *dc,
++	struct resource_pool *pool)
++{
++	unsigned int i;
++	struct audio_init_data audio_init_data = { 0 };
++	struct dc_context *ctx = dc->ctx;
++	pool->adapter_srv = adapter_serv;
++	pool->funcs = &dce110_res_pool_funcs;
++
++	pool->stream_engines.engine.ENGINE_ID_DIGA = 1;
++	pool->stream_engines.engine.ENGINE_ID_DIGB = 1;
++	pool->stream_engines.engine.ENGINE_ID_DIGC = 1;
++	pool->stream_engines.engine.ENGINE_ID_DIGD = 1;
++	pool->stream_engines.engine.ENGINE_ID_DIGE = 1;
++	pool->stream_engines.engine.ENGINE_ID_DIGF = 1;
++
++	pool->clock_sources[DCE110_CLK_SRC_PLL0] = dce110_clock_source_create(
++		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
++		CLOCK_SOURCE_ID_PLL0, &dce110_clk_src_reg_offsets[0]);
++	pool->clock_sources[DCE110_CLK_SRC_PLL1] = dce110_clock_source_create(
++		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
++		CLOCK_SOURCE_ID_PLL1, &dce110_clk_src_reg_offsets[1]);
++	pool->clock_sources[DCE110_CLK_SRC_EXT] =  dce110_clock_source_create(
++		ctx, dal_adapter_service_get_bios_parser(adapter_serv),
++		CLOCK_SOURCE_ID_EXTERNAL, &dce110_clk_src_reg_offsets[0]);
++	pool->clk_src_count = DCE110_CLK_SRC_TOTAL;
++
++	for (i = 0; i < pool->clk_src_count; i++) {
++		if (pool->clock_sources[i] == NULL) {
++			dal_error("DC: failed to create clock sources!\n");
++			BREAK_TO_DEBUGGER();
++			goto clk_src_create_fail;
++		}
++	}
++
++	pool->display_clock = dal_display_clock_dce110_create(ctx, adapter_serv);
++	if (pool->display_clock == NULL) {
++		dal_error("DC: failed to create display clock!\n");
++		BREAK_TO_DEBUGGER();
++		goto disp_clk_create_fail;
++	}
++
++	{
++		struct irq_service_init_data init_data;
++		init_data.ctx = dc->ctx;
++		pool->irqs = dal_irq_service_create(
++				dal_adapter_service_get_dce_version(
++					dc->res_pool.adapter_srv),
++				&init_data);
++		if (!pool->irqs)
++			goto irqs_create_fail;
++
++	}
++
++	pool->controller_count =
++		dal_adapter_service_get_func_controllers_num(adapter_serv);
++	pool->stream_enc_count = dal_adapter_service_get_stream_engines_num(
++			adapter_serv);
++	pool->scaler_filter = dal_scaler_filter_create(ctx);
++	if (pool->scaler_filter == NULL) {
++		BREAK_TO_DEBUGGER();
++		dal_error("DC: failed to create filter!\n");
++		goto filter_create_fail;
++	}
++
++	for (i = 0; i < pool->controller_count; i++) {
++		pool->timing_generators[i] = dce110_timing_generator_create(
++				adapter_serv, ctx, i, &dce110_tg_offsets[i]);
++		if (pool->timing_generators[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error("DC: failed to create tg!\n");
++			goto controller_create_fail;
++		}
++
++		pool->mis[i] = dce110_mem_input_create(ctx, i,
++				&dce110_mi_reg_offsets[i]);
++		if (pool->mis[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error(
++				"DC: failed to create memory input!\n");
++			goto controller_create_fail;
++		}
++
++		pool->ipps[i] = dce110_ipp_create(ctx, i, &dce110_ipp_reg_offsets[i]);
++		if (pool->ipps[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error(
++				"DC: failed to create input pixel processor!\n");
++			goto controller_create_fail;
++		}
++
++		pool->transforms[i] = dce110_transform_create(
++					ctx, i, &dce110_xfm_offsets[i]);
++		if (pool->transforms[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error(
++				"DC: failed to create transform!\n");
++			goto controller_create_fail;
++		}
++		pool->transforms[i]->funcs->transform_set_scaler_filter(
++				pool->transforms[i],
++				pool->scaler_filter);
++
++		pool->opps[i] = dce110_opp_create(ctx, i, &dce110_opp_reg_offsets[i]);
++		if (pool->opps[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error(
++				"DC: failed to create output pixel processor!\n");
++			goto controller_create_fail;
++		}
++	}
++
++	audio_init_data.as = adapter_serv;
++	audio_init_data.ctx = ctx;
++	pool->audio_count = 0;
++	for (i = 0; i < pool->controller_count; i++) {
++		struct graphics_object_id obj_id;
++
++		obj_id = dal_adapter_service_enum_audio_object(adapter_serv, i);
++		if (false == dal_graphics_object_id_is_valid(obj_id)) {
++			/* no more valid audio objects */
++			break;
++		}
++
++		audio_init_data.audio_stream_id = obj_id;
++		pool->audios[i] = dal_audio_create(&audio_init_data);
++		if (pool->audios[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error("DC: failed to create DPPs!\n");
++			goto audio_create_fail;
++		}
++		pool->audio_count++;
++	}
++
++	for (i = 0; i < pool->stream_enc_count; i++) {
++		/* TODO: rework fragile code*/
++		if (pool->stream_engines.u_all & 1 << i) {
++			pool->stream_enc[i] = dce110_stream_encoder_create(
++				i, dc->ctx,
++				dal_adapter_service_get_bios_parser(
++					adapter_serv),
++				&stream_enc_regs[i]);
++			if (pool->stream_enc[i] == NULL) {
++				BREAK_TO_DEBUGGER();
++				dal_error("DC: failed to create stream_encoder!\n");
++				goto stream_enc_create_fail;
++			}
++		}
++	}
++
++	for (i = 0; i < num_virtual_links; i++) {
++		pool->stream_enc[pool->stream_enc_count] =
++			virtual_stream_encoder_create(
++				dc->ctx, dal_adapter_service_get_bios_parser(
++								adapter_serv));
++		if (pool->stream_enc[pool->stream_enc_count] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dal_error("DC: failed to create stream_encoder!\n");
++			goto stream_enc_create_fail;
++		}
++		pool->stream_enc_count++;
++	}
++
++	return true;
++
++stream_enc_create_fail:
++	for (i = 0; i < pool->stream_enc_count; i++) {
++		if (pool->stream_enc[i] != NULL)
++			dc_service_free(pool->stream_enc[i]->ctx,
++				DCE110STRENC_FROM_STRENC(pool->stream_enc[i]));
++	}
++
++audio_create_fail:
++	for (i = 0; i < pool->controller_count; i++) {
++		if (pool->audios[i] != NULL)
++			dal_audio_destroy(&pool->audios[i]);
++	}
++
++controller_create_fail:
++	for (i = 0; i < pool->controller_count; i++) {
++		if (pool->opps[i] != NULL)
++			dce110_opp_destroy(&pool->opps[i]);
++
++		if (pool->transforms[i] != NULL)
++			dce110_transform_destroy(&pool->transforms[i]);
++
++		if (pool->ipps[i] != NULL)
++			dce110_ipp_destroy(&pool->ipps[i]);
++
++		if (pool->mis[i] != NULL) {
++			dc_service_free(pool->mis[i]->ctx,
++					TO_DCE110_MEM_INPUT(pool->mis[i]));
++			pool->mis[i] = NULL;
++		}
++
++		if (pool->timing_generators[i] != NULL)	{
++			dc_service_free(pool->timing_generators[i]->ctx,
++				DCE110TG_FROM_TG(pool->timing_generators[i]));
++			pool->timing_generators[i] = NULL;
++		}
++	}
++
++filter_create_fail:
++	dal_irq_service_destroy(&pool->irqs);
++
++irqs_create_fail:
++	dal_display_clock_destroy(&pool->display_clock);
++
++disp_clk_create_fail:
++clk_src_create_fail:
++	for (i = 0; i < pool->clk_src_count; i++) {
++		if (pool->clock_sources[i] != NULL)
++			dce110_clock_source_destroy(&pool->clock_sources[i]);
++	}
++
++	return false;
++}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
+index 5f00a3c..5d60df2 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
+@@ -31,8 +31,6 @@
+ struct adapter_service;
+ struct dc;
+ struct resource_pool;
+-struct dc_validation_set;
+-
+ 
+ bool dce110_construct_resource_pool(
+ 	struct adapter_service *adapter_serv,
+@@ -42,19 +40,6 @@ bool dce110_construct_resource_pool(
+ 
+ void dce110_destruct_resource_pool(struct resource_pool *pool);
+ 
+-enum dc_status dce110_validate_with_context(
+-		const struct dc *dc,
+-		const struct dc_validation_set set[],
+-		uint8_t set_count,
+-		struct validate_context *context);
+-
+-enum dc_status dce110_validate_bandwidth(
+-		const struct dc *dc,
+-		struct validate_context *context);
+-
+-struct link_encoder *dce110_link_encoder_create(
+-	const struct encoder_init_data *enc_init_data);
+-
+ void dce110_link_encoder_destroy(struct link_encoder **enc);
+ 
+ #endif /* __DC_RESOURCE_DCE110_H__ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
+index 79e34dc..50b7c70 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
+@@ -35,8 +35,8 @@
+ #include "include/grph_object_id.h"
+ #include "include/adapter_service_interface.h"
+ #include "include/logger_interface.h"
+-#include "inc/timing_generator_types.h"
+ #include "dce110_timing_generator.h"
++#include "../inc/timing_generator.h"
+ 
+ enum black_color_format {
+ 	BLACK_COLOR_FORMAT_RGB_FULLRANGE = 0,	/* used as index in array */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+index 0a57052..163fadd 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+@@ -27,7 +27,7 @@
+ #define __DC_TIMING_GENERATOR_DCE110_H__
+ 
+ 
+-#include "inc/timing_generator_types.h"
++#include "../inc/timing_generator.h"
+ #include "../include/grph_object_id.h"
+ #include "../include/hw_sequencer_types.h"
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h b/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h
+index d794132..4d4fd0c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h
+@@ -14,10 +14,8 @@
+ struct dc {
+ 	struct dc_context *ctx;
+ 
+-	/** link-related data - begin **/
+ 	uint8_t link_count;
+ 	struct core_link *links[MAX_PIPES * 2];
+-	/** link-related data - end **/
+ 
+ 	/* TODO: determine max number of targets*/
+ 	struct validate_context current_context;
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+index e3b5918..7d63ebb 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+@@ -273,6 +273,25 @@ void core_link_disable_stream(
+ /********** DAL Core*********************/
+ #include "display_clock_interface.h"
+ 
++struct resource_pool;
++struct validate_context;
++
++struct resource_funcs {
++	void (*destruct)(struct resource_pool *pool);
++	struct link_encoder *(*link_enc_create)(
++			const struct encoder_init_data *init);
++	void (*link_enc_destroy)(struct link_encoder **enc);
++	enum dc_status (*validate_with_context)(
++					const struct dc *dc,
++					const struct dc_validation_set set[],
++					uint8_t set_count,
++					struct validate_context *context);
++
++	enum dc_status (*validate_bandwidth)(
++					const struct dc *dc,
++					struct validate_context *context);
++};
++
+ struct resource_pool {
+ 	struct scaler_filter * scaler_filter;
+ 
+@@ -297,6 +316,8 @@ struct resource_pool {
+ 	struct display_clock *display_clock;
+ 	struct adapter_service *adapter_srv;
+ 	struct irq_service *irqs;
++
++	struct resource_funcs *funcs;
+ };
+ 
+ struct controller_ctx {
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+index 1dedf7c..bbb39e4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+@@ -39,68 +39,47 @@ enum pipe_gating_control {
+ struct hw_sequencer_funcs {
+ 
+ 	enum dc_status (*apply_ctx_to_hw)(
+-					const struct dc *dc,
+-					struct validate_context *context);
++			const struct dc *dc, struct validate_context *context);
+ 
+-	void (*reset_hw_ctx)(struct dc *dc,
+-					struct validate_context *context,
+-					uint8_t target_count);
++	void (*reset_hw_ctx)(
++				struct dc *dc,
++				struct validate_context *context,
++				uint8_t target_count);
+ 
+ 	bool (*set_plane_config)(
+-					struct core_surface *surface,
+-					struct core_target *target);
++				const struct dc *dc,
++				struct core_surface *surface,
++				struct core_target *target);
+ 
+ 	bool (*update_plane_address)(
+-					const struct core_surface *surface,
+-					struct core_target *target);
+-
+-	bool (*enable_memory_requests)(struct timing_generator *tg);
+-
+-	bool (*disable_memory_requests)(struct timing_generator *tg);
+-
+-	bool (*transform_power_up)(struct transform *xfm);
++				const struct dc *dc,
++				const struct core_surface *surface,
++				struct core_target *target);
+ 
+ 	bool (*set_gamma_ramp)(
+-					struct input_pixel_processor *ipp,
+-					struct output_pixel_processor *opp,
+-					const struct gamma_ramp *ramp,
+-					const struct gamma_parameters *params);
++				struct input_pixel_processor *ipp,
++				struct output_pixel_processor *opp,
++				const struct gamma_ramp *ramp,
++				const struct gamma_parameters *params);
+ 
+ 	void (*power_down)(struct dc *dc);
+ 
+ 	void (*enable_accelerated_mode)(struct dc *dc);
+ 
+-	void (*get_crtc_positions)(
+-					struct timing_generator *tg,
+-					int32_t *h_position,
+-					int32_t *v_position);
+-
+-	uint32_t (*get_vblank_counter)(struct timing_generator *tg);
+-
+ 	void (*enable_timing_synchronization)(
+ 					struct dc_context *dc_ctx,
+ 					uint32_t timing_generator_num,
+ 					struct timing_generator *tgs[]);
+ 
+-	void (*disable_vga)(struct timing_generator *tg);
+-
+-
+-
+-	/* link encoder sequences */
+-	struct link_encoder *(*encoder_create)(
+-			const struct encoder_init_data *init);
+-
+-	void (*encoder_destroy)(struct link_encoder **enc);
+-
+ 	/* backlight control */
+-	void (*encoder_set_lcd_backlight_level)(struct link_encoder *enc,
+-					uint32_t level);
++	void (*encoder_set_lcd_backlight_level)(
++		struct link_encoder *enc, uint32_t level);
++
+ 
++	void (*crtc_switch_to_clk_src)(struct clock_source *, uint8_t);
+ 
+ 	/* power management */
+-	void (*clock_gating_power_up)(
+-					struct dc_context *ctx,
+-					bool enable);
++	void (*clock_gating_power_up)(struct dc_context *ctx, bool enable);
+ 
+ 	void (*enable_display_pipe_clock_gating)(
+ 					struct dc_context *ctx,
+@@ -112,36 +91,25 @@ struct hw_sequencer_funcs {
+ 					struct dc_bios *dcb,
+ 					enum pipe_gating_control power_gating);
+ 
+-	/* resource management and validation*/
+-	bool (*construct_resource_pool)(
+-					struct adapter_service *adapter_serv,
+-					uint8_t num_virtual_links,
+-					struct dc *dc,
+-					struct resource_pool *pool);
+-
+-	void (*destruct_resource_pool)(struct resource_pool *pool);
+-
+-	enum dc_status (*validate_with_context)(
+-					const struct dc *dc,
+-					const struct dc_validation_set set[],
+-					uint8_t set_count,
+-					struct validate_context *context);
+-
+-	enum dc_status (*validate_bandwidth)(
+-					const struct dc *dc,
+-					struct validate_context *context);
+-	void (*program_bw)(
+-					struct dc *dc,
+-					struct validate_context *context);
+-	void (*enable_stream)(
+-					struct core_stream *stream);
+-
+-	void (*disable_stream)(
+-					struct core_stream *stream);
+-
+-	void (*set_mst_bandwidth)(
+-					struct stream_encoder *enc,
+-					struct fixed31_32 avg_time_slots_per_mtp);
++	void (*program_bw)(struct dc *dc, struct validate_context *context);
++
++	void (*enable_stream)(struct core_stream *stream);
++
++	void (*disable_stream)(struct core_stream *stream);
++
++	void (*enable_fe_clock)(
++		struct dc_context *ctx, uint8_t controller_id, bool enable);
++
++	bool (*pipe_control_lock)(
++				struct dc_context *ctx,
++				uint8_t controller_idx,
++				uint32_t control_mask,
++				bool lock);
++
++	void (*set_blender_mode)(
++				struct dc_context *ctx,
++				uint8_t controller_id,
++				uint32_t mode);
+ };
+ 
+ bool dc_construct_hw_sequencer(
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/resource.h b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+index ea6be75..bda92e3 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+@@ -32,6 +32,10 @@
+ /* TODO unhardcode, 4 for CZ*/
+ #define MEMORY_TYPE_MULTIPLIER 4
+ 
++bool dc_construct_resource_pool(struct adapter_service *adapter_serv,
++				struct dc *dc,
++				uint8_t num_virtual_links);
++
+ void build_scaling_params(
+ 	const struct dc_surface *surface,
+ 	struct core_stream *stream);
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/timing_generator.h b/drivers/gpu/drm/amd/dal/dc/inc/timing_generator.h
+new file mode 100644
+index 0000000..e9ca169
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/inc/timing_generator.h
+@@ -0,0 +1,155 @@
++/*
++ * Copyright 2012-15 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#ifndef __DAL_TIMING_GENERATOR_TYPES_H__
++#define __DAL_TIMING_GENERATOR_TYPES_H__
++
++#include "include/grph_csc_types.h"
++
++struct dc_bios;
++
++/**
++ *  These parameters are required as input when doing blanking/Unblanking
++*/
++struct crtc_black_color {
++	uint32_t black_color_r_cr;
++	uint32_t black_color_g_y;
++	uint32_t black_color_b_cb;
++};
++
++/* Contains CRTC vertical/horizontal pixel counters */
++struct crtc_position {
++	uint32_t vertical_count;
++	uint32_t horizontal_count;
++	uint32_t nominal_vcount;
++};
++
++
++enum dcp_gsl_purpose {
++	DCP_GSL_PURPOSE_SURFACE_FLIP = 0,
++	DCP_GSL_PURPOSE_STEREO3D_PHASE,
++	DCP_GSL_PURPOSE_UNDEFINED
++};
++
++struct dcp_gsl_params {
++	enum sync_source gsl_group;
++	enum dcp_gsl_purpose gsl_purpose;
++	bool timing_server;
++	bool overlay_present;
++	bool gsl_paused;
++};
++
++#define LEFT_EYE_3D_PRIMARY_SURFACE 1
++#define RIGHT_EYE_3D_PRIMARY_SURFACE 0
++
++enum test_pattern_dyn_range {
++	TEST_PATTERN_DYN_RANGE_VESA = 0,
++	TEST_PATTERN_DYN_RANGE_CEA
++};
++
++enum test_pattern_mode {
++	TEST_PATTERN_MODE_COLORSQUARES_RGB = 0,
++	TEST_PATTERN_MODE_COLORSQUARES_YCBCR601,
++	TEST_PATTERN_MODE_COLORSQUARES_YCBCR709,
++	TEST_PATTERN_MODE_VERTICALBARS,
++	TEST_PATTERN_MODE_HORIZONTALBARS,
++	TEST_PATTERN_MODE_SINGLERAMP_RGB,
++	TEST_PATTERN_MODE_DUALRAMP_RGB
++};
++
++enum test_pattern_color_format {
++	TEST_PATTERN_COLOR_FORMAT_BPC_6 = 0,
++	TEST_PATTERN_COLOR_FORMAT_BPC_8,
++	TEST_PATTERN_COLOR_FORMAT_BPC_10,
++	TEST_PATTERN_COLOR_FORMAT_BPC_12
++};
++
++enum controller_dp_test_pattern {
++	CONTROLLER_DP_TEST_PATTERN_D102 = 0,
++	CONTROLLER_DP_TEST_PATTERN_SYMBOLERROR,
++	CONTROLLER_DP_TEST_PATTERN_PRBS7,
++	CONTROLLER_DP_TEST_PATTERN_COLORSQUARES,
++	CONTROLLER_DP_TEST_PATTERN_VERTICALBARS,
++	CONTROLLER_DP_TEST_PATTERN_HORIZONTALBARS,
++	CONTROLLER_DP_TEST_PATTERN_COLORRAMP,
++	CONTROLLER_DP_TEST_PATTERN_VIDEOMODE,
++	CONTROLLER_DP_TEST_PATTERN_RESERVED_8,
++	CONTROLLER_DP_TEST_PATTERN_RESERVED_9,
++	CONTROLLER_DP_TEST_PATTERN_RESERVED_A,
++	CONTROLLER_DP_TEST_PATTERN_COLORSQUARES_CEA
++};
++
++enum crtc_state {
++	CRTC_STATE_VBLANK = 0,
++	CRTC_STATE_VACTIVE
++};
++
++struct timing_generator {
++	struct timing_generator_funcs *funcs;
++	struct dc_bios *bp;
++	struct dc_context *ctx;
++};
++
++
++struct dc_crtc_timing;
++
++struct timing_generator_funcs {
++	bool (*validate_timing)(struct timing_generator *tg,
++							const struct dc_crtc_timing *timing);
++	void (*program_timing)(struct timing_generator *tg,
++							const struct dc_crtc_timing *timing,
++							bool use_vbios);
++	bool (*enable_crtc)(struct timing_generator *tg);
++	bool (*disable_crtc)(struct timing_generator *tg);
++	bool (*is_counter_moving)(struct timing_generator *tg);
++	void (*get_position)(struct timing_generator *tg,
++								int32_t *h_position,
++								int32_t *v_position);
++	uint32_t (*get_frame_count)(struct timing_generator *tg);
++	void (*set_early_control)(struct timing_generator *tg,
++							   uint32_t early_cntl);
++	void (*wait_for_state)(struct timing_generator *tg,
++							enum crtc_state state);
++	bool (*set_blank)(struct timing_generator *tg,
++					   bool enable_blanking);
++	void (*set_overscan_blank_color) (struct timing_generator *tg, enum color_space black_color);
++	void (*set_blank_color)(struct timing_generator *tg, enum color_space black_color);
++	void (*set_colors)(struct timing_generator *tg,
++						const struct crtc_black_color *blank_color,
++						const struct crtc_black_color *overscan_color);
++
++	void (*disable_vga)(struct timing_generator *tg);
++	bool (*did_triggered_reset_occur)(struct timing_generator *tg);
++	void (*setup_global_swap_lock)(struct timing_generator *tg,
++							const struct dcp_gsl_params *gsl_params);
++	void (*enable_reset_trigger)(struct timing_generator *tg,
++						const struct trigger_params *trigger_params);
++	void (*disable_reset_trigger)(struct timing_generator *tg);
++	void (*tear_down_global_swap_lock)(struct timing_generator *tg);
++	void (*enable_advanced_request)(struct timing_generator *tg,
++					bool enable, const struct dc_crtc_timing *timing);
++};
++
++#endif
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/timing_generator_types.h b/drivers/gpu/drm/amd/dal/dc/inc/timing_generator_types.h
+deleted file mode 100644
+index e9ca169..0000000
+--- a/drivers/gpu/drm/amd/dal/dc/inc/timing_generator_types.h
++++ /dev/null
+@@ -1,155 +0,0 @@
+-/*
+- * Copyright 2012-15 Advanced Micro Devices, Inc.
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice shall be included in
+- * all copies or substantial portions of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+- * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+- * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+- * OTHER DEALINGS IN THE SOFTWARE.
+- *
+- * Authors: AMD
+- *
+- */
+-
+-#ifndef __DAL_TIMING_GENERATOR_TYPES_H__
+-#define __DAL_TIMING_GENERATOR_TYPES_H__
+-
+-#include "include/grph_csc_types.h"
+-
+-struct dc_bios;
+-
+-/**
+- *  These parameters are required as input when doing blanking/Unblanking
+-*/
+-struct crtc_black_color {
+-	uint32_t black_color_r_cr;
+-	uint32_t black_color_g_y;
+-	uint32_t black_color_b_cb;
+-};
+-
+-/* Contains CRTC vertical/horizontal pixel counters */
+-struct crtc_position {
+-	uint32_t vertical_count;
+-	uint32_t horizontal_count;
+-	uint32_t nominal_vcount;
+-};
+-
+-
+-enum dcp_gsl_purpose {
+-	DCP_GSL_PURPOSE_SURFACE_FLIP = 0,
+-	DCP_GSL_PURPOSE_STEREO3D_PHASE,
+-	DCP_GSL_PURPOSE_UNDEFINED
+-};
+-
+-struct dcp_gsl_params {
+-	enum sync_source gsl_group;
+-	enum dcp_gsl_purpose gsl_purpose;
+-	bool timing_server;
+-	bool overlay_present;
+-	bool gsl_paused;
+-};
+-
+-#define LEFT_EYE_3D_PRIMARY_SURFACE 1
+-#define RIGHT_EYE_3D_PRIMARY_SURFACE 0
+-
+-enum test_pattern_dyn_range {
+-	TEST_PATTERN_DYN_RANGE_VESA = 0,
+-	TEST_PATTERN_DYN_RANGE_CEA
+-};
+-
+-enum test_pattern_mode {
+-	TEST_PATTERN_MODE_COLORSQUARES_RGB = 0,
+-	TEST_PATTERN_MODE_COLORSQUARES_YCBCR601,
+-	TEST_PATTERN_MODE_COLORSQUARES_YCBCR709,
+-	TEST_PATTERN_MODE_VERTICALBARS,
+-	TEST_PATTERN_MODE_HORIZONTALBARS,
+-	TEST_PATTERN_MODE_SINGLERAMP_RGB,
+-	TEST_PATTERN_MODE_DUALRAMP_RGB
+-};
+-
+-enum test_pattern_color_format {
+-	TEST_PATTERN_COLOR_FORMAT_BPC_6 = 0,
+-	TEST_PATTERN_COLOR_FORMAT_BPC_8,
+-	TEST_PATTERN_COLOR_FORMAT_BPC_10,
+-	TEST_PATTERN_COLOR_FORMAT_BPC_12
+-};
+-
+-enum controller_dp_test_pattern {
+-	CONTROLLER_DP_TEST_PATTERN_D102 = 0,
+-	CONTROLLER_DP_TEST_PATTERN_SYMBOLERROR,
+-	CONTROLLER_DP_TEST_PATTERN_PRBS7,
+-	CONTROLLER_DP_TEST_PATTERN_COLORSQUARES,
+-	CONTROLLER_DP_TEST_PATTERN_VERTICALBARS,
+-	CONTROLLER_DP_TEST_PATTERN_HORIZONTALBARS,
+-	CONTROLLER_DP_TEST_PATTERN_COLORRAMP,
+-	CONTROLLER_DP_TEST_PATTERN_VIDEOMODE,
+-	CONTROLLER_DP_TEST_PATTERN_RESERVED_8,
+-	CONTROLLER_DP_TEST_PATTERN_RESERVED_9,
+-	CONTROLLER_DP_TEST_PATTERN_RESERVED_A,
+-	CONTROLLER_DP_TEST_PATTERN_COLORSQUARES_CEA
+-};
+-
+-enum crtc_state {
+-	CRTC_STATE_VBLANK = 0,
+-	CRTC_STATE_VACTIVE
+-};
+-
+-struct timing_generator {
+-	struct timing_generator_funcs *funcs;
+-	struct dc_bios *bp;
+-	struct dc_context *ctx;
+-};
+-
+-
+-struct dc_crtc_timing;
+-
+-struct timing_generator_funcs {
+-	bool (*validate_timing)(struct timing_generator *tg,
+-							const struct dc_crtc_timing *timing);
+-	void (*program_timing)(struct timing_generator *tg,
+-							const struct dc_crtc_timing *timing,
+-							bool use_vbios);
+-	bool (*enable_crtc)(struct timing_generator *tg);
+-	bool (*disable_crtc)(struct timing_generator *tg);
+-	bool (*is_counter_moving)(struct timing_generator *tg);
+-	void (*get_position)(struct timing_generator *tg,
+-								int32_t *h_position,
+-								int32_t *v_position);
+-	uint32_t (*get_frame_count)(struct timing_generator *tg);
+-	void (*set_early_control)(struct timing_generator *tg,
+-							   uint32_t early_cntl);
+-	void (*wait_for_state)(struct timing_generator *tg,
+-							enum crtc_state state);
+-	bool (*set_blank)(struct timing_generator *tg,
+-					   bool enable_blanking);
+-	void (*set_overscan_blank_color) (struct timing_generator *tg, enum color_space black_color);
+-	void (*set_blank_color)(struct timing_generator *tg, enum color_space black_color);
+-	void (*set_colors)(struct timing_generator *tg,
+-						const struct crtc_black_color *blank_color,
+-						const struct crtc_black_color *overscan_color);
+-
+-	void (*disable_vga)(struct timing_generator *tg);
+-	bool (*did_triggered_reset_occur)(struct timing_generator *tg);
+-	void (*setup_global_swap_lock)(struct timing_generator *tg,
+-							const struct dcp_gsl_params *gsl_params);
+-	void (*enable_reset_trigger)(struct timing_generator *tg,
+-						const struct trigger_params *trigger_params);
+-	void (*disable_reset_trigger)(struct timing_generator *tg);
+-	void (*tear_down_global_swap_lock)(struct timing_generator *tg);
+-	void (*enable_advanced_request)(struct timing_generator *tg,
+-					bool enable, const struct dc_crtc_timing *timing);
+-};
+-
+-#endif
+-- 
+2.7.4
+

@@ -1,0 +1,159 @@
+From 05f91cf29df67de0c2d8895b1cd0099f17febc0a Mon Sep 17 00:00:00 2001
+From: David Rokhvarg <David.Rokhvarg@amd.com>
+Date: Tue, 29 Dec 2015 14:40:40 -0500
+Subject: [PATCH 0652/1110] drm/amd/dal: Start/Stop MST Topology only for
+ 'root' connector.
+
+drm_dp_mst_topology_mgr_set_mst() should be called only for the
+phisycal 'aconnector' - to start/stop MST Topology Manager in it.
+The dynamically-created 'aconnectors' are handled by DRM MST and
+we should not start/stop anything in them.
+
+Signed-off-by: David Rokhvarg <David.Rokhvarg@amd.com>
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c  | 38 ++++++----------------
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      | 11 +++----
+ .../drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c    |  7 +++-
+ 3 files changed, 21 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
+index e856f0c..95a129e 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
+@@ -471,30 +471,6 @@ void dc_helpers_dp_mst_handle_mst_hpd_rx_irq(void *param)
+ 	}
+ }
+ 
+-/* Depending on Root connector state, update MST state of all connectors
+- * belonging to it. */
+-static void set_mst_topology_state(struct drm_device *dev)
+-{
+-	struct drm_connector *connector;
+-	struct amdgpu_connector *aconnector = NULL;
+-
+-	mutex_lock(&dev->mode_config.mutex);
+-
+-	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
+-		mutex_unlock(&dev->mode_config.mutex);
+-
+-		aconnector = to_amdgpu_connector(connector);
+-
+-		if (aconnector->is_mst_connector)
+-			drm_dp_mst_topology_mgr_set_mst(&aconnector->mst_mgr,
+-					aconnector->is_mst_connector);
+-
+-		mutex_lock(&dev->mode_config.mutex);
+-	}
+-
+-	mutex_unlock(&dev->mode_config.mutex);
+-}
+-
+ bool dc_helpers_dp_mst_start_top_mgr(
+ 		struct dc_context *ctx,
+ 		const struct dc_link *link)
+@@ -503,8 +479,11 @@ bool dc_helpers_dp_mst_start_top_mgr(
+ 	struct drm_device *dev = adev->ddev;
+ 	struct amdgpu_connector *aconnector = get_connector_for_link(dev, link);
+ 
+-	aconnector->is_mst_connector = true;
+-	set_mst_topology_state(dev);
++	DRM_INFO("DM_MST: starting TM on aconnector: %p [id: %d]\n",
++			aconnector, aconnector->base.base.id);
++
++	drm_dp_mst_topology_mgr_set_mst(&aconnector->mst_mgr, true);
++
+ 	return true;
+ }
+ 
+@@ -516,8 +495,11 @@ void dc_helpers_dp_mst_stop_top_mgr(
+ 	struct drm_device *dev = adev->ddev;
+ 	struct amdgpu_connector *aconnector = get_connector_for_link(dev, link);
+ 
+-	aconnector->is_mst_connector = false;
+-	set_mst_topology_state(dev);
++	DRM_INFO("DM_MST: stopping TM on aconnector: %p [id: %d]\n",
++			aconnector, aconnector->base.base.id);
++
++	if (aconnector->mst_mgr.mst_state == true)
++		drm_dp_mst_topology_mgr_set_mst(&aconnector->mst_mgr, false);
+ }
+ 
+ bool dc_helper_dp_read_dpcd(
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index 62df355..d472a17 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -734,12 +734,11 @@ void amdgpu_dm_update_connector_after_detect(
+ 	const struct dc_sink *sink;
+ 
+ 	/* MST handled by drm_mst framework */
+-	if (aconnector->is_mst_connector)
++	if (aconnector->mst_mgr.mst_state == true)
+ 		return;
+ 
+-	if (!dm_get_sink_from_link(dc_link, aconnector, &sink)) {
++	if (!dm_get_sink_from_link(dc_link, aconnector, &sink))
+ 		return;
+-	}
+ 
+ 	/*
+ 	 * TODO: temporary guard to look for proper fix
+@@ -801,18 +800,18 @@ static void handle_hpd_rx_irq(void *param)
+ 	struct amdgpu_connector *aconnector = (struct amdgpu_connector *)param;
+ 	struct drm_connector *connector = &aconnector->base;
+ 	struct drm_device *dev = connector->dev;
++	bool is_mst_root_connector = aconnector->mst_mgr.mst_state;
+ 
+ 	if (dc_link_handle_hpd_rx_irq(aconnector->dc_link) &&
+-			!aconnector->is_mst_connector) {
++			!is_mst_root_connector) {
+ 		/* Downstream Port status changed. */
+ 		dc_link_detect(aconnector->dc_link);
+ 		amdgpu_dm_update_connector_after_detect(aconnector);
+ 		drm_kms_helper_hotplug_event(dev);
+ 	}
+ 
+-	if (aconnector->is_mst_connector) {
++	if (is_mst_root_connector)
+ 		dc_helpers_dp_mst_handle_mst_hpd_rx_irq(param);
+-	}
+ }
+ 
+ static void register_hpd_handlers(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+index d47ec32..f976409 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -274,7 +274,6 @@ static struct drm_connector *dm_dp_add_mst_connector(struct drm_dp_mst_topology_
+ 	if (!aconnector)
+ 		return NULL;
+ 
+-	aconnector->is_mst_connector = true;
+ 	connector = &aconnector->base;
+ 	aconnector->port = port;
+ 	aconnector->mst_port = master;
+@@ -318,6 +317,9 @@ static struct drm_connector *dm_dp_add_mst_connector(struct drm_dp_mst_topology_
+ 	 */
+ 	amdgpu_dm_connector_funcs_reset(connector);
+ 
++	DRM_INFO("DM_MST: added connector: %p [id: %d] [master: %p]\n",
++			aconnector, connector->base.id, aconnector->mst_port);
++
+ 	DRM_DEBUG_KMS(":%d\n", connector->base.id);
+ 
+ 	return connector;
+@@ -333,6 +335,9 @@ static void dm_dp_destroy_mst_connector(
+ 	struct drm_device *dev = master->base.dev;
+ 	struct amdgpu_device *adev = dev->dev_private;
+ 
++	DRM_INFO("DM_MST: destroying connector: %p [id: %d] [master: %p]\n",
++			aconnector, connector->base.id, aconnector->mst_port);
++
+ 	drm_connector_unregister(connector);
+ 	/* need to nuke the connector */
+ 	drm_modeset_lock_all(dev);
+-- 
+2.7.4
+

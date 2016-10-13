@@ -1,0 +1,3650 @@
+From f6229149c93236443805deed2ec2ef92d672c2d1 Mon Sep 17 00:00:00 2001
+From: Jammy Zhou <Jammy.Zhou@amd.com>
+Date: Tue, 21 Jul 2015 21:18:15 +0800
+Subject: [PATCH 0044/1110] drm/amd/powerplay: add hardware manager
+ sub-component
+
+The hwmgr handles all hardware related calls, including clock/power
+gating control, DPM, read and parse PPTable, etc.
+
+v5: squash in fixes
+v4: implement acpi's atcs function use cgs interface
+v3: fix code style error and add big-endian mode support.
+v2: use cgs interface directly in hwmgr sub-module
+
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+Signed-off-by: Jammy Zhou <Jammy.Zhou@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/powerplay/Makefile             |    2 +-
+ drivers/gpu/drm/amd/powerplay/amd_powerplay.c      |   55 +-
+ drivers/gpu/drm/amd/powerplay/hwmgr/Makefile       |   10 +
+ .../gpu/drm/amd/powerplay/hwmgr/functiontables.c   |  154 ++
+ .../gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c  |   84 +
+ drivers/gpu/drm/amd/powerplay/hwmgr/hwmgr.c        |  201 +++
+ drivers/gpu/drm/amd/powerplay/hwmgr/pp_acpi.c      |   76 +
+ .../gpu/drm/amd/powerplay/hwmgr/processpptables.c  | 1661 ++++++++++++++++++++
+ .../gpu/drm/amd/powerplay/hwmgr/processpptables.h  |   47 +
+ drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h  |    1 -
+ .../gpu/drm/amd/powerplay/inc/hardwaremanager.h    |  280 ++++
+ drivers/gpu/drm/amd/powerplay/inc/hwmgr.h          |  607 +++++++
+ drivers/gpu/drm/amd/powerplay/inc/power_state.h    |  200 +++
+ drivers/gpu/drm/amd/powerplay/inc/pp_acpi.h        |   28 +
+ drivers/gpu/drm/amd/powerplay/inc/pp_instance.h    |    3 +-
+ .../gpu/drm/amd/powerplay/inc/pp_power_source.h    |   36 +
+ 16 files changed, 3439 insertions(+), 6 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/powerplay/hwmgr/Makefile
+ create mode 100644 drivers/gpu/drm/amd/powerplay/hwmgr/functiontables.c
+ create mode 100644 drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c
+ create mode 100644 drivers/gpu/drm/amd/powerplay/hwmgr/hwmgr.c
+ create mode 100644 drivers/gpu/drm/amd/powerplay/hwmgr/pp_acpi.c
+ create mode 100644 drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.c
+ create mode 100644 drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.h
+ create mode 100644 drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h
+ create mode 100644 drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+ create mode 100644 drivers/gpu/drm/amd/powerplay/inc/power_state.h
+ create mode 100644 drivers/gpu/drm/amd/powerplay/inc/pp_acpi.h
+ create mode 100644 drivers/gpu/drm/amd/powerplay/inc/pp_power_source.h
+
+diff --git a/drivers/gpu/drm/amd/powerplay/Makefile b/drivers/gpu/drm/amd/powerplay/Makefile
+index 60c6654..6359c67 100644
+--- a/drivers/gpu/drm/amd/powerplay/Makefile
++++ b/drivers/gpu/drm/amd/powerplay/Makefile
+@@ -6,7 +6,7 @@ subdir-ccflags-y += -Iinclude/drm  \
+ 
+ AMD_PP_PATH = ../powerplay
+ 
+-PP_LIBS = smumgr
++PP_LIBS = smumgr hwmgr
+ 
+ AMD_POWERPLAY = $(addsuffix /Makefile,$(addprefix drivers/gpu/drm/amd/powerplay/,$(PP_LIBS)))
+ 
+diff --git a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+index ea78525..88fdb04 100644
+--- a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
++++ b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+@@ -35,12 +35,46 @@ static int pp_early_init(void *handle)
+ 
+ static int pp_sw_init(void *handle)
+ {
+-	return 0;
++	struct pp_instance *pp_handle;
++	struct pp_hwmgr  *hwmgr;
++	int ret = 0;
++
++	if (handle == NULL)
++		return -EINVAL;
++
++	pp_handle = (struct pp_instance *)handle;
++	hwmgr = pp_handle->hwmgr;
++
++	if (hwmgr == NULL || hwmgr->pptable_func == NULL ||
++	    hwmgr->hwmgr_func == NULL ||
++	    hwmgr->pptable_func->pptable_init == NULL ||
++	    hwmgr->hwmgr_func->backend_init == NULL)
++		return -EINVAL;
++
++	ret = hwmgr->pptable_func->pptable_init(hwmgr);
++	if (ret == 0)
++		ret = hwmgr->hwmgr_func->backend_init(hwmgr);
++
++	return ret;
+ }
+ 
+ static int pp_sw_fini(void *handle)
+ {
+-	return 0;
++	struct pp_instance *pp_handle;
++	struct pp_hwmgr  *hwmgr;
++	int ret = 0;
++
++	if (handle == NULL)
++		return -EINVAL;
++
++	pp_handle = (struct pp_instance *)handle;
++	hwmgr = pp_handle->hwmgr;
++
++	if (hwmgr != NULL || hwmgr->hwmgr_func != NULL ||
++	    hwmgr->hwmgr_func->backend_fini != NULL)
++		ret = hwmgr->hwmgr_func->backend_fini(hwmgr);
++
++	return ret;
+ }
+ 
+ static int pp_hw_init(void *handle)
+@@ -72,6 +106,8 @@ static int pp_hw_init(void *handle)
+ 		smumgr->smumgr_funcs->smu_fini(smumgr);
+ 		return ret;
+ 	}
++	hw_init_power_state_table(pp_handle->hwmgr);
++
+ 	return 0;
+ }
+ 
+@@ -203,6 +239,7 @@ pp_debugfs_print_current_performance_level(void *handle,
+ {
+ 	return;
+ }
++
+ const struct amd_powerplay_funcs pp_dpm_funcs = {
+ 	.get_temperature = NULL,
+ 	.load_firmware = pp_dpm_load_fw,
+@@ -230,10 +267,20 @@ static int amd_pp_instance_init(struct amd_pp_init *pp_init,
+ 
+ 	ret = smum_init(pp_init, handle);
+ 	if (ret)
+-		return ret;
++		goto fail_smum;
++
++	ret = hwmgr_init(pp_init, handle);
++	if (ret)
++		goto fail_hwmgr;
+ 
+ 	amd_pp->pp_handle = handle;
+ 	return 0;
++
++fail_hwmgr:
++	smum_fini(handle->smu_mgr);
++fail_smum:
++	kfree(handle);
++	return ret;
+ }
+ 
+ static int amd_pp_instance_fini(void *handle)
+@@ -242,6 +289,8 @@ static int amd_pp_instance_fini(void *handle)
+ 	if (instance == NULL)
+ 		return -EINVAL;
+ 
++	hwmgr_fini(instance->hwmgr);
++
+ 	smum_fini(instance->smu_mgr);
+ 
+ 	kfree(handle);
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/Makefile b/drivers/gpu/drm/amd/powerplay/hwmgr/Makefile
+new file mode 100644
+index 0000000..ef529e0
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/Makefile
+@@ -0,0 +1,10 @@
++#
++# Makefile for the 'hw manager' sub-component of powerplay.
++# It provides the hardware management services for the driver.
++
++HARDWARE_MGR = hwmgr.o processpptables.o functiontables.o \
++	       hardwaremanager.o pp_acpi.o
++
++AMD_PP_HWMGR = $(addprefix $(AMD_PP_PATH)/hwmgr/,$(HARDWARE_MGR))
++
++AMD_POWERPLAY_FILES += $(AMD_PP_HWMGR)
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/functiontables.c b/drivers/gpu/drm/amd/powerplay/hwmgr/functiontables.c
+new file mode 100644
+index 0000000..5abde8f
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/functiontables.c
+@@ -0,0 +1,154 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include "hwmgr.h"
++
++static int phm_run_table(struct pp_hwmgr *hwmgr,
++			 struct phm_runtime_table_header *rt_table,
++			 void *input,
++			 void *output,
++			 void *temp_storage)
++{
++	int result = 0;
++	phm_table_function *function;
++
++	for (function = rt_table->function_list; NULL != *function; function++) {
++		int tmp = (*function)(hwmgr, input, output, temp_storage, result);
++
++		if (tmp == PP_Result_TableImmediateExit)
++			break;
++		if (tmp) {
++			if (0 == result)
++				result = tmp;
++			if (rt_table->exit_error)
++				break;
++		}
++	}
++
++	return result;
++}
++
++int phm_dispatch_table(struct pp_hwmgr *hwmgr,
++		       struct phm_runtime_table_header *rt_table,
++		       void *input, void *output)
++{
++	int result = 0;
++	void *temp_storage = NULL;
++
++	if (hwmgr == NULL || rt_table == NULL || rt_table->function_list == NULL) {
++		printk(KERN_ERR "[ powerplay ] Invalid Parameter!\n");
++		return 0; /*temp return ture because some function not implement on some asic */
++	}
++
++	if (0 != rt_table->storage_size) {
++		temp_storage = kzalloc(rt_table->storage_size, GFP_KERNEL);
++		if (temp_storage == NULL) {
++			printk(KERN_ERR "[ powerplay ] Could not allocate table temporary storage\n");
++			return -1;
++		}
++	}
++
++	result = phm_run_table(hwmgr, rt_table, input, output, temp_storage);
++
++	if (NULL != temp_storage)
++		kfree(temp_storage);
++
++	return result;
++}
++
++int phm_construct_table(struct pp_hwmgr *hwmgr,
++			struct phm_master_table_header *master_table,
++			struct phm_runtime_table_header *rt_table)
++{
++	uint32_t function_count = 0;
++	const struct phm_master_table_item *table_item;
++	uint32_t size;
++	phm_table_function *run_time_list;
++	phm_table_function *rtf;
++
++	if (hwmgr == NULL || master_table == NULL || rt_table == NULL) {
++		printk(KERN_ERR "[ powerplay ] Invalid Parameter!\n");
++		return -1;
++	}
++
++	for (table_item = master_table->master_list;
++		NULL != table_item->tableFunction; table_item++) {
++		if ((NULL == table_item->isFunctionNeededInRuntimeTable) ||
++		    (table_item->isFunctionNeededInRuntimeTable(hwmgr)))
++			function_count++;
++	}
++
++	size = (function_count + 1) * sizeof(phm_table_function);
++	run_time_list = kzalloc(size, GFP_KERNEL);
++	if (NULL == run_time_list)
++		return -1;
++
++	rtf = run_time_list;
++	for (table_item = master_table->master_list;
++		NULL != table_item->tableFunction; table_item++) {
++		if ((rtf - run_time_list) > function_count) {
++			printk(KERN_ERR "[ powerplay ] Check function results have changed\n");
++			kfree(run_time_list);
++			return -1;
++		}
++
++		if ((NULL == table_item->isFunctionNeededInRuntimeTable) ||
++		     (table_item->isFunctionNeededInRuntimeTable(hwmgr))) {
++			*(rtf++) = table_item->tableFunction;
++		}
++	}
++
++	if ((rtf - run_time_list) > function_count) {
++		printk(KERN_ERR "[ powerplay ] Check function results have changed\n");
++		kfree(run_time_list);
++		return -1;
++	}
++
++	*rtf = NULL;
++	rt_table->function_list = run_time_list;
++	rt_table->exit_error = (0 != (master_table->flags & PHM_MasterTableFlag_ExitOnError));
++	rt_table->storage_size = master_table->storage_size;
++	return 0;
++}
++
++int phm_destroy_table(struct pp_hwmgr *hwmgr,
++		      struct phm_runtime_table_header *rt_table)
++{
++	if (hwmgr == NULL || rt_table == NULL) {
++		printk(KERN_ERR "[ powerplay ] Invalid Parameter\n");
++		return -1;
++	}
++
++	if (NULL == rt_table->function_list)
++		return 0;
++
++	kfree(rt_table->function_list);
++
++	rt_table->function_list = NULL;
++	rt_table->storage_size = 0;
++	rt_table->exit_error = false;
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c b/drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c
+new file mode 100644
+index 0000000..7317e43
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c
+@@ -0,0 +1,84 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#include <linux/errno.h>
++#include "hwmgr.h"
++#include "hardwaremanager.h"
++#include "pp_acpi.h"
++#include "amd_acpi.h"
++
++void phm_init_dynamic_caps(struct pp_hwmgr *hwmgr)
++{
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DisableVoltageTransition);
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DisableEngineTransition);
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DisableMemoryTransition);
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DisableMGClockGating);
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DisableMGCGTSSM);
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DisableLSClockGating);
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_Force3DClockSupport);
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DisableLightSleep);
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DisableMCLS);
++	phm_cap_set(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DisablePowerGating);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DisableDPM);
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DisableSMUUVDHandshake);
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_ThermalAutoThrottling);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_PCIEPerformanceRequest);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_NoOD5Support);
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_UserMaxClockForMultiDisplays);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_VpuRecoveryInProgress);
++
++	if (acpi_atcs_functions_supported(hwmgr->device, ATCS_FUNCTION_PCIE_PERFORMANCE_REQUEST) &&
++		acpi_atcs_functions_supported(hwmgr->device, ATCS_FUNCTION_PCIE_DEVICE_READY_NOTIFICATION))
++		phm_cap_set(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_PCIEPerformanceRequest);
++}
++
++int phm_setup_asic(struct pp_hwmgr *hwmgr)
++{
++	if (phm_cap_enabled(hwmgr->platform_descriptor.platformCaps,
++		PHM_PlatformCaps_TablelessHardwareInterface)) {
++		if (NULL != hwmgr->hwmgr_func->asic_setup)
++			return hwmgr->hwmgr_func->asic_setup(hwmgr);
++	} else {
++		return phm_dispatch_table (hwmgr, &(hwmgr->setup_asic),
++					  NULL, NULL);
++	}
++
++	return 0;
++}
++
++int phm_enable_dynamic_state_management(struct pp_hwmgr *hwmgr)
++{
++	if (phm_cap_enabled(hwmgr->platform_descriptor.platformCaps,
++		PHM_PlatformCaps_TablelessHardwareInterface)) {
++		if (NULL != hwmgr->hwmgr_func->dynamic_state_management_enable)
++			return hwmgr->hwmgr_func->dynamic_state_management_enable(hwmgr);
++	} else {
++		return phm_dispatch_table (hwmgr,
++				&(hwmgr->enable_dynamic_state_management),
++				NULL, NULL);
++	}
++	return 0;
++}
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/hwmgr.c b/drivers/gpu/drm/amd/powerplay/hwmgr/hwmgr.c
+new file mode 100644
+index 0000000..f6b1153
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/hwmgr.c
+@@ -0,0 +1,201 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#include "linux/delay.h"
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include "cgs_common.h"
++#include "power_state.h"
++#include "hwmgr.h"
++
++
++
++int hwmgr_init(struct amd_pp_init *pp_init, struct pp_instance *handle)
++{
++	struct pp_hwmgr *hwmgr;
++
++	if ((handle == NULL) || (pp_init == NULL))
++		return -EINVAL;
++
++	hwmgr = kzalloc(sizeof(struct pp_hwmgr), GFP_KERNEL);
++	if (hwmgr == NULL)
++		return -ENOMEM;
++
++	handle->hwmgr = hwmgr;
++	hwmgr->smumgr = handle->smu_mgr;
++	hwmgr->device = pp_init->device;
++	hwmgr->chip_family = pp_init->chip_family;
++	hwmgr->chip_id = pp_init->chip_id;
++	hwmgr->hw_revision = pp_init->rev_id;
++	hwmgr->usec_timeout = AMD_MAX_USEC_TIMEOUT;
++	hwmgr->power_source = PP_PowerSource_AC;
++
++	switch (hwmgr->chip_family) {
++	default:
++		return -EINVAL;
++	}
++
++	phm_init_dynamic_caps(hwmgr);
++
++	return 0;
++}
++
++int hwmgr_fini(struct pp_hwmgr *hwmgr)
++{
++	if (hwmgr == NULL || hwmgr->ps == NULL)
++		return -EINVAL;
++
++	kfree(hwmgr->ps);
++	kfree(hwmgr);
++	return 0;
++}
++
++int hw_init_power_state_table(struct pp_hwmgr *hwmgr)
++{
++	int result;
++	unsigned int i;
++	unsigned int table_entries;
++	struct pp_power_state *state;
++	int size;
++
++	if (hwmgr->hwmgr_func->get_num_of_pp_table_entries == NULL)
++		return -EINVAL;
++
++	if (hwmgr->hwmgr_func->get_power_state_size == NULL)
++		return -EINVAL;
++
++	hwmgr->num_ps = table_entries = hwmgr->hwmgr_func->get_num_of_pp_table_entries(hwmgr);
++
++	hwmgr->ps_size = size = hwmgr->hwmgr_func->get_power_state_size(hwmgr) +
++					  sizeof(struct pp_power_state);
++
++	hwmgr->ps = kzalloc(size * table_entries, GFP_KERNEL);
++
++	state = hwmgr->ps;
++
++	for (i = 0; i < table_entries; i++) {
++		result = hwmgr->hwmgr_func->get_pp_table_entry(hwmgr, i, state);
++		if (state->classification.flags & PP_StateClassificationFlag_Boot) {
++			hwmgr->boot_ps = state;
++			hwmgr->current_ps = hwmgr->request_ps = state;
++		}
++
++		state->id = i + 1; /* assigned unique num for every power state id */
++
++		if (state->classification.flags & PP_StateClassificationFlag_Uvd)
++			hwmgr->uvd_ps = state;
++		state = (struct pp_power_state *)((uint64_t)state + size);
++	}
++
++	return 0;
++}
++
++
++/**
++ * Returns once the part of the register indicated by the mask has
++ * reached the given value.
++ */
++int phm_wait_on_register(struct pp_hwmgr *hwmgr, uint32_t index,
++			 uint32_t value, uint32_t mask)
++{
++	uint32_t i;
++	uint32_t cur_value;
++
++	if (hwmgr == NULL || hwmgr->device == NULL) {
++		printk(KERN_ERR "[ powerplay ] Invalid Hardware Manager!");
++		return -EINVAL;
++	}
++
++	for (i = 0; i < hwmgr->usec_timeout; i++) {
++		cur_value = cgs_read_register(hwmgr->device, index);
++		if ((cur_value & mask) == (value & mask))
++			break;
++		udelay(1);
++	}
++
++	/* timeout means wrong logic*/
++	if (i == hwmgr->usec_timeout)
++		return -1;
++	return 0;
++}
++
++int phm_wait_for_register_unequal(struct pp_hwmgr *hwmgr,
++				uint32_t index, uint32_t value, uint32_t mask)
++{
++	uint32_t i;
++	uint32_t cur_value;
++
++	if (hwmgr == NULL || hwmgr->device == NULL) {
++		printk(KERN_ERR "[ powerplay ] Invalid Hardware Manager!");
++		return -EINVAL;
++	}
++
++	for (i = 0; i < hwmgr->usec_timeout; i++) {
++		cur_value = cgs_read_register(hwmgr->device, index);
++		if ((cur_value & mask) != (value & mask))
++			break;
++		udelay(1);
++	}
++
++	/* timeout means wrong logic*/
++	if (i == hwmgr->usec_timeout)
++		return -1;
++	return 0;
++}
++
++
++/**
++ * Returns once the part of the register indicated by the mask has
++ * reached the given value.The indirect space is described by giving
++ * the memory-mapped index of the indirect index register.
++ */
++void phm_wait_on_indirect_register(struct pp_hwmgr *hwmgr,
++				uint32_t indirect_port,
++				uint32_t index,
++				uint32_t value,
++				uint32_t mask)
++{
++	if (hwmgr == NULL || hwmgr->device == NULL) {
++		printk(KERN_ERR "[ powerplay ] Invalid Hardware Manager!");
++		return;
++	}
++
++	cgs_write_register(hwmgr->device, indirect_port, index);
++	phm_wait_on_register(hwmgr, indirect_port + 1, mask, value);
++}
++
++void phm_wait_for_indirect_register_unequal(struct pp_hwmgr *hwmgr,
++					uint32_t indirect_port,
++					uint32_t index,
++					uint32_t value,
++					uint32_t mask)
++{
++	if (hwmgr == NULL || hwmgr->device == NULL) {
++		printk(KERN_ERR "[ powerplay ] Invalid Hardware Manager!");
++		return;
++	}
++
++	cgs_write_register(hwmgr->device, indirect_port, index);
++	phm_wait_for_register_unequal(hwmgr, indirect_port + 1,
++				      value, mask);
++}
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/pp_acpi.c b/drivers/gpu/drm/amd/powerplay/hwmgr/pp_acpi.c
+new file mode 100644
+index 0000000..7b2d500
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/pp_acpi.c
+@@ -0,0 +1,76 @@
++#include <linux/errno.h>
++#include "linux/delay.h"
++#include "hwmgr.h"
++#include "amd_acpi.h"
++
++bool acpi_atcs_functions_supported(void *device, uint32_t index)
++{
++	int32_t result;
++	struct atcs_verify_interface output_buf = {0};
++
++	int32_t temp_buffer = 1;
++
++	result = cgs_call_acpi_method(device, CGS_ACPI_METHOD_ATCS,
++						ATCS_FUNCTION_VERIFY_INTERFACE,
++						&temp_buffer,
++						&output_buf,
++						1,
++						sizeof(temp_buffer),
++						sizeof(output_buf));
++
++	return result == 0 ? (output_buf.function_bits & (1 << (index - 1))) != 0 : false;
++}
++
++int acpi_pcie_perf_request(void *device, uint8_t perf_req, bool advertise)
++{
++	struct atcs_pref_req_input atcs_input;
++	struct atcs_pref_req_output atcs_output;
++	u32 retry = 3;
++	int result;
++	struct cgs_system_info info = {0};
++
++	if (!acpi_atcs_functions_supported(device, ATCS_FUNCTION_PCIE_PERFORMANCE_REQUEST))
++		return -EINVAL;
++
++	info.size = sizeof(struct cgs_system_info);
++	info.info_id = CGS_SYSTEM_INFO_ADAPTER_BDF_ID;
++	result = cgs_query_system_info(device, &info);
++	if (result != 0)
++		return -EINVAL;
++	atcs_input.client_id = (uint16_t)info.value;
++	atcs_input.size = sizeof(struct atcs_pref_req_input);
++	atcs_input.valid_flags_mask = ATCS_VALID_FLAGS_MASK;
++	atcs_input.flags = ATCS_WAIT_FOR_COMPLETION;
++	if (advertise)
++		atcs_input.flags |= ATCS_ADVERTISE_CAPS;
++	atcs_input.req_type = ATCS_PCIE_LINK_SPEED;
++	atcs_input.perf_req = perf_req;
++
++	atcs_output.size = sizeof(struct atcs_pref_req_input);
++
++	while (retry--) {
++		result = cgs_call_acpi_method(device,
++						CGS_ACPI_METHOD_ATCS,
++						ATCS_FUNCTION_PCIE_PERFORMANCE_REQUEST,
++						&atcs_input,
++						&atcs_output,
++						0,
++						sizeof(atcs_input),
++						sizeof(atcs_output));
++		if (result != 0)
++			return -EIO;
++
++		switch (atcs_output.ret_val) {
++		case ATCS_REQUEST_REFUSED:
++		default:
++			return -EINVAL;
++		case ATCS_REQUEST_COMPLETE:
++			return 0;
++		case ATCS_REQUEST_IN_PROGRESS:
++			udelay(10);
++			break;
++		}
++	}
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.c b/drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.c
+new file mode 100644
+index 0000000..dc1d3d2
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.c
+@@ -0,0 +1,1661 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++
++#include "processpptables.h"
++#include <atom-types.h>
++#include <atombios.h>
++#include "pptable.h"
++#include "power_state.h"
++#include "hwmgr.h"
++#include "hardwaremanager.h"
++
++
++#define SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V2 12
++#define SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V3 14
++#define SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V4 16
++#define SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V5 18
++#define SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V6 20
++#define SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V7 22
++#define SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V8 24
++#define SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V9 26
++
++#define NUM_BITS_CLOCK_INFO_ARRAY_INDEX 6
++
++static uint16_t get_vce_table_offset(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t vce_table_offset = 0;
++
++	if (le16_to_cpu(powerplay_table->usTableSize) >=
++	   sizeof(ATOM_PPLIB_POWERPLAYTABLE3)) {
++		const ATOM_PPLIB_POWERPLAYTABLE3 *powerplay_table3 =
++			(const ATOM_PPLIB_POWERPLAYTABLE3 *)powerplay_table;
++
++		if (powerplay_table3->usExtendendedHeaderOffset > 0) {
++			const ATOM_PPLIB_EXTENDEDHEADER  *extended_header =
++						(const ATOM_PPLIB_EXTENDEDHEADER *)
++						(((unsigned long)powerplay_table3) +
++						le16_to_cpu(powerplay_table3->usExtendendedHeaderOffset));
++			if (le16_to_cpu(extended_header->usSize) >=
++			   SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V2)
++				vce_table_offset = le16_to_cpu(extended_header->usVCETableOffset);
++		}
++	}
++
++	return vce_table_offset;
++}
++
++static uint16_t get_vce_clock_info_array_offset(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t table_offset = get_vce_table_offset(hwmgr,
++						powerplay_table);
++
++	if (table_offset > 0)
++		return table_offset + 1;
++
++	return 0;
++}
++
++static uint16_t get_vce_clock_info_array_size(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t table_offset = get_vce_clock_info_array_offset(hwmgr,
++							powerplay_table);
++	uint16_t table_size = 0;
++
++	if (table_offset > 0) {
++		const VCEClockInfoArray *p = (const VCEClockInfoArray *)
++			(((unsigned long) powerplay_table) + table_offset);
++		table_size = sizeof(uint8_t) + p->ucNumEntries * sizeof(VCEClockInfo);
++	}
++
++	return table_size;
++}
++
++static uint16_t get_vce_clock_voltage_limit_table_offset(struct pp_hwmgr *hwmgr,
++				const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t table_offset = get_vce_clock_info_array_offset(hwmgr,
++							powerplay_table);
++
++	if (table_offset > 0)
++		return table_offset + get_vce_clock_info_array_size(hwmgr,
++							powerplay_table);
++
++	return 0;
++}
++
++static uint16_t get_vce_clock_voltage_limit_table_size(struct pp_hwmgr *hwmgr,
++							const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t table_offset = get_vce_clock_voltage_limit_table_offset(hwmgr, powerplay_table);
++	uint16_t table_size = 0;
++
++	if (table_offset > 0) {
++		const ATOM_PPLIB_VCE_Clock_Voltage_Limit_Table *ptable =
++			(const ATOM_PPLIB_VCE_Clock_Voltage_Limit_Table *)(((unsigned long) powerplay_table) + table_offset);
++
++		table_size = sizeof(uint8_t) + ptable->numEntries * sizeof(ATOM_PPLIB_VCE_Clock_Voltage_Limit_Record);
++	}
++	return table_size;
++}
++
++static uint16_t get_vce_state_table_offset(struct pp_hwmgr *hwmgr, const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t table_offset = get_vce_clock_voltage_limit_table_offset(hwmgr, powerplay_table);
++
++	if (table_offset > 0)
++		return table_offset + get_vce_clock_voltage_limit_table_size(hwmgr, powerplay_table);
++
++	return 0;
++}
++
++static const ATOM_PPLIB_VCE_State_Table *get_vce_state_table(
++						struct pp_hwmgr *hwmgr,
++						const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t table_offset = get_vce_state_table_offset(hwmgr, powerplay_table);
++
++	if (table_offset > 0)
++		return (const ATOM_PPLIB_VCE_State_Table *)(((unsigned long) powerplay_table) + table_offset);
++
++	return NULL;
++}
++
++static uint16_t get_uvd_table_offset(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t uvd_table_offset = 0;
++
++	if (le16_to_cpu(powerplay_table->usTableSize) >=
++	    sizeof(ATOM_PPLIB_POWERPLAYTABLE3)) {
++		const ATOM_PPLIB_POWERPLAYTABLE3 *powerplay_table3 =
++			(const ATOM_PPLIB_POWERPLAYTABLE3 *)powerplay_table;
++		if (powerplay_table3->usExtendendedHeaderOffset > 0) {
++			const ATOM_PPLIB_EXTENDEDHEADER  *extended_header =
++					(const ATOM_PPLIB_EXTENDEDHEADER *)
++					(((unsigned long)powerplay_table3) +
++				le16_to_cpu(powerplay_table3->usExtendendedHeaderOffset));
++			if (le16_to_cpu(extended_header->usSize) >=
++			    SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V3)
++				uvd_table_offset = le16_to_cpu(extended_header->usUVDTableOffset);
++		}
++	}
++	return uvd_table_offset;
++}
++
++static uint16_t get_uvd_clock_info_array_offset(struct pp_hwmgr *hwmgr,
++			 const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t table_offset = get_uvd_table_offset(hwmgr,
++						    powerplay_table);
++
++	if (table_offset > 0)
++		return table_offset + 1;
++	return 0;
++}
++
++static uint16_t get_uvd_clock_info_array_size(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t table_offset = get_uvd_clock_info_array_offset(hwmgr,
++						    powerplay_table);
++	uint16_t table_size = 0;
++
++	if (table_offset > 0) {
++		const UVDClockInfoArray *p = (const UVDClockInfoArray *)
++					(((unsigned long) powerplay_table)
++					+ table_offset);
++		table_size = sizeof(UCHAR) +
++			     p->ucNumEntries * sizeof(UVDClockInfo);
++	}
++
++	return table_size;
++}
++
++static uint16_t get_uvd_clock_voltage_limit_table_offset(
++			struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t table_offset = get_uvd_clock_info_array_offset(hwmgr,
++						     powerplay_table);
++
++	if (table_offset > 0)
++		return table_offset +
++			get_uvd_clock_info_array_size(hwmgr, powerplay_table);
++
++	return 0;
++}
++
++static uint16_t get_samu_table_offset(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t samu_table_offset = 0;
++
++	if (le16_to_cpu(powerplay_table->usTableSize) >=
++	    sizeof(ATOM_PPLIB_POWERPLAYTABLE3)) {
++		const ATOM_PPLIB_POWERPLAYTABLE3 *powerplay_table3 =
++			(const ATOM_PPLIB_POWERPLAYTABLE3 *)powerplay_table;
++		if (powerplay_table3->usExtendendedHeaderOffset > 0) {
++			const ATOM_PPLIB_EXTENDEDHEADER  *extended_header =
++				(const ATOM_PPLIB_EXTENDEDHEADER *)
++				(((unsigned long)powerplay_table3) +
++				le16_to_cpu(powerplay_table3->usExtendendedHeaderOffset));
++			if (le16_to_cpu(extended_header->usSize) >=
++			    SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V4)
++				samu_table_offset = le16_to_cpu(extended_header->usSAMUTableOffset);
++		}
++	}
++
++	return samu_table_offset;
++}
++
++static uint16_t get_samu_clock_voltage_limit_table_offset(
++			struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t table_offset = get_samu_table_offset(hwmgr,
++					    powerplay_table);
++
++	if (table_offset > 0)
++		return table_offset + 1;
++
++	return 0;
++}
++
++static uint16_t get_acp_table_offset(struct pp_hwmgr *hwmgr,
++				const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t acp_table_offset = 0;
++
++	if (le16_to_cpu(powerplay_table->usTableSize) >=
++	    sizeof(ATOM_PPLIB_POWERPLAYTABLE3)) {
++		const ATOM_PPLIB_POWERPLAYTABLE3 *powerplay_table3 =
++			(const ATOM_PPLIB_POWERPLAYTABLE3 *)powerplay_table;
++		if (powerplay_table3->usExtendendedHeaderOffset > 0) {
++			const ATOM_PPLIB_EXTENDEDHEADER  *pExtendedHeader =
++				(const ATOM_PPLIB_EXTENDEDHEADER *)
++				(((unsigned long)powerplay_table3) +
++				le16_to_cpu(powerplay_table3->usExtendendedHeaderOffset));
++			if (le16_to_cpu(pExtendedHeader->usSize) >=
++			    SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V6)
++				acp_table_offset = le16_to_cpu(pExtendedHeader->usACPTableOffset);
++		}
++	}
++
++	return acp_table_offset;
++}
++
++static uint16_t get_acp_clock_voltage_limit_table_offset(
++				struct pp_hwmgr *hwmgr,
++				const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t tableOffset = get_acp_table_offset(hwmgr, powerplay_table);
++
++	if (tableOffset > 0)
++		return tableOffset + 1;
++
++	return 0;
++}
++
++static uint16_t get_cacp_tdp_table_offset(
++				struct pp_hwmgr *hwmgr,
++				const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t cacTdpTableOffset = 0;
++
++	if (le16_to_cpu(powerplay_table->usTableSize) >=
++	    sizeof(ATOM_PPLIB_POWERPLAYTABLE3)) {
++		const ATOM_PPLIB_POWERPLAYTABLE3 *powerplay_table3 =
++				(const ATOM_PPLIB_POWERPLAYTABLE3 *)powerplay_table;
++		if (powerplay_table3->usExtendendedHeaderOffset > 0) {
++			const ATOM_PPLIB_EXTENDEDHEADER  *pExtendedHeader =
++					(const ATOM_PPLIB_EXTENDEDHEADER *)
++					(((unsigned long)powerplay_table3) +
++				le16_to_cpu(powerplay_table3->usExtendendedHeaderOffset));
++			if (le16_to_cpu(pExtendedHeader->usSize) >=
++			    SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V7)
++				cacTdpTableOffset = le16_to_cpu(pExtendedHeader->usPowerTuneTableOffset);
++		}
++	}
++
++	return cacTdpTableOffset;
++}
++
++static int get_cac_tdp_table(struct pp_hwmgr *hwmgr,
++				struct phm_cac_tdp_table **ptable,
++				const ATOM_PowerTune_Table *table,
++				uint16_t us_maximum_power_delivery_limit)
++{
++	unsigned long table_size;
++	struct phm_cac_tdp_table *tdp_table;
++
++	table_size = sizeof(unsigned long) + sizeof(struct phm_cac_tdp_table);
++
++	tdp_table = kzalloc(table_size, GFP_KERNEL);
++	if (NULL == tdp_table)
++		return -ENOMEM;
++
++	tdp_table->usTDP = le16_to_cpu(table->usTDP);
++	tdp_table->usConfigurableTDP = le16_to_cpu(table->usConfigurableTDP);
++	tdp_table->usTDC = le16_to_cpu(table->usTDC);
++	tdp_table->usBatteryPowerLimit = le16_to_cpu(table->usBatteryPowerLimit);
++	tdp_table->usSmallPowerLimit = le16_to_cpu(table->usSmallPowerLimit);
++	tdp_table->usLowCACLeakage = le16_to_cpu(table->usLowCACLeakage);
++	tdp_table->usHighCACLeakage = le16_to_cpu(table->usHighCACLeakage);
++	tdp_table->usMaximumPowerDeliveryLimit = us_maximum_power_delivery_limit;
++
++	*ptable = tdp_table;
++
++	return 0;
++}
++
++static uint16_t get_sclk_vdd_gfx_table_offset(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t sclk_vdd_gfx_table_offset = 0;
++
++	if (le16_to_cpu(powerplay_table->usTableSize) >=
++	    sizeof(ATOM_PPLIB_POWERPLAYTABLE3)) {
++		const ATOM_PPLIB_POWERPLAYTABLE3 *powerplay_table3 =
++				(const ATOM_PPLIB_POWERPLAYTABLE3 *)powerplay_table;
++		if (powerplay_table3->usExtendendedHeaderOffset > 0) {
++			const ATOM_PPLIB_EXTENDEDHEADER  *pExtendedHeader =
++				(const ATOM_PPLIB_EXTENDEDHEADER *)
++				(((unsigned long)powerplay_table3) +
++				le16_to_cpu(powerplay_table3->usExtendendedHeaderOffset));
++			if (le16_to_cpu(pExtendedHeader->usSize) >=
++			    SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V8)
++				sclk_vdd_gfx_table_offset =
++					le16_to_cpu(pExtendedHeader->usSclkVddgfxTableOffset);
++		}
++	}
++
++	return sclk_vdd_gfx_table_offset;
++}
++
++static uint16_t get_sclk_vdd_gfx_clock_voltage_dependency_table_offset(
++			struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	uint16_t tableOffset = get_sclk_vdd_gfx_table_offset(hwmgr, powerplay_table);
++
++	if (tableOffset > 0)
++		return tableOffset;
++
++	return 0;
++}
++
++
++static int get_clock_voltage_dependency_table(struct pp_hwmgr *hwmgr,
++		struct phm_clock_voltage_dependency_table **ptable,
++		const ATOM_PPLIB_Clock_Voltage_Dependency_Table *table)
++{
++
++	unsigned long table_size, i;
++	struct phm_clock_voltage_dependency_table *dep_table;
++
++	table_size = sizeof(unsigned long) +
++		sizeof(struct phm_clock_voltage_dependency_table)
++		* table->ucNumEntries;
++
++	dep_table = kzalloc(table_size, GFP_KERNEL);
++	if (NULL == dep_table)
++		return -ENOMEM;
++
++	dep_table->count = (unsigned long)table->ucNumEntries;
++
++	for (i = 0; i < dep_table->count; i++) {
++		dep_table->entries[i].clk =
++			((unsigned long)table->entries[i].ucClockHigh << 16) |
++			le16_to_cpu(table->entries[i].usClockLow);
++			dep_table->entries[i].v =
++				(unsigned long)le16_to_cpu(table->entries[i].usVoltage);
++	}
++
++	*ptable = dep_table;
++
++	return 0;
++}
++
++static int get_valid_clk(struct pp_hwmgr *hwmgr,
++			struct phm_clock_array **ptable,
++			const struct phm_clock_voltage_dependency_table *table)
++{
++	unsigned long table_size, i;
++	struct phm_clock_array *clock_table;
++
++	table_size = sizeof(unsigned long) + sizeof(unsigned long) * table->count;
++	clock_table = kzalloc(table_size, GFP_KERNEL);
++	if (NULL == clock_table)
++		return -ENOMEM;
++
++	clock_table->count = (unsigned long)table->count;
++
++	for (i = 0; i < clock_table->count; i++)
++		clock_table->values[i] = (unsigned long)table->entries[i].clk;
++
++	*ptable = clock_table;
++
++	return 0;
++}
++
++static int get_clock_voltage_limit(struct pp_hwmgr *hwmgr,
++			struct phm_clock_and_voltage_limits *limits,
++			const ATOM_PPLIB_Clock_Voltage_Limit_Table *table)
++{
++	limits->sclk = ((unsigned long)table->entries[0].ucSclkHigh << 16) |
++			le16_to_cpu(table->entries[0].usSclkLow);
++	limits->mclk = ((unsigned long)table->entries[0].ucMclkHigh << 16) |
++			le16_to_cpu(table->entries[0].usMclkLow);
++	limits->vddc = (unsigned long)le16_to_cpu(table->entries[0].usVddc);
++	limits->vddci = (unsigned long)le16_to_cpu(table->entries[0].usVddci);
++
++	return 0;
++}
++
++
++static void set_hw_cap(struct pp_hwmgr *hwmgr, bool enable,
++		       enum phm_platform_caps cap)
++{
++	if (enable)
++		phm_cap_set(hwmgr->platform_descriptor.platformCaps, cap);
++	else
++		phm_cap_unset(hwmgr->platform_descriptor.platformCaps, cap);
++}
++
++static int set_platform_caps(struct pp_hwmgr *hwmgr,
++			unsigned long powerplay_caps)
++{
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_POWERPLAY),
++		PHM_PlatformCaps_PowerPlaySupport
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_SBIOSPOWERSOURCE),
++		PHM_PlatformCaps_BiosPowerSourceControl
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_ASPM_L0s),
++		PHM_PlatformCaps_EnableASPML0s
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_ASPM_L1),
++		PHM_PlatformCaps_EnableASPML1
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_BACKBIAS),
++		PHM_PlatformCaps_EnableBackbias
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_HARDWAREDC),
++		PHM_PlatformCaps_AutomaticDCTransition
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_GEMINIPRIMARY),
++		PHM_PlatformCaps_GeminiPrimary
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_STEPVDDC),
++		PHM_PlatformCaps_StepVddc
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_VOLTAGECONTROL),
++		PHM_PlatformCaps_EnableVoltageControl
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_SIDEPORTCONTROL),
++		PHM_PlatformCaps_EnableSideportControl
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_TURNOFFPLL_ASPML1),
++		PHM_PlatformCaps_TurnOffPll_ASPML1
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_HTLINKCONTROL),
++		PHM_PlatformCaps_EnableHTLinkControl
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_MVDDCONTROL),
++		PHM_PlatformCaps_EnableMVDDControl
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_VDDCI_CONTROL),
++		PHM_PlatformCaps_ControlVDDCI
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_REGULATOR_HOT),
++		PHM_PlatformCaps_RegulatorHot
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_GOTO_BOOT_ON_ALERT),
++		PHM_PlatformCaps_BootStateOnAlert
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_DONT_WAIT_FOR_VBLANK_ON_ALERT),
++		PHM_PlatformCaps_DontWaitForVBlankOnAlert
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_BACO),
++		PHM_PlatformCaps_BACO
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_NEW_CAC_VOLTAGE),
++		PHM_PlatformCaps_NewCACVoltage
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_REVERT_GPIO5_POLARITY),
++		PHM_PlatformCaps_RevertGPIO5Polarity
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_OUTPUT_THERMAL2GPIO17),
++		PHM_PlatformCaps_Thermal2GPIO17
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_VRHOT_GPIO_CONFIGURABLE),
++		PHM_PlatformCaps_VRHotGPIOConfigurable
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_TEMP_INVERSION),
++		PHM_PlatformCaps_TempInversion
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_EVV),
++		PHM_PlatformCaps_EVV
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_COMBINE_PCC_WITH_THERMAL_SIGNAL),
++		PHM_PlatformCaps_CombinePCCWithThermalSignal
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_LOAD_POST_PRODUCTION_FIRMWARE),
++		PHM_PlatformCaps_LoadPostProductionFirmware
++	);
++
++	set_hw_cap(
++		hwmgr,
++		0 != (powerplay_caps & ATOM_PP_PLATFORM_CAP_DISABLE_USING_ACTUAL_TEMPERATURE_FOR_POWER_CALC),
++		PHM_PlatformCaps_DisableUsingActualTemperatureForPowerCalc
++	);
++
++	return 0;
++}
++
++static PP_StateClassificationFlags make_classification_flags(
++						   struct pp_hwmgr *hwmgr,
++						    USHORT classification,
++						   USHORT classification2)
++{
++	PP_StateClassificationFlags result = 0;
++
++	if (classification & ATOM_PPLIB_CLASSIFICATION_BOOT)
++		result |= PP_StateClassificationFlag_Boot;
++
++	if (classification & ATOM_PPLIB_CLASSIFICATION_THERMAL)
++		result |= PP_StateClassificationFlag_Thermal;
++
++	if (classification &
++			ATOM_PPLIB_CLASSIFICATION_LIMITEDPOWERSOURCE)
++		result |= PP_StateClassificationFlag_LimitedPowerSource;
++
++	if (classification & ATOM_PPLIB_CLASSIFICATION_REST)
++		result |= PP_StateClassificationFlag_Rest;
++
++	if (classification & ATOM_PPLIB_CLASSIFICATION_FORCED)
++		result |= PP_StateClassificationFlag_Forced;
++
++	if (classification & ATOM_PPLIB_CLASSIFICATION_3DPERFORMANCE)
++		result |= PP_StateClassificationFlag_3DPerformance;
++
++
++	if (classification & ATOM_PPLIB_CLASSIFICATION_OVERDRIVETEMPLATE)
++		result |= PP_StateClassificationFlag_ACOverdriveTemplate;
++
++	if (classification & ATOM_PPLIB_CLASSIFICATION_UVDSTATE)
++		result |= PP_StateClassificationFlag_Uvd;
++
++	if (classification & ATOM_PPLIB_CLASSIFICATION_HDSTATE)
++		result |= PP_StateClassificationFlag_UvdHD;
++
++	if (classification & ATOM_PPLIB_CLASSIFICATION_SDSTATE)
++		result |= PP_StateClassificationFlag_UvdSD;
++
++	if (classification & ATOM_PPLIB_CLASSIFICATION_HD2STATE)
++		result |= PP_StateClassificationFlag_HD2;
++
++	if (classification & ATOM_PPLIB_CLASSIFICATION_ACPI)
++		result |= PP_StateClassificationFlag_ACPI;
++
++	if (classification2 & ATOM_PPLIB_CLASSIFICATION2_LIMITEDPOWERSOURCE_2)
++		result |= PP_StateClassificationFlag_LimitedPowerSource_2;
++
++
++	if (classification2 & ATOM_PPLIB_CLASSIFICATION2_ULV)
++		result |= PP_StateClassificationFlag_ULV;
++
++	if (classification2 & ATOM_PPLIB_CLASSIFICATION2_MVC)
++		result |= PP_StateClassificationFlag_UvdMVC;
++
++	return result;
++}
++
++static int init_non_clock_fields(struct pp_hwmgr *hwmgr,
++						struct pp_power_state *ps,
++							    uint8_t version,
++			 const ATOM_PPLIB_NONCLOCK_INFO *pnon_clock_info) {
++	unsigned long rrr_index;
++	unsigned long tmp;
++
++	ps->classification.ui_label = (le16_to_cpu(pnon_clock_info->usClassification) &
++					ATOM_PPLIB_CLASSIFICATION_UI_MASK) >> ATOM_PPLIB_CLASSIFICATION_UI_SHIFT;
++	ps->classification.flags = make_classification_flags(hwmgr,
++				le16_to_cpu(pnon_clock_info->usClassification),
++				le16_to_cpu(pnon_clock_info->usClassification2));
++
++	ps->classification.temporary_state = false;
++	ps->classification.to_be_deleted = false;
++	tmp = le32_to_cpu(pnon_clock_info->ulCapsAndSettings) &
++		ATOM_PPLIB_SINGLE_DISPLAY_ONLY;
++
++	ps->validation.singleDisplayOnly = (0 != tmp);
++
++	tmp = le32_to_cpu(pnon_clock_info->ulCapsAndSettings) &
++		ATOM_PPLIB_DISALLOW_ON_DC;
++
++	ps->validation.disallowOnDC = (0 != tmp);
++
++	ps->pcie.lanes = ((le32_to_cpu(pnon_clock_info->ulCapsAndSettings) &
++				ATOM_PPLIB_PCIE_LINK_WIDTH_MASK) >>
++				ATOM_PPLIB_PCIE_LINK_WIDTH_SHIFT) + 1;
++
++	ps->pcie.lanes = 0;
++
++	ps->display.disableFrameModulation = false;
++
++	rrr_index = (le32_to_cpu(pnon_clock_info->ulCapsAndSettings) &
++			ATOM_PPLIB_LIMITED_REFRESHRATE_VALUE_MASK) >>
++			ATOM_PPLIB_LIMITED_REFRESHRATE_VALUE_SHIFT;
++
++	if (rrr_index != ATOM_PPLIB_LIMITED_REFRESHRATE_UNLIMITED) {
++		static const uint8_t look_up[(ATOM_PPLIB_LIMITED_REFRESHRATE_VALUE_MASK >> ATOM_PPLIB_LIMITED_REFRESHRATE_VALUE_SHIFT) + 1] = \
++								{ 0, 50, 0 };
++
++		ps->display.refreshrateSource = PP_RefreshrateSource_Explicit;
++		ps->display.explicitRefreshrate = look_up[rrr_index];
++		ps->display.limitRefreshrate = true;
++
++		if (ps->display.explicitRefreshrate == 0)
++			ps->display.limitRefreshrate = false;
++	} else
++		ps->display.limitRefreshrate = false;
++
++	tmp = le32_to_cpu(pnon_clock_info->ulCapsAndSettings) &
++		ATOM_PPLIB_ENABLE_VARIBRIGHT;
++
++	ps->display.enableVariBright = (0 != tmp);
++
++	tmp = le32_to_cpu(pnon_clock_info->ulCapsAndSettings) &
++		ATOM_PPLIB_SWSTATE_MEMORY_DLL_OFF;
++
++	ps->memory.dllOff = (0 != tmp);
++
++	ps->memory.m3arb = (uint8_t)(le32_to_cpu(pnon_clock_info->ulCapsAndSettings) &
++						ATOM_PPLIB_M3ARB_MASK) >> ATOM_PPLIB_M3ARB_SHIFT;
++
++	ps->temperatures.min = PP_TEMPERATURE_UNITS_PER_CENTIGRADES *
++				     pnon_clock_info->ucMinTemperature;
++
++	ps->temperatures.max = PP_TEMPERATURE_UNITS_PER_CENTIGRADES *
++				     pnon_clock_info->ucMaxTemperature;
++
++	tmp = le32_to_cpu(pnon_clock_info->ulCapsAndSettings) &
++		ATOM_PPLIB_SOFTWARE_DISABLE_LOADBALANCING;
++
++	ps->software.disableLoadBalancing = tmp;
++
++	tmp = le32_to_cpu(pnon_clock_info->ulCapsAndSettings) &
++		ATOM_PPLIB_SOFTWARE_ENABLE_SLEEP_FOR_TIMESTAMPS;
++
++	ps->software.enableSleepForTimestamps = (0 != tmp);
++
++	ps->validation.supportedPowerLevels = pnon_clock_info->ucRequiredPower;
++
++	if (ATOM_PPLIB_NONCLOCKINFO_VER1 < version) {
++		ps->uvd_clocks.VCLK = pnon_clock_info->ulVCLK;
++		ps->uvd_clocks.DCLK = pnon_clock_info->ulDCLK;
++	} else {
++		ps->uvd_clocks.VCLK = 0;
++		ps->uvd_clocks.DCLK = 0;
++	}
++
++	return 0;
++}
++
++static ULONG size_of_entry_v2(ULONG num_dpm_levels)
++{
++	return (sizeof(UCHAR) + sizeof(UCHAR) +
++			(num_dpm_levels * sizeof(UCHAR)));
++}
++
++static const ATOM_PPLIB_STATE_V2 *get_state_entry_v2(
++					const StateArray * pstate_arrays,
++							 ULONG entry_index)
++{
++	ULONG i;
++	const ATOM_PPLIB_STATE_V2 *pstate;
++
++	pstate = pstate_arrays->states;
++	if (entry_index <= pstate_arrays->ucNumEntries) {
++		for (i = 0; i < entry_index; i++)
++			pstate = (ATOM_PPLIB_STATE_V2 *)(
++						  (unsigned long)pstate +
++			     size_of_entry_v2(pstate->ucNumDPMLevels));
++	}
++	return pstate;
++}
++
++
++static const ATOM_PPLIB_POWERPLAYTABLE *get_powerplay_table(
++				     struct pp_hwmgr *hwmgr)
++{
++	const void *table_addr = NULL;
++	uint8_t frev, crev;
++	uint16_t size;
++
++	table_addr = cgs_atom_get_data_table(hwmgr->device,
++			GetIndexIntoMasterTable(DATA, PowerPlayInfo),
++			&size, &frev, &crev);
++
++	hwmgr->soft_pp_table = table_addr;
++
++	return (const ATOM_PPLIB_POWERPLAYTABLE *)table_addr;
++}
++
++
++int pp_tables_get_num_of_entries(struct pp_hwmgr *hwmgr,
++				     unsigned long *num_of_entries)
++{
++	const StateArray *pstate_arrays;
++	const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table = get_powerplay_table(hwmgr);
++
++	if (powerplay_table == NULL)
++		return -1;
++
++	if (powerplay_table->sHeader.ucTableFormatRevision >= 6) {
++		pstate_arrays = (StateArray *)(((unsigned long)powerplay_table) +
++					le16_to_cpu(powerplay_table->usStateArrayOffset));
++
++		*num_of_entries = (unsigned long)(pstate_arrays->ucNumEntries);
++	} else
++		*num_of_entries = (unsigned long)(powerplay_table->ucNumStates);
++
++	return 0;
++}
++
++int pp_tables_get_entry(struct pp_hwmgr *hwmgr,
++				unsigned long entry_index,
++				struct pp_power_state *ps,
++			 pp_tables_hw_clock_info_callback func)
++{
++	int i;
++	const StateArray *pstate_arrays;
++	const ATOM_PPLIB_STATE_V2 *pstate_entry_v2;
++	const ATOM_PPLIB_NONCLOCK_INFO *pnon_clock_info;
++	const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table = get_powerplay_table(hwmgr);
++	int result = 0;
++	int res = 0;
++
++	const ClockInfoArray *pclock_arrays;
++
++	const NonClockInfoArray *pnon_clock_arrays;
++
++	const ATOM_PPLIB_STATE *pstate_entry;
++
++	if (powerplay_table == NULL)
++		return -1;
++
++	ps->classification.bios_index = entry_index;
++
++	if (powerplay_table->sHeader.ucTableFormatRevision >= 6) {
++		pstate_arrays = (StateArray *)(((unsigned long)powerplay_table) +
++					le16_to_cpu(powerplay_table->usStateArrayOffset));
++
++		if (entry_index > pstate_arrays->ucNumEntries)
++			return -1;
++
++		pstate_entry_v2 = get_state_entry_v2(pstate_arrays, entry_index);
++		pclock_arrays = (ClockInfoArray *)(((unsigned long)powerplay_table) +
++					le16_to_cpu(powerplay_table->usClockInfoArrayOffset));
++
++		pnon_clock_arrays = (NonClockInfoArray *)(((unsigned long)powerplay_table) +
++						le16_to_cpu(powerplay_table->usNonClockInfoArrayOffset));
++
++		pnon_clock_info = (ATOM_PPLIB_NONCLOCK_INFO *)((unsigned long)(pnon_clock_arrays->nonClockInfo) +
++					(pstate_entry_v2->nonClockInfoIndex * pnon_clock_arrays->ucEntrySize));
++
++		result = init_non_clock_fields(hwmgr, ps, pnon_clock_arrays->ucEntrySize, pnon_clock_info);
++
++		for (i = 0; i < pstate_entry_v2->ucNumDPMLevels; i++) {
++			const void *pclock_info = (const void *)(
++							(unsigned long)(pclock_arrays->clockInfo) +
++							(pstate_entry_v2->clockInfoIndex[i] * pclock_arrays->ucEntrySize));
++			res = func(hwmgr, &ps->hardware, i, pclock_info);
++			if ((0 == result) && (0 != res))
++				result = res;
++		}
++	} else {
++		if (entry_index > powerplay_table->ucNumStates)
++			return -1;
++
++		pstate_entry = (ATOM_PPLIB_STATE *)((unsigned long)powerplay_table + powerplay_table->usStateArrayOffset +
++				entry_index * powerplay_table->ucStateEntrySize);
++
++		pnon_clock_info = (ATOM_PPLIB_NONCLOCK_INFO *)((unsigned long)powerplay_table +
++						le16_to_cpu(powerplay_table->usNonClockInfoArrayOffset) +
++						pstate_entry->ucNonClockStateIndex *
++						powerplay_table->ucNonClockSize);
++
++		result = init_non_clock_fields(hwmgr, ps,
++							powerplay_table->ucNonClockSize,
++							pnon_clock_info);
++
++		for (i = 0; i < powerplay_table->ucStateEntrySize-1; i++) {
++			const void *pclock_info = (const void *)((unsigned long)powerplay_table +
++						le16_to_cpu(powerplay_table->usClockInfoArrayOffset) +
++						pstate_entry->ucClockStateIndices[i] *
++						powerplay_table->ucClockInfoSize);
++
++			int res = func(hwmgr, &ps->hardware, i, pclock_info);
++
++			if ((0 == result) && (0 != res))
++					result = res;
++		}
++	}
++
++	if ((0 == result) &&
++		(0 != (ps->classification.flags & PP_StateClassificationFlag_Boot)))
++		result = hwmgr->hwmgr_func->patch_boot_state(hwmgr, &(ps->hardware));
++
++	return result;
++}
++
++
++
++static int init_powerplay_tables(
++			struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table
++)
++{
++	return 0;
++}
++
++
++static int init_thermal_controller(
++			struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	return 0;
++}
++
++static int init_overdrive_limits_V1_4(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table,
++			const ATOM_FIRMWARE_INFO_V1_4 *fw_info)
++{
++	hwmgr->platform_descriptor.overdriveLimit.engineClock =
++				le32_to_cpu(fw_info->ulASICMaxEngineClock);
++
++	hwmgr->platform_descriptor.overdriveLimit.memoryClock =
++				le32_to_cpu(fw_info->ulASICMaxMemoryClock);
++
++	hwmgr->platform_descriptor.maxOverdriveVDDC =
++		le32_to_cpu(fw_info->ul3DAccelerationEngineClock) & 0x7FF;
++
++	hwmgr->platform_descriptor.minOverdriveVDDC =
++			   le16_to_cpu(fw_info->usBootUpVDDCVoltage);
++
++	hwmgr->platform_descriptor.maxOverdriveVDDC =
++			   le16_to_cpu(fw_info->usBootUpVDDCVoltage);
++
++	hwmgr->platform_descriptor.overdriveVDDCStep = 0;
++	return 0;
++}
++
++static int init_overdrive_limits_V2_1(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table,
++			const ATOM_FIRMWARE_INFO_V2_1 *fw_info)
++{
++	const ATOM_PPLIB_POWERPLAYTABLE3 *powerplay_table3;
++	const ATOM_PPLIB_EXTENDEDHEADER *header;
++
++	if (le16_to_cpu(powerplay_table->usTableSize) <
++	    sizeof(ATOM_PPLIB_POWERPLAYTABLE3))
++		return 0;
++
++	powerplay_table3 = (const ATOM_PPLIB_POWERPLAYTABLE3 *)powerplay_table;
++
++	if (0 == powerplay_table3->usExtendendedHeaderOffset)
++		return 0;
++
++	header = (ATOM_PPLIB_EXTENDEDHEADER *)(((unsigned long) powerplay_table) +
++			le16_to_cpu(powerplay_table3->usExtendendedHeaderOffset));
++
++	hwmgr->platform_descriptor.overdriveLimit.engineClock = le32_to_cpu(header->ulMaxEngineClock);
++	hwmgr->platform_descriptor.overdriveLimit.memoryClock = le32_to_cpu(header->ulMaxMemoryClock);
++
++
++	hwmgr->platform_descriptor.minOverdriveVDDC = 0;
++	hwmgr->platform_descriptor.maxOverdriveVDDC = 0;
++	hwmgr->platform_descriptor.overdriveVDDCStep = 0;
++
++	return 0;
++}
++
++static int init_overdrive_limits(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	int result;
++	uint8_t frev, crev;
++	uint16_t size;
++
++	const ATOM_COMMON_TABLE_HEADER *fw_info = NULL;
++
++	hwmgr->platform_descriptor.overdriveLimit.engineClock = 0;
++	hwmgr->platform_descriptor.overdriveLimit.memoryClock = 0;
++	hwmgr->platform_descriptor.minOverdriveVDDC = 0;
++	hwmgr->platform_descriptor.maxOverdriveVDDC = 0;
++
++	/* We assume here that fw_info is unchanged if this call fails.*/
++	fw_info = cgs_atom_get_data_table(hwmgr->device,
++			 GetIndexIntoMasterTable(DATA, FirmwareInfo),
++			 &size, &frev, &crev);
++
++	if ((fw_info->ucTableFormatRevision == 1)
++		&& (fw_info->usStructureSize >= sizeof(ATOM_FIRMWARE_INFO_V1_4)))
++		result = init_overdrive_limits_V1_4(hwmgr,
++				powerplay_table,
++				(const ATOM_FIRMWARE_INFO_V1_4 *)fw_info);
++
++	else if ((fw_info->ucTableFormatRevision == 2)
++		&& (fw_info->usStructureSize >= sizeof(ATOM_FIRMWARE_INFO_V2_1)))
++		result = init_overdrive_limits_V2_1(hwmgr,
++				powerplay_table,
++				(const ATOM_FIRMWARE_INFO_V2_1 *)fw_info);
++
++	if (hwmgr->platform_descriptor.overdriveLimit.engineClock > 0
++		&& hwmgr->platform_descriptor.overdriveLimit.memoryClock > 0
++		&& !phm_cap_enabled(hwmgr->platform_descriptor.platformCaps,
++			PHM_PlatformCaps_OverdriveDisabledByPowerBudget))
++		phm_cap_set(hwmgr->platform_descriptor.platformCaps,
++				PHM_PlatformCaps_ACOverdriveSupport);
++
++	return result;
++}
++
++static int get_uvd_clock_voltage_limit_table(struct pp_hwmgr *hwmgr,
++		struct phm_uvd_clock_voltage_dependency_table **ptable,
++		const ATOM_PPLIB_UVD_Clock_Voltage_Limit_Table *table,
++		const UVDClockInfoArray *array)
++{
++	unsigned long table_size, i;
++	struct phm_uvd_clock_voltage_dependency_table *uvd_table;
++
++	table_size = sizeof(unsigned long) +
++		 sizeof(struct phm_uvd_clock_voltage_dependency_table) *
++		 table->numEntries;
++
++	uvd_table = kzalloc(table_size, GFP_KERNEL);
++	if (NULL == uvd_table)
++		return -ENOMEM;
++
++	uvd_table->count = table->numEntries;
++
++	for (i = 0; i < table->numEntries; i++) {
++		const UVDClockInfo *entry =
++			&array->entries[table->entries[i].ucUVDClockInfoIndex];
++		uvd_table->entries[i].v = (unsigned long)le16_to_cpu(table->entries[i].usVoltage);
++		uvd_table->entries[i].vclk = ((unsigned long)entry->ucVClkHigh << 16)
++					 | le16_to_cpu(entry->usVClkLow);
++		uvd_table->entries[i].dclk = ((unsigned long)entry->ucDClkHigh << 16)
++					 | le16_to_cpu(entry->usDClkLow);
++	}
++
++	*ptable = uvd_table;
++
++	return 0;
++}
++
++static int get_vce_clock_voltage_limit_table(struct pp_hwmgr *hwmgr,
++		struct phm_vce_clock_voltage_dependency_table **ptable,
++		const ATOM_PPLIB_VCE_Clock_Voltage_Limit_Table *table,
++		const VCEClockInfoArray    *array)
++{
++	unsigned long table_size, i;
++	struct phm_vce_clock_voltage_dependency_table *vce_table = NULL;
++
++	table_size = sizeof(unsigned long) +
++			sizeof(struct phm_vce_clock_voltage_dependency_table)
++			* table->numEntries;
++
++	vce_table = kzalloc(table_size, GFP_KERNEL);
++	if (NULL == vce_table)
++		return -ENOMEM;
++
++	vce_table->count = table->numEntries;
++	for (i = 0; i < table->numEntries; i++) {
++		const VCEClockInfo *entry = &array->entries[table->entries[i].ucVCEClockInfoIndex];
++
++		vce_table->entries[i].v = (unsigned long)le16_to_cpu(table->entries[i].usVoltage);
++		vce_table->entries[i].evclk = ((unsigned long)entry->ucEVClkHigh << 16)
++					| le16_to_cpu(entry->usEVClkLow);
++		vce_table->entries[i].ecclk = ((unsigned long)entry->ucECClkHigh << 16)
++					| le16_to_cpu(entry->usECClkLow);
++	}
++
++	*ptable = vce_table;
++
++	return 0;
++}
++
++static int get_samu_clock_voltage_limit_table(struct pp_hwmgr *hwmgr,
++		 struct phm_samu_clock_voltage_dependency_table **ptable,
++		 const ATOM_PPLIB_SAMClk_Voltage_Limit_Table *table)
++{
++	unsigned long table_size, i;
++	struct phm_samu_clock_voltage_dependency_table *samu_table;
++
++	table_size = sizeof(unsigned long) +
++		sizeof(struct phm_samu_clock_voltage_dependency_table) *
++		table->numEntries;
++
++	samu_table = kzalloc(table_size, GFP_KERNEL);
++	if (NULL == samu_table)
++		return -ENOMEM;
++
++	samu_table->count = table->numEntries;
++
++	for (i = 0; i < table->numEntries; i++) {
++		samu_table->entries[i].v = (unsigned long)le16_to_cpu(table->entries[i].usVoltage);
++		samu_table->entries[i].samclk = ((unsigned long)table->entries[i].ucSAMClockHigh << 16)
++					 | le16_to_cpu(table->entries[i].usSAMClockLow);
++	}
++
++	*ptable = samu_table;
++
++	return 0;
++}
++
++static int get_acp_clock_voltage_limit_table(struct pp_hwmgr *hwmgr,
++		struct phm_acp_clock_voltage_dependency_table **ptable,
++		const ATOM_PPLIB_ACPClk_Voltage_Limit_Table *table)
++{
++	unsigned table_size, i;
++	struct phm_acp_clock_voltage_dependency_table *acp_table;
++
++	table_size = sizeof(unsigned long) +
++		sizeof(struct phm_acp_clock_voltage_dependency_table) *
++		table->numEntries;
++
++	acp_table = kzalloc(table_size, GFP_KERNEL);
++	if (NULL == acp_table)
++		return -ENOMEM;
++
++	acp_table->count = (unsigned long)table->numEntries;
++
++	for (i = 0; i < table->numEntries; i++) {
++		acp_table->entries[i].v = (unsigned long)le16_to_cpu(table->entries[i].usVoltage);
++		acp_table->entries[i].acpclk = ((unsigned long)table->entries[i].ucACPClockHigh << 16)
++					 | le16_to_cpu(table->entries[i].usACPClockLow);
++	}
++
++	*ptable = acp_table;
++
++	return 0;
++}
++
++static int init_clock_voltage_dependency(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	ATOM_PPLIB_Clock_Voltage_Dependency_Table *table;
++	ATOM_PPLIB_Clock_Voltage_Limit_Table *limit_table;
++	int result = 0;
++
++	uint16_t vce_clock_info_array_offset;
++	uint16_t uvd_clock_info_array_offset;
++	uint16_t table_offset;
++
++	hwmgr->dyn_state.vddc_dependency_on_sclk = NULL;
++	hwmgr->dyn_state.vddci_dependency_on_mclk = NULL;
++	hwmgr->dyn_state.vddc_dependency_on_mclk = NULL;
++	hwmgr->dyn_state.vddc_dep_on_dal_pwrl = NULL;
++	hwmgr->dyn_state.mvdd_dependency_on_mclk = NULL;
++	hwmgr->dyn_state.vce_clocl_voltage_dependency_table = NULL;
++	hwmgr->dyn_state.uvd_clocl_voltage_dependency_table = NULL;
++	hwmgr->dyn_state.samu_clock_voltage_dependency_table = NULL;
++	hwmgr->dyn_state.acp_clock_voltage_dependency_table = NULL;
++	hwmgr->dyn_state.ppm_parameter_table = NULL;
++	hwmgr->dyn_state.vdd_gfx_dependency_on_sclk = NULL;
++
++	vce_clock_info_array_offset = get_vce_clock_info_array_offset(
++						hwmgr, powerplay_table);
++	table_offset = get_vce_clock_voltage_limit_table_offset(hwmgr,
++						powerplay_table);
++	if (vce_clock_info_array_offset > 0 && table_offset > 0) {
++		const VCEClockInfoArray *array = (const VCEClockInfoArray *)
++				(((unsigned long) powerplay_table) +
++				vce_clock_info_array_offset);
++		const ATOM_PPLIB_VCE_Clock_Voltage_Limit_Table *table =
++				(const ATOM_PPLIB_VCE_Clock_Voltage_Limit_Table *)
++				(((unsigned long) powerplay_table) + table_offset);
++		result = get_vce_clock_voltage_limit_table(hwmgr,
++				&hwmgr->dyn_state.vce_clocl_voltage_dependency_table,
++				table, array);
++	}
++
++	uvd_clock_info_array_offset = get_uvd_clock_info_array_offset(hwmgr, powerplay_table);
++	table_offset = get_uvd_clock_voltage_limit_table_offset(hwmgr, powerplay_table);
++
++	if (uvd_clock_info_array_offset > 0 && table_offset > 0) {
++		const UVDClockInfoArray *array = (const UVDClockInfoArray *)
++				(((unsigned long) powerplay_table) +
++				uvd_clock_info_array_offset);
++		const ATOM_PPLIB_UVD_Clock_Voltage_Limit_Table *ptable =
++				(const ATOM_PPLIB_UVD_Clock_Voltage_Limit_Table *)
++				(((unsigned long) powerplay_table) + table_offset);
++		result = get_uvd_clock_voltage_limit_table(hwmgr,
++				&hwmgr->dyn_state.uvd_clocl_voltage_dependency_table, ptable, array);
++	}
++
++	table_offset = get_samu_clock_voltage_limit_table_offset(hwmgr,
++							    powerplay_table);
++
++	if (table_offset > 0) {
++		const ATOM_PPLIB_SAMClk_Voltage_Limit_Table *ptable =
++				(const ATOM_PPLIB_SAMClk_Voltage_Limit_Table *)
++				(((unsigned long) powerplay_table) + table_offset);
++		result = get_samu_clock_voltage_limit_table(hwmgr,
++				&hwmgr->dyn_state.samu_clock_voltage_dependency_table, ptable);
++	}
++
++	table_offset = get_acp_clock_voltage_limit_table_offset(hwmgr,
++							     powerplay_table);
++
++	if (table_offset > 0) {
++		const ATOM_PPLIB_ACPClk_Voltage_Limit_Table *ptable =
++				(const ATOM_PPLIB_ACPClk_Voltage_Limit_Table *)
++				(((unsigned long) powerplay_table) + table_offset);
++		result = get_acp_clock_voltage_limit_table(hwmgr,
++				&hwmgr->dyn_state.acp_clock_voltage_dependency_table, ptable);
++	}
++
++	table_offset = get_cacp_tdp_table_offset(hwmgr, powerplay_table);
++	if (table_offset > 0) {
++		UCHAR rev_id = *(UCHAR *)(((unsigned long)powerplay_table) + table_offset);
++
++		if (rev_id > 0) {
++			const ATOM_PPLIB_POWERTUNE_Table_V1 *tune_table =
++				(const ATOM_PPLIB_POWERTUNE_Table_V1 *)
++				(((unsigned long) powerplay_table) + table_offset);
++			result = get_cac_tdp_table(hwmgr, &hwmgr->dyn_state.cac_dtp_table,
++				&tune_table->power_tune_table,
++				le16_to_cpu(tune_table->usMaximumPowerDeliveryLimit));
++			hwmgr->dyn_state.cac_dtp_table->usDefaultTargetOperatingTemp =
++				le16_to_cpu(tune_table->usTjMax);
++		} else {
++			const ATOM_PPLIB_POWERTUNE_Table *tune_table =
++				(const ATOM_PPLIB_POWERTUNE_Table *)
++				(((unsigned long) powerplay_table) + table_offset);
++			result = get_cac_tdp_table(hwmgr,
++				&hwmgr->dyn_state.cac_dtp_table,
++				&tune_table->power_tune_table, 255);
++		}
++	}
++
++	if (le16_to_cpu(powerplay_table->usTableSize) >=
++		sizeof(ATOM_PPLIB_POWERPLAYTABLE4)) {
++		const ATOM_PPLIB_POWERPLAYTABLE4 *powerplay_table4 =
++				(const ATOM_PPLIB_POWERPLAYTABLE4 *)powerplay_table;
++		if (0 != powerplay_table4->usVddcDependencyOnSCLKOffset) {
++			table = (ATOM_PPLIB_Clock_Voltage_Dependency_Table *)
++				(((unsigned long) powerplay_table4) +
++				powerplay_table4->usVddcDependencyOnSCLKOffset);
++			result = get_clock_voltage_dependency_table(hwmgr,
++				&hwmgr->dyn_state.vddc_dependency_on_sclk, table);
++		}
++
++		if (result == 0 && (0 != powerplay_table4->usVddciDependencyOnMCLKOffset)) {
++			table = (ATOM_PPLIB_Clock_Voltage_Dependency_Table *)
++				(((unsigned long) powerplay_table4) +
++				powerplay_table4->usVddciDependencyOnMCLKOffset);
++			result = get_clock_voltage_dependency_table(hwmgr,
++				&hwmgr->dyn_state.vddci_dependency_on_mclk, table);
++		}
++
++		if (result == 0 && (0 != powerplay_table4->usVddcDependencyOnMCLKOffset)) {
++			table = (ATOM_PPLIB_Clock_Voltage_Dependency_Table *)
++				(((unsigned long) powerplay_table4) +
++				powerplay_table4->usVddcDependencyOnMCLKOffset);
++			result = get_clock_voltage_dependency_table(hwmgr,
++				&hwmgr->dyn_state.vddc_dependency_on_mclk, table);
++		}
++
++		if (result == 0 && (0 != powerplay_table4->usMaxClockVoltageOnDCOffset)) {
++			limit_table = (ATOM_PPLIB_Clock_Voltage_Limit_Table *)
++				(((unsigned long) powerplay_table4) +
++				powerplay_table4->usMaxClockVoltageOnDCOffset);
++			result = get_clock_voltage_limit(hwmgr,
++				&hwmgr->dyn_state.max_clock_voltage_on_dc, limit_table);
++		}
++
++		if (result == 0 && (NULL != hwmgr->dyn_state.vddc_dependency_on_mclk) &&
++			(0 != hwmgr->dyn_state.vddc_dependency_on_mclk->count))
++			result = get_valid_clk(hwmgr, &hwmgr->dyn_state.valid_mclk_values,
++					hwmgr->dyn_state.vddc_dependency_on_mclk);
++
++		if(result == 0 && (NULL != hwmgr->dyn_state.vddc_dependency_on_sclk) &&
++			(0 != hwmgr->dyn_state.vddc_dependency_on_sclk->count))
++			result = get_valid_clk(hwmgr,
++				&hwmgr->dyn_state.valid_sclk_values,
++				hwmgr->dyn_state.vddc_dependency_on_sclk);
++
++		if (result == 0 && (0 != powerplay_table4->usMvddDependencyOnMCLKOffset)) {
++			table = (ATOM_PPLIB_Clock_Voltage_Dependency_Table *)
++				(((unsigned long) powerplay_table4) +
++				powerplay_table4->usMvddDependencyOnMCLKOffset);
++			result = get_clock_voltage_dependency_table(hwmgr,
++				&hwmgr->dyn_state.mvdd_dependency_on_mclk, table);
++		}
++	}
++
++	table_offset = get_sclk_vdd_gfx_clock_voltage_dependency_table_offset(hwmgr,
++								powerplay_table);
++
++	if (table_offset > 0) {
++		table = (ATOM_PPLIB_Clock_Voltage_Dependency_Table *)
++			(((unsigned long) powerplay_table) + table_offset);
++		result = get_clock_voltage_dependency_table(hwmgr,
++			&hwmgr->dyn_state.vdd_gfx_dependency_on_sclk, table);
++	}
++
++	return result;
++}
++
++static int get_cac_leakage_table(struct pp_hwmgr *hwmgr,
++				 struct phm_cac_leakage_table **ptable,
++				const ATOM_PPLIB_CAC_Leakage_Table *table)
++{
++	struct phm_cac_leakage_table  *cac_leakage_table;
++	unsigned long            table_size, i;
++
++	table_size = sizeof(ULONG) +
++		(sizeof(struct phm_cac_leakage_table) * table->ucNumEntries);
++
++	cac_leakage_table = kzalloc(table_size, GFP_KERNEL);
++
++	cac_leakage_table->count = (ULONG)table->ucNumEntries;
++
++	for (i = 0; i < cac_leakage_table->count; i++) {
++		if (phm_cap_enabled(hwmgr->platform_descriptor.platformCaps,
++				PHM_PlatformCaps_EVV)) {
++			cac_leakage_table->entries[i].Vddc1 = le16_to_cpu(table->entries[i].usVddc1);
++			cac_leakage_table->entries[i].Vddc2 = le16_to_cpu(table->entries[i].usVddc2);
++			cac_leakage_table->entries[i].Vddc3 = le16_to_cpu(table->entries[i].usVddc3);
++		} else {
++			cac_leakage_table->entries[i].Vddc    = le16_to_cpu(table->entries[i].usVddc);
++			cac_leakage_table->entries[i].Leakage = le32_to_cpu(table->entries[i].ulLeakageValue);
++		}
++	}
++
++	*ptable = cac_leakage_table;
++
++	return 0;
++}
++
++static int get_platform_power_management_table(struct pp_hwmgr *hwmgr,
++			ATOM_PPLIB_PPM_Table *atom_ppm_table)
++{
++	struct phm_ppm_table *ptr = kzalloc(sizeof(ATOM_PPLIB_PPM_Table), GFP_KERNEL);
++
++	if (NULL == ptr)
++		return -ENOMEM;
++
++	ptr->ppm_design            = atom_ppm_table->ucPpmDesign;
++	ptr->cpu_core_number        = le16_to_cpu(atom_ppm_table->usCpuCoreNumber);
++	ptr->platform_tdp          = le32_to_cpu(atom_ppm_table->ulPlatformTDP);
++	ptr->small_ac_platform_tdp   = le32_to_cpu(atom_ppm_table->ulSmallACPlatformTDP);
++	ptr->platform_tdc          = le32_to_cpu(atom_ppm_table->ulPlatformTDC);
++	ptr->small_ac_platform_tdc   = le32_to_cpu(atom_ppm_table->ulSmallACPlatformTDC);
++	ptr->apu_tdp               = le32_to_cpu(atom_ppm_table->ulApuTDP);
++	ptr->dgpu_tdp              = le32_to_cpu(atom_ppm_table->ulDGpuTDP);
++	ptr->dgpu_ulv_power         = le32_to_cpu(atom_ppm_table->ulDGpuUlvPower);
++	ptr->tj_max                = le32_to_cpu(atom_ppm_table->ulTjmax);
++	hwmgr->dyn_state.ppm_parameter_table = ptr;
++
++	return 0;
++}
++
++static int init_dpm2_parameters(struct pp_hwmgr *hwmgr,
++			const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	int result = 0;
++
++	if (le16_to_cpu(powerplay_table->usTableSize) >=
++	    sizeof(ATOM_PPLIB_POWERPLAYTABLE5)) {
++		const  ATOM_PPLIB_POWERPLAYTABLE5 *ptable5 =
++				(const ATOM_PPLIB_POWERPLAYTABLE5 *)powerplay_table;
++		const  ATOM_PPLIB_POWERPLAYTABLE4 *ptable4 =
++				(const ATOM_PPLIB_POWERPLAYTABLE4 *)
++				(&ptable5->basicTable4);
++		const  ATOM_PPLIB_POWERPLAYTABLE3 *ptable3 =
++				(const ATOM_PPLIB_POWERPLAYTABLE3 *)
++				(&ptable4->basicTable3);
++		const  ATOM_PPLIB_EXTENDEDHEADER  *extended_header;
++		uint16_t table_offset;
++		ATOM_PPLIB_PPM_Table *atom_ppm_table;
++
++		hwmgr->platform_descriptor.TDPLimit     = le32_to_cpu(ptable5->ulTDPLimit);
++		hwmgr->platform_descriptor.nearTDPLimit = le32_to_cpu(ptable5->ulNearTDPLimit);
++
++		hwmgr->platform_descriptor.TDPODLimit   = le16_to_cpu(ptable5->usTDPODLimit);
++		hwmgr->platform_descriptor.TDPAdjustment = 0;
++
++		hwmgr->platform_descriptor.VidAdjustment = 0;
++		hwmgr->platform_descriptor.VidAdjustmentPolarity = 0;
++		hwmgr->platform_descriptor.VidMinLimit     = 0;
++		hwmgr->platform_descriptor.VidMaxLimit     = 1500000;
++		hwmgr->platform_descriptor.VidStep         = 6250;
++
++		hwmgr->platform_descriptor.nearTDPLimitAdjusted = le32_to_cpu(ptable5->ulNearTDPLimit);
++
++		if (hwmgr->platform_descriptor.TDPODLimit != 0)
++			phm_cap_set(hwmgr->platform_descriptor.platformCaps,
++					PHM_PlatformCaps_PowerControl);
++
++		hwmgr->platform_descriptor.SQRampingThreshold = le32_to_cpu(ptable5->ulSQRampingThreshold);
++
++		hwmgr->platform_descriptor.CACLeakage = le32_to_cpu(ptable5->ulCACLeakage);
++
++		hwmgr->dyn_state.cac_leakage_table = NULL;
++
++		if (0 != ptable5->usCACLeakageTableOffset) {
++			const ATOM_PPLIB_CAC_Leakage_Table *pCAC_leakage_table =
++				(ATOM_PPLIB_CAC_Leakage_Table *)(((unsigned long)ptable5) +
++				le16_to_cpu(ptable5->usCACLeakageTableOffset));
++			result = get_cac_leakage_table(hwmgr,
++				&hwmgr->dyn_state.cac_leakage_table, pCAC_leakage_table);
++		}
++
++		hwmgr->platform_descriptor.LoadLineSlope = le16_to_cpu(ptable5->usLoadLineSlope);
++
++		hwmgr->dyn_state.ppm_parameter_table = NULL;
++
++		if (0 != ptable3->usExtendendedHeaderOffset) {
++			extended_header = (const ATOM_PPLIB_EXTENDEDHEADER *)
++					(((unsigned long)powerplay_table) +
++					le16_to_cpu(ptable3->usExtendendedHeaderOffset));
++			if ((extended_header->usPPMTableOffset > 0) &&
++				le16_to_cpu(extended_header->usSize) >=
++				    SIZE_OF_ATOM_PPLIB_EXTENDEDHEADER_V5) {
++				table_offset = le16_to_cpu(extended_header->usPPMTableOffset);
++				atom_ppm_table = (ATOM_PPLIB_PPM_Table *)
++					(((unsigned long)powerplay_table) + table_offset);
++				if (0 == get_platform_power_management_table(hwmgr, atom_ppm_table))
++					phm_cap_set(hwmgr->platform_descriptor.platformCaps,
++						PHM_PlatformCaps_EnablePlatformPowerManagement);
++			}
++		}
++	}
++	return result;
++}
++
++static int init_phase_shedding_table(struct pp_hwmgr *hwmgr,
++		const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table)
++{
++	if (le16_to_cpu(powerplay_table->usTableSize) >=
++	    sizeof(ATOM_PPLIB_POWERPLAYTABLE4)) {
++		const ATOM_PPLIB_POWERPLAYTABLE4 *powerplay_table4 =
++				(const ATOM_PPLIB_POWERPLAYTABLE4 *)powerplay_table;
++
++		if (0 != powerplay_table4->usVddcPhaseShedLimitsTableOffset) {
++			const ATOM_PPLIB_PhaseSheddingLimits_Table *ptable =
++				(ATOM_PPLIB_PhaseSheddingLimits_Table *)
++				(((unsigned long)powerplay_table4) +
++				le16_to_cpu(powerplay_table4->usVddcPhaseShedLimitsTableOffset));
++			struct phm_phase_shedding_limits_table *table;
++			unsigned long size, i;
++
++
++			size = sizeof(unsigned long) +
++				(sizeof(struct phm_phase_shedding_limits_table) *
++				ptable->ucNumEntries);
++
++			table = kzalloc(size, GFP_KERNEL);
++
++			table->count = (unsigned long)ptable->ucNumEntries;
++
++			for (i = 0; i < table->count; i++) {
++				table->entries[i].Voltage = (unsigned long)le16_to_cpu(ptable->entries[i].usVoltage);
++				table->entries[i].Sclk    = ((unsigned long)ptable->entries[i].ucSclkHigh << 16)
++							| le16_to_cpu(ptable->entries[i].usSclkLow);
++				table->entries[i].Mclk    = ((unsigned long)ptable->entries[i].ucMclkHigh << 16)
++							| le16_to_cpu(ptable->entries[i].usMclkLow);
++			}
++			hwmgr->dyn_state.vddc_phase_shed_limits_table = table;
++		}
++	}
++
++	return 0;
++}
++
++int get_number_of_vce_state_table_entries(
++						  struct pp_hwmgr *hwmgr)
++{
++	const ATOM_PPLIB_POWERPLAYTABLE *table =
++					     get_powerplay_table(hwmgr);
++	const ATOM_PPLIB_VCE_State_Table *vce_table =
++				    get_vce_state_table(hwmgr, table);
++
++	if (vce_table > 0)
++		return vce_table->numEntries;
++
++	return 0;
++}
++
++int get_vce_state_table_entry(struct pp_hwmgr *hwmgr,
++							unsigned long i,
++							struct PP_VCEState *vce_state,
++							void **clock_info,
++							unsigned long *flag)
++{
++	const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table = get_powerplay_table(hwmgr);
++
++	const ATOM_PPLIB_VCE_State_Table *vce_state_table = get_vce_state_table(hwmgr, powerplay_table);
++
++	unsigned short vce_clock_info_array_offset = get_vce_clock_info_array_offset(hwmgr, powerplay_table);
++
++	const VCEClockInfoArray *vce_clock_info_array = (const VCEClockInfoArray *)(((unsigned long) powerplay_table) + vce_clock_info_array_offset);
++
++	const ClockInfoArray *clock_arrays = (ClockInfoArray *)(((unsigned long)powerplay_table) + powerplay_table->usClockInfoArrayOffset);
++
++	const ATOM_PPLIB_VCE_State_Record *record = &vce_state_table->entries[i];
++
++	const VCEClockInfo *vce_clock_info = &vce_clock_info_array->entries[record->ucVCEClockInfoIndex];
++
++	unsigned long clockInfoIndex = record->ucClockInfoIndex & 0x3F;
++
++	*flag = (record->ucClockInfoIndex >> NUM_BITS_CLOCK_INFO_ARRAY_INDEX);
++
++	vce_state->evclk = ((uint32_t)vce_clock_info->ucEVClkHigh << 16) | vce_clock_info->usEVClkLow;
++	vce_state->ecclk = ((uint32_t)vce_clock_info->ucECClkHigh << 16) | vce_clock_info->usECClkLow;
++
++	*clock_info = (void *)((unsigned long)(clock_arrays->clockInfo) + (clockInfoIndex * clock_arrays->ucEntrySize));
++
++	return 0;
++}
++
++
++static int pp_tables_initialize(struct pp_hwmgr *hwmgr)
++{
++	int result;
++	const ATOM_PPLIB_POWERPLAYTABLE *powerplay_table;
++
++	powerplay_table = get_powerplay_table(hwmgr);
++
++	result = init_powerplay_tables(hwmgr, powerplay_table);
++
++	if (0 == result)
++		result = set_platform_caps(hwmgr,
++				le32_to_cpu(powerplay_table->ulPlatformCaps));
++
++	if (0 == result)
++		result = init_thermal_controller(hwmgr, powerplay_table);
++
++	if (0 == result)
++		result = init_overdrive_limits(hwmgr, powerplay_table);
++
++	if (0 == result)
++		result = init_clock_voltage_dependency(hwmgr,
++						powerplay_table);
++
++	if (0 == result)
++		result = init_dpm2_parameters(hwmgr, powerplay_table);
++
++	if (0 == result)
++		result = init_phase_shedding_table(hwmgr, powerplay_table);
++
++	return result;
++}
++
++static int pp_tables_uninitialize(struct pp_hwmgr *hwmgr)
++{
++	if (NULL != hwmgr->soft_pp_table) {
++		kfree(hwmgr->soft_pp_table);
++		hwmgr->soft_pp_table = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.vddc_dependency_on_sclk) {
++		kfree(hwmgr->dyn_state.vddc_dependency_on_sclk);
++		hwmgr->dyn_state.vddc_dependency_on_sclk = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.vddci_dependency_on_mclk) {
++		kfree(hwmgr->dyn_state.vddci_dependency_on_mclk);
++		hwmgr->dyn_state.vddci_dependency_on_mclk = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.vddc_dependency_on_mclk) {
++		kfree(hwmgr->dyn_state.vddc_dependency_on_mclk);
++		hwmgr->dyn_state.vddc_dependency_on_mclk = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.mvdd_dependency_on_mclk) {
++		kfree(hwmgr->dyn_state.mvdd_dependency_on_mclk);
++		hwmgr->dyn_state.mvdd_dependency_on_mclk = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.valid_mclk_values) {
++		kfree(hwmgr->dyn_state.valid_mclk_values);
++		hwmgr->dyn_state.valid_mclk_values = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.valid_sclk_values) {
++		kfree(hwmgr->dyn_state.valid_sclk_values);
++		hwmgr->dyn_state.valid_sclk_values = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.cac_leakage_table) {
++		kfree(hwmgr->dyn_state.cac_leakage_table);
++		hwmgr->dyn_state.cac_leakage_table = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.vddc_phase_shed_limits_table) {
++		kfree(hwmgr->dyn_state.vddc_phase_shed_limits_table);
++		hwmgr->dyn_state.vddc_phase_shed_limits_table = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.vce_clocl_voltage_dependency_table) {
++		kfree(hwmgr->dyn_state.vce_clocl_voltage_dependency_table);
++		hwmgr->dyn_state.vce_clocl_voltage_dependency_table = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.uvd_clocl_voltage_dependency_table) {
++		kfree(hwmgr->dyn_state.uvd_clocl_voltage_dependency_table);
++		hwmgr->dyn_state.uvd_clocl_voltage_dependency_table = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.samu_clock_voltage_dependency_table) {
++		kfree(hwmgr->dyn_state.samu_clock_voltage_dependency_table);
++		hwmgr->dyn_state.samu_clock_voltage_dependency_table = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.acp_clock_voltage_dependency_table) {
++		kfree(hwmgr->dyn_state.acp_clock_voltage_dependency_table);
++		hwmgr->dyn_state.acp_clock_voltage_dependency_table = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.cac_dtp_table) {
++		kfree(hwmgr->dyn_state.cac_dtp_table);
++		hwmgr->dyn_state.cac_dtp_table = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.ppm_parameter_table) {
++		kfree(hwmgr->dyn_state.ppm_parameter_table);
++		hwmgr->dyn_state.ppm_parameter_table = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.vdd_gfx_dependency_on_sclk) {
++		kfree(hwmgr->dyn_state.vdd_gfx_dependency_on_sclk);
++		hwmgr->dyn_state.vdd_gfx_dependency_on_sclk = NULL;
++	}
++
++	if (NULL != hwmgr->dyn_state.vq_budgeting_table) {
++		kfree(hwmgr->dyn_state.vq_budgeting_table);
++		hwmgr->dyn_state.vq_budgeting_table = NULL;
++	}
++
++	return 0;
++}
++
++const struct pp_table_func pptable_funcs = {
++	.pptable_init = pp_tables_initialize,
++	.pptable_fini = pp_tables_uninitialize,
++	.pptable_get_number_of_vce_state_table_entries =
++				get_number_of_vce_state_table_entries,
++	.pptable_get_vce_state_table_entry =
++						get_vce_state_table_entry,
++};
++
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.h b/drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.h
+new file mode 100644
+index 0000000..3043480
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ * Interface Functions related to the BIOS PowerPlay Tables.
++ *
++ */
++
++#ifndef PROCESSPPTABLES_H
++#define PROCESSPPTABLES_H
++
++struct pp_hwmgr;
++struct pp_power_state;
++struct pp_hw_power_state;
++
++extern const struct pp_table_func pptable_funcs;
++
++typedef int (*pp_tables_hw_clock_info_callback)(struct pp_hwmgr *hwmgr,
++					struct pp_hw_power_state *hw_ps,
++							unsigned int index,
++						 const void *clock_info);
++
++int pp_tables_get_num_of_entries(struct pp_hwmgr *hwmgr,
++				     unsigned long *num_of_entries);
++
++int pp_tables_get_entry(struct pp_hwmgr *hwmgr,
++						unsigned long entry_index,
++						struct pp_power_state *ps,
++				pp_tables_hw_clock_info_callback func);
++
++#endif
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+index 09d9d5a..2281d88 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+@@ -28,7 +28,6 @@
+ #include "amd_shared.h"
+ #include "cgs_common.h"
+ 
+-
+ enum amd_pp_event {
+ 	AMD_PP_EVENT_INITIALIZE = 0,
+ 	AMD_PP_EVENT_UNINITIALIZE,
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h b/drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h
+new file mode 100644
+index 0000000..26e1256
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h
+@@ -0,0 +1,280 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#ifndef _HARDWARE_MANAGER_H_
++#define _HARDWARE_MANAGER_H_
++
++struct pp_hwmgr;
++
++/* Automatic Power State Throttling */
++enum PHM_AutoThrottleSource
++{
++    PHM_AutoThrottleSource_Thermal,
++    PHM_AutoThrottleSource_External
++};
++
++typedef enum PHM_AutoThrottleSource PHM_AutoThrottleSource;
++
++enum phm_platform_caps {
++	PHM_PlatformCaps_AtomBiosPpV1 = 0,
++	PHM_PlatformCaps_PowerPlaySupport,
++	PHM_PlatformCaps_ACOverdriveSupport,
++	PHM_PlatformCaps_BacklightSupport,
++	PHM_PlatformCaps_ThermalController,
++	PHM_PlatformCaps_BiosPowerSourceControl,
++	PHM_PlatformCaps_DisableVoltageTransition,
++	PHM_PlatformCaps_DisableEngineTransition,
++	PHM_PlatformCaps_DisableMemoryTransition,
++	PHM_PlatformCaps_DynamicPowerManagement,
++	PHM_PlatformCaps_EnableASPML0s,
++	PHM_PlatformCaps_EnableASPML1,
++	PHM_PlatformCaps_OD5inACSupport,
++	PHM_PlatformCaps_OD5inDCSupport,
++	PHM_PlatformCaps_SoftStateOD5,
++	PHM_PlatformCaps_NoOD5Support,
++	PHM_PlatformCaps_ContinuousHardwarePerformanceRange,
++	PHM_PlatformCaps_ActivityReporting,
++	PHM_PlatformCaps_EnableBackbias,
++	PHM_PlatformCaps_OverdriveDisabledByPowerBudget,
++	PHM_PlatformCaps_ShowPowerBudgetWarning,
++	PHM_PlatformCaps_PowerBudgetWaiverAvailable,
++	PHM_PlatformCaps_GFXClockGatingSupport,
++	PHM_PlatformCaps_MMClockGatingSupport,
++	PHM_PlatformCaps_AutomaticDCTransition,
++	PHM_PlatformCaps_GeminiPrimary,
++	PHM_PlatformCaps_MemorySpreadSpectrumSupport,
++	PHM_PlatformCaps_EngineSpreadSpectrumSupport,
++	PHM_PlatformCaps_StepVddc,
++	PHM_PlatformCaps_DynamicPCIEGen2Support,
++	PHM_PlatformCaps_SMC,
++	PHM_PlatformCaps_FaultyInternalThermalReading,          /* Internal thermal controller reports faulty temperature value when DAC2 is active */
++	PHM_PlatformCaps_EnableVoltageControl,                  /* indicates voltage can be controlled */
++	PHM_PlatformCaps_EnableSideportControl,                 /* indicates Sideport can be controlled */
++	PHM_PlatformCaps_VideoPlaybackEEUNotification,          /* indicates EEU notification of video start/stop is required */
++	PHM_PlatformCaps_TurnOffPll_ASPML1,                     /* PCIE Turn Off PLL in ASPM L1 */
++	PHM_PlatformCaps_EnableHTLinkControl,                   /* indicates HT Link can be controlled by ACPI or CLMC overrided/automated mode. */
++	PHM_PlatformCaps_PerformanceStateOnly,                  /* indicates only performance power state to be used on current system. */
++	PHM_PlatformCaps_ExclusiveModeAlwaysHigh,               /* In Exclusive (3D) mode always stay in High state. */
++	PHM_PlatformCaps_DisableMGClockGating,                  /* to disable Medium Grain Clock Gating or not */
++	PHM_PlatformCaps_DisableMGCGTSSM,                       /* TO disable Medium Grain Clock Gating Shader Complex control */
++	PHM_PlatformCaps_UVDAlwaysHigh,                         /* In UVD mode always stay in High state */
++	PHM_PlatformCaps_DisablePowerGating,                    /* to disable power gating */
++	PHM_PlatformCaps_CustomThermalPolicy,                   /* indicates only performance power state to be used on current system. */
++	PHM_PlatformCaps_StayInBootState,                       /* Stay in Boot State, do not do clock/voltage or PCIe Lane and Gen switching (RV7xx and up). */
++	PHM_PlatformCaps_SMCAllowSeparateSWThermalState,        /* SMC use separate SW thermal state, instead of the default SMC thermal policy. */
++	PHM_PlatformCaps_MultiUVDStateSupport,                  /* Powerplay state table supports multi UVD states. */
++	PHM_PlatformCaps_EnableSCLKDeepSleepForUVD,             /* With HW ECOs, we don't need to disable SCLK Deep Sleep for UVD state. */
++	PHM_PlatformCaps_EnableMCUHTLinkControl,                /* Enable HT link control by MCU */
++	PHM_PlatformCaps_ABM,                                   /* ABM support.*/
++	PHM_PlatformCaps_KongThermalPolicy,                     /* A thermal policy specific for Kong */
++	PHM_PlatformCaps_SwitchVDDNB,                           /* if the users want to switch VDDNB */
++	PHM_PlatformCaps_ULPS,                                  /* support ULPS mode either through ACPI state or ULPS state */
++	PHM_PlatformCaps_NativeULPS,                            /* hardware capable of ULPS state (other than through the ACPI state) */
++	PHM_PlatformCaps_EnableMVDDControl,                     /* indicates that memory voltage can be controlled */
++	PHM_PlatformCaps_ControlVDDCI,                          /* Control VDDCI separately from VDDC. */
++	PHM_PlatformCaps_DisableDCODT,                          /* indicates if DC ODT apply or not */
++	PHM_PlatformCaps_DynamicACTiming,                       /* if the SMC dynamically re-programs MC SEQ register values */
++	PHM_PlatformCaps_EnableThermalIntByGPIO,                /* enable throttle control through GPIO */
++	PHM_PlatformCaps_BootStateOnAlert,                      /* Go to boot state on alerts, e.g. on an AC->DC transition. */
++	PHM_PlatformCaps_DontWaitForVBlankOnAlert,              /* Do NOT wait for VBLANK during an alert (e.g. AC->DC transition). */
++	PHM_PlatformCaps_Force3DClockSupport,                   /* indicates if the platform supports force 3D clock. */
++	PHM_PlatformCaps_MicrocodeFanControl,                   /* Fan is controlled by the SMC microcode. */
++	PHM_PlatformCaps_AdjustUVDPriorityForSP,
++	PHM_PlatformCaps_DisableLightSleep,                     /* Light sleep for evergreen family. */
++	PHM_PlatformCaps_DisableMCLS,                           /* MC Light sleep */
++	PHM_PlatformCaps_RegulatorHot,                          /* Enable throttling on 'regulator hot' events. */
++	PHM_PlatformCaps_BACO,                                  /* Support Bus Alive Chip Off mode */
++	PHM_PlatformCaps_DisableDPM,                            /* Disable DPM, supported from Llano */
++	PHM_PlatformCaps_DynamicM3Arbiter,                      /* support dynamically change m3 arbitor parameters */
++	PHM_PlatformCaps_SclkDeepSleep,                         /* support sclk deep sleep */
++	PHM_PlatformCaps_DynamicPatchPowerState,                /* this ASIC supports to patch power state dynamically */
++	PHM_PlatformCaps_ThermalAutoThrottling,                 /* enabling auto thermal throttling, */
++	PHM_PlatformCaps_SumoThermalPolicy,                     /* A thermal policy specific for Sumo */
++	PHM_PlatformCaps_PCIEPerformanceRequest,                /* support to change RC voltage */
++	PHM_PlatformCaps_BLControlledByGPU,                     /* support varibright */
++	PHM_PlatformCaps_PowerContainment,                      /* support DPM2 power containment (AKA TDP clamping) */
++	PHM_PlatformCaps_SQRamping,                             /* support DPM2 SQ power throttle */
++	PHM_PlatformCaps_CAC,                                   /* support Capacitance * Activity power estimation */
++	PHM_PlatformCaps_NIChipsets,                            /* Northern Island and beyond chipsets */
++	PHM_PlatformCaps_TrinityChipsets,                       /* Trinity chipset */
++	PHM_PlatformCaps_EvergreenChipsets,                     /* Evergreen family chipset */
++	PHM_PlatformCaps_PowerControl,                          /* Cayman and beyond chipsets */
++	PHM_PlatformCaps_DisableLSClockGating,                  /* to disable Light Sleep control for HDP memories */
++	PHM_PlatformCaps_BoostState,                            /* this ASIC supports boost state */
++	PHM_PlatformCaps_UserMaxClockForMultiDisplays,          /* indicates if max memory clock is used for all status when multiple displays are connected */
++	PHM_PlatformCaps_RegWriteDelay,                         /* indicates if back to back reg write delay is required */
++	PHM_PlatformCaps_NonABMSupportInPPLib,                  /* ABM is not supported in PPLIB, (moved from PPLIB to DAL) */
++	PHM_PlatformCaps_GFXDynamicMGPowerGating,               /* Enable Dynamic MG PowerGating on Trinity */
++	PHM_PlatformCaps_DisableSMUUVDHandshake,                /* Disable SMU UVD Handshake */
++	PHM_PlatformCaps_DTE,                                   /* Support Digital Temperature Estimation */
++	PHM_PlatformCaps_W5100Specifc_SmuSkipMsgDTE,            /* This is for the feature requested by David B., and Tonny W.*/
++	PHM_PlatformCaps_UVDPowerGating,                        /* enable UVD power gating, supported from Llano */
++	PHM_PlatformCaps_UVDDynamicPowerGating,                 /* enable UVD Dynamic power gating, supported from UVD5 */
++	PHM_PlatformCaps_VCEPowerGating,                        /* Enable VCE power gating, supported for TN and later ASICs */
++	PHM_PlatformCaps_SamuPowerGating,                       /* Enable SAMU power gating, supported for KV and later ASICs */
++	PHM_PlatformCaps_UVDDPM,                                /* UVD clock DPM */
++	PHM_PlatformCaps_VCEDPM,                                /* VCE clock DPM */
++	PHM_PlatformCaps_SamuDPM,                               /* SAMU clock DPM */
++	PHM_PlatformCaps_AcpDPM,                                /* ACP clock DPM */
++	PHM_PlatformCaps_SclkDeepSleepAboveLow,                 /* Enable SCLK Deep Sleep on all DPM states */
++	PHM_PlatformCaps_DynamicUVDState,                       /* Dynamic UVD State */
++	PHM_PlatformCaps_WantSAMClkWithDummyBackEnd,            /* Set SAM Clk With Dummy Back End */
++	PHM_PlatformCaps_WantUVDClkWithDummyBackEnd,            /* Set UVD Clk With Dummy Back End */
++	PHM_PlatformCaps_WantVCEClkWithDummyBackEnd,            /* Set VCE Clk With Dummy Back End */
++	PHM_PlatformCaps_WantACPClkWithDummyBackEnd,            /* Set SAM Clk With Dummy Back End */
++	PHM_PlatformCaps_OD6inACSupport,                        /* indicates that the ASIC/back end supports OD6 */
++	PHM_PlatformCaps_OD6inDCSupport,                        /* indicates that the ASIC/back end supports OD6 in DC */
++	PHM_PlatformCaps_EnablePlatformPowerManagement,         /* indicates that Platform Power Management feature is supported */
++	PHM_PlatformCaps_SurpriseRemoval,                       /* indicates that surprise removal feature is requested */
++	PHM_PlatformCaps_NewCACVoltage,                         /* indicates new CAC voltage table support */
++	PHM_PlatformCaps_DBRamping,                             /* for dI/dT feature */
++	PHM_PlatformCaps_TDRamping,                             /* for dI/dT feature */
++	PHM_PlatformCaps_TCPRamping,                            /* for dI/dT feature */
++	PHM_PlatformCaps_EnableSMU7ThermalManagement,           /* SMC will manage thermal events */
++	PHM_PlatformCaps_FPS,                                   /* FPS support */
++	PHM_PlatformCaps_ACP,                                   /* ACP support */
++	PHM_PlatformCaps_SclkThrottleLowNotification,           /* SCLK Throttle Low Notification */
++	PHM_PlatformCaps_XDMAEnabled,                           /* XDMA engine is enabled */
++	PHM_PlatformCaps_UseDummyBackEnd,                       /* use dummy back end */
++	PHM_PlatformCaps_EnableDFSBypass,                       /* Enable DFS bypass */
++	PHM_PlatformCaps_VddNBDirectRequest,
++	PHM_PlatformCaps_PauseMMSessions,
++	PHM_PlatformCaps_UnTabledHardwareInterface,             /* Tableless/direct call hardware interface for CI and newer ASICs */
++	PHM_PlatformCaps_SMU7,                                  /* indicates that vpuRecoveryBegin without SMU shutdown */
++	PHM_PlatformCaps_RevertGPIO5Polarity,                   /* indicates revert GPIO5 plarity table support */
++	PHM_PlatformCaps_Thermal2GPIO17,                        /* indicates thermal2GPIO17 table support */
++	PHM_PlatformCaps_ThermalOutGPIO,                        /* indicates ThermalOutGPIO support, pin number is assigned by VBIOS */
++	PHM_PlatformCaps_DisableMclkSwitchingForFrameLock,      /* Disable memory clock switch during Framelock */
++	PHM_PlatformCaps_VRHotGPIOConfigurable,                 /* indicates VR_HOT GPIO configurable */
++	PHM_PlatformCaps_TempInversion,                         /* enable Temp Inversion feature */
++	PHM_PlatformCaps_IOIC3,
++	PHM_PlatformCaps_ConnectedStandby,
++	PHM_PlatformCaps_EVV,
++	PHM_PlatformCaps_EnableLongIdleBACOSupport,
++	PHM_PlatformCaps_CombinePCCWithThermalSignal,
++	PHM_PlatformCaps_DisableUsingActualTemperatureForPowerCalc,
++	PHM_PlatformCaps_StablePState,
++	PHM_PlatformCaps_OD6PlusinACSupport,
++	PHM_PlatformCaps_OD6PlusinDCSupport,
++	PHM_PlatformCaps_ODThermalLimitUnlock,
++	PHM_PlatformCaps_ReducePowerLimit,
++	PHM_PlatformCaps_ODFuzzyFanControlSupport,
++	PHM_PlatformCaps_GeminiRegulatorFanControlSupport,
++	PHM_PlatformCaps_ControlVDDGFX,
++	PHM_PlatformCaps_BBBSupported,
++	PHM_PlatformCaps_DisableVoltageIsland,
++	PHM_PlatformCaps_FanSpeedInTableIsRPM,
++	PHM_PlatformCaps_GFXClockGatingManagedInCAIL,
++	PHM_PlatformCaps_IcelandULPSSWWorkAround,
++	PHM_PlatformCaps_FPSEnhancement,
++	PHM_PlatformCaps_LoadPostProductionFirmware,
++	PHM_PlatformCaps_VpuRecoveryInProgress,
++	PHM_PlatformCaps_Falcon_QuickTransition,
++	PHM_PlatformCaps_AVFS,
++	PHM_PlatformCaps_ClockStretcher,
++	PHM_PlatformCaps_TablelessHardwareInterface,
++	PHM_PlatformCaps_EnableDriverEVV,
++	PHM_PlatformCaps_Max
++};
++
++#define PHM_MAX_NUM_CAPS_BITS_PER_FIELD (sizeof(uint32_t)*8)
++
++/* Number of uint32_t entries used by CAPS table */
++#define PHM_MAX_NUM_CAPS_ULONG_ENTRIES \
++	((PHM_PlatformCaps_Max + ((PHM_MAX_NUM_CAPS_BITS_PER_FIELD) - 1)) / (PHM_MAX_NUM_CAPS_BITS_PER_FIELD))
++
++struct pp_hw_descriptor {
++	uint32_t hw_caps[PHM_MAX_NUM_CAPS_ULONG_ENTRIES];
++};
++
++/* Function for setting a platform cap */
++static inline void phm_cap_set(uint32_t *caps,
++			enum phm_platform_caps c)
++{
++	caps[c / PHM_MAX_NUM_CAPS_BITS_PER_FIELD] |= (1UL <<
++			     (c & (PHM_MAX_NUM_CAPS_BITS_PER_FIELD - 1)));
++}
++
++static inline void phm_cap_unset(uint32_t *caps,
++			enum phm_platform_caps c)
++{
++	caps[c / PHM_MAX_NUM_CAPS_BITS_PER_FIELD] &= ~(1UL << (c & (PHM_MAX_NUM_CAPS_BITS_PER_FIELD - 1)));
++}
++
++static inline bool phm_cap_enabled(const uint32_t *caps, enum phm_platform_caps c)
++{
++	return (0 != (caps[c / PHM_MAX_NUM_CAPS_BITS_PER_FIELD] &
++		  (1UL << (c & (PHM_MAX_NUM_CAPS_BITS_PER_FIELD - 1)))));
++}
++
++enum phm_clock_Type {
++	PHM_DispClock = 1,
++	PHM_SClock,
++	PHM_MemClock
++};
++
++#define MAX_NUM_CLOCKS 16
++
++struct PP_Clocks {
++	uint32_t engineClock;
++	uint32_t memoryClock;
++	uint32_t BusBandwidth;
++	uint32_t engineClockInSR;
++};
++
++struct phm_platform_descriptor {
++	uint32_t platformCaps[PHM_MAX_NUM_CAPS_ULONG_ENTRIES];
++	uint32_t vbiosInterruptId;
++	struct PP_Clocks overdriveLimit;
++	struct PP_Clocks clockStep;
++	uint32_t hardwareActivityPerformanceLevels;
++	uint32_t minimumClocksReductionPercentage;
++	uint32_t minOverdriveVDDC;
++	uint32_t maxOverdriveVDDC;
++	uint32_t overdriveVDDCStep;
++	uint32_t hardwarePerformanceLevels;
++	uint16_t powerBudget;
++	uint32_t TDPLimit;
++	uint32_t nearTDPLimit;
++	uint32_t nearTDPLimitAdjusted;
++	uint32_t SQRampingThreshold;
++	uint32_t CACLeakage;
++	uint16_t TDPODLimit;
++	uint32_t TDPAdjustment;
++	bool TDPAdjustmentPolarity;
++	uint16_t LoadLineSlope;
++	uint32_t  VidMinLimit;
++	uint32_t  VidMaxLimit;
++	uint32_t  VidStep;
++	uint32_t  VidAdjustment;
++	bool VidAdjustmentPolarity;
++};
++
++struct phm_clocks {
++	uint32_t num_of_entries;
++	uint32_t clock[MAX_NUM_CLOCKS];
++};
++
++extern int phm_setup_asic(struct pp_hwmgr *hwmgr);
++extern int phm_enable_dynamic_state_management(struct pp_hwmgr *hwmgr);
++extern void phm_init_dynamic_caps(struct pp_hwmgr *hwmgr);
++#endif /* _HARDWARE_MANAGER_H_ */
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+new file mode 100644
+index 0000000..07fba41
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+@@ -0,0 +1,607 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#ifndef _HWMGR_H_
++#define _HWMGR_H_
++
++#include "amd_powerplay.h"
++#include "pp_instance.h"
++#include "hardwaremanager.h"
++#include "pp_power_source.h"
++
++struct pp_instance;
++struct pp_hwmgr;
++struct pp_hw_power_state;
++struct pp_power_state;
++struct PP_VCEState;
++
++enum PP_Result {
++	PP_Result_TableImmediateExit = 0x13,
++};
++
++#define PCIE_PERF_REQ_REMOVE_REGISTRY   0
++#define PCIE_PERF_REQ_FORCE_LOWPOWER    1
++#define PCIE_PERF_REQ_GEN1         2
++#define PCIE_PERF_REQ_GEN2         3
++#define PCIE_PERF_REQ_GEN3         4
++
++enum PHM_BackEnd_Magic {
++	PHM_Dummy_Magic       = 0xAA5555AA,
++	PHM_RV770_Magic       = 0xDCBAABCD,
++	PHM_Kong_Magic        = 0x239478DF,
++	PHM_NIslands_Magic    = 0x736C494E,
++	PHM_Sumo_Magic        = 0x8339FA11,
++	PHM_SIslands_Magic    = 0x369431AC,
++	PHM_Trinity_Magic     = 0x96751873,
++	PHM_CIslands_Magic    = 0x38AC78B0,
++	PHM_Kv_Magic          = 0xDCBBABC0,
++	PHM_VIslands_Magic    = 0x20130307,
++	PHM_Cz_Magic          = 0x67DCBA25
++};
++
++enum PP_DAL_POWERLEVEL {
++	PP_DAL_POWERLEVEL_INVALID = 0,
++	PP_DAL_POWERLEVEL_ULTRALOW,
++	PP_DAL_POWERLEVEL_LOW,
++	PP_DAL_POWERLEVEL_NOMINAL,
++	PP_DAL_POWERLEVEL_PERFORMANCE,
++
++	PP_DAL_POWERLEVEL_0 = PP_DAL_POWERLEVEL_ULTRALOW,
++	PP_DAL_POWERLEVEL_1 = PP_DAL_POWERLEVEL_LOW,
++	PP_DAL_POWERLEVEL_2 = PP_DAL_POWERLEVEL_NOMINAL,
++	PP_DAL_POWERLEVEL_3 = PP_DAL_POWERLEVEL_PERFORMANCE,
++	PP_DAL_POWERLEVEL_4 = PP_DAL_POWERLEVEL_3+1,
++	PP_DAL_POWERLEVEL_5 = PP_DAL_POWERLEVEL_4+1,
++	PP_DAL_POWERLEVEL_6 = PP_DAL_POWERLEVEL_5+1,
++	PP_DAL_POWERLEVEL_7 = PP_DAL_POWERLEVEL_6+1,
++};
++
++#define PHM_PCIE_POWERGATING_TARGET_GFX            0
++#define PHM_PCIE_POWERGATING_TARGET_DDI            1
++#define PHM_PCIE_POWERGATING_TARGET_PLLCASCADE     2
++#define PHM_PCIE_POWERGATING_TARGET_PHY            3
++
++typedef int (*phm_table_function)(struct pp_hwmgr *hwmgr, void *input,
++				  void *output, void *storage, int result);
++
++typedef bool (*phm_check_function)(struct pp_hwmgr *hwmgr);
++
++struct phm_acp_arbiter {
++	uint32_t acpclk;
++};
++
++struct phm_uvd_arbiter {
++	uint32_t vclk;
++	uint32_t dclk;
++	uint32_t vclk_ceiling;
++	uint32_t dclk_ceiling;
++};
++
++struct phm_vce_arbiter {
++	uint32_t   evclk;
++	uint32_t   ecclk;
++};
++
++struct phm_gfx_arbiter {
++	uint32_t sclk;
++	uint32_t mclk;
++	uint32_t sclk_over_drive;
++	uint32_t mclk_over_drive;
++	uint32_t sclk_threshold;
++	uint32_t num_cus;
++};
++
++/* Entries in the master tables */
++struct phm_master_table_item {
++	phm_check_function isFunctionNeededInRuntimeTable;
++	phm_table_function tableFunction;
++};
++
++enum phm_master_table_flag {
++	PHM_MasterTableFlag_None         = 0,
++	PHM_MasterTableFlag_ExitOnError  = 1,
++};
++
++/* The header of the master tables */
++struct phm_master_table_header {
++	uint32_t storage_size;
++	uint32_t flags;
++	struct phm_master_table_item *master_list;
++};
++
++struct phm_runtime_table_header {
++	uint32_t storage_size;
++	bool exit_error;
++	phm_table_function *function_list;
++};
++
++struct phm_clock_array {
++	uint32_t count;
++	uint32_t values[1];
++};
++
++struct phm_clock_voltage_dependency_record {
++	uint32_t clk;
++	uint32_t v;
++};
++
++struct phm_vceclock_voltage_dependency_record {
++	uint32_t ecclk;
++	uint32_t evclk;
++	uint32_t v;
++};
++
++struct phm_uvdclock_voltage_dependency_record {
++	uint32_t vclk;
++	uint32_t dclk;
++	uint32_t v;
++};
++
++struct phm_samuclock_voltage_dependency_record {
++	uint32_t samclk;
++	uint32_t v;
++};
++
++struct phm_acpclock_voltage_dependency_record {
++	uint32_t acpclk;
++	uint32_t v;
++};
++
++struct phm_clock_voltage_dependency_table {
++	uint32_t count;										/* Number of entries. */
++	struct phm_clock_voltage_dependency_record entries[1];		/* Dynamically allocate count entries. */
++};
++
++struct phm_phase_shedding_limits_record {
++	uint32_t  Voltage;
++	uint32_t    Sclk;
++	uint32_t    Mclk;
++};
++
++
++extern int phm_dispatch_table(struct pp_hwmgr *hwmgr,
++			      struct phm_runtime_table_header *rt_table,
++			      void *input, void *output);
++
++extern int phm_construct_table(struct pp_hwmgr *hwmgr,
++			       struct phm_master_table_header *master_table,
++			       struct phm_runtime_table_header *rt_table);
++
++extern int phm_destroy_table(struct pp_hwmgr *hwmgr,
++			     struct phm_runtime_table_header *rt_table);
++
++
++struct phm_uvd_clock_voltage_dependency_record {
++	uint32_t vclk;
++	uint32_t dclk;
++	uint32_t v;
++};
++
++struct phm_uvd_clock_voltage_dependency_table {
++	uint8_t count;
++	struct phm_uvd_clock_voltage_dependency_record entries[1];
++};
++
++struct phm_acp_clock_voltage_dependency_record {
++	uint32_t acpclk;
++	uint32_t v;
++};
++
++struct phm_acp_clock_voltage_dependency_table {
++	uint32_t count;
++	struct phm_acp_clock_voltage_dependency_record entries[1];
++};
++
++struct phm_vce_clock_voltage_dependency_record {
++	uint32_t ecclk;
++	uint32_t evclk;
++	uint32_t v;
++};
++
++struct phm_phase_shedding_limits_table {
++	uint32_t                           count;
++	struct phm_phase_shedding_limits_record  entries[1];
++};
++
++struct phm_vceclock_voltage_dependency_table {
++	uint8_t count;                                    /* Number of entries. */
++	struct phm_vceclock_voltage_dependency_record entries[1]; /* Dynamically allocate count entries. */
++};
++
++struct phm_uvdclock_voltage_dependency_table {
++	uint8_t count;                                    /* Number of entries. */
++	struct phm_uvdclock_voltage_dependency_record entries[1]; /* Dynamically allocate count entries. */
++};
++
++struct phm_samuclock_voltage_dependency_table {
++	uint8_t count;                                    /* Number of entries. */
++	struct phm_samuclock_voltage_dependency_record entries[1]; /* Dynamically allocate count entries. */
++};
++
++struct phm_acpclock_voltage_dependency_table {
++	uint32_t count;                                    /* Number of entries. */
++	struct phm_acpclock_voltage_dependency_record entries[1]; /* Dynamically allocate count entries. */
++};
++
++struct phm_vce_clock_voltage_dependency_table {
++	uint8_t count;
++	struct phm_vce_clock_voltage_dependency_record entries[1];
++};
++
++struct pp_hwmgr_func {
++	int (*backend_init)(struct pp_hwmgr *hw_mgr);
++	int (*backend_fini)(struct pp_hwmgr *hw_mgr);
++	int (*asic_setup)(struct pp_hwmgr *hw_mgr);
++	int (*get_power_state_size)(struct pp_hwmgr *hw_mgr);
++	int (*force_dpm_level)(struct pp_hwmgr *hw_mgr, enum amd_dpm_forced_level level);
++	int (*dynamic_state_management_enable)(struct pp_hwmgr *hw_mgr);
++	int (*patch_boot_state)(struct pp_hwmgr *hwmgr, struct pp_hw_power_state *hw_ps);
++	int (*get_pp_table_entry)(struct pp_hwmgr *hwmgr, unsigned long, struct pp_power_state *);
++	int (*get_num_of_pp_table_entries)(struct pp_hwmgr *hwmgr);
++};
++
++struct pp_table_func {
++	int (*pptable_init)(struct pp_hwmgr *hw_mgr);
++	int (*pptable_fini)(struct pp_hwmgr *hw_mgr);
++	int (*pptable_get_number_of_vce_state_table_entries)(struct pp_hwmgr *hw_mgr);
++	int (*pptable_get_vce_state_table_entry)(
++						struct pp_hwmgr *hwmgr,
++						unsigned long i,
++						struct PP_VCEState *vce_state,
++						void **clock_info,
++						unsigned long *flag);
++};
++
++union phm_cac_leakage_record {
++	struct {
++		uint16_t Vddc;          /* in CI, we use it for StdVoltageHiSidd */
++		uint32_t Leakage;       /* in CI, we use it for StdVoltageLoSidd */
++	};
++	struct {
++		uint16_t Vddc1;
++		uint16_t Vddc2;
++		uint16_t Vddc3;
++	};
++};
++
++struct phm_cac_leakage_table {
++	uint32_t count;
++	union phm_cac_leakage_record entries[1];
++};
++
++struct phm_samu_clock_voltage_dependency_record {
++	uint32_t samclk;
++	uint32_t v;
++};
++
++
++struct phm_samu_clock_voltage_dependency_table {
++	uint8_t count;
++	struct phm_samu_clock_voltage_dependency_record entries[1];
++};
++
++struct phm_cac_tdp_table {
++	uint16_t usTDP;
++	uint16_t usConfigurableTDP;
++	uint16_t usTDC;
++	uint16_t usBatteryPowerLimit;
++	uint16_t usSmallPowerLimit;
++	uint16_t usLowCACLeakage;
++	uint16_t usHighCACLeakage;
++	uint16_t usMaximumPowerDeliveryLimit;
++	uint16_t usOperatingTempMinLimit;
++	uint16_t usOperatingTempMaxLimit;
++	uint16_t usOperatingTempStep;
++	uint16_t usOperatingTempHyst;
++	uint16_t usDefaultTargetOperatingTemp;
++	uint16_t usTargetOperatingTemp;
++	uint16_t usPowerTuneDataSetID;
++	uint16_t usSoftwareShutdownTemp;
++	uint16_t usClockStretchAmount;
++	uint16_t usTemperatureLimitHotspot;
++	uint16_t usTemperatureLimitLiquid1;
++	uint16_t usTemperatureLimitLiquid2;
++	uint16_t usTemperatureLimitVrVddc;
++	uint16_t usTemperatureLimitVrMvdd;
++	uint16_t usTemperatureLimitPlx;
++	uint8_t  ucLiquid1_I2C_address;
++	uint8_t  ucLiquid2_I2C_address;
++	uint8_t  ucLiquid_I2C_Line;
++	uint8_t  ucVr_I2C_address;
++	uint8_t  ucVr_I2C_Line;
++	uint8_t  ucPlx_I2C_address;
++	uint8_t  ucPlx_I2C_Line;
++};
++
++struct phm_ppm_table {
++	uint8_t   ppm_design;
++	uint16_t  cpu_core_number;
++	uint32_t  platform_tdp;
++	uint32_t  small_ac_platform_tdp;
++	uint32_t  platform_tdc;
++	uint32_t  small_ac_platform_tdc;
++	uint32_t  apu_tdp;
++	uint32_t  dgpu_tdp;
++	uint32_t  dgpu_ulv_power;
++	uint32_t  tj_max;
++};
++
++struct phm_vq_budgeting_record {
++	uint32_t ulCUs;
++	uint32_t ulSustainableSOCPowerLimitLow;
++	uint32_t ulSustainableSOCPowerLimitHigh;
++	uint32_t ulMinSclkLow;
++	uint32_t ulMinSclkHigh;
++	uint8_t  ucDispConfig;
++	uint32_t ulDClk;
++	uint32_t ulEClk;
++	uint32_t ulSustainableSclk;
++	uint32_t ulSustainableCUs;
++};
++
++struct phm_vq_budgeting_table {
++	uint8_t numEntries;
++	struct phm_vq_budgeting_record entries[1];
++};
++
++struct phm_clock_and_voltage_limits {
++	uint32_t sclk;
++	uint32_t mclk;
++	uint16_t vddc;
++	uint16_t vddci;
++	uint16_t vddgfx;
++};
++
++
++
++struct phm_dynamic_state_info {
++	struct phm_clock_voltage_dependency_table *vddc_dependency_on_sclk;
++	struct phm_clock_voltage_dependency_table *vddci_dependency_on_mclk;
++	struct phm_clock_voltage_dependency_table *vddc_dependency_on_mclk;
++	struct phm_clock_voltage_dependency_table *mvdd_dependency_on_mclk;
++	struct phm_clock_voltage_dependency_table *vddc_dep_on_dal_pwrl;
++	struct phm_clock_array                    *valid_sclk_values;
++	struct phm_clock_array                    *valid_mclk_values;
++	struct phm_clock_and_voltage_limits       max_clock_voltage_on_dc;
++	struct phm_clock_and_voltage_limits       max_clock_voltage_on_ac;
++	uint32_t                                  mclk_sclk_ratio;
++	uint32_t                                  sclk_mclk_delta;
++	uint32_t                                  vddc_vddci_delta;
++	uint32_t                                  min_vddc_for_pcie_gen2;
++	struct phm_cac_leakage_table              *cac_leakage_table;
++	struct phm_phase_shedding_limits_table	  *vddc_phase_shed_limits_table;
++
++	struct phm_vce_clock_voltage_dependency_table
++					    *vce_clocl_voltage_dependency_table;
++	struct phm_uvd_clock_voltage_dependency_table
++					    *uvd_clocl_voltage_dependency_table;
++	struct phm_acp_clock_voltage_dependency_table
++					    *acp_clock_voltage_dependency_table;
++	struct phm_samu_clock_voltage_dependency_table
++					   *samu_clock_voltage_dependency_table;
++
++	struct phm_ppm_table                          *ppm_parameter_table;
++	struct phm_cac_tdp_table                      *cac_dtp_table;
++	struct phm_clock_voltage_dependency_table	  *vdd_gfx_dependency_on_sclk;
++	struct phm_vq_budgeting_table		  		  *vq_budgeting_table;
++};
++
++struct pp_hwmgr {
++	uint32_t chip_family;
++	uint32_t chip_id;
++	uint32_t hw_revision;
++	uint32_t sub_sys_id;
++	uint32_t sub_vendor_id;
++
++	void *device;
++	struct pp_smumgr *smumgr;
++	const void *soft_pp_table;
++	enum amd_dpm_forced_level dpm_level;
++
++	struct phm_gfx_arbiter gfx_arbiter;
++	struct phm_acp_arbiter acp_arbiter;
++	struct phm_uvd_arbiter uvd_arbiter;
++	struct phm_vce_arbiter vce_arbiter;
++	uint32_t usec_timeout;
++	void *pptable;
++	struct phm_platform_descriptor platform_descriptor;
++	void *backend;
++	enum PP_DAL_POWERLEVEL	dal_power_level;
++	struct phm_dynamic_state_info dyn_state;
++	struct phm_runtime_table_header setup_asic;
++	struct phm_runtime_table_header disable_dynamic_state_management;
++	struct phm_runtime_table_header enable_dynamic_state_management;
++	const struct pp_hwmgr_func *hwmgr_func;
++	const struct pp_table_func *pptable_func;
++	struct pp_power_state    *ps;
++        enum pp_power_source  power_source;
++	uint32_t num_ps;
++	uint32_t ps_size;
++	struct pp_power_state    *current_ps;
++	struct pp_power_state    *request_ps;
++	struct pp_power_state    *boot_ps;
++	struct pp_power_state    *uvd_ps;
++};
++
++
++extern int hwmgr_init(struct amd_pp_init *pp_init,
++		      struct pp_instance *handle);
++
++extern int hwmgr_fini(struct pp_hwmgr *hwmgr);
++
++extern int hw_init_power_state_table(struct pp_hwmgr *hwmgr);
++
++extern int phm_wait_on_register(struct pp_hwmgr *hwmgr, uint32_t index,
++				uint32_t value, uint32_t mask);
++
++extern int phm_wait_for_register_unequal(struct pp_hwmgr *hwmgr,
++				uint32_t index, uint32_t value, uint32_t mask);
++
++
++
++extern void phm_wait_on_indirect_register(struct pp_hwmgr *hwmgr,
++				uint32_t indirect_port,
++				uint32_t index,
++				uint32_t value,
++				uint32_t mask);
++
++extern void phm_wait_for_indirect_register_unequal(
++				struct pp_hwmgr *hwmgr,
++				uint32_t indirect_port,
++				uint32_t index,
++				uint32_t value,
++				uint32_t mask);
++
++#define PHM_FIELD_SHIFT(reg, field) reg##__##field##__SHIFT
++#define PHM_FIELD_MASK(reg, field) reg##__##field##_MASK
++
++#define PHM_SET_FIELD(origval, reg, field, fieldval)	\
++	(((origval) & ~PHM_FIELD_MASK(reg, field)) |	\
++	 (PHM_FIELD_MASK(reg, field) & ((fieldval) << PHM_FIELD_SHIFT(reg, field))))
++
++#define PHM_GET_FIELD(value, reg, field)	\
++	(((value) & PHM_FIELD_MASK(reg, field)) >>	\
++	 PHM_FIELD_SHIFT(reg, field))
++
++
++#define PHM_WAIT_REGISTER_GIVEN_INDEX(hwmgr, index, value, mask)	\
++	phm_wait_on_register(hwmgr, index, value, mask)
++
++#define PHM_WAIT_REGISTER_UNEQUAL_GIVEN_INDEX(hwmgr, index, value, mask)	\
++	phm_wait_for_register_unequal(hwmgr, index, value, mask)
++
++#define PHM_WAIT_INDIRECT_REGISTER_GIVEN_INDEX(hwmgr, port, index, value, mask)	\
++	phm_wait_on_indirect_register(hwmgr, mm##port##_INDEX, index, value, mask)
++
++#define PHM_WAIT_INDIRECT_REGISTER_UNEQUAL_GIVEN_INDEX(hwmgr, port, index, value, mask)	\
++	phm_wait_for_indirect_register_unequal(hwmgr, mm##port##_INDEX, index, value, mask)
++
++#define PHM_WAIT_VFPF_INDIRECT_REGISTER_GIVEN_INDEX(hwmgr, port, index, value, mask)	\
++	phm_wait_on_indirect_register(hwmgr, mm##port##_INDEX_0, index, value, mask)
++
++#define PHM_WAIT_VFPF_INDIRECT_REGISTER_UNEQUAL_GIVEN_INDEX(hwmgr, port, index, value, mask)	\
++	phm_wait_for_indirect_register_unequal(hwmgr, mm##port##_INDEX_0, index, value, mask)
++
++/* Operations on named registers. */
++
++#define PHM_WAIT_REGISTER(hwmgr, reg, value, mask)	\
++	PHM_WAIT_REGISTER_GIVEN_INDEX(hwmgr, mm##reg, value, mask)
++
++#define PHM_WAIT_REGISTER_UNEQUAL(hwmgr, reg, value, mask)	\
++	PHM_WAIT_REGISTER_UNEQUAL_GIVEN_INDEX(hwmgr, mm##reg, value, mask)
++
++#define PHM_WAIT_INDIRECT_REGISTER(hwmgr, port, reg, value, mask)	\
++	PHM_WAIT_INDIRECT_REGISTER_GIVEN_INDEX(hwmgr, port, ix##reg, value, mask)
++
++#define PHM_WAIT_INDIRECT_REGISTER_UNEQUAL(hwmgr, port, reg, value, mask)	\
++	PHM_WAIT_INDIRECT_REGISTER_UNEQUAL_GIVEN_INDEX(hwmgr, port, ix##reg, value, mask)
++
++#define PHM_WAIT_VFPF_INDIRECT_REGISTER(hwmgr, port, reg, value, mask)	\
++	PHM_WAIT_VFPF_INDIRECT_REGISTER_GIVEN_INDEX(hwmgr, port, ix##reg, value, mask)
++
++#define PHM_WAIT_VFPF_INDIRECT_REGISTER_UNEQUAL(hwmgr, port, reg, value, mask)	\
++	PHM_WAIT_VFPF_INDIRECT_REGISTER_UNEQUAL_GIVEN_INDEX(hwmgr, port, ix##reg, value, mask)
++
++/* Operations on named fields. */
++
++#define PHM_READ_FIELD(device, reg, field)	\
++	PHM_GET_FIELD(cgs_read_register(device, mm##reg), reg, field)
++
++#define PHM_READ_INDIRECT_FIELD(device, port, reg, field)	\
++	PHM_GET_FIELD(cgs_read_ind_register(device, port, ix##reg),	\
++			reg, field)
++
++#define PHM_READ_VFPF_INDIRECT_FIELD(device, port, reg, field)	\
++	PHM_GET_FIELD(cgs_read_ind_register(device, port, ix##reg),	\
++			reg, field)
++
++#define PHM_WRITE_FIELD(device, reg, field, fieldval)	\
++	cgs_write_register(device, mm##reg, PHM_SET_FIELD(	\
++				cgs_read_register(device, mm##reg), reg, field, fieldval))
++
++#define PHM_WRITE_INDIRECT_FIELD(device, port, reg, field, fieldval)	\
++	cgs_write_ind_register(device, port, ix##reg,	\
++			PHM_SET_FIELD(cgs_read_ind_register(device, port, ix##reg),	\
++				reg, field, fieldval))
++
++#define PHM_WRITE_VFPF_INDIRECT_FIELD(device, port, reg, field, fieldval)	\
++	cgs_write_ind_register(device, port, ix##reg,	\
++			PHM_SET_FIELD(cgs_read_ind_register(device, port, ix##reg),	\
++				reg, field, fieldval))
++
++#define PHM_WAIT_FIELD(hwmgr, reg, field, fieldval)	\
++	PHM_WAIT_REGISTER(hwmgr, reg, (fieldval)	\
++			<< PHM_FIELD_SHIFT(reg, field), PHM_FIELD_MASK(reg, field))
++
++#define PHM_WAIT_INDIRECT_FIELD(hwmgr, port, reg, field, fieldval)	\
++	PHM_WAIT_INDIRECT_REGISTER(hwmgr, port, reg, (fieldval)	\
++			<< PHM_FIELD_SHIFT(reg, field), PHM_FIELD_MASK(reg, field))
++
++#define PHM_WAIT_VFPF_INDIRECT_FIELD(hwmgr, port, reg, field, fieldval)	\
++	PHM_WAIT_VFPF_INDIRECT_REGISTER(hwmgr, port, reg, (fieldval)	\
++			<< PHM_FIELD_SHIFT(reg, field), PHM_FIELD_MASK(reg, field))
++
++#define PHM_WAIT_FIELD_UNEQUAL(hwmgr, reg, field, fieldval)	\
++	PHM_WAIT_REGISTER_UNEQUAL(hwmgr, reg, (fieldval)	\
++			<< PHM_FIELD_SHIFT(reg, field), PHM_FIELD_MASK(reg, field))
++
++#define PHM_WAIT_INDIRECT_FIELD_UNEQUAL(hwmgr, port, reg, field, fieldval)	\
++	PHM_WAIT_INDIRECT_REGISTER_UNEQUAL(hwmgr, port, reg, (fieldval)	\
++			<< PHM_FIELD_SHIFT(reg, field), PHM_FIELD_MASK(reg, field))
++
++#define PHM_WAIT_VFPF_INDIRECT_FIELD_UNEQUAL(hwmgr, port, reg, field, fieldval)	\
++	PHM_WAIT_VFPF_INDIRECT_REGISTER_UNEQUAL(hwmgr, port, reg, (fieldval)	\
++			<< PHM_FIELD_SHIFT(reg, field), PHM_FIELD_MASK(reg, field))
++
++/* Operations on arrays of registers & fields. */
++
++#define PHM_READ_ARRAY_REGISTER(device, reg, offset)	\
++	cgs_read_register(device, mm##reg + (offset))
++
++#define PHM_WRITE_ARRAY_REGISTER(device, reg, offset, value)	\
++	cgs_write_register(device, mm##reg + (offset), value)
++
++#define PHM_WAIT_ARRAY_REGISTER(hwmgr, reg, offset, value, mask)	\
++	PHM_WAIT_REGISTER_GIVEN_INDEX(hwmgr, mm##reg + (offset), value, mask)
++
++#define PHM_WAIT_ARRAY_REGISTER_UNEQUAL(hwmgr, reg, offset, value, mask)	\
++	PHM_WAIT_REGISTER_UNEQUAL_GIVEN_INDEX(hwmgr, mm##reg + (offset), value, mask)
++
++#define PHM_READ_ARRAY_FIELD(hwmgr, reg, offset, field) \
++	PHM_GET_FIELD(PHM_READ_ARRAY_REGISTER(hwmgr->device, reg, offset), reg, field)
++
++#define PHM_WRITE_ARRAY_FIELD(hwmgr, reg, offset, field, fieldvalue)	\
++	PHM_WRITE_ARRAY_REGISTER(hwmgr->device, reg, offset,	\
++			PHM_SET_FIELD(PHM_READ_ARRAY_REGISTER(hwmgr->device, reg, offset),	\
++				reg, field, fieldvalue))
++
++#define PHM_WAIT_ARRAY_FIELD(hwmgr, reg, offset, field, fieldvalue)	\
++	PHM_WAIT_REGISTER_GIVEN_INDEX(hwmgr, mm##reg + (offset),	\
++			(fieldvalue) << PHM_FIELD_SHIFT(reg, field),	\
++			PHM_FIELD_MASK(reg, field))
++
++#define PHM_WAIT_ARRAY_FIELD_UNEQUAL(hwmgr, reg, offset, field, fieldvalue)	\
++	PHM_WAIT_REGISTER_UNEQUAL_GIVEN_INDEX(hwmgr, mm##reg + (offset),	\
++			(fieldvalue) << PHM_FIELD_SHIFT(reg, field),	\
++			PHM_FIELD_MASK(reg, field))
++
++#endif /* _HWMGR_H_ */
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/power_state.h b/drivers/gpu/drm/amd/powerplay/inc/power_state.h
+new file mode 100644
+index 0000000..c63bcc7
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/inc/power_state.h
+@@ -0,0 +1,200 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#ifndef PP_POWERSTATE_H
++#define PP_POWERSTATE_H
++
++struct pp_hw_power_state {
++	unsigned int magic;
++};
++
++struct pp_power_state;
++
++
++#define PP_INVALID_POWER_STATE_ID (0)
++
++
++/*
++ * An item of a list containing Power States.
++ */
++
++struct PP_StateLinkedList {
++	struct pp_power_state *next;
++	struct pp_power_state *prev;
++};
++
++
++enum PP_StateUILabel {
++	PP_StateUILabel_None,
++	PP_StateUILabel_Battery,
++	PP_StateUILabel_MiddleLow,
++	PP_StateUILabel_Balanced,
++	PP_StateUILabel_MiddleHigh,
++	PP_StateUILabel_Performance,
++	PP_StateUILabel_BACO
++};
++
++enum PP_StateClassificationFlag {
++	PP_StateClassificationFlag_Boot                = 0x0001,
++	PP_StateClassificationFlag_Thermal             = 0x0002,
++	PP_StateClassificationFlag_LimitedPowerSource  = 0x0004,
++	PP_StateClassificationFlag_Rest                = 0x0008,
++	PP_StateClassificationFlag_Forced              = 0x0010,
++	PP_StateClassificationFlag_User3DPerformance   = 0x0020,
++	PP_StateClassificationFlag_User2DPerformance   = 0x0040,
++	PP_StateClassificationFlag_3DPerformance       = 0x0080,
++	PP_StateClassificationFlag_ACOverdriveTemplate   = 0x0100,
++	PP_StateClassificationFlag_Uvd                 = 0x0200,
++	PP_StateClassificationFlag_3DPerformanceLow    = 0x0400,
++	PP_StateClassificationFlag_ACPI                = 0x0800,
++	PP_StateClassificationFlag_HD2                 = 0x1000,
++	PP_StateClassificationFlag_UvdHD               = 0x2000,
++	PP_StateClassificationFlag_UvdSD               = 0x4000,
++	PP_StateClassificationFlag_UserDCPerformance    = 0x8000,
++	PP_StateClassificationFlag_DCOverdriveTemplate   = 0x10000,
++	PP_StateClassificationFlag_BACO                  = 0x20000,
++	PP_StateClassificationFlag_LimitedPowerSource_2  = 0x40000,
++	PP_StateClassificationFlag_ULV                   = 0x80000,
++	PP_StateClassificationFlag_UvdMVC               = 0x100000,
++};
++
++typedef unsigned int PP_StateClassificationFlags;
++
++struct PP_StateClassificationBlock {
++	enum PP_StateUILabel         ui_label;
++	enum PP_StateClassificationFlag  flags;
++	int                          bios_index;
++	bool                      temporary_state;
++	bool                      to_be_deleted;
++};
++
++struct PP_StatePcieBlock {
++	unsigned int lanes;
++};
++
++enum PP_RefreshrateSource {
++	PP_RefreshrateSource_EDID,
++	PP_RefreshrateSource_Explicit
++};
++
++struct PP_StateDisplayBlock {
++	bool              disableFrameModulation;
++	bool              limitRefreshrate;
++	enum PP_RefreshrateSource refreshrateSource;
++	int                  explicitRefreshrate;
++	int                  edidRefreshrateIndex;
++	bool              enableVariBright;
++};
++
++struct PP_StateMemroyBlock {
++	bool              dllOff;
++	uint8_t                 m3arb;
++	uint8_t                 unused[3];
++};
++
++struct PP_StateSoftwareAlgorithmBlock {
++	bool disableLoadBalancing;
++	bool enableSleepForTimestamps;
++};
++
++#define PP_TEMPERATURE_UNITS_PER_CENTIGRADES 1000
++
++/**
++ * Type to hold a temperature range.
++ */
++struct PP_TemperatureRange {
++	uint16_t min;
++	uint16_t max;
++};
++
++struct PP_StateValidationBlock {
++	bool singleDisplayOnly;
++	bool disallowOnDC;
++	uint8_t supportedPowerLevels;
++};
++
++struct PP_UVD_CLOCKS {
++	uint32_t VCLK;
++	uint32_t DCLK;
++};
++
++/**
++* Structure to hold a PowerPlay Power State.
++*/
++struct pp_power_state {
++	uint32_t                            id;
++	struct PP_StateLinkedList                  orderedList;
++	struct PP_StateLinkedList                  allStatesList;
++
++	struct PP_StateClassificationBlock         classification;
++	struct PP_StateValidationBlock             validation;
++	struct PP_StatePcieBlock                   pcie;
++	struct PP_StateDisplayBlock                display;
++	struct PP_StateMemroyBlock                 memory;
++	struct PP_TemperatureRange                 temperatures;
++	struct PP_StateSoftwareAlgorithmBlock      software;
++	struct PP_UVD_CLOCKS                       uvd_clocks;
++	struct pp_hw_power_state  hardware;
++};
++
++
++/*Structure to hold a VCE state entry*/
++struct PP_VCEState {
++	uint32_t evclk;
++	uint32_t ecclk;
++	uint32_t sclk;
++	uint32_t mclk;
++};
++
++enum PP_MMProfilingState {
++	PP_MMProfilingState_NA = 0,
++	PP_MMProfilingState_Started,
++	PP_MMProfilingState_Stopped
++};
++
++struct PP_Clock_Engine_Request {
++	unsigned long clientType;
++	unsigned long ctxid;
++	uint64_t  context_handle;
++	unsigned long sclk;
++	unsigned long sclkHardMin;
++	unsigned long mclk;
++	unsigned long iclk;
++	unsigned long evclk;
++	unsigned long ecclk;
++	unsigned long ecclkHardMin;
++	unsigned long vclk;
++	unsigned long dclk;
++	unsigned long samclk;
++	unsigned long acpclk;
++	unsigned long sclkOverdrive;
++	unsigned long mclkOverdrive;
++	unsigned long sclk_threshold;
++	unsigned long flag;
++	unsigned long vclk_ceiling;
++	unsigned long dclk_ceiling;
++	unsigned long num_cus;
++	unsigned long pmflag;
++	enum PP_MMProfilingState MMProfilingState;
++};
++
++#endif
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/pp_acpi.h b/drivers/gpu/drm/amd/powerplay/inc/pp_acpi.h
+new file mode 100644
+index 0000000..3bd5e69
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/inc/pp_acpi.h
+@@ -0,0 +1,28 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++extern bool acpi_atcs_functions_supported(void *device,
++							uint32_t index);
++extern int acpi_pcie_perf_request(void *device,
++						uint8_t perf_req,
++						bool advertise);
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/pp_instance.h b/drivers/gpu/drm/amd/powerplay/inc/pp_instance.h
+index 318f827..35dfcd9 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/pp_instance.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/pp_instance.h
+@@ -24,10 +24,11 @@
+ #define _PP_INSTANCE_H_
+ 
+ #include "smumgr.h"
+-
++#include "hwmgr.h"
+ 
+ struct pp_instance {
+ 	struct pp_smumgr *smu_mgr;
++	struct pp_hwmgr *hwmgr;
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/pp_power_source.h b/drivers/gpu/drm/amd/powerplay/inc/pp_power_source.h
+new file mode 100644
+index 0000000..b43315c
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/inc/pp_power_source.h
+@@ -0,0 +1,36 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef PP_POWERSOURCE_H
++#define PP_POWERSOURCE_H
++
++enum pp_power_source {
++	PP_PowerSource_AC = 0,
++	PP_PowerSource_DC,
++	PP_PowerSource_LimitedPower,
++	PP_PowerSource_LimitedPower_2,
++	PP_PowerSource_Max
++};
++
++
++#endif
+-- 
+2.7.4
+

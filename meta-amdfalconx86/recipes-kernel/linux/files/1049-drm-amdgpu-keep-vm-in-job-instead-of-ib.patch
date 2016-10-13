@@ -1,0 +1,303 @@
+From 442066909f2cae3d323fb3de4f1645f62988e0f9 Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Tue, 19 Apr 2016 20:11:32 +0800
+Subject: [PATCH 1049/1110] drm/amdgpu: keep vm in job instead of ib
+
+ib.vm is a legacy way to get vm, after scheduler
+implemented vm should be get from job, and all ibs
+from one job share the same vm, no need to keep ib.vm
+just move vm field to job.
+
+this patch as well add job as paramter to ib_schedule
+so it can get vm from job->vm.
+
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  6 +++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c  | 15 ++++-----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c | 10 +++++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c   |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c  |  2 +-
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c  |  2 +-
+ 11 files changed, 23 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 01aab7e..35de174 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -743,7 +743,6 @@ struct amdgpu_ib {
+ 	uint64_t			gpu_addr;
+ 	uint32_t			*ptr;
+ 	struct amdgpu_user_fence        *user;
+-	struct amdgpu_vm		*vm;
+         unsigned                        vm_id;
+         uint64_t                        vm_pd_addr;
+ 	struct amdgpu_ctx		*ctx;
+@@ -765,8 +764,7 @@ enum amdgpu_ring_type {
+ 
+ extern const struct amd_sched_backend_ops amdgpu_sched_ops;
+ int amdgpu_job_alloc_with_ib(struct amdgpu_device *adev, unsigned size,
+-                             struct amdgpu_job **job);
+-
++                      struct amdgpu_job **job, struct amdgpu_vm *vm);
+ void amdgpu_job_free(struct amdgpu_job *job);
+ void amdgpu_job_free_func(struct kref *refcount);
+ int amdgpu_job_submit(struct amdgpu_job *job, struct amdgpu_ring *ring,
+@@ -1200,6 +1198,7 @@ int amdgpu_ib_get(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ void amdgpu_ib_free(struct amdgpu_device *adev, struct amdgpu_ib *ib, struct fence *f);
+ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+                        struct amdgpu_ib *ib, struct fence *last_vm_update,
++                       struct amdgpu_job *job, struct fence **f);
+ int amdgpu_ib_pool_init(struct amdgpu_device *adev);
+ void amdgpu_ib_pool_fini(struct amdgpu_device *adev);
+ int amdgpu_ib_ring_tests(struct amdgpu_device *adev);
+@@ -1255,6 +1254,7 @@ struct amdgpu_cs_parser {
+ struct amdgpu_job {
+ 	struct amd_sched_job    base;
+ 	struct amdgpu_device	*adev;
++        struct amdgpu_vm        *vm;
+         struct amdgpu_ring      *ring;
+         struct amdgpu_sync      sync;
+ 	struct amdgpu_ib	*ibs;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 55a5814..7e8b6bb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -161,6 +161,7 @@ static int amdgpu_cs_user_fence_chunk(struct amdgpu_cs_parser *p,
+ int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
+ {
+         struct amdgpu_fpriv *fpriv = p->filp->driver_priv;
++        struct amdgpu_vm *vm = &fpriv->vm;
+ 	union drm_amdgpu_cs *cs = data;
+ 	uint64_t *chunk_array_user;
+ 	uint64_t *chunk_array;
+@@ -259,7 +260,7 @@ int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
+ 		}
+ 	}
+ 
+-        ret = amdgpu_job_alloc(p->adev, num_ibs, &p->job);
++        ret = amdgpu_job_alloc(p->adev, num_ibs, &p->job, vm);
+         if (ret)
+                 goto free_all_kdata;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 146b55e..1d15ac6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -74,7 +74,6 @@ int amdgpu_ib_get(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 			ib->gpu_addr = amdgpu_sa_bo_gpu_addr(ib->sa_bo);
+ 	}
+ 
+-	ib->vm = vm;
+ 	ib->vm_id = 0;
+ 
+ 	return 0;
+@@ -116,13 +115,13 @@ void amdgpu_ib_free(struct amdgpu_device *adev, struct amdgpu_ib *ib, struct fen
+  */
+ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+                        struct amdgpu_ib *ibs, struct fence *last_vm_update,
+-		       struct fence **f)
++                       struct amdgpu_job *job, struct fence **f)
+ {
+         struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib *ib = &ibs[0];
+ 	struct amdgpu_ctx *ctx, *old_ctx;
+-	struct amdgpu_vm *vm;
+ 	struct fence *hwf;
++        struct amdgpu_vm *vm = NULL;
+         unsigned i, patch_offset = ~0;
+ 
+ 	int r = 0;
+@@ -131,7 +130,8 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 		return -EINVAL;
+ 
+ 	ctx = ibs->ctx;
+-	vm = ibs->vm;
++	if (job) /* for domain0 job like ring test, ibs->job is not assigned */
++		vm = job->vm;
+ 
+ 	if (!ring->ready) {
+ 		dev_err(adev->dev, "couldn't schedule ib\n");
+@@ -171,13 +171,6 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 	for (i = 0; i < num_ibs; ++i) {
+ 		ib = &ibs[i];
+ 
+-                if (ib->ctx != ctx || ib->vm != vm) {
+-			ring->current_ctx = old_ctx;
+-			if (ib->vm_id)
+-				amdgpu_vm_reset_id(adev, ib->vm_id);
+-			amdgpu_ring_undo(ring);
+-			return -EINVAL;
+-		}
+ 		amdgpu_ring_emit_ib(ring, ib);
+ 		ring->current_ctx = ctx;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index f9e7336..50257ad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -46,7 +46,7 @@ void amdgpu_job_timeout_func(struct work_struct *work)
+ }
+ 
+ int amdgpu_job_alloc(struct amdgpu_device *adev, unsigned num_ibs,
+-                    struct amdgpu_job **job)
++                    struct amdgpu_job **job, struct amdgpu_vm *vm)
+ {
+        size_t size = sizeof(struct amdgpu_job);
+ 
+@@ -60,6 +60,7 @@ int amdgpu_job_alloc(struct amdgpu_device *adev, unsigned num_ibs,
+                return -ENOMEM;
+ 
+        (*job)->adev = adev;
++       (*job)->vm = vm;
+        (*job)->ibs = (void *)&(*job)[1];
+        (*job)->num_ibs = num_ibs;
+        INIT_WORK(&(*job)->base.work_free_job, amdgpu_job_free_handler);
+@@ -74,7 +75,7 @@ int amdgpu_job_alloc_with_ib(struct amdgpu_device *adev, unsigned size,
+ {
+        int r;
+ 
+-       r = amdgpu_job_alloc(adev, 1, job);
++       r = amdgpu_job_alloc(adev, 1, job, NULL);
+        if (r)
+                return r;
+ 
+@@ -137,8 +138,7 @@ int amdgpu_job_submit(struct amdgpu_job *job, struct amdgpu_ring *ring,
+ static struct fence *amdgpu_job_dependency(struct amd_sched_job *sched_job)
+ {
+        struct amdgpu_job *job = to_amdgpu_job(sched_job);
+-       struct amdgpu_vm *vm = job->ibs->vm;
+-
++       struct amdgpu_vm *vm = job->vm;
+        struct fence *fence = amdgpu_sync_get_fence(&job->sync);
+ 
+        if (fence == NULL && vm && !job->ibs->vm_id) {
+@@ -185,7 +185,7 @@ static struct fence *amdgpu_job_run(struct amd_sched_job *sched_job)
+ 
+        trace_amdgpu_sched_run_job(job);
+        r = amdgpu_ib_schedule(job->ring, job->num_ibs, job->ibs,
+-                              job->sync.last_vm_update, &fence);
++                              job->sync.last_vm_update, job, &fence);
+        if (r) {
+                DRM_ERROR("Error scheduling IBs (%d)\n", r);
+                goto err;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+index 7327a20..7c44f74 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+@@ -924,7 +924,7 @@ static int amdgpu_uvd_send_msg(struct amdgpu_ring *ring, struct amdgpu_bo *bo,
+ 						 AMDGPU_FENCE_OWNER_UNDEFINED,
+ 						 &f);
+         if (direct) {
+-                r = amdgpu_ib_schedule(ring, 1, ib, NULL, &f);
++                r = amdgpu_ib_schedule(ring, 1, ib, NULL, NULL, &f);
+                 job->fence = f;
+                 if (r)
+                         goto err_free;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+index 199f5cb..97c3268 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+@@ -452,7 +452,7 @@ int amdgpu_vce_get_create_msg(struct amdgpu_ring *ring, uint32_t handle,
+ 						 &amdgpu_vce_free_job,
+ 						 AMDGPU_FENCE_OWNER_UNDEFINED,
+ 						 &f);
+-        r = amdgpu_ib_schedule(ring, 1, ib, NULL, &f);
++        r = amdgpu_ib_schedule(ring, 1, ib, NULL, NULL, &f);
+                  job->fence = f;
+ 	if (r)
+ 		goto err;
+@@ -524,7 +524,7 @@ int amdgpu_vce_get_destroy_msg(struct amdgpu_ring *ring, uint32_t handle,
+ 						 &f);
+ 
+        if (direct) {
+-                r = amdgpu_ib_schedule(ring, 1, ib, NULL, &f);
++                r = amdgpu_ib_schedule(ring, 1, ib, NULL, NULL, &f);
+                 if (r)
+                         goto err;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 1ae79fc..48505c9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -643,7 +643,7 @@ static int cik_sdma_ring_test_ib(struct amdgpu_ring *ring)
+ 	ib.ptr[3] = 1;
+ 	ib.ptr[4] = 0xDEADBEEF;
+ 	ib.length_dw = 5;
+-        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, &f);
++        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, NULL, &f);
+ 	if (r)
+ 		goto err1;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index f1842f9..ef1a800 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2136,7 +2136,7 @@ static int gfx_v7_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	ib.ptr[2] = 0xDEADBEEF;
+ 	ib.length_dw = 3;
+ 
+-        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, &f);
++        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, NULL, &f);
+ 	if (r)
+ 		goto err2;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index dffa413..c2941ba 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -800,7 +800,7 @@ static int gfx_v8_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	ib.ptr[2] = 0xDEADBEEF;
+ 	ib.length_dw = 3;
+ 
+-        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, &f);
++        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, NULL, &f);
+ 	if (r)
+ 		goto err2;
+ 
+@@ -1551,7 +1551,7 @@ static int gfx_v8_0_do_edc_gpr_workarounds(struct amdgpu_device *adev)
+ 	ib.ptr[ib.length_dw++] = EVENT_TYPE(7) | EVENT_INDEX(4);
+ 
+ 	/* shedule the ib on the ring */
+-        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, &f);
++        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, NULL, &f);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: ib submit failed (%d).\n", r);
+ 		goto fail;
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index 037a425..6bfdb3f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -701,7 +701,7 @@ static int sdma_v2_4_ring_test_ib(struct amdgpu_ring *ring)
+ 	ib.ptr[7] = SDMA_PKT_HEADER_OP(SDMA_OP_NOP);
+ 	ib.length_dw = 8;
+ 
+-        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, &f);
++        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, NULL, &f);
+ 	if (r)
+ 		goto err1;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index c94c266..798d39b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -925,7 +925,7 @@ static int sdma_v3_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	ib.ptr[7] = SDMA_PKT_NOP_HEADER_OP(SDMA_OP_NOP);
+ 	ib.length_dw = 8;
+ 
+-        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, &f);
++        r = amdgpu_ib_schedule(ring, 1, &ib, NULL, NULL, &f);
+ 	if (r)
+ 		goto err1;
+ 
+-- 
+2.7.4
+

@@ -1,0 +1,189 @@
+From 2f62816bd4ac61ca50b157d900fbd02cc94a92aa Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Thu, 10 Mar 2016 12:14:44 +0800
+Subject: [PATCH 0451/1110] drm/amdgpu: use ref to keep job alive
+
+this is to fix fatal page fault error that occured if:
+job is signaled/released after its timeout work is already
+put to the global queue (in this case the cancel_delayed_work
+will return false), which will lead to NX-protection error
+page fault during job_timeout_func.
+
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c        |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c       | 15 ++++++++++++---
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c |  8 +++++++-
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h | 13 +++++++++++++
+ 5 files changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 2474405..b0aeca5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -750,6 +750,7 @@ int amdgpu_job_alloc_with_ib(struct amdgpu_device *adev, unsigned size,
+                              struct amdgpu_job **job);
+ 
+ void amdgpu_job_free(struct amdgpu_job *job);
++void amdgpu_job_free_func(struct kref *refcount);
+ int amdgpu_job_submit(struct amdgpu_job *job, struct amdgpu_ring *ring,
+                       struct amd_sched_entity *entity, void *owner,
+                       struct fence **f);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index df923cf..807670c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -924,6 +924,7 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+         r = amd_sched_job_init(&job->base, &ring->sched,
+                                                 &p->ctx->rings[ring->idx].entity,
+                                                 amdgpu_job_timeout_func,
++                                                amdgpu_job_free_func,
+                                                 p->filp, &fence);
+         if (r) {
+ 	
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index d00335a..7b4bbcc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -31,7 +31,7 @@
+ static void amdgpu_job_free_handler(struct work_struct *ws)
+ {
+ 	struct amdgpu_job *job = container_of(ws, struct amdgpu_job, base.work_free_job);
+-	kfree(job);
++	amd_sched_job_put(&job->base);
+ }
+ 
+ void amdgpu_job_timeout_func(struct work_struct *work)
+@@ -41,6 +41,8 @@ void amdgpu_job_timeout_func(struct work_struct *work)
+ 				job->base.sched->name,
+ 				(uint32_t)atomic_read(&job->ring->fence_drv.last_seq),
+ 				job->ring->fence_drv.sync_seq);
++
++	amd_sched_job_put(&job->base);
+ }
+ 
+ int amdgpu_job_alloc(struct amdgpu_device *adev, unsigned num_ibs,
+@@ -101,6 +103,12 @@ void amdgpu_job_free(struct amdgpu_job *job)
+                 kfree(job);
+ }
+ 
++void amdgpu_job_free_func(struct kref *refcount)
++{
++	struct amdgpu_job *job = container_of(refcount, struct amdgpu_job, base.refcount);
++	kfree(job);
++}
++
+ int amdgpu_job_submit(struct amdgpu_job *job, struct amdgpu_ring *ring,
+                       struct amd_sched_entity *entity, void *owner,
+                       struct fence **f)
+@@ -112,9 +120,10 @@ int amdgpu_job_submit(struct amdgpu_job *job, struct amdgpu_ring *ring,
+                return -EINVAL;
+ 
+        r = amd_sched_job_init(&job->base, &ring->sched,
+-                                                       entity, owner,
++                                                       entity,
+                                                        amdgpu_job_timeout_func,
+-                                                       &fence);
++                                                       amdgpu_job_free_func,
++                                                       owner, &fence);
+        if (r)
+                return r;
+ 
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index b7e8071..639c70d 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -333,7 +333,8 @@ void amd_sched_job_finish(struct amd_sched_job *s_job)
+ 	struct amd_gpu_scheduler *sched = s_job->sched;
+ 
+ 	if (sched->timeout != MAX_SCHEDULE_TIMEOUT) {
+-		cancel_delayed_work(&s_job->work_tdr); /*TODO: how to deal the case that tdr is running */
++		if (cancel_delayed_work(&s_job->work_tdr))
++			amd_sched_job_put(s_job);
+ 
+ 		/* queue TDR for next job */
+ 		next = list_first_entry_or_null(&sched->ring_mirror_list,
+@@ -341,6 +342,7 @@ void amd_sched_job_finish(struct amd_sched_job *s_job)
+ 
+ 		if (next) {
+ 			INIT_DELAYED_WORK(&next->work_tdr, s_job->timeout_callback);
++			amd_sched_job_get(next);
+ 			schedule_delayed_work(&next->work_tdr, sched->timeout);
+ 		}
+ 	}
+@@ -354,6 +356,7 @@ void amd_sched_job_begin(struct amd_sched_job *s_job)
+ 		list_first_entry_or_null(&sched->ring_mirror_list, struct amd_sched_job, node) == s_job)
+ 	{
+ 		INIT_DELAYED_WORK(&s_job->work_tdr, s_job->timeout_callback);
++		amd_sched_job_get(s_job);
+ 		schedule_delayed_work(&s_job->work_tdr, sched->timeout);
+ 	}
+ }
+@@ -382,9 +385,11 @@ int amd_sched_job_init(struct amd_sched_job *job,
+ 						struct amd_gpu_scheduler *sched,
+ 						struct amd_sched_entity *entity,
+ 						void (*timeout_cb)(struct work_struct *work),
++						void (*free_cb)(struct kref *refcount),
+ 						void *owner, struct fence **fence)
+ {
+ 	INIT_LIST_HEAD(&job->node);
++	kref_init(&job->refcount);
+ 	job->sched = sched;
+ 	job->s_entity = entity;
+ 	job->s_fence = amd_sched_fence_create(entity, owner);
+@@ -393,6 +398,7 @@ int amd_sched_job_init(struct amd_sched_job *job,
+ 
+ 	job->s_fence->s_job = job;
+ 	job->timeout_callback = timeout_cb;
++	job->free_callback = free_cb;
+ 
+ 	if (fence)
+ 		*fence = &job->s_fence->base;
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index a5700ad..95ebfd0 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -78,6 +78,7 @@ struct amd_sched_fence {
+ };
+ 
+ struct amd_sched_job {
++	struct kref refcount;
+ 	struct amd_gpu_scheduler        *sched;
+ 	struct amd_sched_entity         *s_entity;
+ 	struct amd_sched_fence          *s_fence;
+@@ -87,6 +88,7 @@ struct amd_sched_job {
+ 	struct list_head			   node;
+ 	struct delayed_work work_tdr;
+ 	void (*timeout_callback) (struct work_struct *work);
++	void (*free_callback)(struct kref *refcount);
+ };
+ 
+ extern const struct fence_ops amd_sched_fence_ops;
+@@ -155,9 +157,20 @@ int amd_sched_job_init(struct amd_sched_job *job,
+ 					struct amd_gpu_scheduler *sched,
+ 					struct amd_sched_entity *entity,
+ 					void (*timeout_cb)(struct work_struct *work),
++					void (*free_cb)(struct kref* refcount),
+ 					void *owner, struct fence **fence);
+ void amd_sched_job_pre_schedule(struct amd_gpu_scheduler *sched ,
+ 								struct amd_sched_job *s_job);
+ void amd_sched_job_finish(struct amd_sched_job *s_job);
+ void amd_sched_job_begin(struct amd_sched_job *s_job);
++static inline void amd_sched_job_get(struct amd_sched_job *job) {
++	if (job)
++		kref_get(&job->refcount);
++}
++
++static inline void amd_sched_job_put(struct amd_sched_job *job) {
++	if (job)
++		kref_put(&job->refcount, job->free_callback);
++}
++
+ #endif
+-- 
+2.7.4
+

@@ -1,0 +1,1270 @@
+From fc2a45ea5855721d7cf2c891e9592b4c63dd612c Mon Sep 17 00:00:00 2001
+From: Jun Lei <Jun.Lei@amd.com>
+Date: Tue, 29 Dec 2015 19:25:37 -0500
+Subject: [PATCH 0661/1110] drm/amd/dal: Refactor DCE11 timing generator
+
+Refactor timing generator for DCE11 to be called directly from DC rather than
+exclusively through HWSS.
+
+This is meant as a template to avoid always going through HWSS for all calls to HW.
+This creates a better defined role for HWSS to only implement actual
+sequences rather than as a generic layer.
+
+Signed-off-by: Jordan Lazare <Jordan.Lazare@amd.com>
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |  87 +++--
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    |  71 +++-
+ .../amd/dal/dc/dce110/dce110_timing_generator.c    | 363 +++++++++++++--------
+ .../amd/dal/dc/dce110/dce110_timing_generator.h    |  55 +++-
+ .../amd/dal/include/timing_generator_interface.h   |  30 ++
+ .../drm/amd/dal/include/timing_generator_types.h   |  50 ++-
+ 6 files changed, 470 insertions(+), 186 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/dal/include/timing_generator_interface.h
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index fa6b9b4..1085137 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -671,7 +671,7 @@ static void enable_stream(struct core_stream *stream)
+ 	if (early_control == 0)
+ 		early_control = lane_count;
+ 
+-	dce110_timing_generator_set_early_control(tg, early_control);
++	tg->funcs->set_early_control(tg, early_control);
+ 
+ 	/* enable audio only within mode set */
+ 	if (stream->audio != NULL) {
+@@ -800,7 +800,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 		/* Must blank CRTC after disabling power gating and before any
+ 		 * programming, otherwise CRTC will be hung in bad state
+ 		 */
+-		dce110_timing_generator_blank_crtc(stream->tg);
++		stream->tg->funcs->set_blank(stream->tg, true);
+ 
+ 		core_link_disable_stream(
+ 				stream->sink->link, stream);
+@@ -815,12 +815,10 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 		}
+ 
+ 
+-		if (false == dce110_timing_generator_program_timing_generator(
++		stream->tg->funcs->program_timing(
+ 				stream->tg,
+-				&stream->public.timing)) {
+-			BREAK_TO_DEBUGGER();
+-			return DC_ERROR_UNEXPECTED;
+-		}
++				&stream->public.timing,
++				true);
+ 	}
+ 
+ 	/*TODO: mst support - use total stream count*/
+@@ -829,7 +827,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 			context->target_count);
+ 
+ 	if (timing_changed) {
+-		if (false == dce110_timing_generator_enable_crtc(
++		if (false == stream->tg->funcs->enable_crtc(
+ 				stream->tg)) {
+ 			BREAK_TO_DEBUGGER();
+ 			return DC_ERROR_UNEXPECTED;
+@@ -896,7 +894,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(uint8_t controller_idx,
+ 	color_space = get_output_color_space(
+ 			&stream->public.timing);
+ 
+-	dce110_timing_generator_program_blank_color(
++	stream->tg->funcs->set_blank_color(
+ 			context->res_ctx.pool.timing_generators[controller_idx],
+ 			color_space);
+ 
+@@ -928,7 +926,7 @@ static void power_down_controllers(struct dc *dc)
+ 	int i;
+ 
+ 	for (i = 0; i < dc->res_pool.controller_count; i++) {
+-		dce110_timing_generator_disable_crtc(
++		dc->res_pool.timing_generators[i]->funcs->disable_crtc(
+ 				dc->res_pool.timing_generators[i]);
+ 	}
+ }
+@@ -972,7 +970,7 @@ static void disable_vga_and_power_gate_all_controllers(
+ 		tg = dc->res_pool.timing_generators[i];
+ 		ctx = dc->ctx;
+ 
+-		dce110_timing_generator_disable_vga(tg);
++		tg->funcs->disable_vga(tg);
+ 
+ 		/* Enable CLOCK gating for each pipe BEFORE controller
+ 		 * powergating. */
+@@ -1336,7 +1334,7 @@ static bool setup_line_buffer_pixel_depth(
+ 
+ 	if (current_depth != depth) {
+ 		if (blank)
+-			dce110_timing_generator_wait_for_vblank(tg);
++			tg->funcs->wait_for_state(tg, CRTC_STATE_VBLANK);
+ 
+ 		return dce110_transform_set_pixel_storage_depth(xfm, depth);
+ 	}
+@@ -1421,9 +1419,7 @@ static void program_scaler(
+ 		LB_PIXEL_DEPTH_24BPP,
+ 		false);
+ 
+-	dce110_timing_generator_set_overscan_color_black(
+-			tg,
+-			surface->public.colorimetry.color_space);
++	tg->funcs->set_overscan_blank_color(tg, surface->public.colorimetry.color_space);
+ 
+ 	dce110_transform_set_scaler(xfm, &scaler_data);
+ 
+@@ -1433,8 +1429,6 @@ static void program_scaler(
+ 			false);
+ }
+ 
+-
+-
+ static void configure_locking(struct dc_context *ctx, uint8_t controller_id)
+ {
+ 	/* main controller should be in mode 0 (master pipe) */
+@@ -1484,7 +1478,7 @@ static bool set_plane_config(
+ 			PIPE_LOCK_CONTROL_SURFACE,
+ 			true);
+ 
+-	dce110_timing_generator_program_blanking(tg, dc_crtc_timing);
++	tg->funcs->program_timing(tg, dc_crtc_timing, false);
+ 
+ 	enable_fe_clock(ctx, controller_idx, true);
+ 
+@@ -1577,8 +1571,8 @@ static void reset_single_stream_hw_ctx(struct core_stream *stream,
+ 
+ 	core_link_disable_stream(stream->sink->link, stream);
+ 
+-	dce110_timing_generator_blank_crtc(stream->tg);
+-	dce110_timing_generator_disable_crtc(stream->tg);
++	stream->tg->funcs->set_blank(stream->tg, true);
++	stream->tg->funcs->disable_crtc(stream->tg);
+ 	dce110_mem_input_deallocate_dmif_buffer(stream->mi, context->target_count);
+ 	dce110_transform_set_scaler_bypass(stream->xfm);
+ 	disable_stereo_mixer(stream->ctx);
+@@ -1630,12 +1624,12 @@ static bool wait_for_reset_trigger_to_occur(
+ 
+ 	for (i = 0; i < frames_to_wait_on_triggered_reset; i++) {
+ 
+-		if (!dce110_timing_generator_is_counter_moving(tg)) {
++		if (!tg->funcs->is_counter_moving(tg)) {
+ 			DC_ERROR("TG counter is not moving!\n");
+ 			break;
+ 		}
+ 
+-		if (dce110_timing_generator_did_triggered_reset_occur(tg)) {
++		if (tg->funcs->did_triggered_reset_occur(tg)) {
+ 			rc = true;
+ 			/* usually occurs at i=1 */
+ 			DC_SYNC_INFO("GSL: reset occurred at wait count: %d\n",
+@@ -1644,8 +1638,8 @@ static bool wait_for_reset_trigger_to_occur(
+ 		}
+ 
+ 		/* Wait for one frame. */
+-		dce110_timing_generator_wait_for_vactive(tg);
+-		dce110_timing_generator_wait_for_vblank(tg);
++		tg->funcs->wait_for_state(tg, CRTC_STATE_VACTIVE);
++		tg->funcs->wait_for_state(tg, CRTC_STATE_VBLANK);
+ 	}
+ 
+ 	if (false == rc)
+@@ -1675,8 +1669,7 @@ static void enable_timing_synchronization(
+ 		 * the 1st one in the group. */
+ 		gsl_params.timing_server = (0 == i ? true : false);
+ 
+-		dce110_timing_generator_setup_global_swap_lock(tgs[i],
+-				&gsl_params);
++		tgs[i]->funcs->setup_global_swap_lock(tgs[i], &gsl_params);
+ 	}
+ 
+ 	/* Reset slave controllers on master VSync */
+@@ -1687,8 +1680,7 @@ static void enable_timing_synchronization(
+ 	trigger_params.source = SYNC_SOURCE_GSL_GROUP0;
+ 
+ 	for (i = 1 /* skip the master */; i < timing_generator_num; i++) {
+-		dce110_timing_generator_enable_reset_trigger(tgs[i],
+-				&trigger_params);
++		tgs[i]->funcs->enable_reset_trigger(tgs[i], &trigger_params);
+ 
+ 		DC_SYNC_INFO("GSL: waiting for reset to occur.\n");
+ 		wait_for_reset_trigger_to_occur(dc_ctx, tgs[i]);
+@@ -1696,35 +1688,60 @@ static void enable_timing_synchronization(
+ 		/* Regardless of success of the wait above, remove the reset or
+ 		 * the driver will start timing out on Display requests. */
+ 		DC_SYNC_INFO("GSL: disabling trigger-reset.\n");
+-		dce110_timing_generator_disable_reset_trigger(tgs[i]);
++		tgs[i]->funcs->disable_reset_trigger(tgs[i]);
+ 	}
+ 
+ 	/* GSL Vblank synchronization is a one time sync mechanism, assumption
+ 	 * is that the sync'ed displays will not drift out of sync over time*/
+ 	DC_SYNC_INFO("GSL: Restoring register states.\n");
+ 	for (i = 0; i < timing_generator_num; i++)
+-		dce110_timing_generator_tear_down_global_swap_lock(tgs[i]);
++		tgs[i]->funcs->tear_down_global_swap_lock(tgs[i]);
+ 
+ 	DC_SYNC_INFO("GSL: Set-up complete.\n");
+ }
+ 
++static void get_crtc_positions(struct timing_generator *tg,
++		int32_t *h_position, int32_t *v_position)
++{
++	tg->funcs->get_position(tg, h_position, v_position);
++}
++
++static bool enable_memory_request(struct timing_generator *tg)
++{
++	return tg->funcs->set_blank(tg, false);
++}
++
++static bool disable_memory_requests(struct timing_generator *tg)
++{
++	return tg->funcs->set_blank(tg, true);
++}
++
++static uint32_t get_vblank_counter(struct timing_generator *tg)
++{
++	return tg->funcs->get_frame_count(tg);
++}
++
++static void disable_vga(struct timing_generator *tg)
++{
++	tg->funcs->disable_vga(tg);
++}
+ 
+ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.apply_ctx_to_hw = apply_ctx_to_hw,
+ 	.reset_hw_ctx = reset_hw_ctx,
+ 	.set_plane_config = set_plane_config,
+ 	.update_plane_address = update_plane_address,
+-	.enable_memory_requests = dce110_timing_generator_unblank_crtc,
+-	.disable_memory_requests = dce110_timing_generator_blank_crtc,
++	.enable_memory_requests = enable_memory_request,
++	.disable_memory_requests = disable_memory_requests,
+ 	.cursor_set_attributes = dce110_ipp_cursor_set_attributes,
+ 	.cursor_set_position = dce110_ipp_cursor_set_position,
+ 	.set_gamma_ramp = set_gamma_ramp,
+ 	.power_down = power_down,
+ 	.enable_accelerated_mode = enable_accelerated_mode,
+-	.get_crtc_positions = dce110_timing_generator_get_crtc_positions,
+-	.get_vblank_counter = dce110_timing_generator_get_vblank_counter,
++	.get_crtc_positions = get_crtc_positions,
++	.get_vblank_counter = get_vblank_counter,
+ 	.enable_timing_synchronization = enable_timing_synchronization,
+-	.disable_vga = dce110_timing_generator_disable_vga,
++	.disable_vga = disable_vga,
+ 	.encoder_create = dce110_link_encoder_create,
+ 	.encoder_destroy = dce110_link_encoder_destroy,
+ 	.encoder_hw_init = dce110_link_encoder_hw_init,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index cb084da..d789853 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -30,6 +30,7 @@
+ #include "resource.h"
+ #include "dce_base/dce_base_resource.h"
+ #include "include/irq_service_interface.h"
++#include "include/timing_generator_interface.h"
+ 
+ #include "dce110/dce110_timing_generator.h"
+ #include "dce110/dce110_link_encoder.h"
+@@ -39,6 +40,8 @@
+ #include "dce110/dce110_stream_encoder.h"
+ #include "dce110/dce110_opp.h"
+ 
++#include "dce/dce_11_0_d.h"
++
+ enum dce110_clk_src_array_id {
+ 	DCE110_CLK_SRC_PLL0 = 0,
+ 	DCE110_CLK_SRC_PLL1,
+@@ -47,6 +50,53 @@ enum dce110_clk_src_array_id {
+ 	DCE110_CLK_SRC_TOTAL
+ };
+ 
++static const struct dce110_timing_generator_offsets dce110_tg_offsets[] = {
++		{
++			.crtc = (mmCRTC0_CRTC_CONTROL - mmCRTC_CONTROL),
++			.dcp =  (mmDCP0_GRPH_CONTROL - mmGRPH_CONTROL),
++		},
++		{
++			.crtc = (mmCRTC1_CRTC_CONTROL - mmCRTC_CONTROL),
++			.dcp = (mmDCP1_GRPH_CONTROL - mmGRPH_CONTROL),
++		},
++		{
++			.crtc = (mmCRTC2_CRTC_CONTROL - mmCRTC_CONTROL),
++			.dcp = (mmDCP2_GRPH_CONTROL - mmGRPH_CONTROL),
++		},
++		{
++			.crtc = (mmCRTC3_CRTC_CONTROL - mmCRTC_CONTROL),
++			.dcp = (mmDCP3_GRPH_CONTROL - mmGRPH_CONTROL),
++		},
++		{
++			.crtc = (mmCRTC4_CRTC_CONTROL - mmCRTC_CONTROL),
++			.dcp = (mmDCP4_GRPH_CONTROL - mmGRPH_CONTROL),
++		},
++		{
++			.crtc = (mmCRTC5_CRTC_CONTROL - mmCRTC_CONTROL),
++			.dcp = (mmDCP5_GRPH_CONTROL - mmGRPH_CONTROL),
++		}
++};
++
++static struct timing_generator *dce110_timing_generator_create(
++		struct adapter_service *as,
++		struct dc_context *ctx,
++		uint32_t instance,
++		const struct dce110_timing_generator_offsets *offsets)
++{
++	struct dce110_timing_generator *tg110 =
++		dc_service_alloc(ctx, sizeof(struct dce110_timing_generator));
++
++	if (!tg110)
++		return NULL;
++
++	if (dce110_timing_generator_construct(tg110, as, ctx, instance, offsets))
++		return &tg110->base;
++
++	BREAK_TO_DEBUGGER();
++	dc_service_free(ctx, tg110);
++	return NULL;
++}
++
+ bool dce110_construct_resource_pool(
+ 	struct adapter_service *adapter_serv,
+ 	struct dc *dc,
+@@ -117,7 +167,7 @@ bool dce110_construct_resource_pool(
+ 
+ 	for (i = 0; i < pool->controller_count; i++) {
+ 		pool->timing_generators[i] = dce110_timing_generator_create(
+-				adapter_serv, ctx, i + 1);
++				adapter_serv, ctx, i, &dce110_tg_offsets[i]);
+ 		if (pool->timing_generators[i] == NULL) {
+ 			BREAK_TO_DEBUGGER();
+ 			dal_error("DC: failed to create tg!\n");
+@@ -225,9 +275,10 @@ controller_create_fail:
+ 		if (pool->mis[i] != NULL)
+ 			dce110_mem_input_destroy(&pool->mis[i]);
+ 
+-		if (pool->timing_generators[i] != NULL)
+-			dce110_timing_generator_destroy(
+-				&pool->timing_generators[i]);
++		if (pool->timing_generators[i] != NULL)	{
++			dc_service_free(pool->timing_generators[i]->ctx, DCE110TG_FROM_TG(pool->timing_generators[i]));
++			pool->timing_generators[i] = NULL;
++		}
+ 	}
+ 
+ filter_create_fail:
+@@ -262,9 +313,10 @@ void dce110_destruct_resource_pool(struct resource_pool *pool)
+ 		if (pool->mis[i] != NULL)
+ 			dce110_mem_input_destroy(&pool->mis[i]);
+ 
+-		if (pool->timing_generators[i] != NULL)
+-			dce110_timing_generator_destroy(
+-				&pool->timing_generators[i]);
++		if (pool->timing_generators[i] != NULL)	{
++			dc_service_free(pool->timing_generators[i]->ctx, DCE110TG_FROM_TG(pool->timing_generators[i]));
++			pool->timing_generators[i] = NULL;
++		}
+ 	}
+ 
+ 	for (i = 0; i < pool->stream_enc_count; i++) {
+@@ -454,10 +506,7 @@ static enum dc_status validate_mapped_resource(
+ 			if (status != DC_OK)
+ 				return status;
+ 
+-			if (!dce110_timing_generator_validate_timing(
+-					stream->tg,
+-					&stream->public.timing,
+-					SIGNAL_TYPE_HDMI_TYPE_A))
++			if (!stream->tg->funcs->validate_timing(stream->tg, &stream->public.timing))
+ 				return DC_FAIL_CONTROLLER_VALIDATE;
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
+index 3c6c04a..b47ba61 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
+@@ -52,27 +52,16 @@ enum black_color_format {
+ #define MAX_H_TOTAL (CRTC_H_TOTAL__CRTC_H_TOTAL_MASK + 1)
+ #define MAX_V_TOTAL (CRTC_V_TOTAL__CRTC_V_TOTAL_MASKhw + 1)
+ 
+-
+-#define FROM_TIMING_GENERATOR(tg)\
+-	container_of(tg, struct dce110_timing_generator, base)
+-
+ #define CRTC_REG(reg) (reg + tg110->offsets.crtc)
+ #define DCP_REG(reg) (reg + tg110->offsets.dcp)
+ 
+-static const struct dce110_timing_generator_offsets reg_offsets[] = {
+-	{
+-		.crtc = 0,
+-		.dcp = 0,
+-	},
+-	{
+-		.crtc = (mmCRTC1_CRTC_CONTROL - mmCRTC0_CRTC_CONTROL),
+-		.dcp = (mmDCP1_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
+-	},
+-	{
+-		.crtc = (mmCRTC2_CRTC_CONTROL - mmCRTC0_CRTC_CONTROL),
+-		.dcp = (mmDCP2_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
+-	}
+-};
++/* Flowing register offsets are same in files of
++ * dce/dce_11_0_d.h
++ * dce/vi_ellesmere_p/vi_ellesmere_d.h
++ *
++ * So we can create dce110 timing generator to use it.
++ */
++
+ /*******************************************************************************
+  * GSL Sync related values */
+ 
+@@ -131,16 +120,31 @@ enum trigger_polarity_select {
+ 
+ /******************************************************************************/
+ 
+-static bool dce110_timing_generator_construct(
+-		struct timing_generator *tg,
+-		enum controller_id id)
+-{
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
+-
+-	tg->controller_id = id;
+-	tg110->offsets = reg_offsets[id - 1];
+-	return true;
+-}
++static struct timing_generator_funcs dce110_tg_funcs = {
++		.validate_timing = dce110_tg_validate_timing,
++		.program_timing = dce110_tg_program_timing,
++		.enable_crtc = dce110_timing_generator_enable_crtc,
++		.disable_crtc = dce110_timing_generator_disable_crtc,
++		.is_counter_moving = dce110_timing_generator_is_counter_moving,
++		.get_position = dce110_timing_generator_get_crtc_positions,
++		.get_frame_count = dce110_timing_generator_get_vblank_counter,
++		.set_early_control = dce110_timing_generator_set_early_control,
++		.wait_for_state = dce110_tg_wait_for_state,
++		.set_blank = dce110_tg_set_blank,
++		.set_colors = dce110_tg_set_colors,
++		.set_overscan_blank_color =
++				dce110_timing_generator_set_overscan_color_black,
++		.set_blank_color = dce110_timing_generator_program_blank_color,
++		.disable_vga = dce110_timing_generator_disable_vga,
++		.did_triggered_reset_occur =
++				dce110_timing_generator_did_triggered_reset_occur,
++		.setup_global_swap_lock =
++				dce110_timing_generator_setup_global_swap_lock,
++		.enable_reset_trigger = dce110_timing_generator_enable_reset_trigger,
++		.disable_reset_trigger = dce110_timing_generator_disable_reset_trigger,
++		.tear_down_global_swap_lock =
++				dce110_timing_generator_tear_down_global_swap_lock,
++};
+ 
+ static const struct crtc_black_color black_color_format[] = {
+ 	/* BlackColorFormat_RGB_FullRange */
+@@ -246,7 +250,7 @@ static bool dce110_timing_generator_is_in_vertical_blank(
+ 	uint32_t addr = 0;
+ 	uint32_t value = 0;
+ 	uint32_t field = 0;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+ 	addr = CRTC_REG(mmCRTC_STATUS);
+ 	value = dal_read_reg(tg->ctx, addr);
+@@ -259,7 +263,7 @@ void dce110_timing_generator_set_early_control(
+ 		uint32_t early_cntl)
+ {
+ 	uint32_t regval;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t address = CRTC_REG(mmCRTC_CONTROL);
+ 
+ 	regval = dal_read_reg(tg->ctx, address);
+@@ -279,7 +283,7 @@ bool dce110_timing_generator_enable_crtc(struct timing_generator *tg)
+ 	/* 0 value is needed by DRR and is also suggested default value for CZ
+ 	 */
+ 	uint32_t value;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+ 	value = dal_read_reg(tg->ctx,
+ 			CRTC_REG(mmCRTC_MASTER_UPDATE_MODE));
+@@ -288,7 +292,7 @@ bool dce110_timing_generator_enable_crtc(struct timing_generator *tg)
+ 	dal_write_reg(tg->ctx,
+ 			CRTC_REG(mmCRTC_MASTER_UPDATE_MODE), value);
+ 
+-	result = dal_bios_parser_enable_crtc(tg->bp, tg->controller_id, true);
++	result = dal_bios_parser_enable_crtc(tg->bp, tg110->controller_id, true);
+ 
+ 	return result == BP_RESULT_OK;
+ }
+@@ -298,7 +302,7 @@ void dce110_timing_generator_program_blank_color(
+ 		enum color_space color_space)
+ {
+ 	struct crtc_black_color black_color;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t addr = CRTC_REG(mmCRTC_BLACK_COLOR);
+ 	uint32_t value = dal_read_reg(tg->ctx, addr);
+ 
+@@ -332,7 +336,7 @@ void dce110_timing_generator_program_blank_color(
+ 
+ bool dce110_timing_generator_blank_crtc(struct timing_generator *tg)
+ {
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t addr = CRTC_REG(mmCRTC_BLANK_CONTROL);
+ 	uint32_t value = dal_read_reg(tg->ctx, addr);
+ 	uint8_t counter = 100;
+@@ -372,7 +376,7 @@ bool dce110_timing_generator_blank_crtc(struct timing_generator *tg)
+ 		dal_logger_write(tg->ctx->logger, LOG_MAJOR_ERROR,
+ 				LOG_MINOR_COMPONENT_CONTROLLER,
+ 				"timing generator %d blank timing out.\n",
+-				tg->controller_id);
++				tg110->controller_id);
+ 		return false;
+ 	}
+ 
+@@ -385,7 +389,7 @@ bool dce110_timing_generator_blank_crtc(struct timing_generator *tg)
+  */
+ bool dce110_timing_generator_unblank_crtc(struct timing_generator *tg)
+ {
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t addr = CRTC_REG(mmCRTC_BLANK_CONTROL);
+ 	uint32_t value = dal_read_reg(tg->ctx, addr);
+ 
+@@ -419,7 +423,7 @@ bool dce110_timing_generator_unblank_crtc(struct timing_generator *tg)
+ @TODOSTEREO
+ static void disable_stereo(struct timing_generator *tg)
+ {
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t addr = CRTC_REG(mmCRTC_3D_STRUCTURE_CONTROL);
+ 	uint32_t value = 0;
+ 	uint32_t test = 0;
+@@ -465,7 +469,9 @@ bool dce110_timing_generator_disable_crtc(struct timing_generator *tg)
+ {
+ 	enum bp_result result;
+ 
+-	result = dal_bios_parser_enable_crtc(tg->bp, tg->controller_id, false);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
++
++	result = dal_bios_parser_enable_crtc(tg->bp, tg110->controller_id, false);
+ 
+ 	/* Need to make sure stereo is disabled according to the DCE5.0 spec */
+ 
+@@ -487,7 +493,7 @@ static void program_horz_count_by_2(
+ 	const struct dc_crtc_timing *timing)
+ {
+ 	uint32_t regval;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+ 	regval = dal_read_reg(tg->ctx,
+ 			CRTC_REG(mmCRTC_COUNT_CONTROL));
+@@ -510,12 +516,13 @@ static void program_horz_count_by_2(
+  */
+ bool dce110_timing_generator_program_timing_generator(
+ 	struct timing_generator *tg,
+-	struct dc_crtc_timing *dc_crtc_timing)
++	const struct dc_crtc_timing *dc_crtc_timing)
+ {
+ 	enum bp_result result;
+ 	struct bp_hw_crtc_timing_parameters bp_params;
++	struct dc_crtc_timing patched_crtc_timing;
+ 	uint32_t regval;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+ 	uint32_t vsync_offset = dc_crtc_timing->v_border_bottom +
+ 			dc_crtc_timing->v_front_porch;
+@@ -530,52 +537,54 @@ bool dce110_timing_generator_program_timing_generator(
+ 	/* Due to an asic bug we need to apply the Front Porch workaround prior
+ 	 * to programming the timing.
+ 	 */
+-	dce110_timing_generator_apply_front_porch_workaround(tg, dc_crtc_timing);
+ 
+-	bp_params.controller_id = tg->controller_id;
++	patched_crtc_timing = *dc_crtc_timing;
++
++	dce110_timing_generator_apply_front_porch_workaround(tg, &patched_crtc_timing);
++
++	bp_params.controller_id = tg110->controller_id;
+ 
+-	bp_params.h_total = dc_crtc_timing->h_total;
++	bp_params.h_total = patched_crtc_timing.h_total;
+ 	bp_params.h_addressable =
+-		dc_crtc_timing->h_addressable;
+-	bp_params.v_total = dc_crtc_timing->v_total;
+-	bp_params.v_addressable = dc_crtc_timing->v_addressable;
++		patched_crtc_timing.h_addressable;
++	bp_params.v_total = patched_crtc_timing.v_total;
++	bp_params.v_addressable = patched_crtc_timing.v_addressable;
+ 
+ 	bp_params.h_sync_start = h_sync_start;
+-	bp_params.h_sync_width = dc_crtc_timing->h_sync_width;
++	bp_params.h_sync_width = patched_crtc_timing.h_sync_width;
+ 	bp_params.v_sync_start = v_sync_start;
+-	bp_params.v_sync_width = dc_crtc_timing->v_sync_width;
++	bp_params.v_sync_width = patched_crtc_timing.v_sync_width;
+ 
+ 	/* Set overscan */
+ 	bp_params.h_overscan_left =
+-		dc_crtc_timing->h_border_left;
++		patched_crtc_timing.h_border_left;
+ 	bp_params.h_overscan_right =
+-		dc_crtc_timing->h_border_right;
+-	bp_params.v_overscan_top = dc_crtc_timing->v_border_top;
++		patched_crtc_timing.h_border_right;
++	bp_params.v_overscan_top = patched_crtc_timing.v_border_top;
+ 	bp_params.v_overscan_bottom =
+-		dc_crtc_timing->v_border_bottom;
++		patched_crtc_timing.v_border_bottom;
+ 
+ 	/* Set flags */
+-	if (dc_crtc_timing->flags.HSYNC_POSITIVE_POLARITY == 1)
++	if (patched_crtc_timing.flags.HSYNC_POSITIVE_POLARITY == 1)
+ 		bp_params.flags.HSYNC_POSITIVE_POLARITY = 1;
+ 
+-	if (dc_crtc_timing->flags.VSYNC_POSITIVE_POLARITY == 1)
++	if (patched_crtc_timing.flags.VSYNC_POSITIVE_POLARITY == 1)
+ 		bp_params.flags.VSYNC_POSITIVE_POLARITY = 1;
+ 
+-	if (dc_crtc_timing->flags.INTERLACE == 1)
++	if (patched_crtc_timing.flags.INTERLACE == 1)
+ 		bp_params.flags.INTERLACE = 1;
+ 
+-	if (dc_crtc_timing->flags.HORZ_COUNT_BY_TWO == 1)
++	if (patched_crtc_timing.flags.HORZ_COUNT_BY_TWO == 1)
+ 		bp_params.flags.HORZ_COUNT_BY_TWO = 1;
+ 
+ 	result = dal_bios_parser_program_crtc_timing(tg->bp, &bp_params);
+ 
+-	program_horz_count_by_2(tg, dc_crtc_timing);
+-
++	program_horz_count_by_2(tg, &patched_crtc_timing);
+ 
+ 	regval = dal_read_reg(tg->ctx,
+ 			CRTC_REG(mmCRTC_START_LINE_CONTROL));
+ 
+-	if (dce110_timing_generator_get_vsynch_and_front_porch_size(dc_crtc_timing) <= 3) {
++	if (dce110_timing_generator_get_vsynch_and_front_porch_size(&patched_crtc_timing) <= 3) {
+ 		set_reg_field_value(regval, 3,
+ 				CRTC_START_LINE_CONTROL,
+ 				CRTC_ADVANCED_START_LINE_POSITION);
+@@ -632,7 +641,7 @@ void dce110_timing_generator_program_drr(
+ 	uint32_t v_total_max = 0;
+ 	uint32_t v_total_cntl = 0;
+ 	uint32_t static_screen_cntl = 0;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+ 	uint32_t addr = 0;
+ 
+@@ -796,7 +805,7 @@ void dce110_timing_generator_program_drr(
+  */
+ uint32_t dce110_timing_generator_get_vblank_counter(struct timing_generator *tg)
+ {
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t addr = CRTC_REG(mmCRTC_STATUS_FRAME_COUNT);
+ 	uint32_t value = dal_read_reg(tg->ctx, addr);
+ 	uint32_t field = get_reg_field_value(
+@@ -822,7 +831,7 @@ void dce110_timing_generator_get_crtc_positions(
+ 	int32_t *v_position)
+ {
+ 	uint32_t value;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+ 	value = dal_read_reg(tg->ctx, CRTC_REG(mmCRTC_STATUS_POSITION));
+ 
+@@ -852,7 +861,7 @@ uint32_t dce110_timing_generator_get_crtc_scanoutpos(
+ 	int32_t *vbl,
+ 	int32_t *position)
+ {
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	/* TODO 1: Update the implementation once caller is updated
+ 	 * WARNING!! This function is returning the whole register value
+ 	 * because the caller is expecting it instead of proper vertical and
+@@ -887,7 +896,7 @@ void dce110_timing_generator_program_blanking(
+ 	uint32_t hsync_offset = timing->h_border_right +
+ 			timing->h_front_porch;
+ 	uint32_t h_sync_start = timing->h_addressable + hsync_offset;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+ 	struct dc_context *ctx = tg->ctx;
+ 	uint32_t value = 0;
+@@ -969,7 +978,7 @@ void dce110_timing_generator_set_test_pattern(
+ 	struct dc_context *ctx = tg->ctx;
+ 	uint32_t value;
+ 	uint32_t addr;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+ 	/* TODO: add support for other test patterns */
+ 	switch (test_pattern) {
+@@ -1037,6 +1046,8 @@ bool dce110_timing_generator_validate_timing(
+ 			timing->h_front_porch;
+ 	uint32_t h_sync_start = timing->h_addressable + hsync_offset;
+ 
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
++
+ 	ASSERT(timing != NULL);
+ 
+ 	if (!timing)
+@@ -1047,18 +1058,18 @@ bool dce110_timing_generator_validate_timing(
+ 	 * needs more than 8192 horizontal and
+ 	 * more than 8192 vertical total pixels)
+ 	 */
+-	if (timing->h_total > tg->max_h_total ||
+-		timing->v_total > tg->max_v_total)
++	if (timing->h_total > tg110->max_h_total ||
++		timing->v_total > tg110->max_v_total)
+ 		return false;
+ 
+ 	h_blank = (timing->h_total - timing->h_addressable -
+ 		timing->h_border_right -
+ 		timing->h_border_left);
+ 
+-	if (h_blank < tg->min_h_blank)
++	if (h_blank < tg110->min_h_blank)
+ 		return false;
+ 
+-	if (timing->h_front_porch < tg->min_h_front_porch)
++	if (timing->h_front_porch < tg110->min_h_front_porch)
+ 		return false;
+ 
+ 	h_back_porch = h_blank - (h_sync_start -
+@@ -1066,7 +1077,7 @@ bool dce110_timing_generator_validate_timing(
+ 		timing->h_border_right -
+ 		timing->h_sync_width);
+ 
+-	if (h_back_porch < tg->min_h_back_porch)
++	if (h_back_porch < tg110->min_h_back_porch)
+ 		return false;
+ 
+ 	return true;
+@@ -1109,63 +1120,35 @@ void dce110_timing_generator_wait_for_vactive(struct timing_generator *tg)
+ 	}
+ }
+ 
+-void dce110_timing_generator_destroy(struct timing_generator **tg)
+-{
+-	dc_service_free((*tg)->ctx, FROM_TIMING_GENERATOR(*tg));
+-	*tg = NULL;
+-}
+-
+-static bool timing_generator_dce110_construct(struct timing_generator *tg,
+-	struct dc_context *ctx,
++bool dce110_timing_generator_construct(
++	struct dce110_timing_generator *tg110,
+ 	struct adapter_service *as,
+-	enum controller_id id)
++	struct dc_context *ctx,
++	uint32_t instance,
++	const struct dce110_timing_generator_offsets *offsets)
+ {
+-	if (!as)
++	if (!tg110)
+ 		return false;
+ 
+-	switch (id) {
+-	case CONTROLLER_ID_D0:
+-	case CONTROLLER_ID_D1:
+-	case CONTROLLER_ID_D2:
+-		break;
+-	default:
++	if (!as)
+ 		return false;
+-	}
+ 
+-	if (!dce110_timing_generator_construct(tg, id))
+-		return false;
++	tg110->controller_id = CONTROLLER_ID_D0 + instance;
++	tg110->offsets = *offsets;
+ 
+-	tg->ctx = ctx;
+-	tg->bp = dal_adapter_service_get_bios_parser(as);
++	tg110->base.funcs = &dce110_tg_funcs;
+ 
+-	tg->max_h_total = CRTC_H_TOTAL__CRTC_H_TOTAL_MASK + 1;
+-	tg->max_v_total = CRTC_V_TOTAL__CRTC_V_TOTAL_MASK + 1;
++	tg110->base.ctx = ctx;
++	tg110->base.bp = dal_adapter_service_get_bios_parser(as);
+ 
+-	tg->min_h_blank = 56;
+-	tg->min_h_front_porch = 4;
+-	tg->min_h_back_porch = 4;
++	tg110->max_h_total = CRTC_H_TOTAL__CRTC_H_TOTAL_MASK + 1;
++	tg110->max_v_total = CRTC_V_TOTAL__CRTC_V_TOTAL_MASK + 1;
+ 
+-	return true;
+-}
++	tg110->min_h_blank = 56;
++	tg110->min_h_front_porch = 4;
++	tg110->min_h_back_porch = 4;
+ 
+-struct timing_generator *dce110_timing_generator_create(
+-	struct adapter_service *as,
+-	struct dc_context *ctx,
+-	enum controller_id id)
+-{
+-	struct dce110_timing_generator *tg =
+-		dc_service_alloc(ctx, sizeof(struct dce110_timing_generator));
+-
+-	if (!tg)
+-		return NULL;
+-
+-	if (timing_generator_dce110_construct(&tg->base, ctx,
+-				as, id))
+-		return &tg->base;
+-
+-	BREAK_TO_DEBUGGER();
+-	dc_service_free(ctx, tg);
+-	return NULL;
++	return true;
+ }
+ 
+ /**
+@@ -1185,7 +1168,7 @@ void dce110_timing_generator_setup_global_swap_lock(
+ 	const struct dcp_gsl_params *gsl_params)
+ {
+ 	uint32_t value;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t address = DCP_REG(mmDCP_GSL_CONTROL);
+ 	uint32_t check_point = FLIP_READY_BACK_LOOKUP;
+ 
+@@ -1267,7 +1250,7 @@ void dce110_timing_generator_tear_down_global_swap_lock(
+ 	 */
+ 
+ 	uint32_t value;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t address = DCP_REG(mmDCP_GSL_CONTROL);
+ 
+ 	value = 0;
+@@ -1365,11 +1348,11 @@ void dce110_timing_generator_enable_advanced_request(
+ 	bool enable,
+ 	const struct dc_crtc_timing *timing)
+ {
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t addr = CRTC_REG(mmCRTC_START_LINE_CONTROL);
+ 	uint32_t value = dal_read_reg(tg->ctx, addr);
+ 
+-	if (enable && FROM_TIMING_GENERATOR(tg)->advanced_request_enable) {
++	if (enable && DCE110TG_FROM_TG(tg)->advanced_request_enable) {
+ 		set_reg_field_value(
+ 			value,
+ 			0,
+@@ -1427,7 +1410,7 @@ void dce110_timing_generator_set_lock_master(struct timing_generator *tg,
+ 		bool lock)
+ {
+ 	struct dc_context *ctx = tg->ctx;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t addr = CRTC_REG(mmCRTC_MASTER_UPDATE_LOCK);
+ 	uint32_t value = dal_read_reg(ctx, addr);
+ 
+@@ -1449,7 +1432,7 @@ void dce110_timing_generator_enable_reset_trigger(
+ 	uint32_t rising_edge = 0;
+ 	uint32_t falling_edge = 0;
+ 	enum trigger_source_select trig_src_select = TRIGGER_SOURCE_SELECT_LOGIC_ZERO;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+ 	/* Setup trigger edge */
+ 	switch (trigger_params->edge) {
+@@ -1560,7 +1543,7 @@ void dce110_timing_generator_disable_reset_trigger(
+ 	struct timing_generator *tg)
+ {
+ 	uint32_t value;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+ 	value = dal_read_reg(tg->ctx, CRTC_REG(mmCRTC_FORCE_COUNT_NOW_CNTL));
+ 
+@@ -1609,7 +1592,7 @@ void dce110_timing_generator_disable_reset_trigger(
+ bool dce110_timing_generator_did_triggered_reset_occur(
+ 	struct timing_generator *tg)
+ {
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t value = dal_read_reg(tg->ctx,
+ 			CRTC_REG(mmCRTC_FORCE_COUNT_NOW_CNTL));
+ 
+@@ -1629,7 +1612,9 @@ void dce110_timing_generator_disable_vga(
+ 	uint32_t addr = 0;
+ 	uint32_t value = 0;
+ 
+-	switch (tg->controller_id) {
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
++
++	switch (tg110->controller_id) {
+ 	case CONTROLLER_ID_D0:
+ 		addr = mmD1VGA_CONTROL;
+ 		break;
+@@ -1653,7 +1638,6 @@ void dce110_timing_generator_disable_vga(
+ 	dal_write_reg(tg->ctx, addr, value);
+ }
+ 
+-
+ /**
+ * set_overscan_color_black
+ *
+@@ -1669,7 +1653,7 @@ void dce110_timing_generator_set_overscan_color_black(
+ 	struct dc_context *ctx = tg->ctx;
+ 	uint32_t value = 0;
+ 	uint32_t addr;
+-	struct dce110_timing_generator *tg110 = FROM_TIMING_GENERATOR(tg);
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	/* Overscan Color for YUV display modes:
+ 	 * to achieve a black color for both the explicit and implicit overscan,
+ 	 * the overscan color registers should be programmed to: */
+@@ -1788,3 +1772,126 @@ void dce110_timing_generator_set_overscan_color_black(
+ 
+ }
+ 
++void dce110_tg_program_blank_color(struct timing_generator *tg,
++		const struct crtc_black_color *black_color)
++{
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
++	uint32_t addr = CRTC_REG(mmCRTC_BLACK_COLOR);
++	uint32_t value = dal_read_reg(tg->ctx, addr);
++
++	set_reg_field_value(
++		value,
++		black_color->black_color_b_cb,
++		CRTC_BLACK_COLOR,
++		CRTC_BLACK_COLOR_B_CB);
++	set_reg_field_value(
++		value,
++		black_color->black_color_g_y,
++		CRTC_BLACK_COLOR,
++		CRTC_BLACK_COLOR_G_Y);
++	set_reg_field_value(
++		value,
++		black_color->black_color_r_cr,
++		CRTC_BLACK_COLOR,
++		CRTC_BLACK_COLOR_R_CR);
++
++	dal_write_reg(tg->ctx, addr, value);
++
++	addr = CRTC_REG(mmCRTC_BLANK_DATA_COLOR);
++	dal_write_reg(tg->ctx, addr, value);
++}
++
++void dce110_tg_set_overscan_color(struct timing_generator *tg,
++	const struct crtc_black_color *overscan_color)
++{
++	struct dc_context *ctx = tg->ctx;
++	uint32_t value = 0;
++	uint32_t addr;
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
++
++	set_reg_field_value(
++		value,
++		overscan_color->black_color_b_cb,
++		CRTC_OVERSCAN_COLOR,
++		CRTC_OVERSCAN_COLOR_BLUE);
++
++	set_reg_field_value(
++		value,
++		overscan_color->black_color_g_y,
++		CRTC_OVERSCAN_COLOR,
++		CRTC_OVERSCAN_COLOR_GREEN);
++
++	set_reg_field_value(
++		value,
++		overscan_color->black_color_r_cr,
++		CRTC_OVERSCAN_COLOR,
++		CRTC_OVERSCAN_COLOR_RED);
++
++	addr = CRTC_REG(mmCRTC_OVERSCAN_COLOR);
++	dal_write_reg(ctx, addr, value);
++}
++
++void dce110_tg_get_position(struct timing_generator *tg,
++	struct crtc_position *position)
++{
++	int32_t h_position;
++	int32_t v_position;
++
++	dce110_timing_generator_get_crtc_positions(tg, &h_position, &v_position);
++
++	position->horizontal_count = (uint32_t)h_position;
++	position->vertical_count = (uint32_t)v_position;
++}
++
++void dce110_tg_program_timing(struct timing_generator *tg,
++	const struct dc_crtc_timing *timing,
++	bool use_vbios)
++{
++	if (use_vbios)
++		dce110_timing_generator_program_timing_generator(tg, timing);
++	else
++		dce110_timing_generator_program_blanking(tg, timing);
++}
++
++bool dce110_tg_set_blank(struct timing_generator *tg,
++		bool enable_blanking)
++{
++	if (enable_blanking)
++		return dce110_timing_generator_blank_crtc(tg);
++	else
++		return dce110_timing_generator_unblank_crtc(tg);
++}
++
++bool dce110_tg_validate_timing(struct timing_generator *tg,
++	const struct dc_crtc_timing *timing)
++{
++	return dce110_timing_generator_validate_timing(tg, timing, SIGNAL_TYPE_NONE);
++}
++
++
++void dce110_tg_wait_for_state(struct timing_generator *tg,
++	enum crtc_state state)
++{
++	switch (state) {
++	case CRTC_STATE_VBLANK:
++		dce110_timing_generator_wait_for_vblank(tg);
++		break;
++
++	case CRTC_STATE_VACTIVE:
++		dce110_timing_generator_wait_for_vactive(tg);
++		break;
++
++	default:
++		break;
++	}
++}
++
++void dce110_tg_set_colors(struct timing_generator *tg,
++	const struct crtc_black_color *blank_color,
++	const struct crtc_black_color *overscan_color)
++{
++	if (blank_color != NULL)
++		dce110_tg_program_blank_color(tg, blank_color);
++	if (overscan_color != NULL)
++		dce110_tg_set_overscan_color(tg, overscan_color);
++}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+index c4a815f..4192972 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+@@ -58,16 +58,29 @@ struct dce110_timing_generator_offsets {
+ struct dce110_timing_generator {
+ 	struct timing_generator base;
+ 	struct dce110_timing_generator_offsets offsets;
++
++	enum controller_id controller_id;
++
++	uint32_t max_h_total;
++	uint32_t max_v_total;
++
++	uint32_t min_h_blank;
++	uint32_t min_h_front_porch;
++	uint32_t min_h_back_porch;
++
+ 	enum sync_source cached_gsl_group;
+ 	bool advanced_request_enable;
+ };
+ 
+-/********** Create and destroy **********/
+-struct timing_generator *dce110_timing_generator_create(
++#define DCE110TG_FROM_TG(tg)\
++	container_of(tg, struct dce110_timing_generator, base)
++
++bool dce110_timing_generator_construct(
++	struct dce110_timing_generator *tg,
+ 	struct adapter_service *as,
+ 	struct dc_context *ctx,
+-	enum controller_id id);
+-void dce110_timing_generator_destroy(struct timing_generator **tg);
++	enum controller_id id,
++	const struct dce110_timing_generator_offsets *offsets);
+ 
+ /* determine if given timing can be supported by TG */
+ bool dce110_timing_generator_validate_timing(
+@@ -80,7 +93,7 @@ bool dce110_timing_generator_validate_timing(
+ /* Program timing generator with given timing */
+ bool dce110_timing_generator_program_timing_generator(
+ 	struct timing_generator *tg,
+-	struct dc_crtc_timing *dc_crtc_timing);
++	const struct dc_crtc_timing *dc_crtc_timing);
+ 
+ /* Disable/Enable Timing Generator */
+ bool dce110_timing_generator_enable_crtc(struct timing_generator *tg);
+@@ -140,17 +153,20 @@ bool dce110_timing_generator_did_triggered_reset_occur(
+ /* TODO: Should we move it to mem_input interface? */
+ bool dce110_timing_generator_blank_crtc(struct timing_generator *tg);
+ bool dce110_timing_generator_unblank_crtc(struct timing_generator *tg);
++/* Move to enable accelerated mode */
+ void dce110_timing_generator_disable_vga(struct timing_generator *tg);
+-
+ /* TODO: Should we move it to transform */
++/* Fully program CRTC timing in timing generator */
+ void dce110_timing_generator_program_blanking(
+ 	struct timing_generator *tg,
+ 	const struct dc_crtc_timing *timing);
+ 
+ /* TODO: Should we move it to opp? */
++/* Combine with below and move YUV/RGB color conversion to SW layer */
+ void dce110_timing_generator_program_blank_color(
+ 	struct timing_generator *tg,
+ 	enum color_space color_space);
++/* Combine with above and move YUV/RGB color conversion to SW layer */
+ void dce110_timing_generator_set_overscan_color_black(
+ 	struct timing_generator *tg,
+ 	enum color_space black_color);
+@@ -183,4 +199,31 @@ void dce110_timing_generator_enable_advanced_request(
+ void dce110_timing_generator_set_lock_master(struct timing_generator *tg,
+ 		bool lock);
+ 
++void dce110_tg_program_blank_color(struct timing_generator *tg,
++	const struct crtc_black_color *black_color);
++
++void dce110_tg_set_overscan_color(struct timing_generator *tg,
++	const struct crtc_black_color *overscan_color);
++
++void dce110_tg_get_position(struct timing_generator *tg,
++	struct crtc_position *position);
++
++void dce110_tg_program_timing(struct timing_generator *tg,
++	const struct dc_crtc_timing *timing,
++	bool use_vbios);
++
++bool dce110_tg_set_blank(struct timing_generator *tg,
++		bool enable_blanking);
++
++bool dce110_tg_validate_timing(struct timing_generator *tg,
++	const struct dc_crtc_timing *timing);
++
++
++void dce110_tg_wait_for_state(struct timing_generator *tg,
++	enum crtc_state state);
++
++void dce110_tg_set_colors(struct timing_generator *tg,
++	const struct crtc_black_color *blank_color,
++	const struct crtc_black_color *overscan_color);
++
+ #endif /* __DC_TIMING_GENERATOR_DCE110_H__ */
+diff --git a/drivers/gpu/drm/amd/dal/include/timing_generator_interface.h b/drivers/gpu/drm/amd/dal/include/timing_generator_interface.h
+new file mode 100644
+index 0000000..da3e694
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/include/timing_generator_interface.h
+@@ -0,0 +1,30 @@
++/*
++ * Copyright 2012-15 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#ifndef __DAL_TIMING_GENERATOR_INTERFACE_H__
++#define __DAL_TIMING_GENERATOR_TNTERFACE_H__
++#include "timing_generator_types.h"
++
++#endif /* AMD_DAL_DEV_INCLUDE_TIMING_GENERATOR_INTERFACE_H_ */
+diff --git a/drivers/gpu/drm/amd/dal/include/timing_generator_types.h b/drivers/gpu/drm/amd/dal/include/timing_generator_types.h
+index bc04acd..15773c0 100644
+--- a/drivers/gpu/drm/amd/dal/include/timing_generator_types.h
++++ b/drivers/gpu/drm/amd/dal/include/timing_generator_types.h
+@@ -28,6 +28,7 @@
+ 
+ #include "include/grph_csc_types.h"
+ 
++
+ /**
+  *  These parameters are required as input when doing blanking/Unblanking
+ */
+@@ -134,16 +135,53 @@ enum controller_dp_test_pattern {
+ 	CONTROLLER_DP_TEST_PATTERN_COLORSQUARES_CEA
+ };
+ 
++enum crtc_state {
++	CRTC_STATE_VBLANK = 0,
++	CRTC_STATE_VACTIVE
++};
++
+ struct timing_generator {
++	struct timing_generator_funcs *funcs;
+ 	struct bios_parser *bp;
+-	enum controller_id controller_id;
+ 	struct dc_context *ctx;
+-	uint32_t max_h_total;
+-	uint32_t max_v_total;
++};
++
+ 
+-	uint32_t min_h_blank;
+-	uint32_t min_h_front_porch;
+-	uint32_t min_h_back_porch;
++struct dc_crtc_timing;
++
++struct timing_generator_funcs {
++	bool (*validate_timing)(struct timing_generator *tg,
++							const struct dc_crtc_timing *timing);
++	void (*program_timing)(struct timing_generator *tg,
++							const struct dc_crtc_timing *timing,
++							bool use_vbios);
++	bool (*enable_crtc)(struct timing_generator *tg);
++	bool (*disable_crtc)(struct timing_generator *tg);
++	bool (*is_counter_moving)(struct timing_generator *tg);
++	void (*get_position)(struct timing_generator *tg,
++								int32_t *h_position,
++								int32_t *v_position);
++	uint32_t (*get_frame_count)(struct timing_generator *tg);
++	void (*set_early_control)(struct timing_generator *tg,
++							   uint32_t early_cntl);
++	void (*wait_for_state)(struct timing_generator *tg,
++							enum crtc_state state);
++	bool (*set_blank)(struct timing_generator *tg,
++					   bool enable_blanking);
++	void (*set_overscan_blank_color) (struct timing_generator *tg, enum color_space black_color);
++	void (*set_blank_color)(struct timing_generator *tg, enum color_space black_color);
++	void (*set_colors)(struct timing_generator *tg,
++						const struct crtc_black_color *blank_color,
++						const struct crtc_black_color *overscan_color);
++
++	void (*disable_vga)(struct timing_generator *tg);
++	bool (*did_triggered_reset_occur)(struct timing_generator *tg);
++	void (*setup_global_swap_lock)(struct timing_generator *tg,
++							const struct dcp_gsl_params *gsl_params);
++	void (*enable_reset_trigger)(struct timing_generator *tg,
++						const struct trigger_params *trigger_params);
++	void (*disable_reset_trigger)(struct timing_generator *tg);
++	void (*tear_down_global_swap_lock)(struct timing_generator *tg);
+ };
+ 
+ #endif
+-- 
+2.7.4
+

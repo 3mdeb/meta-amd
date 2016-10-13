@@ -1,0 +1,221 @@
+From c0f9678f83fea7283f961c8853062637400b4693 Mon Sep 17 00:00:00 2001
+From: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Date: Thu, 10 Dec 2015 20:12:49 +0800
+Subject: [PATCH 0607/1110] drm/amd/dal: share initialization between
+ connectors
+
+Also initialize DPMS to OFF state
+
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland<harry.wentland@amd.com>
+---
+ .../drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c    | 37 +++++++---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    | 82 +++++++++++++---------
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.h    |  7 ++
+ 3 files changed, 84 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+index ba1c854..3246dcd 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -261,6 +261,7 @@ static struct drm_connector *dm_dp_add_mst_connector(struct drm_dp_mst_topology_
+ {
+ 	struct amdgpu_connector *master = container_of(mgr, struct amdgpu_connector, mst_mgr);
+ 	struct drm_device *dev = master->base.dev;
++	struct amdgpu_device *adev = dev->dev_private;
+ 	struct amdgpu_connector *aconnector;
+ 	struct drm_connector *connector;
+ 
+@@ -272,21 +273,41 @@ static struct drm_connector *dm_dp_add_mst_connector(struct drm_dp_mst_topology_
+ 	connector = &aconnector->base;
+ 	aconnector->port = port;
+ 	aconnector->mst_port = master;
+-	aconnector->dc_link = master->dc_link;
+-	aconnector->base.polled = DRM_CONNECTOR_POLL_HPD;
+ 
+-	sema_init(&aconnector->mst_sem, 1);
++	if (drm_connector_init(
++		dev,
++		connector,
++		&dm_dp_mst_connector_funcs,
++		DRM_MODE_CONNECTOR_DisplayPort)) {
++		kfree(aconnector);
++		return NULL;
++	}
++	drm_connector_helper_add(connector, &dm_dp_mst_connector_helper_funcs);
+ 
+-	/* Initialize connector state before adding the connectror to drm and framebuffer lists */
+-	amdgpu_dm_connector_funcs_reset(connector);
++	amdgpu_dm_connector_init_helper(
++		&adev->dm,
++		aconnector,
++		DRM_MODE_CONNECTOR_DisplayPort,
++		master->dc_link,
++		master->connector_id);
+ 
+-	drm_connector_init(dev, connector, &dm_dp_mst_connector_funcs, DRM_MODE_CONNECTOR_DisplayPort);
+-	drm_connector_helper_add(connector, &dm_dp_mst_connector_helper_funcs);
+ 	aconnector->mst_encoder = dm_dp_create_fake_mst_encoder(master);
+ 
+-	drm_object_attach_property(&connector->base, dev->mode_config.path_property, 0);
++	/*
++	 * TODO: understand why this one is needed
++	 */
++	drm_object_attach_property(
++		&connector->base,
++		dev->mode_config.path_property,
++		0);
++
+ 	drm_mode_connector_set_path_property(connector, pathprop);
+ 
++	/*
++	 * Initialize connector state before adding the connectror to drm and
++	 * framebuffer lists
++	 */
++	amdgpu_dm_connector_funcs_reset(connector);
+ 
+ 	DRM_DEBUG_KMS(":%d\n", connector->base.id);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index ea7a623..45a2a68 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -1753,45 +1753,24 @@ int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
+ 	return amdgpu_connector->num_modes;
+ }
+ 
+-/* Note: this function assumes that dc_link_detect() was called for the
+- * dc_link which will be represented by this aconnector. */
+-int amdgpu_dm_connector_init(
++void amdgpu_dm_connector_init_helper(
+ 	struct amdgpu_display_manager *dm,
+ 	struct amdgpu_connector *aconnector,
+-	uint32_t link_index,
+-	struct amdgpu_encoder *aencoder)
++	int connector_type,
++	const struct dc_link *link,
++	int link_index)
+ {
+-	int res, connector_type;
+ 	struct amdgpu_device *adev = dm->ddev->dev_private;
+-	struct dc *dc = dm->dc;
+-	const struct dc_link *link = dc_get_link_at_index(dc, link_index);
+-
+-	DRM_DEBUG_KMS("%s()\n", __func__);
+-
+-	connector_type = to_drm_connector_type(link->connector_signal);
+-
+-	res = drm_connector_init(
+-			dm->ddev,
+-			&aconnector->base,
+-			&amdgpu_dm_connector_funcs,
+-			connector_type);
+-
+-	if (res) {
+-		DRM_ERROR("connector_init failed\n");
+-		aconnector->connector_id = -1;
+-		return res;
+-	}
+-
+-	drm_connector_helper_add(
+-			&aconnector->base,
+-			&amdgpu_dm_connector_helper_funcs);
+ 
+ 	aconnector->connector_id = link_index;
+ 	aconnector->dc_link = link;
+ 	aconnector->base.interlace_allowed = true;
+ 	aconnector->base.doublescan_allowed = true;
++	aconnector->base.dpms = DRM_MODE_DPMS_OFF;
+ 	aconnector->hpd.hpd = link_index; /* maps to 'enum amdgpu_hpd_id' */
+ 
++
++
+ 	/*configure suport HPD hot plug connector_>polled default value is 0
+ 	 * which means HPD hot plug not supported*/
+ 	switch (connector_type) {
+@@ -1822,15 +1801,51 @@ int amdgpu_dm_connector_init(
+ 				adev->mode_info.underscan_vborder_property,
+ 				0);
+ 
+-	/* TODO: Don't do this manually anymore
+-	aconnector->base.encoder = &aencoder->base;
+-	*/
++	sema_init(&aconnector->mst_sem, 1);
++}
++
++/* Note: this function assumes that dc_link_detect() was called for the
++ * dc_link which will be represented by this aconnector. */
++int amdgpu_dm_connector_init(
++	struct amdgpu_display_manager *dm,
++	struct amdgpu_connector *aconnector,
++	uint32_t link_index,
++	struct amdgpu_encoder *aencoder)
++{
++	int res, connector_type;
++	struct dc *dc = dm->dc;
++	const struct dc_link *link = dc_get_link_at_index(dc, link_index);
++
++	DRM_DEBUG_KMS("%s()\n", __func__);
++
++	connector_type = to_drm_connector_type(link->connector_signal);
++
++	res = drm_connector_init(
++			dm->ddev,
++			&aconnector->base,
++			&amdgpu_dm_connector_funcs,
++			connector_type);
++
++	if (res) {
++		DRM_ERROR("connector_init failed\n");
++		aconnector->connector_id = -1;
++		return res;
++	}
++
++	drm_connector_helper_add(
++			&aconnector->base,
++			&amdgpu_dm_connector_helper_funcs);
++
++	amdgpu_dm_connector_init_helper(
++		dm,
++		aconnector,
++		connector_type,
++		link,
++		link_index);
+ 
+ 	drm_mode_connector_attach_encoder(
+ 		&aconnector->base, &aencoder->base);
+ 
+-	/*drm_sysfs_connector_add(&dm_connector->base);*/
+-
+ 	drm_connector_register(&aconnector->base);
+ 
+ 	if (connector_type == DRM_MODE_CONNECTOR_DisplayPort)
+@@ -1856,7 +1871,6 @@ int amdgpu_dm_connector_init(
+ 			dm->backlight_link = link;
+ 	}
+ #endif
+-	sema_init(&aconnector->mst_sem, 1);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.h b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.h
+index 0639732..1b8b3eb 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.h
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.h
+@@ -85,6 +85,13 @@ int amdgpu_dm_connector_atomic_set_property(
+ 
+ int amdgpu_dm_get_encoder_crtc_mask(struct amdgpu_device *adev);
+ 
++void amdgpu_dm_connector_init_helper(
++	struct amdgpu_display_manager *dm,
++	struct amdgpu_connector *aconnector,
++	int connector_type,
++	const struct dc_link *link,
++	int link_index);
++
+ extern const struct drm_encoder_helper_funcs amdgpu_dm_encoder_helper_funcs;
+ 
+ #endif		/* __AMDGPU_DM_TYPES_H__ */
+-- 
+2.7.4
+

@@ -1,0 +1,159 @@
+From 47c1854b8ffaa37712a637e4d1ba91d7eb7ab762 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 3 Feb 2016 16:01:06 +0100
+Subject: [PATCH 0281/1110] drm/amdgpu: send UVD IB tests directly to the ring
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We need the IB test for GPU resets as well and
+the scheduler should be stoped then.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucer@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c | 32 ++++++++++++++++++++++----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.h |  2 +-
+ drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c   |  2 +-
+ 5 files changed, 26 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+index 35aa5a2..16284b9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+@@ -244,7 +244,7 @@ int amdgpu_uvd_suspend(struct amdgpu_device *adev)
+ 
+ 			amdgpu_uvd_note_usage(adev);
+ 
+-			r = amdgpu_uvd_get_destroy_msg(ring, handle, &fence);
++                        r = amdgpu_uvd_get_destroy_msg(ring, handle, false, &fence);
+ 			if (r) {
+ 				DRM_ERROR("Error destroying UVD (%d)!\n", r);
+ 				continue;
+@@ -300,7 +300,8 @@ void amdgpu_uvd_free_handles(struct amdgpu_device *adev, struct drm_file *filp)
+ 
+ 			amdgpu_uvd_note_usage(adev);
+ 
+-			r = amdgpu_uvd_get_destroy_msg(ring, handle, &fence);
++                        r = amdgpu_uvd_get_destroy_msg(ring, handle,
++                                                      false, &fence);
+ 			if (r) {
+ 				DRM_ERROR("Error destroying UVD (%d)!\n", r);
+ 				continue;
+@@ -836,9 +837,9 @@ static int amdgpu_uvd_free_job(
+ 	return 0;
+ }
+ 
+-static int amdgpu_uvd_send_msg(struct amdgpu_ring *ring,
+-			       struct amdgpu_bo *bo,
+-			       struct fence **fence)
++static int amdgpu_uvd_send_msg(struct amdgpu_ring *ring, struct amdgpu_bo *bo,
++                              bool direct, struct fence **fence)
++
+ {
+ 	struct ttm_validate_buffer tv;
+ 	struct ww_acquire_ctx ticket;
+@@ -891,8 +892,19 @@ static int amdgpu_uvd_send_msg(struct amdgpu_ring *ring,
+ 						 &amdgpu_uvd_free_job,
+ 						 AMDGPU_FENCE_OWNER_UNDEFINED,
+ 						 &f);
+-	if (r)
+-		goto err2;
++        if (direct) {
++                r = amdgpu_ib_schedule(ring, 1, ib,
++                                       AMDGPU_FENCE_OWNER_UNDEFINED, &f);
++                if (r)
++                        goto err_free;
++
++                amdgpu_job_free(job);
++        } else {
++                r = amdgpu_job_submit(job, ring,
++                                      AMDGPU_FENCE_OWNER_UNDEFINED, &f);
++                if (r)
++                        goto err_free;
++        }
+ 
+ 	ttm_eu_fence_buffer_objects(&ticket, &head, f);
+ 
+@@ -960,11 +972,11 @@ int amdgpu_uvd_get_create_msg(struct amdgpu_ring *ring, uint32_t handle,
+ 	amdgpu_bo_kunmap(bo);
+ 	amdgpu_bo_unreserve(bo);
+ 
+-	return amdgpu_uvd_send_msg(ring, bo, fence);
++        return amdgpu_uvd_send_msg(ring, bo, true, fence);
+ }
+ 
+ int amdgpu_uvd_get_destroy_msg(struct amdgpu_ring *ring, uint32_t handle,
+-			       struct fence **fence)
++                              bool direct, struct fence **fence)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_bo *bo;
+@@ -1002,7 +1014,7 @@ int amdgpu_uvd_get_destroy_msg(struct amdgpu_ring *ring, uint32_t handle,
+ 	amdgpu_bo_kunmap(bo);
+ 	amdgpu_bo_unreserve(bo);
+ 
+-	return amdgpu_uvd_send_msg(ring, bo, fence);
++        return amdgpu_uvd_send_msg(ring, bo, direct, fence);
+ }
+ 
+ static void amdgpu_uvd_idle_work_handler(struct work_struct *work)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.h
+index 1724c2c..9a3b449 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.h
+@@ -31,7 +31,7 @@ int amdgpu_uvd_resume(struct amdgpu_device *adev);
+ int amdgpu_uvd_get_create_msg(struct amdgpu_ring *ring, uint32_t handle,
+ 			      struct fence **fence);
+ int amdgpu_uvd_get_destroy_msg(struct amdgpu_ring *ring, uint32_t handle,
+-			       struct fence **fence);
++			       bool direct, struct fence **fence);
+ void amdgpu_uvd_free_handles(struct amdgpu_device *adev,
+ 			     struct drm_file *filp);
+ int amdgpu_uvd_ring_parse_cs(struct amdgpu_cs_parser *parser, uint32_t ib_idx);
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+index 91080a5..d2fc1ca 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+@@ -522,7 +522,7 @@ static int uvd_v4_2_ring_test_ib(struct amdgpu_ring *ring)
+ 		goto error;
+ 	}
+ 
+-	r = amdgpu_uvd_get_destroy_msg(ring, 1, &fence);
++	r = amdgpu_uvd_get_destroy_msg(ring, 1, true, &fence);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: failed to get destroy ib (%d).\n", r);
+ 		goto error;
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+index 1e8476a..c5edb98 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+@@ -568,7 +568,7 @@ static int uvd_v5_0_ring_test_ib(struct amdgpu_ring *ring)
+ 		goto error;
+ 	}
+ 
+-	r = amdgpu_uvd_get_destroy_msg(ring, 1, &fence);
++	r = amdgpu_uvd_get_destroy_msg(ring, 1, true, &fence);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: failed to get destroy ib (%d).\n", r);
+ 		goto error;
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+index e55b040..0d5098e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+@@ -800,7 +800,7 @@ static int uvd_v6_0_ring_test_ib(struct amdgpu_ring *ring)
+ 		goto error;
+ 	}
+ 
+-	r = amdgpu_uvd_get_destroy_msg(ring, 1, &fence);
++	r = amdgpu_uvd_get_destroy_msg(ring, 1, true, &fence);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu: failed to get destroy ib (%d).\n", r);
+ 		goto error;
+-- 
+2.7.4
+

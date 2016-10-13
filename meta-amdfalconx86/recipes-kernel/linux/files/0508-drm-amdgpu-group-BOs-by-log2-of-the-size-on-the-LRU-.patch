@@ -1,0 +1,144 @@
+From 9cc9a4472afca6cc46f79dfafe53787a200c6121 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 15 Apr 2016 17:19:16 +0200
+Subject: [PATCH 0508/1110] drm/amdgpu: group BOs by log2 of the size on the
+ LRU v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This allows us to have small BOs on the LRU before big ones.
+
+v2: fix of by one and list corruption bug
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     | 11 ++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 61 +++++++++++++++++++++++++++++++--
+ 2 files changed, 70 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 0214003..06cf1eb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -393,6 +393,14 @@ unsigned amdgpu_fence_count_emitted(struct amdgpu_ring *ring);
+ /*
+  * TTM.
+  */
++
++#define AMDGPU_TTM_LRU_SIZE	20
++
++struct amdgpu_mman_lru {
++	struct list_head		*lru[TTM_NUM_MEM_TYPES];
++	struct list_head		*swap_lru;
++};
++
+ struct amdgpu_mman {
+ 	struct ttm_bo_global_ref        bo_global_ref;
+ 	struct drm_global_reference	mem_global_ref;
+@@ -410,6 +418,9 @@ struct amdgpu_mman {
+ 	struct amdgpu_ring			*buffer_funcs_ring;
+         /* Scheduler entity for buffer moves */
+         struct amd_sched_entity                 entity;
++
++        /* custom LRU management */
++        struct amdgpu_mman_lru                  log2_size[AMDGPU_TTM_LRU_SIZE];
+ };
+ 
+ int amdgpu_copy_buffer(struct amdgpu_ring *ring,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 1ec9491..70f005d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -910,6 +910,52 @@ uint32_t amdgpu_ttm_tt_pte_flags(struct amdgpu_device *adev, struct ttm_tt *ttm,
+ 	return flags;
+ }
+ 
++static void amdgpu_ttm_lru_removal(struct ttm_buffer_object *tbo)
++{
++	struct amdgpu_device *adev = amdgpu_get_adev(tbo->bdev);
++	unsigned i, j;
++
++	for (i = 0; i < AMDGPU_TTM_LRU_SIZE; ++i) {
++		struct amdgpu_mman_lru *lru = &adev->mman.log2_size[i];
++
++		for (j = 0; j < TTM_NUM_MEM_TYPES; ++j)
++			if (&tbo->lru == lru->lru[j])
++				lru->lru[j] = tbo->lru.prev;
++
++		if (&tbo->swap == lru->swap_lru)
++			lru->swap_lru = tbo->swap.prev;
++	}
++}
++
++static struct amdgpu_mman_lru *amdgpu_ttm_lru(struct ttm_buffer_object *tbo)
++{
++	struct amdgpu_device *adev = amdgpu_get_adev(tbo->bdev);
++	unsigned log2_size = min(ilog2(tbo->num_pages),
++				 AMDGPU_TTM_LRU_SIZE - 1);
++
++	return &adev->mman.log2_size[log2_size];
++}
++
++static struct list_head *amdgpu_ttm_lru_tail(struct ttm_buffer_object *tbo)
++{
++	struct amdgpu_mman_lru *lru = amdgpu_ttm_lru(tbo);
++	struct list_head *res = lru->lru[tbo->mem.mem_type];
++
++	lru->lru[tbo->mem.mem_type] = &tbo->lru;
++
++	return res;
++}
++
++static struct list_head *amdgpu_ttm_swap_lru_tail(struct ttm_buffer_object *tbo)
++{
++	struct amdgpu_mman_lru *lru = amdgpu_ttm_lru(tbo);
++	struct list_head *res = lru->swap_lru;
++
++	lru->swap_lru = &tbo->swap;
++
++	return res;
++}
++
+ static struct ttm_bo_driver amdgpu_bo_driver = {
+ 	.ttm_tt_create = &amdgpu_ttm_tt_create,
+ 	.ttm_tt_populate = &amdgpu_ttm_tt_populate,
+@@ -923,12 +969,14 @@ static struct ttm_bo_driver amdgpu_bo_driver = {
+ 	.fault_reserve_notify = &amdgpu_bo_fault_reserve_notify,
+ 	.io_mem_reserve = &amdgpu_ttm_io_mem_reserve,
+ 	.io_mem_free = &amdgpu_ttm_io_mem_free,
+-	.lru_tail = &ttm_bo_default_lru_tail,
+-	.swap_lru_tail = &ttm_bo_default_swap_lru_tail,
++	.lru_removal = &amdgpu_ttm_lru_removal,
++	.lru_tail = &amdgpu_ttm_lru_tail,
++	.swap_lru_tail = &amdgpu_ttm_swap_lru_tail,
+ };
+ 
+ int amdgpu_ttm_init(struct amdgpu_device *adev)
+ {
++	unsigned i, j;
+ 	int r;
+ 
+ 	r = amdgpu_ttm_global_init(adev);
+@@ -946,6 +994,15 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
+ 		DRM_ERROR("failed initializing buffer object driver(%d).\n", r);
+ 		return r;
+ 	}
++
++	for (i = 0; i < AMDGPU_TTM_LRU_SIZE; ++i) {
++		struct amdgpu_mman_lru *lru = &adev->mman.log2_size[i];
++
++		for (j = 0; j < TTM_NUM_MEM_TYPES; ++j)
++			lru->lru[j] = &adev->mman.bdev.man[j].lru;
++		lru->swap_lru = &adev->mman.bdev.glob->swap_lru;
++	}
++
+ 	adev->mman.initialized = true;
+ 	r = ttm_bo_init_mm(&adev->mman.bdev, TTM_PL_VRAM,
+ 				adev->mc.real_vram_size >> PAGE_SHIFT);
+-- 
+2.7.4
+

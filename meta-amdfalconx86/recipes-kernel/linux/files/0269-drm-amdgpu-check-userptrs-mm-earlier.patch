@@ -1,0 +1,191 @@
+From c0768582c76a463866bc22ac8768b04e6070ff2c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 8 Feb 2016 11:08:35 +0100
+Subject: [PATCH 0269/1110] drm/amdgpu: check userptrs mm earlier
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead of when we try to bind it check the usermm when
+we try to use it in the IOCTLs.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h         |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c | 17 +++++++++++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c      |  7 ++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c     |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c  |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c     |  9 +++------
+ 7 files changed, 27 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index a48dbe7..473b447 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -2330,7 +2330,7 @@ void amdgpu_ttm_placement_from_domain(struct amdgpu_bo *rbo, u32 domain);
+ bool amdgpu_ttm_bo_is_amdgpu_bo(struct ttm_buffer_object *bo);
+ int amdgpu_ttm_tt_set_userptr(struct ttm_tt *ttm, uint64_t addr,
+ 				     uint32_t flags);
+-bool amdgpu_ttm_tt_has_userptr(struct ttm_tt *ttm);
++struct mm_struct *amdgpu_ttm_tt_get_usermm(struct ttm_tt *ttm);
+ bool amdgpu_ttm_tt_affect_userptr(struct ttm_tt *ttm, unsigned long start,
+ 				  unsigned long end);
+ bool amdgpu_ttm_tt_is_readonly(struct ttm_tt *ttm);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
+index 1c6c0ac..53b1ebf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
+@@ -102,18 +102,27 @@ static int amdgpu_bo_list_set(struct amdgpu_device *adev,
+ 	for (i = 0; i < num_entries; ++i) {
+ 		struct amdgpu_bo_list_entry *entry = &array[i];
+ 		struct drm_gem_object *gobj;
++                struct mm_struct *usermm;
+ 
+ 		gobj = drm_gem_object_lookup(adev->ddev, filp, info[i].bo_handle);
+ 		if (!gobj)
++                if (!gobj) {
++                        r = -ENOENT;
+ 			goto error_free;
++                }
+ 
+ 		entry->robj = amdgpu_bo_ref(gem_to_amdgpu_bo(gobj));
+ 		drm_gem_object_unreference_unlocked(gobj);
+ 		entry->priority = min(info[i].bo_priority,
+ 				      AMDGPU_BO_LIST_MAX_PRIORITY);
+-                if (amdgpu_ttm_tt_has_userptr(entry->robj->tbo.ttm))
+-			has_userptr = true;
+-		}
++                usermm = amdgpu_ttm_tt_get_usermm(entry->robj->tbo.ttm);
++                if (usermm) {
++                        if (usermm != current->mm) {
++                                r = -EPERM;
++                                goto error_free;
++                        }
++                        has_userptr = true;
++                }
+ 		entry->tv.bo = &entry->robj->tbo;
+ 		entry->tv.shared = true;
+ 
+@@ -143,7 +152,7 @@ static int amdgpu_bo_list_set(struct amdgpu_device *adev,
+ 
+ error_free:
+ 	drm_free_large(array);
+-	return -ENOENT;
++        return r;
+ }
+ 
+ struct amdgpu_bo_list *
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index a344b16..bd9a0be 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -142,7 +142,7 @@ static int amdgpu_cs_user_fence_chunk(struct amdgpu_cs_parser *p,
+ 	p->uf.bo = amdgpu_bo_ref(gem_to_amdgpu_bo(gobj));
+ 	p->uf.offset = fence_data->offset;
+ 
+-	if (amdgpu_ttm_tt_has_userptr(p->uf.bo->tbo.ttm)) {
++        if (amdgpu_ttm_tt_get_usermm(p->uf.bo->tbo.ttm)) {
+ 		drm_gem_object_unreference_unlocked(gobj);
+ 		return -EINVAL;
+ 	}
+@@ -342,8 +342,13 @@ int amdgpu_cs_list_validate(struct amdgpu_cs_parser *p,
+ 
+ 	list_for_each_entry(lobj, validated, tv.head) {
+                 struct amdgpu_bo *bo = lobj->robj;
++                struct mm_struct *usermm;
+                 uint32_t domain;
+ 
++                usermm = amdgpu_ttm_tt_get_usermm(bo->tbo.ttm);
++                if (usermm && usermm != current->mm)
++                        return -EPERM;
++
+                 if (bo->pin_count)
+                         continue;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 95e12f4..2f56bc6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -310,7 +310,7 @@ int amdgpu_mode_dumb_mmap(struct drm_file *filp,
+ 		return -ENOENT;
+ 	}
+ 	robj = gem_to_amdgpu_bo(gobj);
+-	if (amdgpu_ttm_tt_has_userptr(robj->tbo.ttm) ||
++        if (amdgpu_ttm_tt_get_usermm(robj->tbo.ttm) ||
+ 	    (robj->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS)) {
+ 		drm_gem_object_unreference_unlocked(gobj);
+ 		return -EPERM;
+@@ -639,7 +639,7 @@ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
+ 		break;
+ 	}
+ 	case AMDGPU_GEM_OP_SET_PLACEMENT:
+-		if (amdgpu_ttm_tt_has_userptr(robj->tbo.ttm)) {
++                if (amdgpu_ttm_tt_get_usermm(robj->tbo.ttm)) {
+ 			r = -EPERM;
+ 			amdgpu_bo_unreserve(robj);
+ 			break;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index b79a4f3..c884873 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -370,7 +370,7 @@ int amdgpu_bo_pin_restricted(struct amdgpu_bo *bo, u32 domain,
+ 	int r, i;
+ 	unsigned fpfn, lpfn;
+ 
+-	if (amdgpu_ttm_tt_has_userptr(bo->tbo.ttm))
++        if (amdgpu_ttm_tt_get_usermm(bo->tbo.ttm))
+ 		return -EPERM;
+ 
+ 	if (WARN_ON_ONCE(min_offset > max_offset))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+index 59f735a..39db99a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+@@ -121,7 +121,7 @@ struct dma_buf *amdgpu_gem_prime_export(struct drm_device *dev,
+ {
+ 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(gobj);
+ 
+-	if (amdgpu_ttm_tt_has_userptr(bo->tbo.ttm))
++        if (amdgpu_ttm_tt_get_usermm(bo->tbo.ttm))
+ 		return ERR_PTR(-EPERM);
+ 
+ 	return drm_gem_prime_export(dev, gobj, flags);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index f08d53f..a4f7182 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -499,9 +499,6 @@ static int amdgpu_ttm_tt_pin_userptr(struct ttm_tt *ttm)
+ 	enum dma_data_direction direction = write ?
+ 		DMA_BIDIRECTIONAL : DMA_TO_DEVICE;
+ 
+-	if (current->mm != gtt->usermm)
+-		return -EPERM;
+-
+ 	if (gtt->userflags & AMDGPU_GEM_USERPTR_ANONONLY) {
+ 		/* check that we only pin down anonymous memory
+ 		   to prevent problems with writeback */
+@@ -773,14 +770,14 @@ int amdgpu_ttm_tt_set_userptr(struct ttm_tt *ttm, uint64_t addr,
+ 	return 0;
+ }
+ 
+-bool amdgpu_ttm_tt_has_userptr(struct ttm_tt *ttm)
++struct mm_struct *amdgpu_ttm_tt_get_usermm(struct ttm_tt *ttm)
+ {
+ 	struct amdgpu_ttm_tt *gtt = (void *)ttm;
+ 
+ 	if (gtt == NULL)
+-		return false;
++                return NULL;
+ 
+-	return !!gtt->userptr;
++        return gtt->usermm;
+ }
+ 
+ bool amdgpu_ttm_tt_affect_userptr(struct ttm_tt *ttm, unsigned long start,
+-- 
+2.7.4
+

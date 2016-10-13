@@ -1,0 +1,5401 @@
+From f250ee01f34b61d29f2e8ffd841555fe716f1fb8 Mon Sep 17 00:00:00 2001
+From: Yongqiang Sun <yongqiang.sun@amd.com>
+Date: Thu, 4 Feb 2016 10:42:38 -0500
+Subject: [PATCH 0784/1110] drm/amd/dal: Refactor opp gamma related.
+
+Signed-off-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Acked-by: Jordan Lazare <Jordan.Lazare@amd.com>
+---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    |   10 +-
+ drivers/gpu/drm/amd/dal/dc/calcs/Makefile          |    2 +-
+ drivers/gpu/drm/amd/dal/dc/calcs/gamma_calcs.c     | 1342 +++++++++++++
+ drivers/gpu/drm/amd/dal/dc/core/dc_surface.c       |   80 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_target.c        |   77 +-
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |   43 +-
+ drivers/gpu/drm/amd/dal/dc/dc_types.h              |   73 -
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |   98 +-
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.h    |    1 +
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.c     |    3 -
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.h     |   23 +-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_ipp_gamma.c   |  639 +------
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c     |  196 --
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h     |   13 +-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma.c | 2019 +-------------------
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_types.h   |   58 +
+ drivers/gpu/drm/amd/dal/dc/inc/core_types.h        |    9 +
+ drivers/gpu/drm/amd/dal/dc/inc/gamma_calcs.h       |   31 +
+ drivers/gpu/drm/amd/dal/dc/inc/gamma_types.h       |   48 -
+ drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h      |    6 +-
+ drivers/gpu/drm/amd/dal/dc/inc/ipp.h               |   33 +-
+ drivers/gpu/drm/amd/dal/dc/inc/opp.h               |   17 +-
+ drivers/gpu/drm/amd/dal/include/video_csc_types.h  |    1 -
+ .../gpu/drm/amd/dal/include/video_gamma_types.h    |    1 -
+ 24 files changed, 1790 insertions(+), 3033 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/calcs/gamma_calcs.c
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/dce110/dce110_types.h
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/inc/gamma_calcs.h
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index 3f80880..2cb445d 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -499,16 +499,20 @@ static void fill_gamma_from_crtc(
+ 	struct dc_surface *dc_surface)
+ {
+ 	int i;
+-	struct gamma_ramp *gamma;
++	struct dc_gamma *gamma;
+ 	uint16_t *red, *green, *blue;
+ 	int end = (crtc->gamma_size > NUM_OF_RAW_GAMMA_RAMP_RGB_256) ?
+ 			NUM_OF_RAW_GAMMA_RAMP_RGB_256 : crtc->gamma_size;
++	struct amdgpu_device *adev = crtc->dev->dev_private;
+ 
+ 	red = crtc->gamma_store;
+ 	green = red + crtc->gamma_size;
+ 	blue = green + crtc->gamma_size;
+ 
+-	gamma = &dc_surface->gamma_correction;
++	gamma = dc_create_gamma(adev->dm.dc);
++
++	if (gamma == NULL)
++		return;
+ 
+ 	for (i = 0; i < end; i++) {
+ 		gamma->gamma_ramp_rgb256x3x16.red[i] =
+@@ -521,6 +525,8 @@ static void fill_gamma_from_crtc(
+ 
+ 	gamma->type = GAMMA_RAMP_RBG256X3X16;
+ 	gamma->size = sizeof(gamma->gamma_ramp_rgb256x3x16);
++
++	dc_surface->gamma_correction = gamma;
+ }
+ 
+ static void fill_plane_attributes(
+diff --git a/drivers/gpu/drm/amd/dal/dc/calcs/Makefile b/drivers/gpu/drm/amd/dal/dc/calcs/Makefile
+index 7f1916b..9ac4ad1 100644
+--- a/drivers/gpu/drm/amd/dal/dc/calcs/Makefile
++++ b/drivers/gpu/drm/amd/dal/dc/calcs/Makefile
+@@ -3,7 +3,7 @@
+ # It calculates Bandwidth and Watermarks values for HW programming
+ #
+ 
+-BW_CALCS = bandwidth_calcs.o bw_fixed.o scaler_filter.o
++BW_CALCS = bandwidth_calcs.o bw_fixed.o scaler_filter.o gamma_calcs.o
+ 
+ AMD_DAL_BW_CALCS = $(addprefix $(AMDDALPATH)/dc/calcs/,$(BW_CALCS))
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/calcs/gamma_calcs.c b/drivers/gpu/drm/amd/dal/dc/calcs/gamma_calcs.c
+new file mode 100644
+index 0000000..e3a41b3
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/calcs/gamma_calcs.c
+@@ -0,0 +1,1342 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#include "dm_services.h"
++#include "gamma_calcs.h"
++#include "core_types.h"
++
++struct curve_config {
++	uint32_t offset;
++	int8_t segments[16];
++	int8_t begin;
++};
++
++static bool build_custom_float(
++	struct fixed31_32 value,
++	const struct custom_float_format *format,
++	bool *negative,
++	uint32_t *mantissa,
++	uint32_t *exponenta)
++{
++	uint32_t exp_offset = (1 << (format->exponenta_bits - 1)) - 1;
++
++	const struct fixed31_32 mantissa_constant_plus_max_fraction =
++		dal_fixed31_32_from_fraction(
++			(1LL << (format->mantissa_bits + 1)) - 1,
++			1LL << format->mantissa_bits);
++
++	struct fixed31_32 mantiss;
++
++	if (dal_fixed31_32_eq(
++		value,
++		dal_fixed31_32_zero)) {
++		*negative = false;
++		*mantissa = 0;
++		*exponenta = 0;
++		return true;
++	}
++
++	if (dal_fixed31_32_lt(
++		value,
++		dal_fixed31_32_zero)) {
++		*negative = format->sign;
++		value = dal_fixed31_32_neg(value);
++	} else {
++		*negative = false;
++	}
++
++	if (dal_fixed31_32_lt(
++		value,
++		dal_fixed31_32_one)) {
++		uint32_t i = 1;
++
++		do {
++			value = dal_fixed31_32_shl(value, 1);
++			++i;
++		} while (dal_fixed31_32_lt(
++			value,
++			dal_fixed31_32_one));
++
++		--i;
++
++		if (exp_offset <= i) {
++			*mantissa = 0;
++			*exponenta = 0;
++			return true;
++		}
++
++		*exponenta = exp_offset - i;
++	} else if (dal_fixed31_32_le(
++		mantissa_constant_plus_max_fraction,
++		value)) {
++		uint32_t i = 1;
++
++		do {
++			value = dal_fixed31_32_shr(value, 1);
++			++i;
++		} while (dal_fixed31_32_lt(
++			mantissa_constant_plus_max_fraction,
++			value));
++
++		*exponenta = exp_offset + i - 1;
++	} else {
++		*exponenta = exp_offset;
++	}
++
++	mantiss = dal_fixed31_32_sub(
++		value,
++		dal_fixed31_32_one);
++
++	if (dal_fixed31_32_lt(
++			mantiss,
++			dal_fixed31_32_zero) ||
++		dal_fixed31_32_lt(
++			dal_fixed31_32_one,
++			mantiss))
++		mantiss = dal_fixed31_32_zero;
++	else
++		mantiss = dal_fixed31_32_shl(
++			mantiss,
++			format->mantissa_bits);
++
++	*mantissa = dal_fixed31_32_floor(mantiss);
++
++	return true;
++}
++
++static bool setup_custom_float(
++	const struct custom_float_format *format,
++	bool negative,
++	uint32_t mantissa,
++	uint32_t exponenta,
++	uint32_t *result)
++{
++	uint32_t i = 0;
++	uint32_t j = 0;
++
++	uint32_t value = 0;
++
++	/* verification code:
++	 * once calculation is ok we can remove it
++	 */
++
++	const uint32_t mantissa_mask =
++		(1 << (format->mantissa_bits + 1)) - 1;
++
++	const uint32_t exponenta_mask =
++		(1 << (format->exponenta_bits + 1)) - 1;
++
++	if (mantissa & ~mantissa_mask) {
++		BREAK_TO_DEBUGGER();
++		mantissa = mantissa_mask;
++	}
++
++	if (exponenta & ~exponenta_mask) {
++		BREAK_TO_DEBUGGER();
++		exponenta = exponenta_mask;
++	}
++
++	/* end of verification code */
++
++	while (i < format->mantissa_bits) {
++		uint32_t mask = 1 << i;
++
++		if (mantissa & mask)
++			value |= mask;
++
++		++i;
++	}
++
++	while (j < format->exponenta_bits) {
++		uint32_t mask = 1 << j;
++
++		if (exponenta & mask)
++			value |= mask << i;
++
++		++j;
++	}
++
++	if (negative && format->sign)
++		value |= 1 << (i + j);
++
++	*result = value;
++
++	return true;
++}
++
++
++static bool convert_to_custom_float_format_ex(
++	struct fixed31_32 value,
++	const struct custom_float_format *format,
++	struct custom_float_value *result)
++{
++	return build_custom_float(
++		value, format,
++		&result->negative, &result->mantissa, &result->exponenta) &&
++	setup_custom_float(
++		format, result->negative, result->mantissa, result->exponenta,
++		&result->value);
++}
++
++static bool round_custom_float_6_12(
++	struct hw_x_point *x)
++{
++	struct custom_float_format fmt;
++
++	struct custom_float_value value;
++
++	fmt.exponenta_bits = 6;
++	fmt.mantissa_bits = 12;
++	fmt.sign = true;
++
++	if (!convert_to_custom_float_format_ex(
++		x->x, &fmt, &value))
++		return false;
++
++	x->adjusted_x = x->x;
++
++	if (value.mantissa) {
++		BREAK_TO_DEBUGGER();
++
++		return false;
++	}
++
++	return true;
++}
++
++static bool build_hw_curve_configuration(
++	const struct curve_config *curve_config,
++	struct gamma_curve *gamma_curve,
++	struct curve_points *curve_points,
++	struct hw_x_point *points,
++	uint32_t *number_of_points)
++{
++	const int8_t max_regions_number = ARRAY_SIZE(curve_config->segments);
++
++	int8_t i;
++
++	uint8_t segments_calculation[8] = { 0 };
++
++	struct fixed31_32 region1 = dal_fixed31_32_zero;
++	struct fixed31_32 region2;
++	struct fixed31_32 increment;
++
++	uint32_t index = 0;
++	uint32_t segments = 0;
++	uint32_t max_number;
++
++	bool result = false;
++
++	if (!number_of_points) {
++		BREAK_TO_DEBUGGER();
++		return false;
++	}
++
++	max_number = *number_of_points;
++
++	i = 0;
++
++	while (i != max_regions_number) {
++		gamma_curve[i].offset = 0;
++		gamma_curve[i].segments_num = 0;
++
++		++i;
++	}
++
++	i = 0;
++
++	while (i != max_regions_number) {
++		/* number should go in uninterruptible sequence */
++		if (curve_config->segments[i] == -1)
++			break;
++
++		ASSERT(curve_config->segments[i] >= 0);
++
++		segments += (1 << curve_config->segments[i]);
++
++		++i;
++	}
++
++	if (segments > max_number) {
++		BREAK_TO_DEBUGGER();
++	} else {
++		int32_t divisor;
++		uint32_t offset = 0;
++		int8_t begin = curve_config->begin;
++		int32_t region_number = 0;
++
++		i = begin;
++
++		while ((index < max_number) &&
++			(region_number < max_regions_number) &&
++			(i <= 1)) {
++			int32_t j = 0;
++
++			segments = curve_config->segments[region_number];
++			divisor = 1 << segments;
++
++			if (segments == -1) {
++				if (i > 0) {
++					region1 = dal_fixed31_32_shl(
++						dal_fixed31_32_one,
++						i - 1);
++					region2 = dal_fixed31_32_shl(
++						dal_fixed31_32_one,
++						i);
++				} else {
++					region1 = dal_fixed31_32_shr(
++						dal_fixed31_32_one,
++						-(i - 1));
++					region2 = dal_fixed31_32_shr(
++						dal_fixed31_32_one,
++						-i);
++				}
++
++				break;
++			}
++
++			if (i > -1) {
++				region1 = dal_fixed31_32_shl(
++					dal_fixed31_32_one,
++					i);
++				region2 = dal_fixed31_32_shl(
++					dal_fixed31_32_one,
++					i + 1);
++			} else {
++				region1 = dal_fixed31_32_shr(
++					dal_fixed31_32_one,
++					-i);
++				region2 = dal_fixed31_32_shr(
++					dal_fixed31_32_one,
++					-(i + 1));
++			}
++
++			gamma_curve[region_number].offset = offset;
++			gamma_curve[region_number].segments_num = segments;
++
++			offset += divisor;
++
++			++segments_calculation[segments];
++
++			increment = dal_fixed31_32_div_int(
++				dal_fixed31_32_sub(
++					region2,
++					region1),
++				divisor);
++
++			points[index].x = region1;
++
++			round_custom_float_6_12(points + index);
++
++			++index;
++			++region_number;
++
++			while ((index < max_number) && (j < divisor - 1)) {
++				region1 = dal_fixed31_32_add(
++					region1,
++					increment);
++
++				points[index].x = region1;
++				points[index].adjusted_x = region1;
++
++				++index;
++				++j;
++			}
++
++			++i;
++		}
++
++		points[index].x = region1;
++
++		round_custom_float_6_12(points + index);
++
++		*number_of_points = index;
++
++		result = true;
++	}
++
++	curve_points[0].x = points[0].adjusted_x;
++	curve_points[0].offset = dal_fixed31_32_zero;
++
++	curve_points[1].x = points[index - 1].adjusted_x;
++	curve_points[1].offset = dal_fixed31_32_zero;
++
++	curve_points[2].x = points[index].adjusted_x;
++	curve_points[2].offset = dal_fixed31_32_zero;
++
++	return result;
++}
++
++static bool setup_distribution_points(
++		struct gamma_curve *arr_curve_points,
++		struct curve_points *arr_points,
++		uint32_t *hw_points_num,
++		struct hw_x_point *coordinates_x)
++{
++	struct curve_config cfg;
++
++	cfg.offset = 0;
++	cfg.segments[0] = 3;
++	cfg.segments[1] = 4;
++	cfg.segments[2] = 4;
++	cfg.segments[3] = 4;
++	cfg.segments[4] = 4;
++	cfg.segments[5] = 4;
++	cfg.segments[6] = 4;
++	cfg.segments[7] = 4;
++	cfg.segments[8] = 5;
++	cfg.segments[9] = 5;
++	cfg.segments[10] = 0;
++	cfg.segments[11] = -1;
++	cfg.segments[12] = -1;
++	cfg.segments[13] = -1;
++	cfg.segments[14] = -1;
++	cfg.segments[15] = -1;
++
++	cfg.begin = -10;
++
++	if (!build_hw_curve_configuration(
++		&cfg, arr_curve_points,
++		arr_points,
++		coordinates_x, hw_points_num)) {
++		ASSERT_CRITICAL(false);
++		return false;
++	}
++	return true;
++}
++
++struct dividers {
++	struct fixed31_32 divider1;
++	struct fixed31_32 divider2;
++	struct fixed31_32 divider3;
++};
++
++
++static void build_regamma_coefficients(struct gamma_coefficients *coefficients)
++{
++	/* sRGB should apply 2.4 */
++	static const int32_t numerator01[3] = { 31308, 31308, 31308 };
++	static const int32_t numerator02[3] = { 12920, 12920, 12920 };
++	static const int32_t numerator03[3] = { 55, 55, 55 };
++	static const int32_t numerator04[3] = { 55, 55, 55 };
++	static const int32_t numerator05[3] = { 2400, 2400, 2400 };
++
++	const int32_t *numerator1;
++	const int32_t *numerator2;
++	const int32_t *numerator3;
++	const int32_t *numerator4;
++	const int32_t *numerator5;
++
++	uint32_t i = 0;
++
++	numerator1 = numerator01;
++	numerator2 = numerator02;
++	numerator3 = numerator03;
++	numerator4 = numerator04;
++	numerator5 = numerator05;
++
++	do {
++		coefficients->a0[i] = dal_fixed31_32_from_fraction(
++			numerator1[i], 10000000);
++		coefficients->a1[i] = dal_fixed31_32_from_fraction(
++			numerator2[i], 1000);
++		coefficients->a2[i] = dal_fixed31_32_from_fraction(
++			numerator3[i], 1000);
++		coefficients->a3[i] = dal_fixed31_32_from_fraction(
++			numerator4[i], 1000);
++		coefficients->user_gamma[i] = dal_fixed31_32_from_fraction(
++			numerator5[i], 1000);
++
++		++i;
++	} while (i != ARRAY_SIZE(coefficients->a0));
++}
++
++static struct fixed31_32 translate_from_linear_space(
++	struct fixed31_32 arg,
++	struct fixed31_32 a0,
++	struct fixed31_32 a1,
++	struct fixed31_32 a2,
++	struct fixed31_32 a3,
++	struct fixed31_32 gamma)
++{
++	const struct fixed31_32 one = dal_fixed31_32_from_int(1);
++
++	if (dal_fixed31_32_le(arg, dal_fixed31_32_neg(a0)))
++		return dal_fixed31_32_sub(
++			a2,
++			dal_fixed31_32_mul(
++				dal_fixed31_32_add(
++					one,
++					a3),
++				dal_fixed31_32_pow(
++					dal_fixed31_32_neg(arg),
++					dal_fixed31_32_recip(gamma))));
++	else if (dal_fixed31_32_le(a0, arg))
++		return dal_fixed31_32_sub(
++			dal_fixed31_32_mul(
++				dal_fixed31_32_add(
++					one,
++					a3),
++				dal_fixed31_32_pow(
++					arg,
++					dal_fixed31_32_recip(gamma))),
++			a2);
++	else
++		return dal_fixed31_32_mul(
++			arg,
++			a1);
++}
++
++static inline struct fixed31_32 translate_from_linear_space_ex(
++	struct fixed31_32 arg,
++	struct gamma_coefficients *coeff,
++	uint32_t color_index)
++{
++	return translate_from_linear_space(
++		arg,
++		coeff->a0[color_index],
++		coeff->a1[color_index],
++		coeff->a2[color_index],
++		coeff->a3[color_index],
++		coeff->user_gamma[color_index]);
++}
++
++static bool find_software_points(
++	const struct gamma_pixel *axis_x_256,
++	struct fixed31_32 hw_point,
++	enum channel_name channel,
++	uint32_t *index_to_start,
++	uint32_t *index_left,
++	uint32_t *index_right,
++	enum hw_point_position *pos)
++{
++	const uint32_t max_number = RGB_256X3X16 + 3;
++
++	struct fixed31_32 left, right;
++
++	uint32_t i = *index_to_start;
++
++	while (i < max_number) {
++		if (channel == CHANNEL_NAME_RED) {
++			left = axis_x_256[i].r;
++
++			if (i < max_number - 1)
++				right = axis_x_256[i + 1].r;
++			else
++				right = axis_x_256[max_number - 1].r;
++		} else if (channel == CHANNEL_NAME_GREEN) {
++			left = axis_x_256[i].g;
++
++			if (i < max_number - 1)
++				right = axis_x_256[i + 1].g;
++			else
++				right = axis_x_256[max_number - 1].g;
++		} else {
++			left = axis_x_256[i].b;
++
++			if (i < max_number - 1)
++				right = axis_x_256[i + 1].b;
++			else
++				right = axis_x_256[max_number - 1].b;
++		}
++
++		if (dal_fixed31_32_le(left, hw_point) &&
++			dal_fixed31_32_le(hw_point, right)) {
++			*index_to_start = i;
++			*index_left = i;
++
++			if (i < max_number - 1)
++				*index_right = i + 1;
++			else
++				*index_right = max_number - 1;
++
++			*pos = HW_POINT_POSITION_MIDDLE;
++
++			return true;
++		} else if ((i == *index_to_start) &&
++			dal_fixed31_32_le(hw_point, left)) {
++			*index_to_start = i;
++			*index_left = i;
++			*index_right = i;
++
++			*pos = HW_POINT_POSITION_LEFT;
++
++			return true;
++		} else if ((i == max_number - 1) &&
++			dal_fixed31_32_le(right, hw_point)) {
++			*index_to_start = i;
++			*index_left = i;
++			*index_right = i;
++
++			*pos = HW_POINT_POSITION_RIGHT;
++
++			return true;
++		}
++
++		++i;
++	}
++
++	return false;
++}
++
++static bool build_custom_gamma_mapping_coefficients_worker(
++	struct pixel_gamma_point *coeff,
++	const struct hw_x_point *coordinates_x,
++	const struct gamma_pixel *axis_x_256,
++	enum channel_name channel,
++	uint32_t number_of_points,
++	enum surface_pixel_format pixel_format)
++{
++	uint32_t i = 0;
++
++	while (i <= number_of_points) {
++		struct fixed31_32 coord_x;
++
++		uint32_t index_to_start = 0;
++		uint32_t index_left = 0;
++		uint32_t index_right = 0;
++
++		enum hw_point_position hw_pos;
++
++		struct gamma_point *point;
++
++		struct fixed31_32 left_pos;
++		struct fixed31_32 right_pos;
++
++		/*
++		 * TODO: confirm enum in surface_pixel_format
++		 * if (pixel_format == PIXEL_FORMAT_FP16)
++		 *coord_x = coordinates_x[i].adjusted_x;
++		 *else
++		 */
++		if (channel == CHANNEL_NAME_RED)
++			coord_x = coordinates_x[i].regamma_y_red;
++		else if (channel == CHANNEL_NAME_GREEN)
++			coord_x = coordinates_x[i].regamma_y_green;
++		else
++			coord_x = coordinates_x[i].regamma_y_blue;
++
++		if (!find_software_points(
++			axis_x_256, coord_x, channel,
++			&index_to_start, &index_left, &index_right, &hw_pos)) {
++			BREAK_TO_DEBUGGER();
++			return false;
++		}
++
++		if (index_left >= RGB_256X3X16 + 3) {
++			BREAK_TO_DEBUGGER();
++			return false;
++		}
++
++		if (index_right >= RGB_256X3X16 + 3) {
++			BREAK_TO_DEBUGGER();
++			return false;
++		}
++
++		if (channel == CHANNEL_NAME_RED) {
++			point = &coeff[i].r;
++
++			left_pos = axis_x_256[index_left].r;
++			right_pos = axis_x_256[index_right].r;
++		} else if (channel == CHANNEL_NAME_GREEN) {
++			point = &coeff[i].g;
++
++			left_pos = axis_x_256[index_left].g;
++			right_pos = axis_x_256[index_right].g;
++		} else {
++			point = &coeff[i].b;
++
++			left_pos = axis_x_256[index_left].b;
++			right_pos = axis_x_256[index_right].b;
++		}
++
++		if (hw_pos == HW_POINT_POSITION_MIDDLE)
++			point->coeff = dal_fixed31_32_div(
++				dal_fixed31_32_sub(
++					coord_x,
++					left_pos),
++				dal_fixed31_32_sub(
++					right_pos,
++					left_pos));
++		else if (hw_pos == HW_POINT_POSITION_LEFT)
++			point->coeff = dal_fixed31_32_zero;
++		else if (hw_pos == HW_POINT_POSITION_RIGHT)
++			point->coeff = dal_fixed31_32_from_int(2);
++		else {
++			BREAK_TO_DEBUGGER();
++			return false;
++		}
++
++		point->left_index = index_left;
++		point->right_index = index_right;
++		point->pos = hw_pos;
++
++		++i;
++	}
++
++	return true;
++}
++
++static inline bool build_oem_custom_gamma_mapping_coefficients(
++	struct pixel_gamma_point *coeff128_oem,
++	const struct hw_x_point *coordinates_x,
++	const struct gamma_pixel *axis_x_256,
++	uint32_t number_of_points,
++	enum surface_pixel_format pixel_format)
++{
++	int i;
++
++	for (i = 0; i < 3; i++) {
++		if (!build_custom_gamma_mapping_coefficients_worker(
++				coeff128_oem, coordinates_x, axis_x_256, i,
++				number_of_points, pixel_format))
++			return false;
++	}
++	return true;
++}
++
++static struct fixed31_32 calculate_mapped_value(
++	struct pwl_float_data *rgb,
++	const struct pixel_gamma_point *coeff,
++	enum channel_name channel,
++	uint32_t max_index)
++{
++	const struct gamma_point *point;
++
++	struct fixed31_32 result;
++
++	if (channel == CHANNEL_NAME_RED)
++		point = &coeff->r;
++	else if (channel == CHANNEL_NAME_GREEN)
++		point = &coeff->g;
++	else
++		point = &coeff->b;
++
++	if ((point->left_index < 0) || (point->left_index > max_index)) {
++		BREAK_TO_DEBUGGER();
++		return dal_fixed31_32_zero;
++	}
++
++	if ((point->right_index < 0) || (point->right_index > max_index)) {
++		BREAK_TO_DEBUGGER();
++		return dal_fixed31_32_zero;
++	}
++
++	if (point->pos == HW_POINT_POSITION_MIDDLE)
++		if (channel == CHANNEL_NAME_RED)
++			result = dal_fixed31_32_add(
++				dal_fixed31_32_mul(
++					point->coeff,
++					dal_fixed31_32_sub(
++						rgb[point->right_index].r,
++						rgb[point->left_index].r)),
++				rgb[point->left_index].r);
++		else if (channel == CHANNEL_NAME_GREEN)
++			result = dal_fixed31_32_add(
++				dal_fixed31_32_mul(
++					point->coeff,
++					dal_fixed31_32_sub(
++						rgb[point->right_index].g,
++						rgb[point->left_index].g)),
++				rgb[point->left_index].g);
++		else
++			result = dal_fixed31_32_add(
++				dal_fixed31_32_mul(
++					point->coeff,
++					dal_fixed31_32_sub(
++						rgb[point->right_index].b,
++						rgb[point->left_index].b)),
++				rgb[point->left_index].b);
++	else if (point->pos == HW_POINT_POSITION_LEFT) {
++		BREAK_TO_DEBUGGER();
++		result = dal_fixed31_32_zero;
++	} else {
++		BREAK_TO_DEBUGGER();
++		result = dal_fixed31_32_one;
++	}
++
++	return result;
++}
++
++static inline struct fixed31_32 calculate_oem_mapped_value(
++	struct pwl_float_data *rgb_oem,
++	const struct pixel_gamma_point *coeff,
++	uint32_t index,
++	enum channel_name channel,
++	uint32_t max_index)
++{
++	return calculate_mapped_value(
++			rgb_oem,
++			coeff + index,
++			channel,
++			max_index);
++}
++
++static void build_regamma_curve(struct pwl_float_data_ex *rgb_regamma,
++		struct pwl_float_data *rgb_oem,
++		struct pixel_gamma_point *coeff128_oem,
++		const struct core_gamma *ramp,
++		const struct core_surface *surface,
++		uint32_t hw_points_num,
++		const struct hw_x_point *coordinate_x,
++		const struct gamma_pixel *axis_x,
++		struct dividers dividers)
++{
++	uint32_t i;
++
++	struct gamma_coefficients coeff;
++	struct pwl_float_data_ex *rgb = rgb_regamma;
++	const struct hw_x_point *coord_x = coordinate_x;
++
++	build_regamma_coefficients(&coeff);
++
++	/* Use opp110->regamma.coordinates_x to retrieve
++	 * coordinates chosen base on given user curve (future task).
++	 * The x values are exponentially distributed and currently
++	 * it is hard-coded, the user curve shape is ignored.
++	 * The future task is to recalculate opp110-
++	 * regamma.coordinates_x based on input/user curve,
++	 * translation from 256/1025 to 128 pwl points.
++	 */
++
++	i = 0;
++
++	while (i != hw_points_num + 1) {
++		rgb->r = translate_from_linear_space_ex(
++			coord_x->adjusted_x, &coeff, 0);
++		rgb->g = translate_from_linear_space_ex(
++			coord_x->adjusted_x, &coeff, 1);
++		rgb->b = translate_from_linear_space_ex(
++			coord_x->adjusted_x, &coeff, 2);
++
++		++coord_x;
++		++rgb;
++		++i;
++	}
++}
++
++static bool scale_gamma(struct pwl_float_data *pwl_rgb,
++		const struct core_gamma *ramp,
++		struct dividers dividers)
++{
++	const struct dc_gamma_ramp_rgb256x3x16 *gamma;
++	const uint16_t max_driver = 0xFFFF;
++	const uint16_t max_os = 0xFF00;
++	uint16_t scaler = max_os;
++	uint32_t i;
++	struct pwl_float_data *rgb = pwl_rgb;
++	struct pwl_float_data *rgb_last = rgb + RGB_256X3X16 - 1;
++
++	if (ramp->public.type == GAMMA_RAMP_RBG256X3X16)
++		gamma = &ramp->public.gamma_ramp_rgb256x3x16;
++	else
++		return false; /* invalid option */
++
++	i = 0;
++
++	do {
++		if ((gamma->red[i] > max_os) ||
++			(gamma->green[i] > max_os) ||
++			(gamma->blue[i] > max_os)) {
++			scaler = max_driver;
++			break;
++		}
++		++i;
++	} while (i != RGB_256X3X16);
++
++	i = 0;
++
++	do {
++		rgb->r = dal_fixed31_32_from_fraction(
++			gamma->red[i], scaler);
++		rgb->g = dal_fixed31_32_from_fraction(
++			gamma->green[i], scaler);
++		rgb->b = dal_fixed31_32_from_fraction(
++			gamma->blue[i], scaler);
++
++		++rgb;
++		++i;
++	} while (i != RGB_256X3X16);
++
++	rgb->r = dal_fixed31_32_mul(rgb_last->r,
++			dividers.divider1);
++	rgb->g = dal_fixed31_32_mul(rgb_last->g,
++			dividers.divider1);
++	rgb->b = dal_fixed31_32_mul(rgb_last->b,
++			dividers.divider1);
++
++	++rgb;
++
++	rgb->r = dal_fixed31_32_mul(rgb_last->r,
++			dividers.divider2);
++	rgb->g = dal_fixed31_32_mul(rgb_last->g,
++			dividers.divider2);
++	rgb->b = dal_fixed31_32_mul(rgb_last->b,
++			dividers.divider2);
++
++	++rgb;
++
++	rgb->r = dal_fixed31_32_mul(rgb_last->r,
++			dividers.divider3);
++	rgb->g = dal_fixed31_32_mul(rgb_last->g,
++			dividers.divider3);
++	rgb->b = dal_fixed31_32_mul(rgb_last->b,
++			dividers.divider3);
++
++	return true;
++}
++
++static void build_evenly_distributed_points(
++	struct gamma_pixel *points,
++	uint32_t numberof_points,
++	struct fixed31_32 max_value,
++	struct dividers dividers)
++{
++	struct gamma_pixel *p = points;
++	struct gamma_pixel *p_last = p + numberof_points - 1;
++
++	uint32_t i = 0;
++
++	do {
++		struct fixed31_32 value = dal_fixed31_32_div_int(
++			dal_fixed31_32_mul_int(max_value, i),
++			numberof_points - 1);
++
++		p->r = value;
++		p->g = value;
++		p->b = value;
++
++		++p;
++		++i;
++	} while (i != numberof_points);
++
++	p->r = dal_fixed31_32_div(p_last->r, dividers.divider1);
++	p->g = dal_fixed31_32_div(p_last->g, dividers.divider1);
++	p->b = dal_fixed31_32_div(p_last->b, dividers.divider1);
++
++	++p;
++
++	p->r = dal_fixed31_32_div(p_last->r, dividers.divider2);
++	p->g = dal_fixed31_32_div(p_last->g, dividers.divider2);
++	p->b = dal_fixed31_32_div(p_last->b, dividers.divider2);
++
++	++p;
++
++	p->r = dal_fixed31_32_div(p_last->r, dividers.divider3);
++	p->g = dal_fixed31_32_div(p_last->g, dividers.divider3);
++	p->b = dal_fixed31_32_div(p_last->b, dividers.divider3);
++}
++
++static inline void copy_rgb_regamma_to_coordinates_x(
++		struct hw_x_point *coordinates_x,
++		uint32_t hw_points_num,
++		const struct pwl_float_data_ex *rgb_ex)
++{
++	struct hw_x_point *coords = coordinates_x;
++	uint32_t i = 0;
++	const struct pwl_float_data_ex *rgb_regamma = rgb_ex;
++
++	while (i <= hw_points_num) {
++		coords->regamma_y_red = rgb_regamma->r;
++		coords->regamma_y_green = rgb_regamma->g;
++		coords->regamma_y_blue = rgb_regamma->b;
++
++		++coords;
++		++rgb_regamma;
++		++i;
++	}
++}
++
++static bool calculate_interpolated_hardware_curve(
++	struct pwl_result_data *rgb,
++	struct pixel_gamma_point *coeff128,
++	struct pwl_float_data *rgb_user,
++	const struct hw_x_point *coordinates_x,
++	const struct gamma_pixel *axis_x_256,
++	uint32_t number_of_points,
++	enum surface_pixel_format pixel_format)
++{
++
++	const struct pixel_gamma_point *coeff;
++	struct pixel_gamma_point *coeff_128 = coeff128;
++	uint32_t max_entries = 3 - 1;
++	struct pwl_result_data *rgb_resulted = rgb;
++
++	uint32_t i = 0;
++
++	if (!build_oem_custom_gamma_mapping_coefficients(
++			coeff_128, coordinates_x, axis_x_256,
++			number_of_points,
++			pixel_format))
++		return false;
++
++	coeff = coeff128;
++	max_entries += RGB_256X3X16;
++
++	/* TODO: float point case */
++
++	while (i <= number_of_points) {
++		rgb_resulted->red = calculate_mapped_value(
++			rgb_user, coeff, CHANNEL_NAME_RED, max_entries);
++		rgb_resulted->green = calculate_mapped_value(
++			rgb_user, coeff, CHANNEL_NAME_GREEN, max_entries);
++		rgb_resulted->blue = calculate_mapped_value(
++			rgb_user, coeff, CHANNEL_NAME_BLUE, max_entries);
++
++		++coeff;
++		++rgb_resulted;
++		++i;
++	}
++
++	return true;
++}
++
++static bool map_regamma_hw_to_x_user(
++	struct pixel_gamma_point *coeff128,
++	struct pwl_float_data *rgb_oem,
++	struct pwl_result_data *rgb_resulted,
++	struct pwl_float_data *rgb_user,
++	struct hw_x_point *coords_x,
++	const struct gamma_pixel *axis_x,
++	const struct dc_gamma *gamma,
++	const struct pwl_float_data_ex *rgb_regamma,
++	struct dividers dividers,
++	uint32_t hw_points_num,
++	const struct core_surface *surface)
++{
++	/* setup to spare calculated ideal regamma values */
++
++	struct pixel_gamma_point *coeff = coeff128;
++
++	struct hw_x_point *coords = coords_x;
++
++	copy_rgb_regamma_to_coordinates_x(coords, hw_points_num, rgb_regamma);
++
++	return calculate_interpolated_hardware_curve(
++			rgb_resulted, coeff, rgb_user, coords, axis_x,
++			hw_points_num, surface->public.format);
++}
++
++static void build_new_custom_resulted_curve(
++	struct pwl_result_data *rgb_resulted,
++	uint32_t hw_points_num)
++{
++	struct pwl_result_data *rgb = rgb_resulted;
++	struct pwl_result_data *rgb_plus_1 = rgb + 1;
++
++	uint32_t i;
++
++	i = 0;
++
++	while (i != hw_points_num + 1) {
++		rgb->red = dal_fixed31_32_clamp(
++			rgb->red, dal_fixed31_32_zero,
++			dal_fixed31_32_one);
++		rgb->green = dal_fixed31_32_clamp(
++			rgb->green, dal_fixed31_32_zero,
++			dal_fixed31_32_one);
++		rgb->blue = dal_fixed31_32_clamp(
++			rgb->blue, dal_fixed31_32_zero,
++			dal_fixed31_32_one);
++
++		++rgb;
++		++i;
++	}
++
++	rgb = rgb_resulted;
++
++	i = 1;
++
++	while (i != hw_points_num + 1) {
++		if (dal_fixed31_32_lt(rgb_plus_1->red, rgb->red))
++			rgb_plus_1->red = rgb->red;
++		if (dal_fixed31_32_lt(rgb_plus_1->green, rgb->green))
++			rgb_plus_1->green = rgb->green;
++		if (dal_fixed31_32_lt(rgb_plus_1->blue, rgb->blue))
++			rgb_plus_1->blue = rgb->blue;
++
++		rgb->delta_red = dal_fixed31_32_sub(
++			rgb_plus_1->red,
++			rgb->red);
++		rgb->delta_green = dal_fixed31_32_sub(
++			rgb_plus_1->green,
++			rgb->green);
++		rgb->delta_blue = dal_fixed31_32_sub(
++			rgb_plus_1->blue,
++			rgb->blue);
++
++		++rgb_plus_1;
++		++rgb;
++		++i;
++	}
++}
++
++static void rebuild_curve_configuration_magic(
++		struct curve_points *arr_points,
++		struct pwl_result_data *rgb_resulted,
++		const struct hw_x_point *coordinates_x,
++		uint32_t hw_points_num)
++{
++	const struct fixed31_32 magic_number =
++		dal_fixed31_32_from_fraction(249, 1000);
++
++	struct fixed31_32 y_r;
++	struct fixed31_32 y_g;
++	struct fixed31_32 y_b;
++
++	struct fixed31_32 y1_min;
++	struct fixed31_32 y2_max;
++	struct fixed31_32 y3_max;
++
++	y_r = rgb_resulted[0].red;
++	y_g = rgb_resulted[0].green;
++	y_b = rgb_resulted[0].blue;
++
++	y1_min = dal_fixed31_32_min(y_r, dal_fixed31_32_min(y_g, y_b));
++
++	arr_points[0].x = coordinates_x[0].adjusted_x;
++	arr_points[0].y = y1_min;
++	arr_points[0].slope = dal_fixed31_32_div(
++					arr_points[0].y,
++					arr_points[0].x);
++
++	arr_points[1].x = dal_fixed31_32_add(
++			coordinates_x[hw_points_num - 1].adjusted_x,
++			magic_number);
++
++	arr_points[2].x = arr_points[1].x;
++
++	y_r = rgb_resulted[hw_points_num - 1].red;
++	y_g = rgb_resulted[hw_points_num - 1].green;
++	y_b = rgb_resulted[hw_points_num - 1].blue;
++
++	y2_max = dal_fixed31_32_max(y_r, dal_fixed31_32_max(y_g, y_b));
++
++	arr_points[1].y = y2_max;
++
++	y_r = rgb_resulted[hw_points_num].red;
++	y_g = rgb_resulted[hw_points_num].green;
++	y_b = rgb_resulted[hw_points_num].blue;
++
++	y3_max = dal_fixed31_32_max(y_r, dal_fixed31_32_max(y_g, y_b));
++
++	arr_points[2].y = y3_max;
++
++	arr_points[2].slope = dal_fixed31_32_one;
++}
++
++static bool convert_to_custom_float_format(
++	struct fixed31_32 value,
++	const struct custom_float_format *format,
++	uint32_t *result)
++{
++	uint32_t mantissa;
++	uint32_t exponenta;
++	bool negative;
++
++	return build_custom_float(
++		value, format, &negative, &mantissa, &exponenta) &&
++	setup_custom_float(
++		format, negative, mantissa, exponenta, result);
++}
++
++static bool convert_to_custom_float(
++		struct pwl_result_data *rgb_resulted,
++		struct curve_points *arr_points,
++		uint32_t hw_points_num)
++{
++	struct custom_float_format fmt;
++
++	struct pwl_result_data *rgb = rgb_resulted;
++
++	uint32_t i = 0;
++
++	fmt.exponenta_bits = 6;
++	fmt.mantissa_bits = 12;
++	fmt.sign = true;
++
++	if (!convert_to_custom_float_format(
++		arr_points[0].x,
++		&fmt,
++		&arr_points[0].custom_float_x)) {
++		BREAK_TO_DEBUGGER();
++		return false;
++	}
++
++	if (!convert_to_custom_float_format(
++		arr_points[0].offset,
++		&fmt,
++		&arr_points[0].custom_float_offset)) {
++		BREAK_TO_DEBUGGER();
++		return false;
++	}
++
++	if (!convert_to_custom_float_format(
++		arr_points[0].slope,
++		&fmt,
++		&arr_points[0].custom_float_slope)) {
++		BREAK_TO_DEBUGGER();
++		return false;
++	}
++
++	fmt.mantissa_bits = 10;
++	fmt.sign = false;
++
++	if (!convert_to_custom_float_format(
++		arr_points[1].x,
++		&fmt,
++		&arr_points[1].custom_float_x)) {
++		BREAK_TO_DEBUGGER();
++		return false;
++	}
++
++	if (!convert_to_custom_float_format(
++		arr_points[1].y,
++		&fmt,
++		&arr_points[1].custom_float_y)) {
++		BREAK_TO_DEBUGGER();
++		return false;
++	}
++
++	if (!convert_to_custom_float_format(
++		arr_points[2].slope,
++		&fmt,
++		&arr_points[2].custom_float_slope)) {
++		BREAK_TO_DEBUGGER();
++		return false;
++	}
++
++	fmt.mantissa_bits = 12;
++	fmt.sign = true;
++
++	while (i != hw_points_num) {
++		if (!convert_to_custom_float_format(
++			rgb->red,
++			&fmt,
++			&rgb->red_reg)) {
++			BREAK_TO_DEBUGGER();
++			return false;
++		}
++
++		if (!convert_to_custom_float_format(
++			rgb->green,
++			&fmt,
++			&rgb->green_reg)) {
++			BREAK_TO_DEBUGGER();
++			return false;
++		}
++
++		if (!convert_to_custom_float_format(
++			rgb->blue,
++			&fmt,
++			&rgb->blue_reg)) {
++			BREAK_TO_DEBUGGER();
++			return false;
++		}
++
++		if (!convert_to_custom_float_format(
++			rgb->delta_red,
++			&fmt,
++			&rgb->delta_red_reg)) {
++			BREAK_TO_DEBUGGER();
++			return false;
++		}
++
++		if (!convert_to_custom_float_format(
++			rgb->delta_green,
++			&fmt,
++			&rgb->delta_green_reg)) {
++			BREAK_TO_DEBUGGER();
++			return false;
++		}
++
++		if (!convert_to_custom_float_format(
++			rgb->delta_blue,
++			&fmt,
++			&rgb->delta_blue_reg)) {
++			BREAK_TO_DEBUGGER();
++			return false;
++		}
++
++		++rgb;
++		++i;
++	}
++
++	return true;
++}
++
++void calculate_regamma_params(struct regamma_params *params,
++		struct temp_params *temp_params,
++		const struct core_gamma *ramp,
++		const struct core_surface *surface)
++{
++	struct gamma_curve *arr_curve_points = params->arr_curve_points;
++	struct curve_points *arr_points = params->arr_points;
++	struct hw_x_point *coordinates_x = temp_params->coordinates_x;
++	struct pwl_float_data *rgb_user = temp_params->rgb_user;
++	struct pwl_float_data_ex *rgb_regamma = temp_params->rgb_regamma;
++	struct pwl_float_data *rgb_oem = temp_params->rgb_oem;
++	struct pwl_result_data *rgb_resulted = params->rgb_resulted;
++	struct dividers dividers;
++	struct gamma_pixel *axix_x_256 = temp_params->axix_x_256;
++	struct pixel_gamma_point *coeff128_oem = temp_params->coeff128_oem;
++	struct pixel_gamma_point *coeff128 = temp_params->coeff128;
++
++	dividers.divider1 = dal_fixed31_32_from_fraction(3, 2);
++	dividers.divider2 = dal_fixed31_32_from_int(2);
++	dividers.divider3 = dal_fixed31_32_from_fraction(5, 2);
++
++	build_evenly_distributed_points(
++			axix_x_256,
++			256,
++			dal_fixed31_32_one,
++			dividers);
++
++	scale_gamma(rgb_user, ramp, dividers);
++
++	setup_distribution_points(arr_curve_points, arr_points,
++			&params->hw_points_num, coordinates_x);
++
++	build_regamma_curve(rgb_regamma, rgb_oem, coeff128_oem,
++			ramp, surface, params->hw_points_num,
++			coordinates_x, axix_x_256, dividers);
++
++	map_regamma_hw_to_x_user(coeff128, rgb_oem, rgb_resulted, rgb_user,
++			coordinates_x, axix_x_256, &ramp->public, rgb_regamma,
++			dividers, params->hw_points_num, surface);
++
++	build_new_custom_resulted_curve(rgb_resulted, params->hw_points_num);
++
++	rebuild_curve_configuration_magic(
++			arr_points,
++			rgb_resulted,
++			coordinates_x,
++			params->hw_points_num);
++
++	convert_to_custom_float(rgb_resulted, arr_points,
++			params->hw_points_num);
++}
++
++
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_surface.c b/drivers/gpu/drm/amd/dal/dc/core/dc_surface.c
+index 1a9ee8f..3878a61 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_surface.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_surface.c
+@@ -40,36 +40,33 @@ struct surface {
+ 	int ref_count;
+ };
+ 
++struct gamma {
++	struct core_gamma protected;
++	int ref_count;
++};
++
+ #define DC_SURFACE_TO_SURFACE(dc_surface) container_of(dc_surface, struct surface, protected.public)
+ #define CORE_SURFACE_TO_SURFACE(core_surface) container_of(core_surface, struct surface, protected)
+ 
++#define DC_GAMMA_TO_GAMMA(dc_gamma) \
++	container_of(dc_gamma, struct gamma, protected.public)
++#define CORE_GAMMA_TO_GAMMA(core_gamma) \
++	container_of(core_gamma, struct gamma, protected)
++
++
+ /*******************************************************************************
+  * Private functions
+  ******************************************************************************/
+ static bool construct(struct dc_context *ctx, struct surface *surface)
+ {
+-	uint32_t i;
+-	struct gamma_ramp *gamma =
+-			&surface->protected.public.gamma_correction;
+-
+-	/* construct gamma default value. */
+-	for (i = 0; i < NUM_OF_RAW_GAMMA_RAMP_RGB_256; i++) {
+-		gamma->gamma_ramp_rgb256x3x16.red[i] =
+-				(unsigned short) (i << 8);
+-		gamma->gamma_ramp_rgb256x3x16.green[i] =
+-				(unsigned short) (i << 8);
+-		gamma->gamma_ramp_rgb256x3x16.blue[i] =
+-				(unsigned short) (i << 8);
+-	}
+-	gamma->type = GAMMA_RAMP_TYPE_RGB256;
+-	gamma->size = sizeof(gamma->gamma_ramp_rgb256x3x16);
+-
+ 	surface->protected.ctx = ctx;
+ 	return true;
+ }
+ 
+ static void destruct(struct surface *surface)
+ {
++	if (surface->protected.public.gamma_correction)
++		dc_gamma_release(surface->protected.public.gamma_correction);
+ }
+ 
+ /*******************************************************************************
+@@ -121,3 +118,54 @@ void dc_surface_release(const struct dc_surface *dc_surface)
+ 		dm_free(surface->protected.ctx, surface);
+ 	}
+ }
++
++static bool construct_gamma(struct dc_context *ctx, struct gamma *gamma)
++{
++	return true;
++}
++
++static void destruct_gamma(struct gamma *gamma)
++{
++
++}
++
++void dc_gamma_retain(const struct dc_gamma *dc_gamma)
++{
++	struct gamma *gamma = DC_GAMMA_TO_GAMMA(dc_gamma);
++
++	++gamma->ref_count;
++}
++
++void dc_gamma_release(const struct dc_gamma *dc_gamma)
++{
++	struct gamma *gamma = DC_GAMMA_TO_GAMMA(dc_gamma);
++	--gamma->ref_count;
++
++	if (gamma->ref_count == 0) {
++		destruct_gamma(gamma);
++		dm_free(gamma->protected.ctx, gamma);
++	}
++}
++
++
++struct dc_gamma *dc_create_gamma(const struct dc *dc)
++{
++	struct gamma *gamma = dm_alloc(dc->ctx, sizeof(*gamma));
++
++	if (gamma == NULL)
++		goto alloc_fail;
++
++	if (false == construct_gamma(dc->ctx, gamma))
++		goto construct_fail;
++
++	dc_gamma_retain(&gamma->protected.public);
++
++	return &gamma->protected.public;
++
++construct_fail:
++	dm_free(dc->ctx, gamma);
++
++alloc_fail:
++	return NULL;
++}
++
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+index 7980e9f..e8579bc 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_target.c
+@@ -133,68 +133,6 @@ target_alloc_fail:
+ 	return NULL;
+ }
+ 
+-static void build_gamma_params(
+-		enum pixel_format pixel_format,
+-		struct gamma_parameters *gamma_param)
+-{
+-	uint32_t i;
+-
+-	/* translate parameters */
+-	gamma_param->surface_pixel_format = pixel_format;
+-
+-	gamma_param->regamma_adjust_type = GRAPHICS_REGAMMA_ADJUST_SW;
+-	gamma_param->degamma_adjust_type = GRAPHICS_REGAMMA_ADJUST_SW;
+-
+-	gamma_param->selected_gamma_lut = GRAPHICS_GAMMA_LUT_REGAMMA;
+-
+-	/* TODO support non-legacy gamma */
+-	gamma_param->disable_adjustments = false;
+-	gamma_param->flag.bits.config_is_changed = 0;
+-	gamma_param->flag.bits.regamma_update = 1;
+-	gamma_param->flag.bits.gamma_update = 1;
+-
+-	/* Set regamma */
+-	gamma_param->regamma.features.bits.GRAPHICS_DEGAMMA_SRGB = 1;
+-	gamma_param->regamma.features.bits.OVERLAY_DEGAMMA_SRGB = 1;
+-	gamma_param->regamma.features.bits.GAMMA_RAMP_ARRAY = 0;
+-	gamma_param->regamma.features.bits.APPLY_DEGAMMA = 0;
+-
+-	for (i = 0; i < COEFF_RANGE; i++) {
+-		gamma_param->regamma.gamma_coeff.a0[i] = REGAMMA_COEFF_A0;
+-		gamma_param->regamma.gamma_coeff.a1[i] = REGAMMA_COEFF_A1;
+-		gamma_param->regamma.gamma_coeff.a2[i] = REGAMMA_COEFF_A2;
+-		gamma_param->regamma.gamma_coeff.a3[i] = REGAMMA_COEFF_A3;
+-		gamma_param->regamma.gamma_coeff.gamma[i] = REGAMMA_COEFF_GAMMA;
+-	}
+-}
+-
+-
+-static bool program_gamma(
+-		struct dc_context *ctx,
+-		struct dc_surface *surface,
+-		struct input_pixel_processor *ipp,
+-		struct output_pixel_processor *opp)
+-{
+-	struct gamma_parameters *gamma_param;
+-	bool result= false;
+-
+-	gamma_param = dm_alloc(ctx, sizeof(struct gamma_parameters));
+-
+-	if (!gamma_param)
+-		goto gamma_param_fail;
+-
+-	build_gamma_params(surface->format, gamma_param);
+-
+-	result = ctx->dc->hwss.set_gamma_ramp(ipp, opp,
+-			&surface->gamma_correction,
+-			gamma_param);
+-
+-	dm_free(ctx, gamma_param);
+-
+-gamma_param_fail:
+-	return result;
+-}
+-
+ static bool validate_surface_address(
+ 		struct dc_plane_address address)
+ {
+@@ -298,18 +236,27 @@ bool dc_commit_surfaces_to_target(
+ 	for (i = 0; i < new_surface_count; i++) {
+ 		struct dc_surface *surface = new_surfaces[i];
+ 		struct core_surface *core_surface = DC_SURFACE_TO_CORE(surface);
++		struct core_stream *stream =
++				DC_STREAM_TO_CORE(target->public.streams[0]);
+ 		bool is_valid_address =
+ 				validate_surface_address(surface->address);
+ 
++
+ 		dal_logger_write(dc->ctx->logger,
+ 					LOG_MAJOR_INTERFACE_TRACE,
+ 					LOG_MINOR_COMPONENT_DC,
+ 					"0x%x:",
+ 					surface);
+ 
+-		program_gamma(dc->ctx, surface,
+-			DC_STREAM_TO_CORE(target->public.streams[0])->ipp,
+-			DC_STREAM_TO_CORE(target->public.streams[0])->opp);
++		if (surface->gamma_correction) {
++			struct core_gamma *gamma = DC_GAMMA_TO_CORE(
++						surface->gamma_correction);
++
++			dc->hwss.set_gamma_correction(
++					stream->ipp,
++					stream->opp,
++					gamma, core_surface);
++		}
+ 
+ 		dc->hwss.set_plane_config(dc, core_surface, target);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index cc3395d..901c8c4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -59,6 +59,43 @@ void dc_destroy(struct dc **dc);
+  * Surface Interfaces
+  ******************************************************************************/
+ 
++enum {
++	RGB_256X3X16 = 256,
++	FLOAT_GAMMA_RAMP_MAX = 1025
++};
++
++enum dc_gamma_ramp_type {
++	GAMMA_RAMP_RBG256X3X16,
++	GAMMA_RAMP_FLOAT,
++};
++
++struct float_rgb {
++	struct fixed32_32 red;
++	struct fixed32_32 green;
++	struct fixed32_32 blue;
++};
++
++struct dc_gamma_ramp_float {
++	struct float_rgb scale;
++	struct float_rgb offset;
++	struct float_rgb gamma_curve[FLOAT_GAMMA_RAMP_MAX];
++};
++
++struct dc_gamma_ramp_rgb256x3x16 {
++	uint16_t red[RGB_256X3X16];
++	uint16_t green[RGB_256X3X16];
++	uint16_t blue[RGB_256X3X16];
++};
++
++struct dc_gamma {
++	enum dc_gamma_ramp_type type;
++	union {
++		struct dc_gamma_ramp_rgb256x3x16 gamma_ramp_rgb256x3x16;
++		struct dc_gamma_ramp_float gamma_ramp_float;
++	};
++	uint32_t size;
++};
++
+ struct dc_surface {
+ 	bool visible;
+ 	bool flip_immediate;
+@@ -77,8 +114,7 @@ struct dc_surface {
+ 	enum dc_rotation_angle rotation;
+ 	enum plane_stereo_format stereo_format;
+ 
+-	struct gamma_ramp gamma_correction; /* deprecated */
+-	struct dc_gamma_ramp gamma;
++	struct dc_gamma *gamma_correction;
+ };
+ 
+ /*
+@@ -102,6 +138,9 @@ const struct dc_surface_status* dc_surface_get_status(
+ void dc_surface_retain(const struct dc_surface *dc_surface);
+ void dc_surface_release(const struct dc_surface *dc_surface);
+ 
++void dc_gamma_release(const struct dc_gamma *dc_gamma);
++struct dc_gamma *dc_create_gamma(const struct dc *dc);
++
+ /*
+  * This structure holds a surface address.  There could be multiple addresses
+  * in cases such as Stereo 3D, Planar YUV, etc.  Other per-flip attributes such
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_types.h b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+index 67e62c3..5593c17 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+@@ -559,79 +559,6 @@ enum dc_connection_type {
+ 	dc_connection_active_dongle
+ };
+ 
+-/*
+- * Gamma ramp representation in DC
+- *
+- * A gamma ramp is just a curve defined within the range of [min, max] with
+- * arbitrary precision.
+- *
+- * DM is responsible for providing DC with an interface to obtain any y value
+- * within that range with a selected precision.
+- *
+- * bit32 ------------------------------------------------- bit 0
+- *       [  padding  ][ exponent bits ][  fraction bits  ]
+- *
+- * DC specifies the input x value and precision to the callback function
+- * get_gamma_value as well as providing the context and DM returns the y
+- * value.
+- *
+- * If fraction_bits + exponent_bits exceed width of 32 bits, get_gamma_value
+- * returns 0.  If x is outside the bounds of [min, max], get_gamma_value
+- * returns 0.
+- *
+- */
+-/* TODO: Deprecated */
+-enum {
+-	RGB_256X3X16 = 256,
+-	DX_GAMMA_RAMP_MAX = 1025
+-};
+-
+-enum gamma_ramp_type {
+-	GAMMA_RAMP_UNINITIALIZED = 0,
+-	GAMMA_RAMP_DEFAULT,
+-	GAMMA_RAMP_RBG256X3X16,
+-	GAMMA_RAMP_DXGI_1,
+-};
+-
+-struct dxgi_rgb {
+-	struct fixed32_32 red;
+-	struct fixed32_32 green;
+-	struct fixed32_32 blue;
+-};
+-
+-struct gamma_ramp_dxgi_1 {
+-	struct dxgi_rgb scale;
+-	struct dxgi_rgb offset;
+-	struct dxgi_rgb gamma_curve[DX_GAMMA_RAMP_MAX];
+-};
+-
+-struct gamma_ramp_rgb256x3x16 {
+-	uint16_t red[RGB_256X3X16];
+-	uint16_t green[RGB_256X3X16];
+-	uint16_t blue[RGB_256X3X16];
+-};
+-
+-struct gamma_ramp {
+-	enum gamma_ramp_type type;
+-	union {
+-		struct gamma_ramp_rgb256x3x16 gamma_ramp_rgb256x3x16;
+-		struct gamma_ramp_dxgi_1 gamma_ramp_dxgi1;
+-	};
+-	uint32_t size;
+-};
+-
+-
+-struct dc_gamma_ramp {
+-	uint32_t (*get_gamma_value) (
+-			void *context,
+-			uint8_t exponent_bits,
+-			uint8_t fraction_bits,
+-			uint32_t x);
+-	void *context;
+-	uint32_t min;
+-	uint32_t max;
+-};
+-
+ struct dc_csc_adjustments {
+ 	struct fixed31_32 contrast;
+ 	struct fixed31_32 saturation;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 754e81d..946e42f 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -42,6 +42,7 @@
+ #include "stream_encoder.h"
+ #include "link_encoder.h"
+ #include "clock_source.h"
++#include "gamma_calcs.h"
+ 
+ /* include DCE11 register header files */
+ #include "dce/dce_11_0_d.h"
+@@ -476,64 +477,83 @@ static bool dce110_enable_display_power_gating(
+ 		return false;
+ }
+ 
++static void build_prescale_params(struct ipp_prescale_params *prescale_params,
++		const struct core_surface *surface)
++{
++	prescale_params->mode = IPP_PRESCALE_MODE_FIXED_UNSIGNED;
++
++	switch (surface->public.format) {
++	case SURFACE_PIXEL_FORMAT_GRPH_ARGB8888:
++	case SURFACE_PIXEL_FORMAT_GRPH_BGRA8888:
++		prescale_params->scale = 0x2000;
++		break;
++	case SURFACE_PIXEL_FORMAT_GRPH_ARGB2101010:
++	case SURFACE_PIXEL_FORMAT_GRPH_ABGR2101010:
++		/* TODO */
++		break;
++	case SURFACE_PIXEL_FORMAT_GRPH_ARGB16161616:
++	case SURFACE_PIXEL_FORMAT_GRPH_ABGR16161616F:
++		/* TODO */
++		break;
++	default:
++		ASSERT(false);
++	}
++}
++
+ 
+ static bool set_gamma_ramp(
+ 	struct input_pixel_processor *ipp,
+ 	struct output_pixel_processor *opp,
+-	const struct gamma_ramp *ramp,
+-	const struct gamma_parameters *params)
++	const struct core_gamma *ramp,
++	const struct core_surface *surface)
+ {
+-	/*Power on LUT memory*/
+-	opp->funcs->opp_power_on_regamma_lut(opp, true);
++	struct ipp_prescale_params *prescale_params;
++	struct regamma_params *regamma_params;
++	struct temp_params *temp_params;
++	bool result = false;
+ 
++	prescale_params = dm_alloc(opp->ctx,
++			sizeof(struct ipp_prescale_params));
+ 
+-	if (params->surface_pixel_format == PIXEL_FORMAT_INDEX8 ||
+-		params->selected_gamma_lut == GRAPHICS_GAMMA_LUT_LEGACY) {
+-		/* do legacy DCP for 256 colors if we are requested to do so */
+-		ipp->funcs->ipp_set_legacy_input_gamma_ramp(
+-			ipp, ramp, params);
++	if (prescale_params == NULL)
++		goto prescale_alloc_fail;
+ 
+-		ipp->funcs->ipp_set_legacy_input_gamma_mode(ipp, true);
++	regamma_params = dm_alloc(opp->ctx,
++			sizeof(struct regamma_params));
++	if (regamma_params == NULL)
++		goto regamma_alloc_fail;
+ 
+-		/* set bypass */
+-		ipp->funcs->ipp_program_prescale(ipp, PIXEL_FORMAT_UNINITIALIZED);
++	temp_params = dm_alloc(opp->ctx, sizeof(struct temp_params));
+ 
+-		ipp->funcs->ipp_set_degamma(ipp, params, true);
++	if (temp_params == NULL)
++		goto temp_alloc_fail;
+ 
+-		opp->funcs->opp_set_regamma(opp, ramp, params, true);
+-	} else if (params->selected_gamma_lut ==
+-			GRAPHICS_GAMMA_LUT_LEGACY_AND_REGAMMA) {
+-		if (!opp->funcs->opp_map_legacy_and_regamma_hw_to_x_user(
+-			opp, ramp, params)) {
+-			BREAK_TO_DEBUGGER();
+-			/* invalid parameters or bug */
+-			return false;
+-		}
++	regamma_params->hw_points_num = GAMMA_HW_POINTS_NUM;
+ 
+-		/* do legacy DCP for 256 colors if we are requested to do so */
+-		ipp->funcs->ipp_set_legacy_input_gamma_ramp(
+-			ipp, ramp, params);
++	opp->funcs->opp_power_on_regamma_lut(opp, true);
+ 
+-		ipp->funcs->ipp_set_legacy_input_gamma_mode(ipp, true);
++	build_prescale_params(prescale_params, surface);
+ 
+-		/* set bypass */
+-		ipp->funcs->ipp_program_prescale(ipp, PIXEL_FORMAT_UNINITIALIZED);
+-	} else {
+-		ipp->funcs->ipp_set_legacy_input_gamma_mode(ipp, false);
++	ipp->funcs->ipp_program_prescale(ipp, prescale_params);
+ 
+-		ipp->funcs->ipp_program_prescale(ipp, params->surface_pixel_format);
++	ipp->funcs->ipp_set_degamma(ipp, IPP_DEGAMMA_MODE_sRGB);
+ 
+-		/* Do degamma step : remove the given gamma value from FB.
+-		 * For FP16 or no degamma do by pass */
+-		ipp->funcs->ipp_set_degamma(ipp, params, false);
++	calculate_regamma_params(regamma_params, temp_params, ramp, surface);
+ 
+-		opp->funcs->opp_set_regamma(opp, ramp, params, false);
+-	}
++	opp->funcs->opp_set_regamma(opp, regamma_params);
+ 
+-	/*re-enable low power mode for LUT memory*/
+ 	opp->funcs->opp_power_on_regamma_lut(opp, false);
+ 
+-	return true;
++	dm_free(opp->ctx, temp_params);
++
++	result = true;
++
++temp_alloc_fail:
++	dm_free(opp->ctx, regamma_params);
++regamma_alloc_fail:
++	dm_free(opp->ctx, prescale_params);
++prescale_alloc_fail:
++	return result;
+ }
+ 
+ static enum dc_status bios_parser_crtc_source_select(
+@@ -1662,7 +1682,7 @@ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.reset_hw_ctx = reset_hw_ctx,
+ 	.set_plane_config = set_plane_config,
+ 	.update_plane_address = update_plane_address,
+-	.set_gamma_ramp = set_gamma_ramp,
++	.set_gamma_correction = set_gamma_ramp,
+ 	.power_down = power_down,
+ 	.enable_accelerated_mode = enable_accelerated_mode,
+ 	.enable_timing_synchronization = enable_timing_synchronization,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.h
+index def54df..eafa345 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.h
+@@ -28,6 +28,7 @@
+ 
+ #include "core_types.h"
+ 
++#define GAMMA_HW_POINTS_NUM 256
+ struct dc;
+ 
+ bool dce110_hw_sequencer_construct(struct dc *dc);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.c
+index 6ab3527..e67b7e6 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.c
+@@ -36,9 +36,6 @@ static struct ipp_funcs funcs = {
+ 		.ipp_cursor_set_position = dce110_ipp_cursor_set_position,
+ 		.ipp_program_prescale = dce110_ipp_program_prescale,
+ 		.ipp_set_degamma = dce110_ipp_set_degamma,
+-		.ipp_set_legacy_input_gamma_mode = dce110_ipp_set_legacy_input_gamma_mode,
+-		.ipp_set_legacy_input_gamma_ramp = dce110_ipp_set_legacy_input_gamma_ramp,
+-		.ipp_set_palette = dce110_ipp_set_palette,
+ };
+ 
+ bool dce110_ipp_construct(
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.h
+index 709906f..dde138c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp.h
+@@ -42,7 +42,6 @@ struct dce110_ipp_reg_offsets {
+ struct dce110_ipp {
+ 	struct input_pixel_processor base;
+ 	struct dce110_ipp_reg_offsets offsets;
+-	struct dev_c_lut saved_palette[RGB_256X3X16];
+ };
+ 
+ bool dce110_ipp_construct(
+@@ -65,29 +64,11 @@ bool dce110_ipp_cursor_set_attributes(
+ /* DEGAMMA RELATED */
+ bool dce110_ipp_set_degamma(
+ 	struct input_pixel_processor *ipp,
+-	const struct gamma_parameters *params,
+-	bool force_bypass);
++	enum ipp_degamma_mode mode);
+ 
+ void dce110_ipp_program_prescale(
+ 	struct input_pixel_processor *ipp,
+-	enum pixel_format pixel_format);
+-
+-void dce110_ipp_set_legacy_input_gamma_mode(
+-		struct input_pixel_processor *ipp,
+-		bool is_legacy);
+-
+-bool dce110_ipp_set_legacy_input_gamma_ramp(
+-	struct input_pixel_processor *ipp,
+-	const struct gamma_ramp *gamma_ramp,
+-	const struct gamma_parameters *params);
+-
+-bool dce110_ipp_set_palette(
+-	struct input_pixel_processor *ipp,
+-	const struct dev_c_lut *palette,
+-	uint32_t start,
+-	uint32_t length,
+-	enum pixel_format surface_pixel_format);
+-
++	struct ipp_prescale_params *params);
+ /*
+  * Helper functions to be resused in other ASICs
+  */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp_gamma.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp_gamma.c
+index fcf65f1..dc0ccbb 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp_gamma.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_ipp_gamma.c
+@@ -41,35 +41,6 @@ enum {
+ 	MAX_INPUT_LUT_ENTRY = 256
+ };
+ 
+-/* CALCULATION OPERATIONS*/
+-static void convert_256_lut_entries_to_gxo_format(
+-	const struct gamma_ramp_rgb256x3x16 *lut,
+-	struct dev_c_lut16 *gamma)
+-{
+-	uint32_t i = 0;
+-
+-	ASSERT(lut);
+-	ASSERT(gamma);
+-
+-	do {
+-		gamma->red = lut->red[i];
+-		gamma->green = lut->green[i];
+-		gamma->blue = lut->blue[i];
+-
+-		++gamma;
+-		++i;
+-	} while (i != MAX_INPUT_LUT_ENTRY);
+-}
+-
+-static void convert_udx_gamma_entries_to_gxo_format(
+-	const struct gamma_ramp_dxgi_1 *lut,
+-	struct dev_c_lut16 *gamma)
+-{
+-	/* TODO here we deal with DXGI gamma table,
+-	 * originally, values was expressed as 'float',
+-	 * now values expressed as 'dal_fixed20_12'. */
+-}
+-
+ /*PROTOTYPE DECLARATIONS*/
+ static void set_lut_inc(
+ 	struct dce110_ipp *ipp110,
+@@ -85,111 +56,111 @@ static void program_white_offsets(
+ 	struct dce110_ipp *ipp110,
+ 	struct dev_c_lut16 *offset);
+ 
+-static void program_lut_gamma(
+-	struct dce110_ipp *ipp110,
+-	const struct dev_c_lut16 *gamma,
+-	const struct gamma_parameters *params);
+-
+-static void program_prescale(
+-	struct dce110_ipp *ipp110,
+-	enum pixel_format pixel_format);
++bool dce110_ipp_set_degamma(
++	struct input_pixel_processor *ipp,
++	enum ipp_degamma_mode mode)
++{
++	struct dce110_ipp *ipp110 = TO_DCE110_IPP(ipp);
+ 
+-static void set_legacy_input_gamma_mode(
+-	struct dce110_ipp *ipp110,
+-	bool is_legacy);
++	uint32_t value = 0;
+ 
+-static bool set_legacy_input_gamma_ramp_rgb256x3x16(
+-	struct dce110_ipp *ipp110,
+-	const struct gamma_ramp *gamma_ramp,
+-	const struct gamma_parameters *params);
++	uint32_t degamma_type = (mode == IPP_DEGAMMA_MODE_sRGB) ? 1 : 0;
+ 
+-static bool set_legacy_input_gamma_ramp_dxgi1(
+-	struct dce110_ipp *ipp110,
+-	const struct gamma_ramp *gamma_ramp,
+-	const struct gamma_parameters *params);
++	set_reg_field_value(
++		value,
++		degamma_type,
++		DEGAMMA_CONTROL,
++		GRPH_DEGAMMA_MODE);
+ 
+-static bool set_default_gamma(
+-	struct dce110_ipp *ipp110,
+-	enum pixel_format surface_pixel_format);
++	set_reg_field_value(
++		value,
++		degamma_type,
++		DEGAMMA_CONTROL,
++		CURSOR_DEGAMMA_MODE);
+ 
+-static void set_degamma(
+-	struct dce110_ipp *ipp110,
+-	const struct gamma_parameters *params,
+-	bool force_bypass);
++	set_reg_field_value(
++		value,
++		degamma_type,
++		DEGAMMA_CONTROL,
++		CURSOR2_DEGAMMA_MODE);
+ 
+-bool dce110_ipp_set_legacy_input_gamma_ramp(
+-	struct input_pixel_processor *ipp,
+-	const struct gamma_ramp *gamma_ramp,
+-	const struct gamma_parameters *params)
+-{
+-	struct dce110_ipp *ipp110 = TO_DCE110_IPP(ipp);
++	dm_write_reg(ipp110->base.ctx, DCP_REG(mmDEGAMMA_CONTROL), value);
+ 
+-	switch (gamma_ramp->type) {
+-	case GAMMA_RAMP_RBG256X3X16:
+-		return set_legacy_input_gamma_ramp_rgb256x3x16(
+-				ipp110, gamma_ramp, params);
+-	case GAMMA_RAMP_DXGI_1:
+-		return set_legacy_input_gamma_ramp_dxgi1(
+-				ipp110, gamma_ramp, params);
+-	default:
+-		ASSERT_CRITICAL(false);
+-		return false;
+-	}
++	return true;
+ }
+ 
+-bool dce110_ipp_set_palette(
++void dce110_ipp_program_prescale(
+ 	struct input_pixel_processor *ipp,
+-	const struct dev_c_lut *palette,
+-	uint32_t start,
+-	uint32_t length,
+-	enum pixel_format surface_pixel_format)
++	struct ipp_prescale_params *params)
+ {
+ 	struct dce110_ipp *ipp110 = TO_DCE110_IPP(ipp);
+-	uint32_t i;
+ 
+-	if (((start + length) > MAX_INPUT_LUT_ENTRY) || (NULL == palette)) {
+-		BREAK_TO_DEBUGGER();
+-		/* wrong input */
+-		return false;
+-	}
++	uint32_t prescale_control = 0;
++	uint32_t prescale_value = 0;
++	uint32_t legacy_lut_control = 0;
+ 
+-	for (i = start; i < start + length; i++) {
+-		ipp110->saved_palette[i] = palette[i];
+-		ipp110->saved_palette[i] = palette[i];
+-		ipp110->saved_palette[i] = palette[i];
+-	}
++	prescale_control = dm_read_reg(ipp110->base.ctx,
++			DCP_REG(mmPRESCALE_GRPH_CONTROL));
+ 
+-	return set_default_gamma(ipp110, surface_pixel_format);
+-}
++	if (params->mode != IPP_PRESCALE_MODE_BYPASS) {
+ 
+-bool dce110_ipp_set_degamma(
+-	struct input_pixel_processor *ipp,
+-	const struct gamma_parameters *params,
+-	bool force_bypass)
+-{
+-	struct dce110_ipp *ipp110 = TO_DCE110_IPP(ipp);
++		set_reg_field_value(
++			prescale_control,
++			0,
++			PRESCALE_GRPH_CONTROL,
++			GRPH_PRESCALE_BYPASS);
+ 
+-	set_degamma(ipp110, params, force_bypass);
++		/*
++		 * If prescale is in use, then legacy lut should
++		 * be bypassed
++		 */
++		legacy_lut_control = dm_read_reg(ipp110->base.ctx,
++			DCP_REG(mmINPUT_GAMMA_CONTROL));
+ 
+-	return true;
+-}
++		set_reg_field_value(
++			legacy_lut_control,
++			1,
++			INPUT_GAMMA_CONTROL,
++			GRPH_INPUT_GAMMA_MODE);
+ 
+-void dce110_ipp_program_prescale(
+-	struct input_pixel_processor *ipp,
+-	enum pixel_format pixel_format)
+-{
+-	struct dce110_ipp *ipp110 = TO_DCE110_IPP(ipp);
++		dm_write_reg(ipp110->base.ctx,
++			DCP_REG(mmINPUT_GAMMA_CONTROL),
++			legacy_lut_control);
++	} else {
++		set_reg_field_value(
++			prescale_control,
++			1,
++			PRESCALE_GRPH_CONTROL,
++			GRPH_PRESCALE_BYPASS);
++	}
+ 
+-	program_prescale(ipp110, pixel_format);
+-}
++	set_reg_field_value(
++		prescale_value,
++		params->scale,
++		PRESCALE_VALUES_GRPH_R,
++		GRPH_PRESCALE_SCALE_R);
+ 
+-void dce110_ipp_set_legacy_input_gamma_mode(
+-		struct input_pixel_processor *ipp,
+-		bool is_legacy)
+-{
+-	struct dce110_ipp *ipp110 = TO_DCE110_IPP(ipp);
++	set_reg_field_value(
++		prescale_value,
++		params->bias,
++		PRESCALE_VALUES_GRPH_R,
++		GRPH_PRESCALE_BIAS_R);
++
++	dm_write_reg(ipp110->base.ctx,
++		DCP_REG(mmPRESCALE_GRPH_CONTROL),
++		prescale_control);
++
++	dm_write_reg(ipp110->base.ctx,
++		DCP_REG(mmPRESCALE_VALUES_GRPH_R),
++		prescale_value);
++
++	dm_write_reg(ipp110->base.ctx,
++		DCP_REG(mmPRESCALE_VALUES_GRPH_G),
++		prescale_value);
+ 
+-	set_legacy_input_gamma_mode(ipp110, is_legacy);
++	dm_write_reg(ipp110->base.ctx,
++		DCP_REG(mmPRESCALE_VALUES_GRPH_B),
++		prescale_value);
+ }
+ 
+ static void set_lut_inc(
+@@ -426,447 +397,3 @@ void dce110_helper_program_black_white_offset(
+ 	program_black_offsets(ipp110, &black_offset);
+ 	program_white_offsets(ipp110, &white_offset);
+ }
+-
+-static void program_lut_gamma(
+-	struct dce110_ipp *ipp110,
+-	const struct dev_c_lut16 *gamma,
+-	const struct gamma_parameters *params)
+-{
+-	uint32_t i = 0;
+-	uint32_t value = 0;
+-	uint32_t addr;
+-
+-	{
+-		uint8_t max_tries = 10;
+-		uint8_t counter = 0;
+-
+-		/* Power on LUT memory */
+-		value = dm_read_reg(
+-				ipp110->base.ctx, DCP_REG(mmDCFE_MEM_PWR_CTRL));
+-
+-		set_reg_field_value(
+-			value,
+-			1,
+-			DCFE_MEM_PWR_CTRL,
+-			DCP_REGAMMA_MEM_PWR_DIS);
+-
+-		dm_write_reg(
+-			ipp110->base.ctx, DCP_REG(mmDCFE_MEM_PWR_CTRL), value);
+-
+-		while (counter < max_tries) {
+-			value =
+-				dm_read_reg(
+-					ipp110->base.ctx,
+-					DCP_REG(mmDCFE_MEM_PWR_STATUS));
+-
+-			if (get_reg_field_value(
+-				value,
+-				DCFE_MEM_PWR_STATUS,
+-				DCP_REGAMMA_MEM_PWR_STATE) == 0)
+-				break;
+-
+-			++counter;
+-		}
+-
+-		if (counter == max_tries) {
+-			dal_logger_write(ipp110->base.ctx->logger,
+-				LOG_MAJOR_WARNING,
+-				LOG_MINOR_COMPONENT_CONTROLLER,
+-				"%s: regamma lut was not powered on in a timely manner, programming still proceeds\n",
+-				__func__);
+-		}
+-	}
+-
+-	dce110_helper_program_black_white_offset(ipp110, params->surface_pixel_format);
+-
+-	dce110_helper_select_lut(ipp110);
+-
+-	if (params->surface_pixel_format == PIXEL_FORMAT_INDEX8) {
+-		addr = DCP_REG(mmDC_LUT_SEQ_COLOR);
+-
+-		do {
+-			struct dev_c_lut *index =
+-				ipp110->saved_palette + i;
+-
+-			set_reg_field_value(
+-				value,
+-				gamma[index->red].red,
+-				DC_LUT_SEQ_COLOR,
+-				DC_LUT_SEQ_COLOR);
+-			dm_write_reg(ipp110->base.ctx, addr, value);
+-
+-
+-			set_reg_field_value(
+-				value,
+-				gamma[index->green].green,
+-				DC_LUT_SEQ_COLOR,
+-				DC_LUT_SEQ_COLOR);
+-			dm_write_reg(ipp110->base.ctx, addr, value);
+-
+-
+-			set_reg_field_value(
+-				value,
+-				gamma[index->blue].blue,
+-				DC_LUT_SEQ_COLOR,
+-				DC_LUT_SEQ_COLOR);
+-			dm_write_reg(ipp110->base.ctx, addr, value);
+-
+-			++i;
+-		} while (i != RGB_256X3X16);
+-	} else {
+-		addr = DCP_REG(mmDC_LUT_SEQ_COLOR);
+-
+-		do {
+-			set_reg_field_value(
+-				value,
+-				gamma[i].red,
+-				DC_LUT_SEQ_COLOR,
+-				DC_LUT_SEQ_COLOR);
+-			dm_write_reg(ipp110->base.ctx, addr, value);
+-
+-
+-			set_reg_field_value(
+-				value,
+-				gamma[i].green,
+-				DC_LUT_SEQ_COLOR,
+-				DC_LUT_SEQ_COLOR);
+-			dm_write_reg(ipp110->base.ctx, addr, value);
+-
+-
+-			set_reg_field_value(
+-				value,
+-				gamma[i].blue,
+-				DC_LUT_SEQ_COLOR,
+-				DC_LUT_SEQ_COLOR);
+-			dm_write_reg(ipp110->base.ctx, addr, value);
+-
+-			++i;
+-		} while (i != RGB_256X3X16);
+-	}
+-
+-	/*  we are done with DCP LUT memory; re-enable low power mode */
+-	value = dm_read_reg(ipp110->base.ctx, DCP_REG(mmDCFE_MEM_PWR_CTRL));
+-
+-	set_reg_field_value(
+-		value,
+-		0,
+-		DCFE_MEM_PWR_CTRL,
+-		DCP_REGAMMA_MEM_PWR_DIS);
+-
+-	dm_write_reg(ipp110->base.ctx, DCP_REG(mmDCFE_MEM_PWR_CTRL), value);
+-}
+-
+-static void program_prescale(
+-	struct dce110_ipp *ipp110,
+-	enum pixel_format pixel_format)
+-{
+-	uint32_t prescale_control;
+-	uint32_t prescale_values_grph_r = 0;
+-	uint32_t prescale_values_grph_g = 0;
+-	uint32_t prescale_values_grph_b = 0;
+-
+-	uint32_t prescale_num;
+-	uint32_t prescale_denom = 1;
+-	uint16_t prescale_hw;
+-	uint32_t bias_num = 0;
+-	uint32_t bias_denom = 1;
+-	uint16_t bias_hw;
+-
+-	const uint32_t addr_control = DCP_REG(mmPRESCALE_GRPH_CONTROL);
+-
+-	prescale_control = dm_read_reg(ipp110->base.ctx, addr_control);
+-
+-	set_reg_field_value(
+-		prescale_control,
+-		0,
+-		PRESCALE_GRPH_CONTROL,
+-		GRPH_PRESCALE_BYPASS);
+-
+-	switch (pixel_format) {
+-	case PIXEL_FORMAT_RGB565:
+-		prescale_num = 64;
+-		prescale_denom = 63;
+-	break;
+-
+-	case PIXEL_FORMAT_ARGB8888:
+-		/* This function should only be called when using regamma
+-		 * and bypassing legacy INPUT GAMMA LUT (function name is
+-		 * misleading)
+-		 */
+-		prescale_num = 256;
+-		prescale_denom = 255;
+-	break;
+-
+-	case PIXEL_FORMAT_ARGB2101010:
+-		prescale_num = 1024;
+-		prescale_denom = 1023;
+-	break;
+-
+-	case PIXEL_FORMAT_ARGB2101010_XRBIAS:
+-		prescale_num = 1024;
+-		prescale_denom = 510;
+-		bias_num = 384;
+-		bias_denom = 1024;
+-	break;
+-
+-	case PIXEL_FORMAT_FP16:
+-		prescale_num = 1;
+-	break;
+-
+-	default:
+-		prescale_num = 1;
+-
+-		set_reg_field_value(
+-			prescale_control,
+-			1,
+-			PRESCALE_GRPH_CONTROL,
+-			GRPH_PRESCALE_BYPASS);
+-	}
+-
+-	prescale_hw = fixed_point_to_int_frac(
+-		dal_fixed31_32_from_fraction(prescale_num, prescale_denom),
+-		2, 13);
+-
+-	bias_hw = fixed_point_to_int_frac(
+-		dal_fixed31_32_from_fraction(bias_num, bias_denom),
+-		2, 13);
+-
+-
+-	set_reg_field_value(
+-		prescale_values_grph_r,
+-		prescale_hw,
+-		PRESCALE_VALUES_GRPH_R,
+-		GRPH_PRESCALE_SCALE_R);
+-
+-	set_reg_field_value(
+-		prescale_values_grph_r,
+-		bias_hw,
+-		PRESCALE_VALUES_GRPH_R,
+-		GRPH_PRESCALE_BIAS_R);
+-
+-
+-	set_reg_field_value(
+-		prescale_values_grph_g,
+-		prescale_hw,
+-		PRESCALE_VALUES_GRPH_G,
+-		GRPH_PRESCALE_SCALE_G);
+-
+-	set_reg_field_value(
+-		prescale_values_grph_g,
+-		bias_hw,
+-		PRESCALE_VALUES_GRPH_G,
+-		GRPH_PRESCALE_BIAS_G);
+-
+-
+-	set_reg_field_value(
+-		prescale_values_grph_b,
+-		prescale_hw,
+-		PRESCALE_VALUES_GRPH_B,
+-		GRPH_PRESCALE_SCALE_B);
+-
+-	set_reg_field_value(
+-		prescale_values_grph_b,
+-		bias_hw,
+-		PRESCALE_VALUES_GRPH_B,
+-		GRPH_PRESCALE_BIAS_B);
+-
+-	dm_write_reg(ipp110->base.ctx,
+-		addr_control, prescale_control);
+-
+-	{
+-		dm_write_reg(ipp110->base.ctx,
+-				DCP_REG(mmPRESCALE_VALUES_GRPH_R),
+-				prescale_values_grph_r);
+-	}
+-
+-	{
+-		dm_write_reg(ipp110->base.ctx,
+-				DCP_REG(mmPRESCALE_VALUES_GRPH_G),
+-				prescale_values_grph_g);
+-	}
+-
+-	{
+-		dm_write_reg(ipp110->base.ctx,
+-				DCP_REG(mmPRESCALE_VALUES_GRPH_B),
+-				prescale_values_grph_b);
+-	}
+-}
+-
+-static void set_legacy_input_gamma_mode(
+-	struct dce110_ipp *ipp110,
+-	bool is_legacy)
+-{
+-	const uint32_t addr = DCP_REG(mmINPUT_GAMMA_CONTROL);
+-	uint32_t value = dm_read_reg(ipp110->base.ctx, addr);
+-
+-	set_reg_field_value(
+-		value,
+-		!is_legacy,
+-		INPUT_GAMMA_CONTROL,
+-		GRPH_INPUT_GAMMA_MODE);
+-
+-	dm_write_reg(ipp110->base.ctx, addr, value);
+-}
+-
+-static bool set_legacy_input_gamma_ramp_rgb256x3x16(
+-	struct dce110_ipp *ipp110,
+-	const struct gamma_ramp *gamma_ramp,
+-	const struct gamma_parameters *params)
+-{
+-	struct dev_c_lut16 *gamma16 =
+-		dm_alloc(
+-			ipp110->base.ctx,
+-			sizeof(struct dev_c_lut16) * MAX_INPUT_LUT_ENTRY);
+-
+-	if (!gamma16)
+-		return false;
+-
+-	convert_256_lut_entries_to_gxo_format(
+-		&gamma_ramp->gamma_ramp_rgb256x3x16, gamma16);
+-
+-	if ((params->surface_pixel_format != PIXEL_FORMAT_ARGB2101010) &&
+-		(params->surface_pixel_format !=
+-			PIXEL_FORMAT_ARGB2101010_XRBIAS) &&
+-		(params->surface_pixel_format != PIXEL_FORMAT_FP16)) {
+-		program_lut_gamma(ipp110, gamma16, params);
+-		dm_free(ipp110->base.ctx, gamma16);
+-		return true;
+-	}
+-
+-	/* TODO process DirectX-specific formats*/
+-	dm_free(ipp110->base.ctx, gamma16);
+-	return false;
+-}
+-
+-static bool set_legacy_input_gamma_ramp_dxgi1(
+-	struct dce110_ipp *ipp110,
+-	const struct gamma_ramp *gamma_ramp,
+-	const struct gamma_parameters *params)
+-{
+-	struct dev_c_lut16 *gamma16 =
+-		dm_alloc(
+-			ipp110->base.ctx,
+-			sizeof(struct dev_c_lut16) * MAX_INPUT_LUT_ENTRY);
+-
+-	if (!gamma16)
+-		return false;
+-
+-	convert_udx_gamma_entries_to_gxo_format(
+-		&gamma_ramp->gamma_ramp_dxgi1, gamma16);
+-
+-	if ((params->surface_pixel_format != PIXEL_FORMAT_ARGB2101010) &&
+-		(params->surface_pixel_format !=
+-			PIXEL_FORMAT_ARGB2101010_XRBIAS) &&
+-		(params->surface_pixel_format != PIXEL_FORMAT_FP16)) {
+-		program_lut_gamma(ipp110, gamma16, params);
+-		dm_free(ipp110->base.ctx, gamma16);
+-		return true;
+-	}
+-
+-	/* TODO process DirectX-specific formats*/
+-	dm_free(ipp110->base.ctx, gamma16);
+-	return false;
+-}
+-
+-static bool set_default_gamma(
+-	struct dce110_ipp *ipp110,
+-	enum pixel_format surface_pixel_format)
+-{
+-	uint32_t i;
+-
+-	struct dev_c_lut16 *gamma16 = NULL;
+-	struct gamma_parameters *params = NULL;
+-
+-	gamma16 = dm_alloc(
+-			ipp110->base.ctx,
+-			sizeof(struct dev_c_lut16) * MAX_INPUT_LUT_ENTRY);
+-
+-	if (!gamma16)
+-		return false;
+-
+-	params = dm_alloc(ipp110->base.ctx, sizeof(*params));
+-
+-	if (!params) {
+-		dm_free(ipp110->base.ctx, gamma16);
+-		return false;
+-	}
+-
+-	for (i = 0; i < MAX_INPUT_LUT_ENTRY; i++) {
+-		gamma16[i].red = gamma16[i].green =
+-			gamma16[i].blue = (uint16_t) (i << 8);
+-	}
+-
+-	params->surface_pixel_format = surface_pixel_format;
+-	params->regamma_adjust_type = GRAPHICS_REGAMMA_ADJUST_HW;
+-	params->degamma_adjust_type = GRAPHICS_DEGAMMA_ADJUST_HW;
+-	params->selected_gamma_lut = GRAPHICS_GAMMA_LUT_REGAMMA;
+-	params->disable_adjustments = false;
+-
+-	params->regamma.features.value = 0;
+-
+-	params->regamma.features.bits.GAMMA_RAMP_ARRAY = 0;
+-	params->regamma.features.bits.GRAPHICS_DEGAMMA_SRGB = 1;
+-	params->regamma.features.bits.OVERLAY_DEGAMMA_SRGB = 1;
+-
+-	for (i = 0; i < 3; i++) {
+-		params->regamma.gamma_coeff.a0[i] = 31308;
+-		params->regamma.gamma_coeff.a1[i] = 12920;
+-		params->regamma.gamma_coeff.a2[i] = 55;
+-		params->regamma.gamma_coeff.a3[i] = 55;
+-		params->regamma.gamma_coeff.gamma[i] = 2400;
+-
+-	}
+-
+-	program_lut_gamma(ipp110, gamma16, params);
+-
+-	dm_free(ipp110->base.ctx, gamma16);
+-	dm_free(ipp110->base.ctx, params);
+-
+-	return true;
+-}
+-
+-static void set_degamma(
+-	struct dce110_ipp *ipp110,
+-	const struct gamma_parameters *params,
+-	bool force_bypass)
+-{
+-	uint32_t value;
+-	const uint32_t addr = DCP_REG(mmDEGAMMA_CONTROL);
+-	uint32_t degamma_type =
+-		params->regamma.features.bits.GRAPHICS_DEGAMMA_SRGB == 1 ?
+-			1 : 2;
+-
+-	value = dm_read_reg(ipp110->base.ctx, addr);
+-
+-	/* if by pass - no degamma
+-	 * when legacy and regamma LUT's we do degamma */
+-	if (params->degamma_adjust_type == GRAPHICS_DEGAMMA_ADJUST_BYPASS ||
+-		(params->surface_pixel_format == PIXEL_FORMAT_FP16 &&
+-			params->selected_gamma_lut ==
+-				GRAPHICS_GAMMA_LUT_REGAMMA))
+-		degamma_type = 0;
+-
+-	if (force_bypass)
+-		degamma_type = 0;
+-
+-	set_reg_field_value(
+-		value,
+-		degamma_type,
+-		DEGAMMA_CONTROL,
+-		GRPH_DEGAMMA_MODE);
+-
+-	set_reg_field_value(
+-		value,
+-		degamma_type,
+-		DEGAMMA_CONTROL,
+-		CURSOR_DEGAMMA_MODE);
+-
+-	set_reg_field_value(
+-		value,
+-		degamma_type,
+-		DEGAMMA_CONTROL,
+-		CURSOR2_DEGAMMA_MODE);
+-
+-	dm_write_reg(ipp110->base.ctx, addr, value);
+-}
+-
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
+index acb405e..394f187 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
+@@ -38,55 +38,11 @@ enum {
+ 	MAX_NUMBER_OF_ENTRIES = 256
+ };
+ 
+-static void build_evenly_distributed_points(
+-	struct gamma_pixel *points,
+-	uint32_t numberof_points,
+-	struct fixed31_32 max_value,
+-	struct fixed31_32 divider1,
+-	struct fixed31_32 divider2,
+-	struct fixed31_32 divider3)
+-{
+-	struct gamma_pixel *p = points;
+-	struct gamma_pixel *p_last = p + numberof_points - 1;
+-
+-	uint32_t i = 0;
+-
+-	do {
+-		struct fixed31_32 value = dal_fixed31_32_div_int(
+-			dal_fixed31_32_mul_int(max_value, i),
+-			numberof_points - 1);
+-
+-		p->r = value;
+-		p->g = value;
+-		p->b = value;
+-
+-		++p;
+-		++i;
+-	} while (i != numberof_points);
+-
+-	p->r = dal_fixed31_32_div(p_last->r, divider1);
+-	p->g = dal_fixed31_32_div(p_last->g, divider1);
+-	p->b = dal_fixed31_32_div(p_last->b, divider1);
+-
+-	++p;
+-
+-	p->r = dal_fixed31_32_div(p_last->r, divider2);
+-	p->g = dal_fixed31_32_div(p_last->g, divider2);
+-	p->b = dal_fixed31_32_div(p_last->b, divider2);
+-
+-	++p;
+-
+-	p->r = dal_fixed31_32_div(p_last->r, divider3);
+-	p->g = dal_fixed31_32_div(p_last->g, divider3);
+-	p->b = dal_fixed31_32_div(p_last->b, divider3);
+-}
+-
+ /*****************************************/
+ /* Constructor, Destructor               */
+ /*****************************************/
+ 
+ struct opp_funcs funcs = {
+-		.opp_map_legacy_and_regamma_hw_to_x_user = dce110_opp_map_legacy_and_regamma_hw_to_x_user,
+ 		.opp_power_on_regamma_lut = dce110_opp_power_on_regamma_lut,
+ 		.opp_program_bit_depth_reduction = dce110_opp_program_bit_depth_reduction,
+ 		.opp_program_clamping_and_pixel_encoding = dce110_opp_program_clamping_and_pixel_encoding,
+@@ -101,7 +57,6 @@ bool dce110_opp_construct(struct dce110_opp *opp110,
+ 	uint32_t inst,
+ 	const struct dce110_opp_reg_offsets *offsets)
+ {
+-
+ 	opp110->base.funcs = &funcs;
+ 
+ 	opp110->base.ctx = ctx;
+@@ -110,162 +65,11 @@ bool dce110_opp_construct(struct dce110_opp *opp110,
+ 
+ 	opp110->offsets = *offsets;
+ 
+-	opp110->regamma.hw_points_num = 128;
+-	opp110->regamma.coordinates_x = NULL;
+-	opp110->regamma.rgb_resulted = NULL;
+-	opp110->regamma.rgb_regamma = NULL;
+-	opp110->regamma.coeff128 = NULL;
+-	opp110->regamma.coeff128_oem = NULL;
+-	opp110->regamma.coeff128_dx = NULL;
+-	opp110->regamma.axis_x_256 = NULL;
+-	opp110->regamma.axis_x_1025 = NULL;
+-	opp110->regamma.rgb_oem = NULL;
+-	opp110->regamma.rgb_user = NULL;
+-	opp110->regamma.extra_points = 3;
+-	opp110->regamma.use_half_points = false;
+-	opp110->regamma.x_max1 = dal_fixed31_32_one;
+-	opp110->regamma.x_max2 = dal_fixed31_32_from_int(2);
+-	opp110->regamma.x_min = dal_fixed31_32_zero;
+-	opp110->regamma.divider1 = dal_fixed31_32_from_fraction(3, 2);
+-	opp110->regamma.divider2 = dal_fixed31_32_from_int(2);
+-	opp110->regamma.divider3 = dal_fixed31_32_from_fraction(5, 2);
+-
+-	opp110->regamma.rgb_user = dm_alloc(
+-		ctx,
+-		sizeof(struct pwl_float_data) *
+-		(DX_GAMMA_RAMP_MAX + opp110->regamma.extra_points));
+-	if (!opp110->regamma.rgb_user)
+-		goto failure_1;
+-
+-	opp110->regamma.rgb_oem = dm_alloc(
+-		ctx,
+-		sizeof(struct pwl_float_data) *
+-		(DX_GAMMA_RAMP_MAX + opp110->regamma.extra_points));
+-	if (!opp110->regamma.rgb_oem)
+-		goto failure_2;
+-
+-	opp110->regamma.rgb_resulted = dm_alloc(
+-		ctx,
+-		sizeof(struct pwl_result_data) *
+-		(MAX_NUMBER_OF_ENTRIES + opp110->regamma.extra_points));
+-	if (!opp110->regamma.rgb_resulted)
+-		goto failure_3;
+-
+-	opp110->regamma.rgb_regamma = dm_alloc(
+-		ctx,
+-		sizeof(struct pwl_float_data_ex) *
+-		(MAX_NUMBER_OF_ENTRIES + opp110->regamma.extra_points));
+-	if (!opp110->regamma.rgb_regamma)
+-		goto failure_4;
+-
+-	opp110->regamma.coordinates_x = dm_alloc(
+-		ctx,
+-		sizeof(struct hw_x_point) *
+-		(MAX_NUMBER_OF_ENTRIES + opp110->regamma.extra_points));
+-	if (!opp110->regamma.coordinates_x)
+-		goto failure_5;
+-
+-	opp110->regamma.axis_x_256 = dm_alloc(
+-		ctx,
+-		sizeof(struct gamma_pixel) *
+-		(MAX_LUT_ENTRY + opp110->regamma.extra_points));
+-	if (!opp110->regamma.axis_x_256)
+-		goto failure_6;
+-
+-	opp110->regamma.axis_x_1025 = dm_alloc(
+-		ctx,
+-		sizeof(struct gamma_pixel) *
+-		(DX_GAMMA_RAMP_MAX + opp110->regamma.extra_points));
+-	if (!opp110->regamma.axis_x_1025)
+-		goto failure_7;
+-
+-	opp110->regamma.coeff128 = dm_alloc(
+-		ctx,
+-		sizeof(struct pixel_gamma_point) *
+-		(MAX_NUMBER_OF_ENTRIES + opp110->regamma.extra_points));
+-	if (!opp110->regamma.coeff128)
+-		goto failure_8;
+-
+-	opp110->regamma.coeff128_oem = dm_alloc(
+-		ctx,
+-		sizeof(struct pixel_gamma_point) *
+-		(MAX_NUMBER_OF_ENTRIES + opp110->regamma.extra_points));
+-	if (!opp110->regamma.coeff128_oem)
+-		goto failure_9;
+-
+-	opp110->regamma.coeff128_dx = dm_alloc(
+-		ctx,
+-		sizeof(struct pixel_gamma_point) *
+-		(MAX_NUMBER_OF_ENTRIES + opp110->regamma.extra_points));
+-	if (!opp110->regamma.coeff128_dx)
+-		goto failure_10;
+-
+-	/* init palette */
+-	{
+-		uint32_t i = 0;
+-
+-		do {
+-			opp110->regamma.saved_palette[i].red = (uint8_t)i;
+-			opp110->regamma.saved_palette[i].green = (uint8_t)i;
+-			opp110->regamma.saved_palette[i].blue = (uint8_t)i;
+-
+-			++i;
+-		} while (i != MAX_LUT_ENTRY);
+-	}
+-
+-	build_evenly_distributed_points(
+-		opp110->regamma.axis_x_256,
+-		MAX_LUT_ENTRY,
+-		opp110->regamma.x_max1,
+-		opp110->regamma.divider1,
+-		opp110->regamma.divider2,
+-		opp110->regamma.divider3);
+-
+-	build_evenly_distributed_points(
+-		opp110->regamma.axis_x_1025,
+-		DX_GAMMA_RAMP_MAX,
+-		opp110->regamma.x_max1,
+-		opp110->regamma.divider1,
+-		opp110->regamma.divider2,
+-		opp110->regamma.divider3);
+-
+-	return true;
+-
+-failure_10:
+-	dm_free(ctx, opp110->regamma.coeff128_oem);
+-failure_9:
+-	dm_free(ctx, opp110->regamma.coeff128);
+-failure_8:
+-	dm_free(ctx, opp110->regamma.axis_x_1025);
+-failure_7:
+-	dm_free(ctx, opp110->regamma.axis_x_256);
+-failure_6:
+-	dm_free(ctx, opp110->regamma.coordinates_x);
+-failure_5:
+-	dm_free(ctx, opp110->regamma.rgb_regamma);
+-failure_4:
+-	dm_free(ctx, opp110->regamma.rgb_resulted);
+-failure_3:
+-	dm_free(ctx, opp110->regamma.rgb_oem);
+-failure_2:
+-	dm_free(ctx, opp110->regamma.rgb_user);
+-failure_1:
+-
+ 	return true;
+ }
+ 
+ void dce110_opp_destroy(struct output_pixel_processor **opp)
+ {
+-	dm_free((*opp)->ctx, FROM_DCE11_OPP(*opp)->regamma.coeff128_dx);
+-	dm_free((*opp)->ctx, FROM_DCE11_OPP(*opp)->regamma.coeff128_oem);
+-	dm_free((*opp)->ctx, FROM_DCE11_OPP(*opp)->regamma.coeff128);
+-	dm_free((*opp)->ctx, FROM_DCE11_OPP(*opp)->regamma.axis_x_1025);
+-	dm_free((*opp)->ctx, FROM_DCE11_OPP(*opp)->regamma.axis_x_256);
+-	dm_free((*opp)->ctx, FROM_DCE11_OPP(*opp)->regamma.coordinates_x);
+-	dm_free((*opp)->ctx, FROM_DCE11_OPP(*opp)->regamma.rgb_regamma);
+-	dm_free((*opp)->ctx, FROM_DCE11_OPP(*opp)->regamma.rgb_resulted);
+-	dm_free((*opp)->ctx, FROM_DCE11_OPP(*opp)->regamma.rgb_oem);
+-	dm_free((*opp)->ctx, FROM_DCE11_OPP(*opp)->regamma.rgb_user);
+ 	dm_free((*opp)->ctx, FROM_DCE11_OPP(*opp));
+ 	*opp = NULL;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h
+index e53eb74..3460e18 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h
+@@ -27,7 +27,9 @@
+ 
+ #include "dc_types.h"
+ #include "inc/opp.h"
+-#include "gamma_types.h"
++#include "core_types.h"
++
++#include "gamma_types.h" /* decprecated */
+ 
+ struct gamma_parameters;
+ 
+@@ -107,14 +109,11 @@ void dce110_opp_power_on_regamma_lut(
+ 
+ bool dce110_opp_set_regamma(
+ 	struct output_pixel_processor *opp,
+-	const struct gamma_ramp *ramp,
+-	const struct gamma_parameters *params,
+-	bool force_bypass);
++	const struct regamma_params *params);
+ 
+-bool dce110_opp_map_legacy_and_regamma_hw_to_x_user(
++void dce110_opp_power_on_regamma_lut(
+ 	struct output_pixel_processor *opp,
+-	const struct gamma_ramp *gamma_ramp,
+-	const struct gamma_parameters *params);
++	bool power_on);
+ 
+ void dce110_opp_set_csc_adjustment(
+ 	struct output_pixel_processor *opp,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma.c
+index 32cf57d..f7a4bc2 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_regamma.c
+@@ -44,1724 +44,6 @@ enum {
+ 
+ };
+ 
+-struct curve_config {
+-	uint32_t offset;
+-	int8_t segments[MAX_REGIONS_NUMBER];
+-	int8_t begin;
+-};
+-
+-/* BASE */
+-static bool find_software_points(
+-	struct dce110_opp *opp110,
+-	struct fixed31_32 hw_point,
+-	enum channel_name channel,
+-	uint32_t *index_to_start,
+-	uint32_t *index_left,
+-	uint32_t *index_right,
+-	enum hw_point_position *pos)
+-{
+-	const uint32_t max_number =
+-			RGB_256X3X16 + opp110->regamma.extra_points;
+-
+-	struct fixed31_32 left, right;
+-
+-	uint32_t i = *index_to_start;
+-
+-	while (i < max_number) {
+-		if (channel == CHANNEL_NAME_RED) {
+-			left = opp110->
+-					regamma.axis_x_256[i].r;
+-
+-			if (i < max_number - 1)
+-				right = opp110->
+-					regamma.axis_x_256[i + 1].r;
+-			else
+-				right = opp110->
+-					regamma.axis_x_256[max_number - 1].r;
+-		} else if (channel == CHANNEL_NAME_GREEN) {
+-			left = opp110->regamma.axis_x_256[i].g;
+-
+-			if (i < max_number - 1)
+-				right = opp110->
+-					regamma.axis_x_256[i + 1].g;
+-			else
+-				right = opp110->
+-					regamma.axis_x_256[max_number - 1].g;
+-		} else {
+-			left = opp110->regamma.axis_x_256[i].b;
+-
+-			if (i < max_number - 1)
+-				right = opp110->
+-					regamma.axis_x_256[i + 1].b;
+-			else
+-				right = opp110->
+-					regamma.axis_x_256[max_number - 1].b;
+-		}
+-
+-		if (dal_fixed31_32_le(left, hw_point) &&
+-			dal_fixed31_32_le(hw_point, right)) {
+-			*index_to_start = i;
+-			*index_left = i;
+-
+-			if (i < max_number - 1)
+-				*index_right = i + 1;
+-			else
+-				*index_right = max_number - 1;
+-
+-			*pos = HW_POINT_POSITION_MIDDLE;
+-
+-			return true;
+-		} else if ((i == *index_to_start) &&
+-			dal_fixed31_32_le(hw_point, left)) {
+-			*index_to_start = i;
+-			*index_left = i;
+-			*index_right = i;
+-
+-			*pos = HW_POINT_POSITION_LEFT;
+-
+-			return true;
+-		} else if ((i == max_number - 1) &&
+-			dal_fixed31_32_le(right, hw_point)) {
+-			*index_to_start = i;
+-			*index_left = i;
+-			*index_right = i;
+-
+-			*pos = HW_POINT_POSITION_RIGHT;
+-
+-			return true;
+-		}
+-
+-		++i;
+-	}
+-
+-	return false;
+-}
+-
+-static bool find_software_points_dx(
+-	struct dce110_opp *opp110,
+-	struct fixed31_32 hw_point,
+-	enum channel_name channel,
+-	uint32_t *index_to_start,
+-	uint32_t *index_left,
+-	uint32_t *index_right,
+-	enum hw_point_position *pos)
+-{
+-	const uint32_t max_number = DX_GAMMA_RAMP_MAX +
+-					opp110->regamma.extra_points;
+-
+-	struct fixed31_32 left, right;
+-
+-	uint32_t i = *index_to_start;
+-
+-	while (i < max_number) {
+-		if (channel == CHANNEL_NAME_RED) {
+-			left = opp110->regamma.axis_x_1025[i].r;
+-
+-			if (i < DX_GAMMA_RAMP_MAX - 1)
+-				right = opp110->
+-					regamma.axis_x_1025[i + 1].r;
+-			else
+-				right = opp110->
+-				regamma.axis_x_1025[DX_GAMMA_RAMP_MAX-1].r;
+-		} else if (channel == CHANNEL_NAME_GREEN) {
+-			left = opp110->regamma.axis_x_1025[i].g;
+-
+-			if (i < DX_GAMMA_RAMP_MAX - 1)
+-				right = opp110->
+-					regamma.axis_x_1025[i + 1].g;
+-			else
+-				right = opp110->
+-				regamma.axis_x_1025[DX_GAMMA_RAMP_MAX-1].g;
+-		} else {
+-			left = opp110->regamma.axis_x_1025[i].b;
+-
+-			if (i < DX_GAMMA_RAMP_MAX - 1)
+-				right = opp110->
+-					regamma.axis_x_1025[i + 1].b;
+-			else
+-				right = opp110->
+-				regamma.axis_x_1025[DX_GAMMA_RAMP_MAX-1].b;
+-		}
+-
+-		if (dal_fixed31_32_le(left, hw_point) &&
+-			dal_fixed31_32_le(hw_point, right)) {
+-			*index_to_start = i;
+-			*index_left = i;
+-
+-			if (i < DX_GAMMA_RAMP_MAX - 1)
+-				*index_right = i + 1;
+-			else
+-				*index_right = DX_GAMMA_RAMP_MAX - 1;
+-
+-			*pos = HW_POINT_POSITION_MIDDLE;
+-
+-			return true;
+-		} else if ((i == *index_to_start) &&
+-			dal_fixed31_32_le(hw_point, left)) {
+-			*index_to_start = i;
+-			*index_left = i;
+-			*index_right = i;
+-
+-			*pos = HW_POINT_POSITION_LEFT;
+-
+-			return true;
+-		} else if ((i == max_number - 1) &&
+-			dal_fixed31_32_le(right, hw_point)) {
+-			*index_to_start = i;
+-			*index_left = i;
+-			*index_right = i;
+-
+-			*pos = HW_POINT_POSITION_RIGHT;
+-
+-			return true;
+-		}
+-
+-		++i;
+-	}
+-
+-	return false;
+-}
+-
+-static bool build_custom_gamma_mapping_coefficients_worker(
+-	struct dce110_opp *opp110,
+-	struct pixel_gamma_point *coeff,
+-	enum channel_name channel,
+-	uint32_t number_of_points,
+-	enum pixel_format pixel_format)
+-{
+-	uint32_t i = 0;
+-
+-	while (i <= number_of_points) {
+-		struct fixed31_32 coord_x;
+-
+-		uint32_t index_to_start = 0;
+-		uint32_t index_left = 0;
+-		uint32_t index_right = 0;
+-
+-		enum hw_point_position hw_pos;
+-
+-		struct gamma_point *point;
+-
+-		struct fixed31_32 left_pos;
+-		struct fixed31_32 right_pos;
+-
+-		if (pixel_format == PIXEL_FORMAT_FP16)
+-			coord_x = opp110->
+-				regamma.coordinates_x[i].adjusted_x;
+-		else if (channel == CHANNEL_NAME_RED)
+-			coord_x = opp110->
+-				regamma.coordinates_x[i].regamma_y_red;
+-		else if (channel == CHANNEL_NAME_GREEN)
+-			coord_x = opp110->
+-				regamma.coordinates_x[i].regamma_y_green;
+-		else
+-			coord_x = opp110->
+-				regamma.coordinates_x[i].regamma_y_blue;
+-
+-		if (!find_software_points(
+-			opp110, coord_x, channel,
+-			&index_to_start, &index_left, &index_right, &hw_pos)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (index_left >= RGB_256X3X16 +
+-				opp110->regamma.extra_points) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (index_right >= RGB_256X3X16 +
+-				opp110->regamma.extra_points) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (channel == CHANNEL_NAME_RED) {
+-			point = &coeff[i].r;
+-
+-			left_pos = opp110->
+-					regamma.axis_x_256[index_left].r;
+-			right_pos = opp110->
+-					regamma.axis_x_256[index_right].r;
+-		} else if (channel == CHANNEL_NAME_GREEN) {
+-			point = &coeff[i].g;
+-
+-			left_pos = opp110->
+-					regamma.axis_x_256[index_left].g;
+-			right_pos = opp110->
+-					regamma.axis_x_256[index_right].g;
+-		} else {
+-			point = &coeff[i].b;
+-
+-			left_pos = opp110->
+-					regamma.axis_x_256[index_left].b;
+-			right_pos = opp110->
+-					regamma.axis_x_256[index_right].b;
+-		}
+-
+-		if (hw_pos == HW_POINT_POSITION_MIDDLE)
+-			point->coeff = dal_fixed31_32_div(
+-				dal_fixed31_32_sub(
+-					coord_x,
+-					left_pos),
+-				dal_fixed31_32_sub(
+-					right_pos,
+-					left_pos));
+-		else if (hw_pos == HW_POINT_POSITION_LEFT)
+-			point->coeff = opp110->regamma.x_min;
+-		else if (hw_pos == HW_POINT_POSITION_RIGHT)
+-			point->coeff = opp110->regamma.x_max2;
+-		else {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		point->left_index = index_left;
+-		point->right_index = index_right;
+-		point->pos = hw_pos;
+-
+-		++i;
+-	}
+-
+-	return true;
+-}
+-
+-static inline bool build_custom_gamma_mapping_coefficients(
+-	struct dce110_opp *opp110,
+-	enum channel_name channel,
+-	uint32_t number_of_points,
+-	enum pixel_format pixel_format)
+-{
+-	return build_custom_gamma_mapping_coefficients_worker(
+-		opp110, opp110->regamma.coeff128, channel,
+-		number_of_points, pixel_format);
+-}
+-
+-static inline bool build_oem_custom_gamma_mapping_coefficients(
+-	struct dce110_opp *opp110,
+-	enum channel_name channel,
+-	uint32_t number_of_points,
+-	enum pixel_format pixel_format)
+-{
+-	return build_custom_gamma_mapping_coefficients_worker(
+-		opp110, opp110->regamma.coeff128_oem, channel,
+-		number_of_points, pixel_format);
+-}
+-
+-static bool build_custom_dx_gamma_mapping_coefficients(
+-	struct dce110_opp *opp110,
+-	enum channel_name channel,
+-	uint32_t number_of_points,
+-	enum pixel_format pixel_format)
+-{
+-	uint32_t i = 0;
+-
+-	while (i <= number_of_points) {
+-		struct fixed31_32 coord_x;
+-
+-		uint32_t index_to_start = 0;
+-		uint32_t index_left = 0;
+-		uint32_t index_right = 0;
+-
+-		enum hw_point_position hw_pos;
+-
+-		struct gamma_point *point;
+-
+-		struct fixed31_32 left_pos;
+-		struct fixed31_32 right_pos;
+-
+-		if (pixel_format == PIXEL_FORMAT_FP16)
+-			coord_x = opp110->
+-			regamma.coordinates_x[i].adjusted_x;
+-		else if (channel == CHANNEL_NAME_RED)
+-			coord_x = opp110->
+-			regamma.coordinates_x[i].regamma_y_red;
+-		else if (channel == CHANNEL_NAME_GREEN)
+-			coord_x = opp110->
+-			regamma.coordinates_x[i].regamma_y_green;
+-		else
+-			coord_x = opp110->
+-			regamma.coordinates_x[i].regamma_y_blue;
+-
+-		if (!find_software_points_dx(
+-			opp110, coord_x, channel,
+-			&index_to_start, &index_left, &index_right, &hw_pos)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (index_left >= DX_GAMMA_RAMP_MAX +
+-				opp110->regamma.extra_points) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (index_right >= DX_GAMMA_RAMP_MAX +
+-				opp110->regamma.extra_points) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (channel == CHANNEL_NAME_RED) {
+-			point = &opp110->regamma.coeff128_dx[i].r;
+-
+-			left_pos = opp110->
+-					regamma.axis_x_1025[index_left].r;
+-			right_pos = opp110->
+-					regamma.axis_x_1025[index_right].r;
+-		} else if (channel == CHANNEL_NAME_GREEN) {
+-			point = &opp110->regamma.coeff128_dx[i].g;
+-
+-			left_pos = opp110->
+-					regamma.axis_x_1025[index_left].g;
+-			right_pos = opp110->
+-					regamma.axis_x_1025[index_right].g;
+-		} else {
+-			point = &opp110->regamma.coeff128_dx[i].b;
+-
+-			left_pos = opp110->
+-					regamma.axis_x_1025[index_left].b;
+-			right_pos = opp110->
+-					regamma.axis_x_1025[index_right].b;
+-		}
+-
+-		if (hw_pos == HW_POINT_POSITION_MIDDLE)
+-			point->coeff = dal_fixed31_32_div(
+-				dal_fixed31_32_sub(
+-					coord_x,
+-					left_pos),
+-				dal_fixed31_32_sub(
+-					right_pos,
+-					left_pos));
+-		else if (hw_pos == HW_POINT_POSITION_LEFT)
+-			point->coeff = opp110->regamma.x_min;
+-		else if (hw_pos == HW_POINT_POSITION_RIGHT)
+-			point->coeff = opp110->regamma.x_max2;
+-		else {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		point->left_index = index_left;
+-		point->right_index = index_right;
+-		point->pos = hw_pos;
+-
+-		++i;
+-	}
+-
+-	return true;
+-}
+-
+-static struct fixed31_32 calculate_mapped_value(
+-	struct dce110_opp *opp110,
+-	struct pwl_float_data *rgb,
+-	const struct pixel_gamma_point *coeff,
+-	enum channel_name channel,
+-	uint32_t max_index)
+-{
+-	const struct gamma_point *point;
+-
+-	struct fixed31_32 result;
+-
+-	if (channel == CHANNEL_NAME_RED)
+-		point = &coeff->r;
+-	else if (channel == CHANNEL_NAME_GREEN)
+-		point = &coeff->g;
+-	else
+-		point = &coeff->b;
+-
+-	if ((point->left_index < 0) || (point->left_index > max_index)) {
+-		BREAK_TO_DEBUGGER();
+-		return dal_fixed31_32_zero;
+-	}
+-
+-	if ((point->right_index < 0) || (point->right_index > max_index)) {
+-		BREAK_TO_DEBUGGER();
+-		return dal_fixed31_32_zero;
+-	}
+-
+-	if (point->pos == HW_POINT_POSITION_MIDDLE)
+-		if (channel == CHANNEL_NAME_RED)
+-			result = dal_fixed31_32_add(
+-				dal_fixed31_32_mul(
+-					point->coeff,
+-					dal_fixed31_32_sub(
+-						rgb[point->right_index].r,
+-						rgb[point->left_index].r)),
+-				rgb[point->left_index].r);
+-		else if (channel == CHANNEL_NAME_GREEN)
+-			result = dal_fixed31_32_add(
+-				dal_fixed31_32_mul(
+-					point->coeff,
+-					dal_fixed31_32_sub(
+-						rgb[point->right_index].g,
+-						rgb[point->left_index].g)),
+-				rgb[point->left_index].g);
+-		else
+-			result = dal_fixed31_32_add(
+-				dal_fixed31_32_mul(
+-					point->coeff,
+-					dal_fixed31_32_sub(
+-						rgb[point->right_index].b,
+-						rgb[point->left_index].b)),
+-				rgb[point->left_index].b);
+-	else if (point->pos == HW_POINT_POSITION_LEFT) {
+-		BREAK_TO_DEBUGGER();
+-		result = opp110->regamma.x_min;
+-	} else {
+-		BREAK_TO_DEBUGGER();
+-		result = opp110->regamma.x_max1;
+-	}
+-
+-	return result;
+-}
+-
+-static inline struct fixed31_32 calculate_regamma_user_mapped_value(
+-	struct dce110_opp *opp110,
+-	const struct pixel_gamma_point *coeff,
+-	enum channel_name channel,
+-	uint32_t max_index)
+-{
+-	return calculate_mapped_value(
+-		opp110, opp110->regamma.rgb_oem,
+-		coeff, channel, max_index);
+-}
+-
+-static inline struct fixed31_32 calculate_user_mapped_value(
+-	struct dce110_opp *opp110,
+-	const struct pixel_gamma_point *coeff,
+-	enum channel_name channel,
+-	uint32_t max_index)
+-{
+-	return calculate_mapped_value(
+-		opp110, opp110->regamma.rgb_user,
+-		coeff, channel, max_index);
+-}
+-
+-static inline struct fixed31_32 calculate_oem_mapped_value(
+-	struct dce110_opp *opp110,
+-	uint32_t index,
+-	enum channel_name channel,
+-	uint32_t max_index)
+-{
+-	return calculate_regamma_user_mapped_value(
+-		opp110, opp110->regamma.coeff128_oem +
+-		index, channel, max_index);
+-}
+-
+-static void scale_oem_gamma(
+-	struct dce110_opp *opp110,
+-	const struct regamma_ramp *regamma_ramp)
+-{
+-	const uint16_t max_driver = 0xFFFF;
+-	const uint16_t max_os = 0xFF00;
+-
+-	uint16_t scale = max_os;
+-
+-	uint32_t i;
+-
+-	struct pwl_float_data *rgb = opp110->regamma.rgb_oem;
+-	struct pwl_float_data *rgb_last = rgb + RGB_256X3X16 - 1;
+-
+-	/* find OEM maximum */
+-
+-	i = 0;
+-
+-	do {
+-		if ((regamma_ramp->gamma[i] > max_os) ||
+-			(regamma_ramp->gamma[i + RGB_256X3X16] > max_os) ||
+-			(regamma_ramp->gamma[i + 2 * RGB_256X3X16] > max_os)) {
+-			scale = max_driver;
+-			break;
+-		}
+-
+-		++i;
+-	} while (i != RGB_256X3X16);
+-
+-	/* scale */
+-
+-	i = 0;
+-
+-	do {
+-		rgb->r = dal_fixed31_32_div_int(
+-			dal_fixed31_32_from_int(
+-				regamma_ramp->gamma[i]),
+-			scale);
+-		rgb->g = dal_fixed31_32_div_int(
+-			dal_fixed31_32_from_int(
+-				regamma_ramp->gamma[i + RGB_256X3X16]),
+-			scale);
+-		rgb->b = dal_fixed31_32_div_int(
+-			dal_fixed31_32_from_int(
+-				regamma_ramp->gamma[i + 2 * RGB_256X3X16]),
+-			scale);
+-
+-		++rgb;
+-		++i;
+-	} while (i != RGB_256X3X16);
+-
+-	/* add 3 extra points, 2 physical plus 1 virtual */
+-
+-	rgb->r = dal_fixed31_32_mul(rgb_last->r,
+-			opp110->regamma.divider1);
+-	rgb->g = dal_fixed31_32_mul(rgb_last->g,
+-			opp110->regamma.divider1);
+-	rgb->b = dal_fixed31_32_mul(rgb_last->b,
+-			opp110->regamma.divider1);
+-
+-	++rgb;
+-
+-	rgb->r = dal_fixed31_32_mul(rgb_last->r,
+-			opp110->regamma.divider2);
+-	rgb->g = dal_fixed31_32_mul(rgb_last->g,
+-			opp110->regamma.divider2);
+-	rgb->b = dal_fixed31_32_mul(rgb_last->b,
+-			opp110->regamma.divider2);
+-
+-	++rgb;
+-
+-	rgb->r = dal_fixed31_32_mul(rgb_last->r,
+-			opp110->regamma.divider3);
+-	rgb->g = dal_fixed31_32_mul(rgb_last->g,
+-			opp110->regamma.divider3);
+-	rgb->b = dal_fixed31_32_mul(rgb_last->b,
+-			opp110->regamma.divider3);
+-}
+-
+-static inline void copy_rgb_regamma_to_coordinates_x(
+-	struct dce110_opp *opp110)
+-{
+-	struct hw_x_point *coords = opp110->regamma.coordinates_x;
+-	const struct pwl_float_data_ex *rgb_regamma =
+-			opp110->regamma.rgb_regamma;
+-
+-	uint32_t i = 0;
+-
+-	while (i <= opp110->regamma.hw_points_num) {
+-		coords->regamma_y_red = rgb_regamma->r;
+-		coords->regamma_y_green = rgb_regamma->g;
+-		coords->regamma_y_blue = rgb_regamma->b;
+-
+-		++coords;
+-		++rgb_regamma;
+-		++i;
+-	}
+-}
+-
+-static bool calculate_interpolated_hardware_curve(
+-	struct dce110_opp *opp110,
+-	const struct gamma_ramp *gamma_ramp,
+-	const struct gamma_parameters *params)
+-{
+-	struct pwl_result_data *rgb_resulted =
+-			opp110->regamma.rgb_resulted;
+-
+-	const struct pixel_gamma_point *coeff;
+-	uint32_t max_entries = opp110->regamma.extra_points - 1;
+-
+-	uint32_t i = 0;
+-
+-	if (gamma_ramp->type == GAMMA_RAMP_RBG256X3X16) {
+-		if (!build_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_RED,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!build_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_GREEN,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!build_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_BLUE,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		coeff = opp110->regamma.coeff128;
+-		max_entries += RGB_256X3X16;
+-	} else if (gamma_ramp->type == GAMMA_RAMP_DXGI_1) {
+-		if (!build_custom_dx_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_RED,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!build_custom_dx_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_GREEN,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!build_custom_dx_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_BLUE,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		coeff = opp110->regamma.coeff128_dx;
+-		max_entries += DX_GAMMA_RAMP_MAX;
+-	} else {
+-		BREAK_TO_DEBUGGER();
+-		return false;
+-	}
+-
+-	while (i <= opp110->regamma.hw_points_num) {
+-		rgb_resulted->red = calculate_user_mapped_value(
+-			opp110, coeff, CHANNEL_NAME_RED, max_entries);
+-		rgb_resulted->green = calculate_user_mapped_value(
+-			opp110, coeff, CHANNEL_NAME_GREEN, max_entries);
+-		rgb_resulted->blue = calculate_user_mapped_value(
+-			opp110, coeff, CHANNEL_NAME_BLUE, max_entries);
+-
+-		++coeff;
+-		++rgb_resulted;
+-		++i;
+-	}
+-
+-	return true;
+-}
+-
+-static void map_standard_regamma_hw_to_x_user(
+-	struct dce110_opp *opp110,
+-	enum gamma_ramp_type type,
+-	const struct gamma_parameters *params)
+-{
+-	struct pwl_result_data *rgb_resulted =
+-			opp110->regamma.rgb_resulted;
+-	const struct pwl_float_data_ex *rgb_regamma =
+-			opp110->regamma.rgb_regamma;
+-
+-	uint32_t i = 0;
+-
+-	while (i <= opp110->regamma.hw_points_num) {
+-		rgb_resulted->red = rgb_regamma->r;
+-		rgb_resulted->green = rgb_regamma->g;
+-		rgb_resulted->blue = rgb_regamma->b;
+-
+-		++rgb_resulted;
+-		++rgb_regamma;
+-		++i;
+-	}
+-}
+-
+-bool dce110_opp_map_legacy_and_regamma_hw_to_x_user(
+-	struct output_pixel_processor *opp,
+-	const struct gamma_ramp *gamma_ramp,
+-	const struct gamma_parameters *params)
+-{
+-	struct dce110_opp *opp110 = TO_DCE110_OPP(opp);
+-
+-	if (params->regamma.features.bits.GAMMA_RAMP_ARRAY ||
+-		params->regamma.features.bits.APPLY_DEGAMMA) {
+-
+-		const uint32_t max_entries =
+-			RGB_256X3X16 + opp110->regamma.extra_points - 1;
+-
+-		const struct pixel_gamma_point *coeff =
+-				opp110->regamma.coeff128;
+-		struct pwl_result_data *rgb_resulted =
+-				opp110->regamma.rgb_resulted;
+-
+-		uint32_t i = 0;
+-
+-		scale_oem_gamma(opp110, &params->regamma.regamma_ramp);
+-
+-		copy_rgb_regamma_to_coordinates_x(opp110);
+-
+-		if (!build_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_RED,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!build_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_GREEN,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!build_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_BLUE,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		while (i <= opp110->regamma.hw_points_num) {
+-			rgb_resulted->red =
+-				calculate_regamma_user_mapped_value(opp110,
+-					coeff,
+-					CHANNEL_NAME_RED, max_entries);
+-			rgb_resulted->green =
+-				calculate_regamma_user_mapped_value(opp110,
+-					coeff,
+-					CHANNEL_NAME_GREEN, max_entries);
+-			rgb_resulted->blue =
+-				calculate_regamma_user_mapped_value(opp110,
+-					coeff,
+-					CHANNEL_NAME_BLUE, max_entries);
+-
+-			++coeff;
+-			++rgb_resulted;
+-			++i;
+-		}
+-	} else
+-		map_standard_regamma_hw_to_x_user(opp110,
+-				gamma_ramp->type,
+-				params);
+-
+-	return true;
+-}
+-
+-static bool map_regamma_hw_to_x_user(
+-	struct dce110_opp *opp110,
+-	const struct gamma_ramp *gamma_ramp,
+-	const struct gamma_parameters *params)
+-{
+-	/* setup to spare calculated ideal regamma values */
+-	if (params->regamma.features.bits.GAMMA_RAMP_ARRAY ||
+-		params->regamma.features.bits.APPLY_DEGAMMA) {
+-
+-		const uint32_t max_entries =
+-			RGB_256X3X16 + opp110->regamma.extra_points - 1;
+-
+-		const struct pixel_gamma_point *coeff =
+-				opp110->regamma.coeff128;
+-		struct hw_x_point *coords =
+-				opp110->regamma.coordinates_x;
+-
+-		uint32_t i = 0;
+-
+-		scale_oem_gamma(opp110, &params->regamma.regamma_ramp);
+-
+-		copy_rgb_regamma_to_coordinates_x(opp110);
+-
+-		if (!build_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_RED,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!build_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_GREEN,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!build_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_BLUE,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		while (i <= opp110->regamma.hw_points_num) {
+-			coords->regamma_y_red =
+-				calculate_regamma_user_mapped_value(opp110,
+-					coeff,
+-					CHANNEL_NAME_RED, max_entries);
+-			coords->regamma_y_green =
+-				calculate_regamma_user_mapped_value(opp110,
+-					coeff,
+-					CHANNEL_NAME_GREEN, max_entries);
+-			coords->regamma_y_blue =
+-				calculate_regamma_user_mapped_value(opp110,
+-					coeff,
+-					CHANNEL_NAME_BLUE, max_entries);
+-
+-			++coeff;
+-			++coords;
+-			++i;
+-		}
+-	} else {
+-		copy_rgb_regamma_to_coordinates_x(opp110);
+-	}
+-
+-	return calculate_interpolated_hardware_curve(opp110, gamma_ramp,
+-		params);
+-}
+-
+-static void build_regamma_coefficients(
+-	const struct regamma_lut *regamma,
+-	bool is_degamma_srgb,
+-	struct gamma_coefficients *coefficients)
+-{
+-	/* sRGB should apply 2.4 */
+-	static const int32_t numerator01[3] = { 31308, 31308, 31308 };
+-	static const int32_t numerator02[3] = { 12920, 12920, 12920 };
+-	static const int32_t numerator03[3] = { 55, 55, 55 };
+-	static const int32_t numerator04[3] = { 55, 55, 55 };
+-	static const int32_t numerator05[3] = { 2400, 2400, 2400 };
+-
+-	/* Non-sRGB should apply 2.2 */
+-	static const int32_t numerator11[3] = { 180000, 180000, 180000 };
+-	static const int32_t numerator12[3] = { 4500, 4500, 4500 };
+-	static const int32_t numerator13[3] = { 99, 99, 99 };
+-	static const int32_t numerator14[3] = { 99, 99, 99 };
+-	static const int32_t numerator15[3] = { 2200, 2200, 2200 };
+-
+-	const int32_t *numerator1;
+-	const int32_t *numerator2;
+-	const int32_t *numerator3;
+-	const int32_t *numerator4;
+-	const int32_t *numerator5;
+-
+-	uint32_t i = 0;
+-
+-	if (!regamma->features.bits.GAMMA_RAMP_ARRAY) {
+-		numerator1 = regamma->gamma_coeff.a0;
+-		numerator2 = regamma->gamma_coeff.a1;
+-		numerator3 = regamma->gamma_coeff.a2;
+-		numerator4 = regamma->gamma_coeff.a3;
+-		numerator5 = regamma->gamma_coeff.gamma;
+-	} else if (is_degamma_srgb) {
+-		numerator1 = numerator01;
+-		numerator2 = numerator02;
+-		numerator3 = numerator03;
+-		numerator4 = numerator04;
+-		numerator5 = numerator05;
+-	} else {
+-		numerator1 = numerator11;
+-		numerator2 = numerator12;
+-		numerator3 = numerator13;
+-		numerator4 = numerator14;
+-		numerator5 = numerator15;
+-	}
+-
+-	do {
+-		coefficients->a0[i] = dal_fixed31_32_from_fraction(
+-			numerator1[i], 10000000);
+-		coefficients->a1[i] = dal_fixed31_32_from_fraction(
+-			numerator2[i], 1000);
+-		coefficients->a2[i] = dal_fixed31_32_from_fraction(
+-			numerator3[i], 1000);
+-		coefficients->a3[i] = dal_fixed31_32_from_fraction(
+-			numerator4[i], 1000);
+-		coefficients->user_gamma[i] = dal_fixed31_32_from_fraction(
+-			numerator5[i], 1000);
+-
+-		++i;
+-	} while (i != ARRAY_SIZE(regamma->gamma_coeff.a0));
+-}
+-
+-static struct fixed31_32 translate_from_linear_space(
+-	struct fixed31_32 arg,
+-	struct fixed31_32 a0,
+-	struct fixed31_32 a1,
+-	struct fixed31_32 a2,
+-	struct fixed31_32 a3,
+-	struct fixed31_32 gamma)
+-{
+-	const struct fixed31_32 one = dal_fixed31_32_from_int(1);
+-
+-	if (dal_fixed31_32_le(arg, dal_fixed31_32_neg(a0)))
+-		return dal_fixed31_32_sub(
+-			a2,
+-			dal_fixed31_32_mul(
+-				dal_fixed31_32_add(
+-					one,
+-					a3),
+-				dal_fixed31_32_pow(
+-					dal_fixed31_32_neg(arg),
+-					dal_fixed31_32_recip(gamma))));
+-	else if (dal_fixed31_32_le(a0, arg))
+-		return dal_fixed31_32_sub(
+-			dal_fixed31_32_mul(
+-				dal_fixed31_32_add(
+-					one,
+-					a3),
+-				dal_fixed31_32_pow(
+-					arg,
+-					dal_fixed31_32_recip(gamma))),
+-			a2);
+-	else
+-		return dal_fixed31_32_mul(
+-			arg,
+-			a1);
+-}
+-
+-static inline struct fixed31_32 translate_from_linear_space_ex(
+-	struct fixed31_32 arg,
+-	struct gamma_coefficients *coeff,
+-	uint32_t color_index)
+-{
+-	return translate_from_linear_space(
+-		arg,
+-		coeff->a0[color_index],
+-		coeff->a1[color_index],
+-		coeff->a2[color_index],
+-		coeff->a3[color_index],
+-		coeff->user_gamma[color_index]);
+-}
+-
+-static bool build_regamma_curve(
+-	struct dce110_opp *opp110,
+-	const struct gamma_parameters *params)
+-{
+-	struct pwl_float_data_ex *rgb = opp110->regamma.rgb_regamma;
+-
+-	uint32_t i;
+-
+-	struct gamma_coefficients coeff;
+-
+-	struct hw_x_point *coord_x =
+-		opp110->regamma.coordinates_x;
+-
+-	build_regamma_coefficients(
+-		&params->regamma,
+-		params->regamma.features.bits.GRAPHICS_DEGAMMA_SRGB,
+-		&coeff);
+-
+-	/* Use opp110->regamma.coordinates_x to retrieve
+-	 * coordinates chosen base on given user curve (future task).
+-	 * The x values are exponentially distributed and currently
+-	 * it is hard-coded, the user curve shape is ignored.
+-	 * The future task is to recalculate opp110-
+-	 * regamma.coordinates_x based on input/user curve,
+-	 * translation from 256/1025 to 128 pwl points.
+-	 */
+-
+-	i = 0;
+-
+-	while (i != opp110->regamma.hw_points_num + 1) {
+-		rgb->r = translate_from_linear_space_ex(
+-			coord_x->adjusted_x, &coeff, 0);
+-		rgb->g = translate_from_linear_space_ex(
+-			coord_x->adjusted_x, &coeff, 1);
+-		rgb->b = translate_from_linear_space_ex(
+-			coord_x->adjusted_x, &coeff, 2);
+-
+-		++coord_x;
+-		++rgb;
+-		++i;
+-	}
+-
+-	if (params->regamma.features.bits.GAMMA_RAMP_ARRAY &&
+-			!params->regamma.features.bits.APPLY_DEGAMMA) {
+-		const uint32_t max_entries =
+-			RGB_256X3X16 + opp110->regamma.extra_points - 1;
+-
+-		/* interpolate between 256 input points and output 185 points */
+-
+-		scale_oem_gamma(opp110, &params->regamma.regamma_ramp);
+-
+-		if (!build_oem_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_RED,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!build_oem_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_GREEN,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!build_oem_custom_gamma_mapping_coefficients(
+-			opp110, CHANNEL_NAME_BLUE,
+-			opp110->regamma.hw_points_num,
+-			params->surface_pixel_format)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		i = 0;
+-
+-		while (i != opp110->regamma.hw_points_num + 1) {
+-			rgb->r = calculate_oem_mapped_value(
+-				opp110, i, CHANNEL_NAME_RED, max_entries);
+-			rgb->g = calculate_oem_mapped_value(
+-				opp110, i, CHANNEL_NAME_GREEN, max_entries);
+-			rgb->b = calculate_oem_mapped_value(
+-				opp110, i, CHANNEL_NAME_BLUE, max_entries);
+-			++rgb;
+-			++i;
+-		}
+-	}
+-
+-	return true;
+-}
+-
+-static void build_new_custom_resulted_curve(
+-	struct dce110_opp *opp110,
+-	const struct gamma_parameters *params)
+-{
+-	struct pwl_result_data *rgb = opp110->regamma.rgb_resulted;
+-	struct pwl_result_data *rgb_plus_1 = rgb + 1;
+-
+-	uint32_t i;
+-
+-	i = 0;
+-
+-	while (i != opp110->regamma.hw_points_num + 1) {
+-		rgb->red = dal_fixed31_32_clamp(
+-			rgb->red, opp110->regamma.x_min,
+-			opp110->regamma.x_max1);
+-		rgb->green = dal_fixed31_32_clamp(
+-			rgb->green, opp110->regamma.x_min,
+-			opp110->regamma.x_max1);
+-		rgb->blue = dal_fixed31_32_clamp(
+-			rgb->blue, opp110->regamma.x_min,
+-			opp110->regamma.x_max1);
+-
+-		++rgb;
+-		++i;
+-	}
+-
+-	rgb = opp110->regamma.rgb_resulted;
+-
+-	i = 1;
+-
+-	while (i != opp110->regamma.hw_points_num + 1) {
+-		if (dal_fixed31_32_lt(rgb_plus_1->red, rgb->red))
+-			rgb_plus_1->red = rgb->red;
+-		if (dal_fixed31_32_lt(rgb_plus_1->green, rgb->green))
+-			rgb_plus_1->green = rgb->green;
+-		if (dal_fixed31_32_lt(rgb_plus_1->blue, rgb->blue))
+-			rgb_plus_1->blue = rgb->blue;
+-
+-		rgb->delta_red = dal_fixed31_32_sub(
+-			rgb_plus_1->red,
+-			rgb->red);
+-		rgb->delta_green = dal_fixed31_32_sub(
+-			rgb_plus_1->green,
+-			rgb->green);
+-		rgb->delta_blue = dal_fixed31_32_sub(
+-			rgb_plus_1->blue,
+-			rgb->blue);
+-
+-		++rgb_plus_1;
+-		++rgb;
+-		++i;
+-	}
+-}
+-
+-static bool rebuild_curve_configuration_magic(
+-	struct dce110_opp *opp110)
+-{
+-	const struct fixed31_32 magic_number =
+-		dal_fixed31_32_from_fraction(249, 1000);
+-
+-	struct fixed31_32 y_r;
+-	struct fixed31_32 y_g;
+-	struct fixed31_32 y_b;
+-
+-	struct fixed31_32 y1_min;
+-	struct fixed31_32 y2_max;
+-	struct fixed31_32 y3_max;
+-
+-	y_r = opp110->regamma.rgb_resulted[0].red;
+-	y_g = opp110->regamma.rgb_resulted[0].green;
+-	y_b = opp110->regamma.rgb_resulted[0].blue;
+-
+-	y1_min = dal_fixed31_32_min(y_r, dal_fixed31_32_min(y_g, y_b));
+-
+-	opp110->regamma.arr_points[0].x =
+-			opp110->regamma.coordinates_x[0].adjusted_x;
+-	opp110->regamma.arr_points[0].y = y1_min;
+-	opp110->regamma.arr_points[0].slope = dal_fixed31_32_div(
+-		opp110->regamma.arr_points[0].y,
+-		opp110->regamma.arr_points[0].x);
+-
+-	opp110->regamma.arr_points[1].x = dal_fixed31_32_add(
+-		opp110->regamma.coordinates_x
+-		[opp110->regamma.hw_points_num - 1].adjusted_x,
+-		magic_number);
+-
+-	opp110->regamma.arr_points[2].x =
+-			opp110->regamma.arr_points[1].x;
+-
+-	y_r = opp110->regamma.rgb_resulted
+-			[opp110->regamma.hw_points_num - 1].red;
+-	y_g = opp110->regamma.rgb_resulted
+-			[opp110->regamma.hw_points_num - 1].green;
+-	y_b = opp110->regamma.rgb_resulted
+-			[opp110->regamma.hw_points_num - 1].blue;
+-
+-	y2_max = dal_fixed31_32_max(y_r, dal_fixed31_32_max(y_g, y_b));
+-
+-	opp110->regamma.arr_points[1].y = y2_max;
+-
+-	y_r = opp110->regamma.rgb_resulted
+-			[opp110->regamma.hw_points_num].red;
+-	y_g = opp110->regamma.rgb_resulted
+-			[opp110->regamma.hw_points_num].green;
+-	y_b = opp110->regamma.rgb_resulted
+-			[opp110->regamma.hw_points_num].blue;
+-
+-	y3_max = dal_fixed31_32_max(y_r, dal_fixed31_32_max(y_g, y_b));
+-
+-	opp110->regamma.arr_points[2].y = y3_max;
+-
+-	opp110->regamma.arr_points[2].slope = dal_fixed31_32_one;
+-
+-	return true;
+-}
+-
+-static bool build_custom_float(
+-	struct fixed31_32 value,
+-	const struct custom_float_format *format,
+-	bool *negative,
+-	uint32_t *mantissa,
+-	uint32_t *exponenta)
+-{
+-	uint32_t exp_offset = (1 << (format->exponenta_bits - 1)) - 1;
+-
+-	const struct fixed31_32 mantissa_constant_plus_max_fraction =
+-		dal_fixed31_32_from_fraction(
+-			(1LL << (format->mantissa_bits + 1)) - 1,
+-			1LL << format->mantissa_bits);
+-
+-	struct fixed31_32 mantiss;
+-
+-	if (dal_fixed31_32_eq(
+-		value,
+-		dal_fixed31_32_zero)) {
+-		*negative = false;
+-		*mantissa = 0;
+-		*exponenta = 0;
+-		return true;
+-	}
+-
+-	if (dal_fixed31_32_lt(
+-		value,
+-		dal_fixed31_32_zero)) {
+-		*negative = format->sign;
+-		value = dal_fixed31_32_neg(value);
+-	} else {
+-		*negative = false;
+-	}
+-
+-	if (dal_fixed31_32_lt(
+-		value,
+-		dal_fixed31_32_one)) {
+-		uint32_t i = 1;
+-
+-		do {
+-			value = dal_fixed31_32_shl(value, 1);
+-			++i;
+-		} while (dal_fixed31_32_lt(
+-			value,
+-			dal_fixed31_32_one));
+-
+-		--i;
+-
+-		if (exp_offset <= i) {
+-			*mantissa = 0;
+-			*exponenta = 0;
+-			return true;
+-		}
+-
+-		*exponenta = exp_offset - i;
+-	} else if (dal_fixed31_32_le(
+-		mantissa_constant_plus_max_fraction,
+-		value)) {
+-		uint32_t i = 1;
+-
+-		do {
+-			value = dal_fixed31_32_shr(value, 1);
+-			++i;
+-		} while (dal_fixed31_32_lt(
+-			mantissa_constant_plus_max_fraction,
+-			value));
+-
+-		*exponenta = exp_offset + i - 1;
+-	} else {
+-		*exponenta = exp_offset;
+-	}
+-
+-	mantiss = dal_fixed31_32_sub(
+-		value,
+-		dal_fixed31_32_one);
+-
+-	if (dal_fixed31_32_lt(
+-			mantiss,
+-			dal_fixed31_32_zero) ||
+-		dal_fixed31_32_lt(
+-			dal_fixed31_32_one,
+-			mantiss))
+-		mantiss = dal_fixed31_32_zero;
+-	else
+-		mantiss = dal_fixed31_32_shl(
+-			mantiss,
+-			format->mantissa_bits);
+-
+-	*mantissa = dal_fixed31_32_floor(mantiss);
+-
+-	return true;
+-}
+-
+-static bool setup_custom_float(
+-	const struct custom_float_format *format,
+-	bool negative,
+-	uint32_t mantissa,
+-	uint32_t exponenta,
+-	uint32_t *result)
+-{
+-	uint32_t i = 0;
+-	uint32_t j = 0;
+-
+-	uint32_t value = 0;
+-
+-	/* verification code:
+-	 * once calculation is ok we can remove it */
+-
+-	const uint32_t mantissa_mask =
+-		(1 << (format->mantissa_bits + 1)) - 1;
+-
+-	const uint32_t exponenta_mask =
+-		(1 << (format->exponenta_bits + 1)) - 1;
+-
+-	if (mantissa & ~mantissa_mask) {
+-		BREAK_TO_DEBUGGER();
+-		mantissa = mantissa_mask;
+-	}
+-
+-	if (exponenta & ~exponenta_mask) {
+-		BREAK_TO_DEBUGGER();
+-		exponenta = exponenta_mask;
+-	}
+-
+-	/* end of verification code */
+-
+-	while (i < format->mantissa_bits) {
+-		uint32_t mask = 1 << i;
+-
+-		if (mantissa & mask)
+-			value |= mask;
+-
+-		++i;
+-	}
+-
+-	while (j < format->exponenta_bits) {
+-		uint32_t mask = 1 << j;
+-
+-		if (exponenta & mask)
+-			value |= mask << i;
+-
+-		++j;
+-	}
+-
+-	if (negative && format->sign)
+-		value |= 1 << (i + j);
+-
+-	*result = value;
+-
+-	return true;
+-}
+-
+-static bool convert_to_custom_float_format(
+-	struct fixed31_32 value,
+-	const struct custom_float_format *format,
+-	uint32_t *result)
+-{
+-	uint32_t mantissa;
+-	uint32_t exponenta;
+-	bool negative;
+-
+-	return build_custom_float(
+-		value, format, &negative, &mantissa, &exponenta) &&
+-	setup_custom_float(
+-		format, negative, mantissa, exponenta, result);
+-}
+-
+-static bool convert_to_custom_float_format_ex(
+-	struct fixed31_32 value,
+-	const struct custom_float_format *format,
+-	struct custom_float_value *result)
+-{
+-	return build_custom_float(
+-		value, format,
+-		&result->negative, &result->mantissa, &result->exponenta) &&
+-	setup_custom_float(
+-		format, result->negative, result->mantissa, result->exponenta,
+-		&result->value);
+-}
+-
+-static bool convert_to_custom_float(
+-	struct dce110_opp *opp110)
+-{
+-	struct custom_float_format fmt;
+-
+-	struct pwl_result_data *rgb = opp110->regamma.rgb_resulted;
+-
+-	uint32_t i = 0;
+-
+-	fmt.exponenta_bits = 6;
+-	fmt.mantissa_bits = 12;
+-	fmt.sign = true;
+-
+-	if (!convert_to_custom_float_format(
+-		opp110->regamma.arr_points[0].x,
+-		&fmt,
+-		&opp110->regamma.arr_points[0].custom_float_x)) {
+-		BREAK_TO_DEBUGGER();
+-		return false;
+-	}
+-
+-	if (!convert_to_custom_float_format(
+-		opp110->regamma.arr_points[0].offset,
+-		&fmt,
+-		&opp110->regamma.arr_points[0].custom_float_offset)) {
+-		BREAK_TO_DEBUGGER();
+-		return false;
+-	}
+-
+-	if (!convert_to_custom_float_format(
+-		opp110->regamma.arr_points[0].slope,
+-		&fmt,
+-		&opp110->regamma.arr_points[0].custom_float_slope)) {
+-		BREAK_TO_DEBUGGER();
+-		return false;
+-	}
+-
+-	fmt.mantissa_bits = 10;
+-	fmt.sign = false;
+-
+-	if (!convert_to_custom_float_format(
+-		opp110->regamma.arr_points[1].x,
+-		&fmt,
+-		&opp110->regamma.arr_points[1].custom_float_x)) {
+-		BREAK_TO_DEBUGGER();
+-		return false;
+-	}
+-
+-	if (!convert_to_custom_float_format(
+-		opp110->regamma.arr_points[1].y,
+-		&fmt,
+-		&opp110->regamma.arr_points[1].custom_float_y)) {
+-		BREAK_TO_DEBUGGER();
+-		return false;
+-	}
+-
+-	if (!convert_to_custom_float_format(
+-		opp110->regamma.arr_points[2].slope,
+-		&fmt,
+-		&opp110->regamma.arr_points[2].custom_float_slope)) {
+-		BREAK_TO_DEBUGGER();
+-		return false;
+-	}
+-
+-	fmt.mantissa_bits = 12;
+-	fmt.sign = true;
+-
+-	while (i != opp110->regamma.hw_points_num) {
+-		if (!convert_to_custom_float_format(
+-			rgb->red,
+-			&fmt,
+-			&rgb->red_reg)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!convert_to_custom_float_format(
+-			rgb->green,
+-			&fmt,
+-			&rgb->green_reg)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!convert_to_custom_float_format(
+-			rgb->blue,
+-			&fmt,
+-			&rgb->blue_reg)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!convert_to_custom_float_format(
+-			rgb->delta_red,
+-			&fmt,
+-			&rgb->delta_red_reg)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!convert_to_custom_float_format(
+-			rgb->delta_green,
+-			&fmt,
+-			&rgb->delta_green_reg)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		if (!convert_to_custom_float_format(
+-			rgb->delta_blue,
+-			&fmt,
+-			&rgb->delta_blue_reg)) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
+-		}
+-
+-		++rgb;
+-		++i;
+-	}
+-
+-	return true;
+-}
+-
+-static bool round_custom_float_6_12(
+-	struct hw_x_point *x)
+-{
+-	struct custom_float_format fmt;
+-
+-	struct custom_float_value value;
+-
+-	fmt.exponenta_bits = 6;
+-	fmt.mantissa_bits = 12;
+-	fmt.sign = true;
+-
+-	if (!convert_to_custom_float_format_ex(
+-		x->x, &fmt, &value))
+-		return false;
+-
+-	x->adjusted_x = x->x;
+-
+-	if (value.mantissa) {
+-		BREAK_TO_DEBUGGER();
+-
+-		return false;
+-	}
+-
+-	return true;
+-}
+-
+-static bool build_hw_curve_configuration(
+-	const struct curve_config *curve_config,
+-	struct gamma_curve *gamma_curve,
+-	struct curve_points *curve_points,
+-	struct hw_x_point *points,
+-	uint32_t *number_of_points)
+-{
+-	const int8_t max_regions_number = ARRAY_SIZE(curve_config->segments);
+-
+-	int8_t i;
+-
+-	uint8_t segments_calculation[8] = { 0 };
+-
+-	struct fixed31_32 region1 = dal_fixed31_32_zero;
+-	struct fixed31_32 region2;
+-	struct fixed31_32 increment;
+-
+-	uint32_t index = 0;
+-	uint32_t segments = 0;
+-	uint32_t max_number;
+-
+-	bool result = false;
+-
+-	if (!number_of_points) {
+-		BREAK_TO_DEBUGGER();
+-		return false;
+-	}
+-
+-	max_number = *number_of_points;
+-
+-	i = 0;
+-
+-	while (i != max_regions_number) {
+-		gamma_curve[i].offset = 0;
+-		gamma_curve[i].segments_num = 0;
+-
+-		++i;
+-	}
+-
+-	i = 0;
+-
+-	while (i != max_regions_number) {
+-		/* number should go in uninterruptible sequence */
+-		if (curve_config->segments[i] == -1)
+-			break;
+-
+-		ASSERT(curve_config->segments[i] >= 0);
+-
+-		segments += (1 << curve_config->segments[i]);
+-
+-		++i;
+-	}
+-
+-	if (segments > max_number) {
+-		BREAK_TO_DEBUGGER();
+-	} else {
+-		int32_t divisor;
+-		uint32_t offset = 0;
+-		int8_t begin = curve_config->begin;
+-		int32_t region_number = 0;
+-
+-		i = begin;
+-
+-		while ((index < max_number) &&
+-			(region_number < max_regions_number) &&
+-			(i <= 1)) {
+-			int32_t j = 0;
+-
+-			segments = curve_config->segments[region_number];
+-			divisor = 1 << segments;
+-
+-			if (segments == -1) {
+-				if (i > 0) {
+-					region1 = dal_fixed31_32_shl(
+-						dal_fixed31_32_one,
+-						i - 1);
+-					region2 = dal_fixed31_32_shl(
+-						dal_fixed31_32_one,
+-						i);
+-				} else {
+-					region1 = dal_fixed31_32_shr(
+-						dal_fixed31_32_one,
+-						-(i - 1));
+-					region2 = dal_fixed31_32_shr(
+-						dal_fixed31_32_one,
+-						-i);
+-				}
+-
+-				break;
+-			}
+-
+-			if (i > -1) {
+-				region1 = dal_fixed31_32_shl(
+-					dal_fixed31_32_one,
+-					i);
+-				region2 = dal_fixed31_32_shl(
+-					dal_fixed31_32_one,
+-					i + 1);
+-			} else {
+-				region1 = dal_fixed31_32_shr(
+-					dal_fixed31_32_one,
+-					-i);
+-				region2 = dal_fixed31_32_shr(
+-					dal_fixed31_32_one,
+-					-(i + 1));
+-			}
+-
+-			gamma_curve[region_number].offset = offset;
+-			gamma_curve[region_number].segments_num = segments;
+-
+-			offset += divisor;
+-
+-			++segments_calculation[segments];
+-
+-			increment = dal_fixed31_32_div_int(
+-				dal_fixed31_32_sub(
+-					region2,
+-					region1),
+-				divisor);
+-
+-			points[index].x = region1;
+-
+-			round_custom_float_6_12(points + index);
+-
+-			++index;
+-			++region_number;
+-
+-			while ((index < max_number) && (j < divisor - 1)) {
+-				region1 = dal_fixed31_32_add(
+-					region1,
+-					increment);
+-
+-				points[index].x = region1;
+-				points[index].adjusted_x = region1;
+-
+-				++index;
+-				++j;
+-			}
+-
+-			++i;
+-		}
+-
+-		points[index].x = region1;
+-
+-		round_custom_float_6_12(points + index);
+-
+-		*number_of_points = index;
+-
+-		result = true;
+-	}
+-
+-	curve_points[0].x = points[0].adjusted_x;
+-	curve_points[0].offset = dal_fixed31_32_zero;
+-
+-	curve_points[1].x = points[index - 1].adjusted_x;
+-	curve_points[1].offset = dal_fixed31_32_zero;
+-
+-	curve_points[2].x = points[index].adjusted_x;
+-	curve_points[2].offset = dal_fixed31_32_zero;
+-
+-	return result;
+-}
+-
+-static bool setup_distribution_points(
+-	struct dce110_opp *opp110)
+-{
+-	uint32_t hw_points_num = MAX_PWL_ENTRY * 2;
+-
+-	struct curve_config cfg;
+-
+-	cfg.offset = 0;
+-
+-		cfg.segments[0] = 3;
+-		cfg.segments[1] = 4;
+-		cfg.segments[2] = 4;
+-		cfg.segments[3] = 4;
+-		cfg.segments[4] = 4;
+-		cfg.segments[5] = 4;
+-		cfg.segments[6] = 4;
+-		cfg.segments[7] = 4;
+-		cfg.segments[8] = 5;
+-		cfg.segments[9] = 5;
+-		cfg.segments[10] = 0;
+-		cfg.segments[11] = -1;
+-		cfg.segments[12] = -1;
+-		cfg.segments[13] = -1;
+-		cfg.segments[14] = -1;
+-		cfg.segments[15] = -1;
+-
+-	cfg.begin = -10;
+-
+-	if (!build_hw_curve_configuration(
+-		&cfg, opp110->regamma.arr_curve_points,
+-		opp110->regamma.arr_points,
+-		opp110->regamma.coordinates_x, &hw_points_num)) {
+-		ASSERT_CRITICAL(false);
+-		return false;
+-	}
+-
+-	opp110->regamma.hw_points_num = hw_points_num;
+-
+-	return true;
+-}
+-
+-
+ /*
+  *****************************************************************************
+  *  Function: regamma_config_regions_and_segments
+@@ -1779,15 +61,16 @@ static bool setup_distribution_points(
+  *****************************************************************************
+  */
+ static void regamma_config_regions_and_segments(
+-	struct dce110_opp *opp110)
++	struct dce110_opp *opp110,
++	const struct regamma_params *params)
+ {
+-	struct gamma_curve *curve;
++	const struct gamma_curve *curve;
+ 	uint32_t value = 0;
+ 
+ 	{
+ 		set_reg_field_value(
+ 			value,
+-			opp110->regamma.arr_points[0].custom_float_x,
++			params->arr_points[0].custom_float_x,
+ 			REGAMMA_CNTLA_START_CNTL,
+ 			REGAMMA_CNTLA_EXP_REGION_START);
+ 
+@@ -1805,7 +88,7 @@ static void regamma_config_regions_and_segments(
+ 		value = 0;
+ 		set_reg_field_value(
+ 			value,
+-			opp110->regamma.arr_points[0].custom_float_slope,
++			params->arr_points[0].custom_float_slope,
+ 			REGAMMA_CNTLA_SLOPE_CNTL,
+ 			REGAMMA_CNTLA_EXP_REGION_LINEAR_SLOPE);
+ 
+@@ -1816,7 +99,7 @@ static void regamma_config_regions_and_segments(
+ 		value = 0;
+ 		set_reg_field_value(
+ 			value,
+-			opp110->regamma.arr_points[1].custom_float_x,
++			params->arr_points[1].custom_float_x,
+ 			REGAMMA_CNTLA_END_CNTL1,
+ 			REGAMMA_CNTLA_EXP_REGION_END);
+ 
+@@ -1827,13 +110,13 @@ static void regamma_config_regions_and_segments(
+ 		value = 0;
+ 		set_reg_field_value(
+ 			value,
+-			opp110->regamma.arr_points[2].custom_float_slope,
++			params->arr_points[2].custom_float_slope,
+ 			REGAMMA_CNTLA_END_CNTL2,
+ 			REGAMMA_CNTLA_EXP_REGION_END_BASE);
+ 
+ 		set_reg_field_value(
+ 			value,
+-			opp110->regamma.arr_points[1].custom_float_y,
++			params->arr_points[1].custom_float_y,
+ 			REGAMMA_CNTLA_END_CNTL2,
+ 			REGAMMA_CNTLA_EXP_REGION_END_SLOPE);
+ 
+@@ -1841,7 +124,7 @@ static void regamma_config_regions_and_segments(
+ 			DCP_REG(mmREGAMMA_CNTLA_END_CNTL2), value);
+ 	}
+ 
+-	curve = opp110->regamma.arr_curve_points;
++	curve = params->arr_curve_points;
+ 
+ 	{
+ 		value = 0;
+@@ -2102,7 +385,7 @@ static void regamma_config_regions_and_segments(
+ 
+ static void program_pwl(
+ 	struct dce110_opp *opp110,
+-	const struct gamma_parameters *params)
++	const struct regamma_params *params)
+ {
+ 	uint32_t value;
+ 
+@@ -2110,6 +393,18 @@ static void program_pwl(
+ 		uint8_t max_tries = 10;
+ 		uint8_t counter = 0;
+ 
++		value = dm_read_reg(opp110->base.ctx,
++				DCP_REG(mmREGAMMA_CONTROL));
++
++		set_reg_field_value(
++			value,
++			3,
++			REGAMMA_CONTROL,
++			GRPH_REGAMMA_MODE);
++
++		dm_write_reg(opp110->base.ctx, DCP_REG(mmREGAMMA_CONTROL),
++				value);
++
+ 		/* Power on LUT memory */
+ 		value = dm_read_reg(opp110->base.ctx,
+ 				DCFE_REG(mmDCFE_MEM_PWR_CTRL));
+@@ -2168,10 +463,9 @@ static void program_pwl(
+ 
+ 		uint32_t i = 0;
+ 
+-		struct pwl_result_data *rgb =
+-				opp110->regamma.rgb_resulted;
++		const struct pwl_result_data *rgb = params->rgb_resulted;
+ 
+-		while (i != opp110->regamma.hw_points_num) {
++		while (i != params->hw_points_num) {
+ 			dm_write_reg(opp110->base.ctx, addr, rgb->red_reg);
+ 			dm_write_reg(opp110->base.ctx, addr, rgb->green_reg);
+ 			dm_write_reg(opp110->base.ctx, addr, rgb->blue_reg);
+@@ -2200,6 +494,22 @@ static void program_pwl(
+ 	dm_write_reg(opp110->base.ctx, DCFE_REG(mmDCFE_MEM_PWR_CTRL), value);
+ }
+ 
++
++bool dce110_opp_set_regamma(
++	struct output_pixel_processor *opp,
++	const struct regamma_params *params)
++{
++	struct dce110_opp *opp110 = TO_DCE110_OPP(opp);
++
++	/* Setup regions */
++	regamma_config_regions_and_segments(opp110, params);
++
++	/* Program PWL */
++	program_pwl(opp110, params);
++
++	return true;
++}
++
+ void dce110_opp_power_on_regamma_lut(
+ 	struct output_pixel_processor *opp,
+ 	bool power_on)
+@@ -2223,252 +533,3 @@ void dce110_opp_power_on_regamma_lut(
+ 
+ 	dm_write_reg(opp->ctx, DCFE_REG(mmDCFE_MEM_PWR_CTRL), value);
+ }
+-
+-static bool scale_gamma(
+-	struct dce110_opp *opp110,
+-	const struct gamma_ramp *gamma_ramp,
+-	const struct gamma_parameters *params)
+-{
+-	const struct gamma_ramp_rgb256x3x16 *gamma;
+-	bool use_palette = params->surface_pixel_format == PIXEL_FORMAT_INDEX8;
+-
+-	const uint16_t max_driver = 0xFFFF;
+-	const uint16_t max_os = 0xFF00;
+-
+-	uint16_t scaler = max_os;
+-
+-	uint32_t i;
+-
+-	struct dev_c_lut *palette = opp110->regamma.saved_palette;
+-
+-	struct pwl_float_data *rgb = opp110->regamma.rgb_user;
+-	struct pwl_float_data *rgb_last = rgb + RGB_256X3X16 - 1;
+-
+-	if (gamma_ramp->type == GAMMA_RAMP_RBG256X3X16)
+-		gamma = &gamma_ramp->gamma_ramp_rgb256x3x16;
+-	else
+-		return false; /* invalid option */
+-
+-	i = 0;
+-
+-	do {
+-		if ((gamma->red[i] > max_os) ||
+-			(gamma->green[i] > max_os) ||
+-			(gamma->blue[i] > max_os)) {
+-			scaler = max_driver;
+-			break;
+-		}
+-		++i;
+-	} while (i != RGB_256X3X16);
+-
+-	i = 0;
+-
+-	if (use_palette)
+-		do {
+-			rgb->r = dal_fixed31_32_from_fraction(
+-				gamma->red[palette->red], scaler);
+-			rgb->g = dal_fixed31_32_from_fraction(
+-				gamma->green[palette->green], scaler);
+-			rgb->b = dal_fixed31_32_from_fraction(
+-				gamma->blue[palette->blue], scaler);
+-
+-			++palette;
+-			++rgb;
+-			++i;
+-		} while (i != RGB_256X3X16);
+-	else
+-		do {
+-			rgb->r = dal_fixed31_32_from_fraction(
+-				gamma->red[i], scaler);
+-			rgb->g = dal_fixed31_32_from_fraction(
+-				gamma->green[i], scaler);
+-			rgb->b = dal_fixed31_32_from_fraction(
+-				gamma->blue[i], scaler);
+-
+-			++rgb;
+-			++i;
+-		} while (i != RGB_256X3X16);
+-
+-	rgb->r = dal_fixed31_32_mul(rgb_last->r,
+-			opp110->regamma.divider1);
+-	rgb->g = dal_fixed31_32_mul(rgb_last->g,
+-			opp110->regamma.divider1);
+-	rgb->b = dal_fixed31_32_mul(rgb_last->b,
+-			opp110->regamma.divider1);
+-
+-	++rgb;
+-
+-	rgb->r = dal_fixed31_32_mul(rgb_last->r,
+-			opp110->regamma.divider2);
+-	rgb->g = dal_fixed31_32_mul(rgb_last->g,
+-			opp110->regamma.divider2);
+-	rgb->b = dal_fixed31_32_mul(rgb_last->b,
+-			opp110->regamma.divider2);
+-
+-	++rgb;
+-
+-	rgb->r = dal_fixed31_32_mul(rgb_last->r,
+-			opp110->regamma.divider3);
+-	rgb->g = dal_fixed31_32_mul(rgb_last->g,
+-			opp110->regamma.divider3);
+-	rgb->b = dal_fixed31_32_mul(rgb_last->b,
+-			opp110->regamma.divider3);
+-
+-	return true;
+-}
+-
+-
+-static void configure_regamma_mode(
+-	struct dce110_opp *opp110,
+-	const struct gamma_parameters *params,
+-	bool force_bypass)
+-{
+-	const uint32_t addr = DCP_REG(mmREGAMMA_CONTROL);
+-
+-	enum wide_gamut_regamma_mode mode =
+-		WIDE_GAMUT_REGAMMA_MODE_GRAPHICS_MATRIX_A;
+-
+-	uint32_t value = dm_read_reg(opp110->base.ctx, addr);
+-
+-	if (force_bypass) {
+-
+-		set_reg_field_value(
+-			value,
+-			0,
+-			REGAMMA_CONTROL,
+-			GRPH_REGAMMA_MODE);
+-
+-		dm_write_reg(opp110->base.ctx, addr, value);
+-
+-		return;
+-	}
+-
+-	if (params->regamma_adjust_type == GRAPHICS_REGAMMA_ADJUST_BYPASS)
+-		mode = WIDE_GAMUT_REGAMMA_MODE_GRAPHICS_BYPASS;
+-	else if (params->regamma_adjust_type == GRAPHICS_REGAMMA_ADJUST_HW) {
+-		if (params->surface_pixel_format == PIXEL_FORMAT_FP16)
+-			mode = WIDE_GAMUT_REGAMMA_MODE_GRAPHICS_BYPASS;
+-		else
+-			mode = WIDE_GAMUT_REGAMMA_MODE_GRAPHICS_SRGB24;
+-	}
+-
+-	switch (mode) {
+-	case WIDE_GAMUT_REGAMMA_MODE_GRAPHICS_BYPASS:
+-		set_reg_field_value(
+-			value,
+-			0,
+-			REGAMMA_CONTROL,
+-			GRPH_REGAMMA_MODE);
+-		break;
+-	case WIDE_GAMUT_REGAMMA_MODE_GRAPHICS_SRGB24:
+-		set_reg_field_value(
+-			value,
+-			1,
+-			REGAMMA_CONTROL,
+-			GRPH_REGAMMA_MODE);
+-		break;
+-	case WIDE_GAMUT_REGAMMA_MODE_GRAPHICS_XYYCC22:
+-		set_reg_field_value(
+-			value,
+-			2,
+-			REGAMMA_CONTROL,
+-			GRPH_REGAMMA_MODE);
+-		break;
+-	case WIDE_GAMUT_REGAMMA_MODE_GRAPHICS_MATRIX_A:
+-		set_reg_field_value(
+-			value,
+-			3,
+-			REGAMMA_CONTROL,
+-			GRPH_REGAMMA_MODE);
+-		break;
+-	case WIDE_GAMUT_REGAMMA_MODE_GRAPHICS_MATRIX_B:
+-		set_reg_field_value(
+-			value,
+-			4,
+-			REGAMMA_CONTROL,
+-			GRPH_REGAMMA_MODE);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	dm_write_reg(opp110->base.ctx, addr, value);
+-}
+-
+-bool dce110_opp_set_regamma(
+-	struct output_pixel_processor *opp,
+-	const struct gamma_ramp *ramp,
+-	const struct gamma_parameters *params,
+-	bool force_bypass)
+-{
+-	struct dce110_opp *opp110 = TO_DCE110_OPP(opp);
+-
+-	if (force_bypass) {
+-		configure_regamma_mode(opp110, params, true);
+-	} else {
+-		/* 1. Scale gamma to 0 - 1 to m_pRgbUser */
+-		if (!scale_gamma(opp110, ramp, params)) {
+-			ASSERT_CRITICAL(false);
+-			/* invalid option */
+-			return false;
+-		}
+-
+-		/* 2. Configure regamma curve without analysis (future task) */
+-		/*    and program the PWL regions and segments */
+-		if (params->regamma_adjust_type == GRAPHICS_REGAMMA_ADJUST_SW ||
+-			params->surface_pixel_format == PIXEL_FORMAT_FP16) {
+-
+-			/* 3. Setup x exponentially distributed points */
+-			if (!setup_distribution_points(opp110)) {
+-				ASSERT_CRITICAL(false);
+-				/* invalid option */
+-				return false;
+-			}
+-
+-			/* 4. Build ideal regamma curve */
+-			if (!build_regamma_curve(opp110, params)) {
+-				ASSERT_CRITICAL(false);
+-				/* invalid parameters or bug */
+-				return false;
+-			}
+-
+-			/* 5. Map user gamma (evenly distributed x points) to
+-			 * new curve when x is y from ideal regamma , step 5 */
+-			if (!map_regamma_hw_to_x_user(
+-				opp110, ramp, params)) {
+-				ASSERT_CRITICAL(false);
+-				/* invalid parameters or bug */
+-				return false;
+-			}
+-
+-			/* 6.Build and verify resulted curve */
+-			build_new_custom_resulted_curve(opp110, params);
+-
+-			/* 7. Build and translate x to hw format */
+-			if (!rebuild_curve_configuration_magic(opp110)) {
+-				ASSERT_CRITICAL(false);
+-				/* invalid parameters or bug */
+-				return false;
+-			}
+-
+-			/* 8. convert all params to the custom float format */
+-			if (!convert_to_custom_float(opp110)) {
+-				ASSERT_CRITICAL(false);
+-				/* invalid parameters or bug */
+-				return false;
+-			}
+-
+-			/* 9. program regamma curve configuration */
+-			regamma_config_regions_and_segments(opp110);
+-
+-			/* 10. Program PWL */
+-			program_pwl(opp110, params);
+-		}
+-
+-		/*
+-		 * 11. program regamma config
+-		 */
+-		configure_regamma_mode(opp110, params, false);
+-	}
+-	return true;
+-}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_types.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_types.h
+new file mode 100644
+index 0000000..e61a494
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_types.h
+@@ -0,0 +1,58 @@
++/* Copyright 2012-15 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#ifndef _DCE110_TYPES_H_
++#define __DCE110_TYPES_H_
++
++#define GAMMA_SEGMENTS_NUM 16
++struct end_point {
++	uint32_t x_value;
++	uint32_t y_value;
++	uint32_t slope;
++};
++
++struct pwl_segment {
++	uint32_t r_value;
++	uint32_t g_value;
++	uint32_t b_value;
++	uint32_t r_delta;
++	uint32_t g_delta;
++	uint32_t b_delta;
++};
++
++struct dce110_opp_regamma_params {
++	struct {
++		uint8_t num_segments[GAMMA_SEGMENTS_NUM];
++		uint16_t offsets[GAMMA_SEGMENTS_NUM];
++		struct end_point first;
++		struct end_point last;
++	} region_config;
++
++	struct {
++		struct pwl_segment *segments;
++		int num_pwl_segments;
++	} pwl_config;
++};
++
++#endif /* DRIVERS_GPU_DRM_AMD_DAL_DEV_DC_DCE110_DCE110_TYPES_H_ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+index 866853b..e3dbaeb 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+@@ -53,12 +53,21 @@ struct core_target {
+ #define DC_SURFACE_TO_CORE(dc_surface) \
+ 	container_of(dc_surface, struct core_surface, public)
+ 
++#define DC_GAMMA_TO_CORE(dc_gamma) \
++	container_of(dc_gamma, struct core_gamma, public)
++
++
+ struct core_surface {
+ 	struct dc_surface public;
+ 	struct dc_surface_status status;
+ 	struct dc_context *ctx;
+ };
+ 
++struct core_gamma {
++	struct dc_gamma public;
++	struct dc_context *ctx;
++};
++
+ void enable_surface_flip_reporting(struct dc_surface *dc_surface,
+ 		uint32_t controller_id);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/gamma_calcs.h b/drivers/gpu/drm/amd/dal/dc/inc/gamma_calcs.h
+new file mode 100644
+index 0000000..4e35960
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/inc/gamma_calcs.h
+@@ -0,0 +1,31 @@
++/*
++ * gamma_calcs.h
++ *
++ *  Created on: Feb 9, 2016
++ *      Author: yonsun
++ */
++
++#ifndef DRIVERS_GPU_DRM_AMD_DAL_DEV_DC_INC_GAMMA_CALCS_H_
++#define DRIVERS_GPU_DRM_AMD_DAL_DEV_DC_INC_GAMMA_CALCS_H_
++
++#include "opp.h"
++#include "core_types.h"
++#include "dc.h"
++
++struct temp_params {
++	struct hw_x_point coordinates_x[256 + 3];
++	struct pwl_float_data rgb_user[FLOAT_GAMMA_RAMP_MAX + 3];
++	struct pwl_float_data_ex rgb_regamma[256 + 3];
++	struct pwl_float_data rgb_oem[FLOAT_GAMMA_RAMP_MAX + 3];
++	struct gamma_pixel axix_x_256[256];
++	struct pixel_gamma_point coeff128_oem[256 + 3];
++	struct pixel_gamma_point coeff128[256 + 3];
++
++};
++
++void calculate_regamma_params(struct regamma_params *params,
++		struct temp_params *temp_params,
++		const struct core_gamma *ramp,
++		const struct core_surface *surface);
++
++#endif /* DRIVERS_GPU_DRM_AMD_DAL_DEV_DC_INC_GAMMA_CALCS_H_ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/gamma_types.h b/drivers/gpu/drm/amd/dal/dc/inc/gamma_types.h
+index ad21db5..ca23e1b 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/gamma_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/gamma_types.h
+@@ -41,10 +41,6 @@ struct dev_c_lut16 {
+ 	uint16_t blue;
+ };
+ 
+-struct regamma_ramp {
+-	uint16_t gamma[RGB_256X3X16 * 3];
+-};
+-
+ /* used by Graphics and Overlay gamma */
+ struct gamma_coeff {
+ 	int32_t gamma[3];
+@@ -54,35 +50,6 @@ struct gamma_coeff {
+ 	int32_t a3[3];
+ };
+ 
+-struct regamma_lut {
+-	union {
+-		struct {
+-			uint32_t GRAPHICS_DEGAMMA_SRGB :1;
+-			uint32_t OVERLAY_DEGAMMA_SRGB :1;
+-			uint32_t GAMMA_RAMP_ARRAY :1;
+-			uint32_t APPLY_DEGAMMA :1;
+-			uint32_t RESERVED :28;
+-		} bits;
+-		uint32_t value;
+-	} features;
+-
+-	union {
+-		struct regamma_ramp regamma_ramp;
+-		struct gamma_coeff gamma_coeff;
+-	};
+-};
+-
+-union gamma_flag {
+-	struct {
+-		uint32_t config_is_changed :1;
+-		uint32_t both_pipe_req :1;
+-		uint32_t regamma_update :1;
+-		uint32_t gamma_update :1;
+-		uint32_t reserved :28;
+-	} bits;
+-	uint32_t u_all;
+-};
+-
+ enum graphics_regamma_adjust {
+ 	GRAPHICS_REGAMMA_ADJUST_BYPASS = 0, GRAPHICS_REGAMMA_ADJUST_HW, /* without adjustments */
+ 	GRAPHICS_REGAMMA_ADJUST_SW /* use adjustments */
+@@ -99,19 +66,4 @@ enum graphics_degamma_adjust {
+ 	GRAPHICS_DEGAMMA_ADJUST_SW /* use adjustments */
+ };
+ 
+-struct gamma_parameters {
+-	union gamma_flag flag;
+-	enum pixel_format surface_pixel_format; /*OS surface pixel format*/
+-	struct regamma_lut regamma;
+-
+-	enum graphics_regamma_adjust regamma_adjust_type;
+-	enum graphics_degamma_adjust degamma_adjust_type;
+-
+-	enum graphics_gamma_lut selected_gamma_lut;
+-
+-	bool disable_adjustments;
+-
+-	/* here we grow with parameters if necessary */
+-};
+-
+ #endif
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+index 8460dd7..5dd16dc 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+@@ -56,11 +56,11 @@ struct hw_sequencer_funcs {
+ 				const struct core_surface *surface,
+ 				struct core_target *target);
+ 
+-	bool (*set_gamma_ramp)(
++	bool (*set_gamma_correction)(
+ 				struct input_pixel_processor *ipp,
+ 				struct output_pixel_processor *opp,
+-				const struct gamma_ramp *ramp,
+-				const struct gamma_parameters *params);
++				const struct core_gamma *ramp,
++				const struct core_surface *surface);
+ 
+ 	void (*power_down)(struct dc *dc);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/ipp.h b/drivers/gpu/drm/amd/dal/dc/inc/ipp.h
+index 8e7cc31..c98102f 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/ipp.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/ipp.h
+@@ -45,6 +45,25 @@ struct input_pixel_processor {
+ 	struct ipp_funcs *funcs;
+ };
+ 
++enum ipp_prescale_mode {
++	IPP_PRESCALE_MODE_BYPASS,
++	IPP_PRESCALE_MODE_FIXED_SIGNED,
++	IPP_PRESCALE_MODE_FLOAT_SIGNED,
++	IPP_PRESCALE_MODE_FIXED_UNSIGNED,
++	IPP_PRESCALE_MODE_FLOAT_UNSIGNED
++};
++
++struct ipp_prescale_params {
++	enum ipp_prescale_mode mode;
++	uint16_t bias;
++	uint16_t scale;
++};
++
++enum ipp_degamma_mode {
++	IPP_DEGAMMA_MODE_BYPASS,
++	IPP_DEGAMMA_MODE_sRGB
++};
++
+ enum wide_gamut_degamma_mode {
+ 	/*  00  - BITS1:0 Bypass */
+ 	WIDE_GAMUT_DEGAMMA_MODE_GRAPHICS_BYPASS,
+@@ -79,21 +98,11 @@ struct ipp_funcs {
+ 	/* DEGAMMA RELATED */
+ 	bool (*ipp_set_degamma)(
+ 		struct input_pixel_processor *ipp,
+-		const struct gamma_parameters *params,
+-		bool force_bypass);
++		enum ipp_degamma_mode mode);
+ 
+ 	void (*ipp_program_prescale)(
+ 		struct input_pixel_processor *ipp,
+-		enum pixel_format pixel_format);
+-
+-	void (*ipp_set_legacy_input_gamma_mode)(
+-			struct input_pixel_processor *ipp,
+-			bool is_legacy);
+-
+-	bool (*ipp_set_legacy_input_gamma_ramp)(
+-		struct input_pixel_processor *ipp,
+-		const struct gamma_ramp *gamma_ramp,
+-		const struct gamma_parameters *params);
++		struct ipp_prescale_params *params);
+ 
+ 	bool (*ipp_set_palette)(
+ 		struct input_pixel_processor *ipp,
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/opp.h b/drivers/gpu/drm/amd/dal/dc/inc/opp.h
+index 3071df6..307184a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/opp.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/opp.h
+@@ -263,6 +263,14 @@ enum fmt_stereo_action {
+ 	FMT_STEREO_ACTION_UPDATE_POLARITY
+ };
+ 
++struct regamma_params {
++	uint32_t *data;
++	struct gamma_curve arr_curve_points[16];
++	struct curve_points arr_points[3];
++	struct pwl_result_data rgb_resulted[256 + 3];
++	uint32_t hw_points_num;
++};
++
+ struct opp_funcs {
+ 	void (*opp_power_on_regamma_lut)(
+ 		struct output_pixel_processor *opp,
+@@ -270,14 +278,7 @@ struct opp_funcs {
+ 
+ 	bool (*opp_set_regamma)(
+ 		struct output_pixel_processor *opp,
+-		const struct gamma_ramp *ramp,
+-		const struct gamma_parameters *params,
+-		bool force_bypass);
+-
+-	bool (*opp_map_legacy_and_regamma_hw_to_x_user)(
+-		struct output_pixel_processor *opp,
+-		const struct gamma_ramp *gamma_ramp,
+-		const struct gamma_parameters *params);
++		const struct regamma_params *params);
+ 
+ 	void (*opp_set_csc_adjustment)(
+ 		struct output_pixel_processor *opp,
+diff --git a/drivers/gpu/drm/amd/dal/include/video_csc_types.h b/drivers/gpu/drm/amd/dal/include/video_csc_types.h
+index c229f5a..e2a9343 100644
+--- a/drivers/gpu/drm/amd/dal/include/video_csc_types.h
++++ b/drivers/gpu/drm/amd/dal/include/video_csc_types.h
+@@ -108,7 +108,6 @@ struct ovl_csc_adjustment {
+ 	uint32_t matrix_divider;
+ 
+ 	/* DCE50 parameters */
+-	struct regamma_lut regamma;
+ 	enum overlay_gamma_adjust adjust_gamma_type;
+ 	enum overlay_csc_adjust_type adjust_csc_type;
+ 	enum overlay_gamut_adjust_type adjust_gamut_type;
+diff --git a/drivers/gpu/drm/amd/dal/include/video_gamma_types.h b/drivers/gpu/drm/amd/dal/include/video_gamma_types.h
+index 6f9cd3f..e910711 100644
+--- a/drivers/gpu/drm/amd/dal/include/video_gamma_types.h
++++ b/drivers/gpu/drm/amd/dal/include/video_gamma_types.h
+@@ -49,7 +49,6 @@ struct overlay_gamma_parameters {
+ 	int32_t ovl_gamma_cont;
+ 	enum overlay_gamma_adjust adjust_type;
+ 	enum pixel_format desktop_surface;
+-	struct regamma_lut regamma;
+ 
+ 	/* here we grow with parameters if necessary */
+ };
+-- 
+2.7.4
+

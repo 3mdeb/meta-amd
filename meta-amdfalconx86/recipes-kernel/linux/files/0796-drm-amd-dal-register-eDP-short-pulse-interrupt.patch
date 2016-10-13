@@ -1,0 +1,167 @@
+From d96fb309addb53fbde1efb54dc233c6ac753d4d1 Mon Sep 17 00:00:00 2001
+From: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Date: Mon, 4 Jan 2016 14:46:01 +0800
+Subject: [PATCH 0796/1110] drm/amd/dal: register eDP short pulse interrupt
+
+Registration of short pulse interrupt was missed for eDP
+case, because of guard for HPD registration for embedded
+panels.
+
+Signed-off-by: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c     | 12 ++++----
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_irq.c | 15 +++-------
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c         | 36 ++++++++++-------------
+ 3 files changed, 27 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index 0061b8c..7a7f69e 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -959,12 +959,14 @@ static void register_hpd_handlers(struct amdgpu_device *adev)
+ 		aconnector = to_amdgpu_connector(connector);
+ 		dc_link = aconnector->dc_link;
+ 
+-		int_params.int_context = INTERRUPT_LOW_IRQ_CONTEXT;
+-		int_params.irq_source = dc_link->irq_source_hpd;
++		if (DC_IRQ_SOURCE_INVALID != dc_link->irq_source_hpd) {
++			int_params.int_context = INTERRUPT_LOW_IRQ_CONTEXT;
++			int_params.irq_source = dc_link->irq_source_hpd;
+ 
+-		amdgpu_dm_irq_register_interrupt(adev, &int_params,
+-				handle_hpd_irq,
+-				(void *) aconnector);
++			amdgpu_dm_irq_register_interrupt(adev, &int_params,
++					handle_hpd_irq,
++					(void *) aconnector);
++		}
+ 
+ 		if (DC_IRQ_SOURCE_INVALID != dc_link->irq_source_hpd_rx) {
+ 
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_irq.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_irq.c
+index 2ba79ab..d04ed18 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_irq.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_irq.c
+@@ -770,19 +770,12 @@ void amdgpu_dm_hpd_init(struct amdgpu_device *adev)
+ 
+ 		const struct dc_link *dc_link = amdgpu_connector->dc_link;
+ 
+-		if (connector->connector_type == DRM_MODE_CONNECTOR_eDP ||
+-			connector->connector_type == DRM_MODE_CONNECTOR_LVDS) {
+-			/* don't try to enable hpd on eDP or LVDS avoid breaking
+-			 * the aux dp channel on imac and help (but not
+-			 * completely fix)
+-			 * https://bugzilla.redhat.com/show_bug.cgi?id=726143
+-			 * also avoid interrupt storms during dpms.
+-			 */
+-			continue;
++		if (DC_IRQ_SOURCE_INVALID != dc_link->irq_source_hpd) {
++			dc_interrupt_set(adev->dm.dc,
++					dc_link->irq_source_hpd,
++					true);
+ 		}
+ 
+-		dc_interrupt_set(adev->dm.dc, dc_link->irq_source_hpd, true);
+-
+ 		if (DC_IRQ_SOURCE_INVALID != dc_link->irq_source_hpd_rx) {
+ 			dc_interrupt_set(adev->dm.dc,
+ 					dc_link->irq_source_hpd_rx,
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 5fd5800..d9b76f6 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -885,7 +885,6 @@ static enum transmitter translate_encoder_to_transmitter(
+ 	}
+ }
+ 
+-
+ static bool construct(
+ 	struct core_link *link,
+ 	const struct link_init_data *init_params)
+@@ -898,6 +897,9 @@ static bool construct(
+ 	struct encoder_init_data enc_init_data = { 0 };
+ 	struct integrated_info info = {{{ 0 }}};
+ 
++	link->public.irq_source_hpd = DC_IRQ_SOURCE_INVALID;
++	link->public.irq_source_hpd_rx = DC_IRQ_SOURCE_INVALID;
++
+ 	link->dc = init_params->dc;
+ 	link->adapter_srv = as;
+ 	link->ctx = dc_ctx;
+@@ -913,9 +915,15 @@ static bool construct(
+ 		goto create_fail;
+ 	}
+ 
++	hpd_gpio = dal_adapter_service_obtain_hpd_irq(as, link->link_id);
++
++	if (hpd_gpio != NULL)
++		link->public.irq_source_hpd = dal_irq_get_source(hpd_gpio);
++
+ 	switch (link->link_id.id) {
+ 	case CONNECTOR_ID_HDMI_TYPE_A:
+ 		link->public.connector_signal = SIGNAL_TYPE_HDMI_TYPE_A;
++
+ 		break;
+ 	case CONNECTOR_ID_SINGLE_LINK_DVID:
+ 	case CONNECTOR_ID_SINGLE_LINK_DVII:
+@@ -927,29 +935,19 @@ static bool construct(
+ 		break;
+ 	case CONNECTOR_ID_DISPLAY_PORT:
+ 		link->public.connector_signal =	SIGNAL_TYPE_DISPLAY_PORT;
+-		hpd_gpio = dal_adapter_service_obtain_hpd_irq(
+-					as,
+-					link->link_id);
+ 
+-		if (hpd_gpio != NULL) {
++		if (hpd_gpio != NULL)
+ 			link->public.irq_source_hpd_rx =
+ 					dal_irq_get_rx_source(hpd_gpio);
+-			dal_adapter_service_release_irq(
+-					as, hpd_gpio);
+-		}
+ 
+ 		break;
+ 	case CONNECTOR_ID_EDP:
+ 		link->public.connector_signal = SIGNAL_TYPE_EDP;
+-		hpd_gpio = dal_adapter_service_obtain_hpd_irq(
+-					as,
+-					link->link_id);
+ 
+ 		if (hpd_gpio != NULL) {
++			link->public.irq_source_hpd = DC_IRQ_SOURCE_INVALID;
+ 			link->public.irq_source_hpd_rx =
+ 					dal_irq_get_rx_source(hpd_gpio);
+-			dal_adapter_service_release_irq(
+-					as, hpd_gpio);
+ 		}
+ 		break;
+ 	default:
+@@ -959,19 +957,17 @@ static bool construct(
+ 		goto create_fail;
+ 	}
+ 
++	if (hpd_gpio != NULL) {
++		dal_adapter_service_release_irq(
++			as, hpd_gpio);
++	}
++
+ 	/* TODO: #DAL3 Implement id to str function.*/
+ 	LINK_INFO("Connector[%d] description:"
+ 			"signal %d\n",
+ 			init_params->connector_index,
+ 			link->public.connector_signal);
+ 
+-	hpd_gpio = dal_adapter_service_obtain_hpd_irq(as, link->link_id);
+-
+-	if (hpd_gpio != NULL) {
+-		link->public.irq_source_hpd = dal_irq_get_source(hpd_gpio);
+-		dal_adapter_service_release_irq(as, hpd_gpio);
+-	}
+-
+ 	ddc_service_init_data.as = as;
+ 	ddc_service_init_data.ctx = link->ctx;
+ 	ddc_service_init_data.id = link->link_id;
+-- 
+2.7.4
+

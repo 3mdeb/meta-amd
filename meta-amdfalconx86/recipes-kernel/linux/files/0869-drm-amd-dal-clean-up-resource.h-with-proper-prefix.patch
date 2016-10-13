@@ -1,0 +1,858 @@
+From e2357a4df01c1a0ada555e0202597069e22a4cce Mon Sep 17 00:00:00 2001
+From: Tony Cheng <Tony.Cheng@amd.com>
+Date: Sat, 27 Feb 2016 14:07:48 -0500
+Subject: [PATCH 0869/1110] drm/amd/dal: clean up resource.h with proper prefix
+
+- prefix public function with resource_*
+- move pplib related logic to dc.c
+
+Signed-off-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 155 +++++++++++++++++--
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      | 165 ++-------------------
+ .../gpu/drm/amd/dal/dc/dce100/dce100_resource.c    |  14 +-
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |  10 +-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    |  14 +-
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c  |  14 +-
+ drivers/gpu/drm/amd/dal/dc/inc/resource.h          |  40 +++--
+ 7 files changed, 204 insertions(+), 208 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 0ccf1d1..d547fb9 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -376,7 +376,7 @@ ctx_fail:
+ 
+ static void destruct(struct core_dc *dc)
+ {
+-	val_ctx_destruct(&dc->current_context);
++	resource_validate_ctx_destruct(&dc->current_context);
+ 	destroy_links(dc);
+ 	dc->res_pool.funcs->destruct(&dc->res_pool);
+ 	dal_logger_destroy(&dc->ctx->logger);
+@@ -509,8 +509,9 @@ bool dc_validate_resources(
+ 	result = core_dc->res_pool.funcs->validate_with_context(
+ 						core_dc, set, set_count, context);
+ 
+-	val_ctx_destruct(context);
++	resource_validate_ctx_destruct(context);
+ 	dm_free(context);
++
+ context_alloc_fail:
+ 
+ 	return (result == DC_OK);
+@@ -541,7 +542,7 @@ static void program_timing_sync(
+ 			if (!ctx->res_ctx.pipe_ctx[j].stream)
+ 				continue;
+ 
+-			if (is_same_timing(
++			if (resource_is_same_timing(
+ 				&ctx->res_ctx.pipe_ctx[j].stream->public.timing,
+ 				&ctx->res_ctx.pipe_ctx[i].stream->public
+ 								.timing)) {
+@@ -624,6 +625,140 @@ static void target_disable_memory_requests(struct dc_target *dc_target,
+ 	}
+ }
+ 
++void pplib_apply_safe_state(
++	const struct core_dc *dc)
++{
++	dm_pp_apply_safe_state(dc->ctx);
++}
++
++static void fill_display_configs(
++	const struct validate_context *context,
++	struct dm_pp_display_configuration *pp_display_cfg)
++{
++	uint8_t i, j, k;
++	uint8_t num_cfgs = 0;
++
++	for (i = 0; i < context->target_count; i++) {
++		const struct core_target *target = context->targets[i];
++
++		for (j = 0; j < target->public.stream_count; j++) {
++			const struct core_stream *stream =
++				DC_STREAM_TO_CORE(target->public.streams[j]);
++			struct dm_pp_single_disp_config *cfg =
++					&pp_display_cfg->disp_configs[num_cfgs];
++			const struct pipe_ctx *pipe_ctx = NULL;
++
++			for (k = 0; k < MAX_PIPES; k++)
++				if (stream ==
++					context->res_ctx.pipe_ctx[k].stream) {
++					pipe_ctx = &context->res_ctx.pipe_ctx[k];
++					break;
++				}
++
++			num_cfgs++;
++			cfg->signal = pipe_ctx->signal;
++			cfg->pipe_idx = pipe_ctx->pipe_idx;
++			cfg->src_height = stream->public.src.height;
++			cfg->src_width = stream->public.src.width;
++			cfg->ddi_channel_mapping =
++				stream->sink->link->ddi_channel_mapping.raw;
++			cfg->transmitter =
++				stream->sink->link->link_enc->transmitter;
++			cfg->link_settings.lane_count = stream->sink->link->public.cur_link_settings.lane_count;
++			cfg->link_settings.link_rate = stream->sink->link->public.cur_link_settings.link_rate;
++			cfg->link_settings.link_spread = stream->sink->link->public.cur_link_settings.link_spread;
++			cfg->sym_clock = stream->public.timing.pix_clk_khz;
++			switch (stream->public.timing.display_color_depth) {
++			case COLOR_DEPTH_101010:
++				cfg->sym_clock = (cfg->sym_clock * 30) / 24;
++				break;
++			case COLOR_DEPTH_121212:
++				cfg->sym_clock = (cfg->sym_clock * 36) / 24;
++				break;
++			case COLOR_DEPTH_161616:
++				cfg->sym_clock = (cfg->sym_clock * 48) / 24;
++				break;
++			default:
++				break;
++			}
++			/* TODO: unhardcode*/
++			cfg->v_refresh = 60;
++		}
++	}
++	pp_display_cfg->display_count = num_cfgs;
++}
++
++static uint32_t get_min_vblank_time_us(const struct validate_context *context)
++{
++	uint8_t i, j;
++	uint32_t min_vertical_blank_time = -1;
++
++	for (i = 0; i < context->target_count; i++) {
++		const struct core_target *target = context->targets[i];
++
++		for (j = 0; j < target->public.stream_count; j++) {
++			const struct dc_stream *stream =
++						target->public.streams[j];
++			uint32_t vertical_blank_in_pixels = 0;
++			uint32_t vertical_blank_time = 0;
++
++			vertical_blank_in_pixels = stream->timing.h_total *
++				(stream->timing.v_total
++					- stream->timing.v_addressable);
++			vertical_blank_time = vertical_blank_in_pixels
++				* 1000 / stream->timing.pix_clk_khz;
++			if (min_vertical_blank_time > vertical_blank_time)
++				min_vertical_blank_time = vertical_blank_time;
++		}
++	}
++	return min_vertical_blank_time;
++}
++
++void pplib_apply_display_requirements(
++	const struct core_dc *dc,
++	const struct validate_context *context,
++	struct dm_pp_display_configuration *pp_display_cfg)
++{
++	pp_display_cfg->all_displays_in_sync =
++		context->bw_results.all_displays_in_sync;
++	pp_display_cfg->nb_pstate_switch_disable =
++			context->bw_results.nbp_state_change_enable == false;
++	pp_display_cfg->cpu_cc6_disable =
++			context->bw_results.cpuc_state_change_enable == false;
++	pp_display_cfg->cpu_pstate_disable =
++			context->bw_results.cpup_state_change_enable == false;
++	pp_display_cfg->cpu_pstate_separation_time =
++			context->bw_results.required_blackout_duration_us;
++
++	pp_display_cfg->min_memory_clock_khz = context->bw_results.required_yclk
++		/ MEMORY_TYPE_MULTIPLIER;
++	pp_display_cfg->min_engine_clock_khz = context->bw_results.required_sclk;
++	pp_display_cfg->min_engine_clock_deep_sleep_khz
++			= context->bw_results.required_sclk_deep_sleep;
++
++	pp_display_cfg->avail_mclk_switch_time_us =
++						get_min_vblank_time_us(context);
++	/* TODO: dce11.2*/
++	pp_display_cfg->avail_mclk_switch_time_in_disp_active_us = 0;
++
++	pp_display_cfg->disp_clk_khz = context->bw_results.dispclk_khz;
++
++	fill_display_configs(context, pp_display_cfg);
++
++	/* TODO: is this still applicable?*/
++	if (pp_display_cfg->display_count == 1) {
++		const struct dc_crtc_timing *timing =
++			&context->targets[0]->public.streams[0]->timing;
++
++		pp_display_cfg->crtc_index =
++			pp_display_cfg->disp_configs[0].pipe_idx;
++		pp_display_cfg->line_time_in_us = timing->h_total * 1000
++							/ timing->pix_clk_khz;
++	}
++
++	dm_pp_apply_display_requirements(dc->ctx, pp_display_cfg);
++}
++
+ bool dc_commit_targets(
+ 	struct dc *dc,
+ 	struct dc_target *targets[],
+@@ -665,7 +800,7 @@ bool dc_commit_targets(
+ 	result = core_dc->res_pool.funcs->validate_with_context(core_dc, set, target_count, context);
+ 	if (result != DC_OK){
+ 		BREAK_TO_DEBUGGER();
+-		val_ctx_destruct(context);
++		resource_validate_ctx_destruct(context);
+ 		goto fail;
+ 	}
+ 
+@@ -699,7 +834,7 @@ bool dc_commit_targets(
+ 
+ 	pplib_apply_display_requirements(core_dc, context, &context->pp_display_cfg);
+ 
+-	val_ctx_destruct(&core_dc->current_context);
++	resource_validate_ctx_destruct(&core_dc->current_context);
+ 
+ 	core_dc->current_context = *context;
+ 
+@@ -730,7 +865,7 @@ bool dc_commit_surfaces_to_target(
+ 
+ 	context = dm_alloc(sizeof(struct validate_context));
+ 
+-	val_ctx_copy_construct(&core_dc->current_context, context);
++	resource_validate_ctx_copy_construct(&core_dc->current_context, context);
+ 
+ 	/* Cannot commit surface to a target that is not commited */
+ 	for (i = 0; i < context->target_count; i++)
+@@ -773,7 +908,7 @@ bool dc_commit_surfaces_to_target(
+ 				dc_target);
+ 
+ 
+-	if (!attach_surfaces_to_context(
++	if (!resource_attach_surfaces_to_context(
+ 			new_surfaces, new_surface_count, dc_target, context)) {
+ 		BREAK_TO_DEBUGGER();
+ 		goto unexpected_fail;
+@@ -785,7 +920,7 @@ bool dc_commit_surfaces_to_target(
+ 					DC_SURFACE_TO_CORE(new_surfaces[i]))
+ 				continue;
+ 
+-			build_scaling_params(
++			resource_build_scaling_params(
+ 				new_surfaces[i], &context->res_ctx.pipe_ctx[j]);
+ 		}
+ 
+@@ -856,14 +991,14 @@ bool dc_commit_surfaces_to_target(
+ 						&context->pp_display_cfg);
+ 	}
+ 
+-	val_ctx_destruct(&(core_dc->current_context));
++	resource_validate_ctx_destruct(&(core_dc->current_context));
+ 	core_dc->current_context = *context;
+ 	dm_free(context);
+ 	return true;
+ 
+ unexpected_fail:
+ 
+-	val_ctx_destruct(context);
++	resource_validate_ctx_destruct(context);
+ 
+ 	dm_free(context);
+ 	return false;
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index f5bfaf3..0414f3e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -66,7 +66,7 @@ bool dc_construct_resource_pool(struct adapter_service *adapter_serv,
+ 	return false;
+ }
+ 
+-void unreference_clock_source(
++void resource_unreference_clock_source(
+ 		struct resource_context *res_ctx,
+ 		struct clock_source *clock_source)
+ {
+@@ -91,7 +91,7 @@ void unreference_clock_source(
+ 	}
+ }
+ 
+-void reference_clock_source(
++void resource_reference_clock_source(
+ 		struct resource_context *res_ctx,
+ 		struct clock_source *clock_source)
+ {
+@@ -108,7 +108,7 @@ void reference_clock_source(
+ 		res_ctx->dp_clock_source_ref_count++;
+ }
+ 
+-bool is_same_timing(
++bool resource_is_same_timing(
+ 	const struct dc_crtc_timing *timing1,
+ 	const struct dc_crtc_timing *timing2)
+ {
+@@ -136,7 +136,7 @@ static bool is_sharable_clk_src(
+ 	if (dc_is_dp_signal(pipe_with_clk_src->signal))
+ 		return false;
+ 
+-	if(!is_same_timing(
++	if (!resource_is_same_timing(
+ 		&pipe_with_clk_src->stream->public.timing,
+ 		&pipe->stream->public.timing))
+ 		return false;
+@@ -144,7 +144,7 @@ static bool is_sharable_clk_src(
+ 	return true;
+ }
+ 
+-struct clock_source *find_used_clk_src_for_sharing(
++struct clock_source *resource_find_used_clk_src_for_sharing(
+ 					struct resource_context *res_ctx,
+ 					struct pipe_ctx *pipe_ctx)
+ {
+@@ -313,7 +313,7 @@ static void calculate_scaling_ratios(
+ 	}
+ }
+ 
+-void build_scaling_params(
++void resource_build_scaling_params(
+ 	const struct dc_surface *surface,
+ 	struct pipe_ctx *pipe_ctx)
+ {
+@@ -372,7 +372,8 @@ void build_scaling_params(
+ 				surface->dst_rect.y);
+ }
+ 
+-void build_scaling_params_for_context(
++
++void resource_build_scaling_params_for_context(
+ 	const struct core_dc *dc,
+ 	struct validate_context *context)
+ {
+@@ -381,13 +382,13 @@ void build_scaling_params_for_context(
+ 	for (i = 0; i < MAX_PIPES; i++) {
+ 		if (context->res_ctx.pipe_ctx[i].surface != NULL &&
+ 				context->res_ctx.pipe_ctx[i].stream != NULL)
+-			build_scaling_params(
++			resource_build_scaling_params(
+ 				&context->res_ctx.pipe_ctx[i].surface->public,
+ 				&context->res_ctx.pipe_ctx[i]);
+ 	}
+ }
+ 
+-bool attach_surfaces_to_context(
++bool resource_attach_surfaces_to_context(
+ 		struct dc_surface *surfaces[],
+ 		uint8_t surface_count,
+ 		struct dc_target *dc_target,
+@@ -453,140 +454,6 @@ bool attach_surfaces_to_context(
+ 	return true;
+ }
+ 
+-static uint32_t get_min_vblank_time_us(const struct validate_context *context)
+-{
+-	uint8_t i, j;
+-	uint32_t min_vertical_blank_time = -1;
+-
+-	for (i = 0; i < context->target_count; i++) {
+-		const struct core_target *target = context->targets[i];
+-
+-		for (j = 0; j < target->public.stream_count; j++) {
+-			const struct dc_stream *stream =
+-						target->public.streams[j];
+-			uint32_t vertical_blank_in_pixels = 0;
+-			uint32_t vertical_blank_time = 0;
+-
+-			vertical_blank_in_pixels = stream->timing.h_total *
+-				(stream->timing.v_total
+-					- stream->timing.v_addressable);
+-			vertical_blank_time = vertical_blank_in_pixels
+-				* 1000 / stream->timing.pix_clk_khz;
+-			if (min_vertical_blank_time > vertical_blank_time)
+-				min_vertical_blank_time = vertical_blank_time;
+-		}
+-	}
+-	return min_vertical_blank_time;
+-}
+-
+-static void fill_display_configs(
+-	const struct validate_context *context,
+-	struct dm_pp_display_configuration *pp_display_cfg)
+-{
+-	uint8_t i, j, k;
+-	uint8_t num_cfgs = 0;
+-
+-	for (i = 0; i < context->target_count; i++) {
+-		const struct core_target *target = context->targets[i];
+-
+-		for (j = 0; j < target->public.stream_count; j++) {
+-			const struct core_stream *stream =
+-				DC_STREAM_TO_CORE(target->public.streams[j]);
+-			struct dm_pp_single_disp_config *cfg =
+-					&pp_display_cfg->disp_configs[num_cfgs];
+-			const struct pipe_ctx *pipe_ctx = NULL;
+-
+-			for (k = 0; k < MAX_PIPES; k++)
+-				if (stream ==
+-					context->res_ctx.pipe_ctx[k].stream) {
+-					pipe_ctx = &context->res_ctx.pipe_ctx[k];
+-					break;
+-				}
+-
+-			num_cfgs++;
+-			cfg->signal = pipe_ctx->signal;
+-			cfg->pipe_idx = pipe_ctx->pipe_idx;
+-			cfg->src_height = stream->public.src.height;
+-			cfg->src_width = stream->public.src.width;
+-			cfg->ddi_channel_mapping =
+-				stream->sink->link->ddi_channel_mapping.raw;
+-			cfg->transmitter =
+-				stream->sink->link->link_enc->transmitter;
+-			cfg->link_settings.lane_count = stream->sink->link->public.cur_link_settings.lane_count;
+-			cfg->link_settings.link_rate = stream->sink->link->public.cur_link_settings.link_rate;
+-			cfg->link_settings.link_spread = stream->sink->link->public.cur_link_settings.link_spread;
+-			cfg->sym_clock = stream->public.timing.pix_clk_khz;
+-			switch (stream->public.timing.display_color_depth) {
+-			case COLOR_DEPTH_101010:
+-				cfg->sym_clock = (cfg->sym_clock * 30) / 24;
+-				break;
+-			case COLOR_DEPTH_121212:
+-				cfg->sym_clock = (cfg->sym_clock * 36) / 24;
+-				break;
+-			case COLOR_DEPTH_161616:
+-				cfg->sym_clock = (cfg->sym_clock * 48) / 24;
+-				break;
+-			default:
+-				break;
+-			}
+-			/* TODO: unhardcode*/
+-			cfg->v_refresh = 60;
+-		}
+-	}
+-	pp_display_cfg->display_count = num_cfgs;
+-}
+-
+-void pplib_apply_safe_state(
+-	const struct core_dc *dc)
+-{
+-	dm_pp_apply_safe_state(dc->ctx);
+-}
+-
+-void pplib_apply_display_requirements(
+-	const struct core_dc *dc,
+-	const struct validate_context *context,
+-	struct dm_pp_display_configuration *pp_display_cfg)
+-{
+-
+-	pp_display_cfg->all_displays_in_sync =
+-		context->bw_results.all_displays_in_sync;
+-	pp_display_cfg->nb_pstate_switch_disable =
+-			context->bw_results.nbp_state_change_enable == false;
+-	pp_display_cfg->cpu_cc6_disable =
+-			context->bw_results.cpuc_state_change_enable == false;
+-	pp_display_cfg->cpu_pstate_disable =
+-			context->bw_results.cpup_state_change_enable == false;
+-	pp_display_cfg->cpu_pstate_separation_time =
+-			context->bw_results.required_blackout_duration_us;
+-
+-	pp_display_cfg->min_memory_clock_khz = context->bw_results.required_yclk
+-		/ MEMORY_TYPE_MULTIPLIER;
+-	pp_display_cfg->min_engine_clock_khz = context->bw_results.required_sclk;
+-	pp_display_cfg->min_engine_clock_deep_sleep_khz
+-			= context->bw_results.required_sclk_deep_sleep;
+-
+-	pp_display_cfg->avail_mclk_switch_time_us =
+-						get_min_vblank_time_us(context);
+-	pp_display_cfg->avail_mclk_switch_time_in_disp_active_us = 0;
+-
+-	pp_display_cfg->disp_clk_khz = context->bw_results.dispclk_khz;
+-
+-	fill_display_configs(context, pp_display_cfg);
+-
+-	/* TODO: is this still applicable?*/
+-	if (pp_display_cfg->display_count == 1) {
+-		const struct dc_crtc_timing *timing =
+-			&context->targets[0]->public.streams[0]->timing;
+-
+-		pp_display_cfg->crtc_index =
+-			pp_display_cfg->disp_configs[0].pipe_idx;
+-		pp_display_cfg->line_time_in_us = timing->h_total * 1000
+-							/ timing->pix_clk_khz;
+-	}
+-
+-	dm_pp_apply_display_requirements(dc->ctx, pp_display_cfg);
+-}
+-
+ /* Maximum TMDS single link pixel clock 165MHz */
+ #define TMDS_MAX_PIXEL_CLOCK_IN_KHZ 165000
+ 
+@@ -704,7 +571,7 @@ static bool check_timing_change(struct core_stream *cur_stream,
+ 	if (cur_stream->sink != new_stream->sink)
+ 		return true;
+ 
+-	return !is_same_timing(
++	return !resource_is_same_timing(
+ 					&cur_stream->public.timing,
+ 					&new_stream->public.timing);
+ }
+@@ -741,7 +608,7 @@ static void set_stream_signal(struct pipe_ctx *pipe_ctx)
+ 		pipe_ctx->signal = SIGNAL_TYPE_DVI_SINGLE_LINK;
+ }
+ 
+-enum dc_status map_resources(
++enum dc_status resource_map_pool_resources(
+ 		const struct core_dc *dc,
+ 		struct validate_context *context)
+ {
+@@ -775,7 +642,7 @@ enum dc_status map_resources(
+ 					&context->res_ctx,
+ 					pipe_ctx->stream_enc);
+ 
+-				reference_clock_source(
++				resource_reference_clock_source(
+ 					&context->res_ctx,
+ 					pipe_ctx->clock_source);
+ 
+@@ -1251,7 +1118,7 @@ static void set_vendor_info_packet(struct core_stream *stream,
+ 	info_packet->valid = true;
+ }
+ 
+-void val_ctx_destruct(struct validate_context *context)
++void resource_validate_ctx_destruct(struct validate_context *context)
+ {
+ 	int i, j;
+ 
+@@ -1269,7 +1136,7 @@ void val_ctx_destruct(struct validate_context *context)
+  * Copy src_ctx into dst_ctx and retain all surfaces and targets referenced
+  * by the src_ctx
+  */
+-void val_ctx_copy_construct(
++void resource_validate_ctx_copy_construct(
+ 		const struct validate_context *src_ctx,
+ 		struct validate_context *dst_ctx)
+ {
+@@ -1298,7 +1165,7 @@ struct clock_source *dc_resource_find_first_free_pll(
+ 	return NULL;
+ }
+ 
+-void build_info_frame(struct pipe_ctx *pipe_ctx)
++void resource_build_info_frame(struct pipe_ctx *pipe_ctx)
+ {
+ 	enum signal_type signal = SIGNAL_TYPE_NONE;
+ 	struct hw_info_frame info_frame = { { 0 } };
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+index 03a5ab0..f6b9cb8 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+@@ -749,7 +749,7 @@ static enum dc_status validate_mapped_resource(
+ 				if (status != DC_OK)
+ 					return status;
+ 
+-				build_info_frame(pipe_ctx);
++				resource_build_info_frame(pipe_ctx);
+ 
+ 				/* do not need to validate non root pipes */
+ 				break;
+@@ -823,7 +823,7 @@ static enum dc_status map_clock_resources(
+ 						context->res_ctx.pool.dp_clock_source;
+ 				else {
+ 					pipe_ctx->clock_source =
+-						find_used_clk_src_for_sharing(
++						resource_find_used_clk_src_for_sharing(
+ 							&context->res_ctx,
+ 							pipe_ctx);
+ 
+@@ -835,7 +835,7 @@ static enum dc_status map_clock_resources(
+ 				if (pipe_ctx->clock_source == NULL)
+ 					return DC_NO_CLOCK_SOURCE_RESOURCE;
+ 
+-				reference_clock_source(
++				resource_reference_clock_source(
+ 						&context->res_ctx,
+ 						pipe_ctx->clock_source);
+ 
+@@ -870,7 +870,7 @@ enum dc_status dce100_validate_with_context(
+ 						== context->targets[i]) {
+ 				unchanged = true;
+ 				set_target_unchanged(context, i);
+-				attach_surfaces_to_context(
++				resource_attach_surfaces_to_context(
+ 					(struct dc_surface **)dc->current_context.
+ 						target_status[j].surfaces,
+ 					dc->current_context.target_status[j].surface_count,
+@@ -880,7 +880,7 @@ enum dc_status dce100_validate_with_context(
+ 					dc->current_context.target_status[j];
+ 			}
+ 		if (!unchanged || set[i].surface_count != 0)
+-			if (!attach_surfaces_to_context(
++			if (!resource_attach_surfaces_to_context(
+ 					(struct dc_surface **)set[i].surfaces,
+ 					set[i].surface_count,
+ 					&context->targets[i]->public,
+@@ -892,7 +892,7 @@ enum dc_status dce100_validate_with_context(
+ 
+ 	context->res_ctx.pool = dc->res_pool;
+ 
+-	result = map_resources(dc, context);
++	result = resource_map_pool_resources(dc, context);
+ 
+ 	if (result == DC_OK)
+ 		result = map_clock_resources(dc, context);
+@@ -901,7 +901,7 @@ enum dc_status dce100_validate_with_context(
+ 		result = validate_mapped_resource(dc, context);
+ 
+ 	if (result == DC_OK)
+-		build_scaling_params_for_context(dc, context);
++		resource_build_scaling_params_for_context(dc, context);
+ 
+ 	if (result == DC_OK)
+ 		result = dce100_validate_bandwidth(dc, context);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 0513731..1b49201 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -794,7 +794,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 			core_link_disable_stream(old_pipe_ctx);
+ 
+ 			ASSERT(old_pipe_ctx->clock_source);
+-			unreference_clock_source(&dc->current_context.res_ctx, old_pipe_ctx->clock_source);
++			resource_unreference_clock_source(&dc->current_context.res_ctx, old_pipe_ctx->clock_source);
+ 		}
+ 
+ 		/*TODO: AUTO check if timing changed*/
+@@ -1211,15 +1211,15 @@ static void switch_dp_clock_sources(
+ 
+ 		if (dc_is_dp_signal(pipe_ctx->signal)) {
+ 			struct clock_source *clk_src =
+-				find_used_clk_src_for_sharing(
++				resource_find_used_clk_src_for_sharing(
+ 						res_ctx, pipe_ctx);
+ 
+ 			if (clk_src &&
+ 				clk_src != pipe_ctx->clock_source) {
+-				unreference_clock_source(
++				resource_unreference_clock_source(
+ 					res_ctx, pipe_ctx->clock_source);
+ 				pipe_ctx->clock_source = clk_src;
+-				reference_clock_source(res_ctx, clk_src);
++				resource_reference_clock_source(res_ctx, clk_src);
+ 				dc->hwss.crtc_switch_to_clk_src(clk_src, i);
+ 			}
+ 		}
+@@ -1472,7 +1472,7 @@ static void reset_single_pipe_hw_ctx(
+ 	pipe_ctx->mi->funcs->free_mem_input(
+ 				pipe_ctx->mi, context->target_count);
+ 	pipe_ctx->xfm->funcs->transform_set_scaler_bypass(pipe_ctx->xfm);
+-	unreference_clock_source(&context->res_ctx, pipe_ctx->clock_source);
++	resource_unreference_clock_source(&context->res_ctx, pipe_ctx->clock_source);
+ 	dc->hwss.enable_display_power_gating(
+ 		pipe_ctx->stream->ctx, pipe_ctx->pipe_idx, dcb,
+ 			PIPE_GATING_CONTROL_ENABLE);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index cde8d64..66b7014 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -713,7 +713,7 @@ static enum dc_status validate_mapped_resource(
+ 				if (status != DC_OK)
+ 					return status;
+ 
+-				build_info_frame(pipe_ctx);
++				resource_build_info_frame(pipe_ctx);
+ 
+ 				/* do not need to validate non root pipes */
+ 				break;
+@@ -945,7 +945,7 @@ static enum dc_status map_clock_resources(
+ 						context->res_ctx.pool.dp_clock_source;
+ 				else {
+ 					pipe_ctx->clock_source =
+-						find_used_clk_src_for_sharing(
++						resource_find_used_clk_src_for_sharing(
+ 							&context->res_ctx, pipe_ctx);
+ 
+ 					if (pipe_ctx->clock_source == NULL)
+@@ -956,7 +956,7 @@ static enum dc_status map_clock_resources(
+ 				if (pipe_ctx->clock_source == NULL)
+ 					return DC_NO_CLOCK_SOURCE_RESOURCE;
+ 
+-				reference_clock_source(
++				resource_reference_clock_source(
+ 						&context->res_ctx,
+ 						pipe_ctx->clock_source);
+ 
+@@ -991,7 +991,7 @@ enum dc_status dce110_validate_with_context(
+ 						== context->targets[i]) {
+ 				unchanged = true;
+ 				set_target_unchanged(context, i);
+-				attach_surfaces_to_context(
++				resource_attach_surfaces_to_context(
+ 					(struct dc_surface **)dc->current_context.
+ 						target_status[j].surfaces,
+ 					dc->current_context.target_status[j].surface_count,
+@@ -1001,7 +1001,7 @@ enum dc_status dce110_validate_with_context(
+ 					dc->current_context.target_status[j];
+ 			}
+ 		if (!unchanged || set[i].surface_count != 0)
+-			if (!attach_surfaces_to_context(
++			if (!resource_attach_surfaces_to_context(
+ 					(struct dc_surface **)set[i].surfaces,
+ 					set[i].surface_count,
+ 					&context->targets[i]->public,
+@@ -1013,7 +1013,7 @@ enum dc_status dce110_validate_with_context(
+ 
+ 	context->res_ctx.pool = dc->res_pool;
+ 
+-	result = map_resources(dc, context);
++	result = resource_map_pool_resources(dc, context);
+ 
+ 	if (result == DC_OK)
+ 		result = map_clock_resources(dc, context);
+@@ -1022,7 +1022,7 @@ enum dc_status dce110_validate_with_context(
+ 		result = validate_mapped_resource(dc, context);
+ 
+ 	if (result == DC_OK)
+-		build_scaling_params_for_context(dc, context);
++		resource_build_scaling_params_for_context(dc, context);
+ 
+ 	if (result == DC_OK)
+ 		result = dce110_validate_bandwidth(dc, context);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+index fd97afe..864f32a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+@@ -703,7 +703,7 @@ static enum dc_status validate_mapped_resource(
+ 				if (status != DC_OK)
+ 					return status;
+ 
+-				build_info_frame(pipe_ctx);
++				resource_build_info_frame(pipe_ctx);
+ 
+ 				/* do not need to validate non root pipes */
+ 				break;
+@@ -934,7 +934,7 @@ static enum dc_status map_clock_resources(
+ 					pipe_ctx->clock_source = context->res_ctx.pool.dp_clock_source;
+ 				else {
+ 					pipe_ctx->clock_source =
+-						find_used_clk_src_for_sharing(
++						resource_find_used_clk_src_for_sharing(
+ 							&context->res_ctx, pipe_ctx);
+ 
+ 					if (pipe_ctx->clock_source == NULL)
+@@ -945,7 +945,7 @@ static enum dc_status map_clock_resources(
+ 				if (pipe_ctx->clock_source == NULL)
+ 					return DC_NO_CLOCK_SOURCE_RESOURCE;
+ 
+-				reference_clock_source(
++				resource_reference_clock_source(
+ 						&context->res_ctx,
+ 						pipe_ctx->clock_source);
+ 
+@@ -980,7 +980,7 @@ enum dc_status dce80_validate_with_context(
+ 						== context->targets[i]) {
+ 				unchanged = true;
+ 				set_target_unchanged(context, i);
+-				attach_surfaces_to_context(
++				resource_attach_surfaces_to_context(
+ 					(struct dc_surface **)dc->current_context.
+ 						target_status[j].surfaces,
+ 					dc->current_context.target_status[j].surface_count,
+@@ -990,7 +990,7 @@ enum dc_status dce80_validate_with_context(
+ 					dc->current_context.target_status[j];
+ 			}
+ 		if (!unchanged || set[i].surface_count != 0)
+-			if (!attach_surfaces_to_context(
++			if (!resource_attach_surfaces_to_context(
+ 					(struct dc_surface **)set[i].surfaces,
+ 					set[i].surface_count,
+ 					&context->targets[i]->public,
+@@ -1002,7 +1002,7 @@ enum dc_status dce80_validate_with_context(
+ 
+ 	context->res_ctx.pool = dc->res_pool;
+ 
+-	result = map_resources(dc, context);
++	result = resource_map_pool_resources(dc, context);
+ 
+ 	if (result == DC_OK)
+ 		result = map_clock_resources(dc, context);
+@@ -1011,7 +1011,7 @@ enum dc_status dce80_validate_with_context(
+ 		result = validate_mapped_resource(dc, context);
+ 
+ 	if (result == DC_OK)
+-		build_scaling_params_for_context(dc, context);
++		resource_build_scaling_params_for_context(dc, context);
+ 
+ 	if (result == DC_OK)
+ 		result = dce80_validate_bandwidth(dc, context);
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/resource.h b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+index 6991c3e..0836e41 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+@@ -37,56 +37,50 @@ bool dc_construct_resource_pool(struct adapter_service *adapter_serv,
+ 				struct core_dc *dc,
+ 				uint8_t num_virtual_links);
+ 
+-void build_scaling_params(
++enum dc_status resource_map_pool_resources(
++	const struct core_dc *dc,
++	struct validate_context *context);
++
++void resource_build_scaling_params(
+ 	const struct dc_surface *surface,
+ 	struct pipe_ctx *pipe_ctx);
+ 
+-void build_scaling_params_for_context(
++void resource_build_scaling_params_for_context(
+ 	const struct core_dc *dc,
+ 	struct validate_context *context);
+ 
+-void unreference_clock_source(
++void resource_build_info_frame(struct pipe_ctx *pipe_ctx);
++
++void resource_unreference_clock_source(
+ 		struct resource_context *res_ctx,
+ 		struct clock_source *clock_source);
+ 
+-void reference_clock_source(
++void resource_reference_clock_source(
+ 		struct resource_context *res_ctx,
+ 		struct clock_source *clock_source);
+ 
+-bool is_same_timing(
++bool resource_is_same_timing(
+ 	const struct dc_crtc_timing *timing1,
+ 	const struct dc_crtc_timing *timing2);
+ 
+-struct clock_source *find_used_clk_src_for_sharing(
++struct clock_source *resource_find_used_clk_src_for_sharing(
+ 	struct resource_context *res_ctx,
+ 	struct pipe_ctx *pipe_ctx);
+ 
+ struct clock_source *dc_resource_find_first_free_pll(
+ 		struct resource_context *res_ctx);
+ 
+-bool attach_surfaces_to_context(
++bool resource_attach_surfaces_to_context(
+ 		struct dc_surface *surfaces[],
+ 		uint8_t surface_count,
+ 		struct dc_target *dc_target,
+ 		struct validate_context *context);
+ 
+-void pplib_apply_safe_state(const struct core_dc *dc);
+-
+-void pplib_apply_display_requirements(
+-	const struct core_dc *dc,
+-	const struct validate_context *context,
+-	struct dm_pp_display_configuration *pp_display_cfg);
+-
+-void build_info_frame(struct pipe_ctx *pipe_ctx);
+-
+-enum dc_status map_resources(
+-	const struct core_dc *dc,
+-	struct validate_context *context);
+-
+-void val_ctx_destruct(struct validate_context *context);
+-
+-void val_ctx_copy_construct(
++void resource_validate_ctx_copy_construct(
+ 	const struct validate_context *src_ctx,
+ 	struct validate_context *dst_ctx);
+ 
++void resource_validate_ctx_destruct(struct validate_context *context);
++
++
+ #endif /* DRIVERS_GPU_DRM_AMD_DAL_DEV_DC_INC_RESOURCE_H_ */
+-- 
+2.7.4
+

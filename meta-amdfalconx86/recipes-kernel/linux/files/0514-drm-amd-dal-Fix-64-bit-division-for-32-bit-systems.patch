@@ -1,0 +1,167 @@
+From 33d0d344aafaecd354bf9285ec0b32e00b5615a7 Mon Sep 17 00:00:00 2001
+From: Jordan Lazare <Jordan.Lazare@amd.com>
+Date: Mon, 30 Nov 2015 13:43:52 -0500
+Subject: [PATCH 0514/1110] drm/amd/dal: Fix 64-bit division for 32-bit systems
+
+Signed-off-by: Jordan Lazare <Jordan.Lazare@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/calcs/bandwidth_calcs.c | 28 +++++++++++++---------
+ drivers/gpu/drm/amd/dal/dc/calcs/bw_fixed.c        |  9 +++----
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      |  6 +++--
+ .../gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c   |  2 +-
+ drivers/gpu/drm/amd/dal/dc/irq_types.h             |  2 +-
+ 5 files changed, 28 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/calcs/bandwidth_calcs.c b/drivers/gpu/drm/amd/dal/dc/calcs/bandwidth_calcs.c
+index 68618bb..5c72a66 100644
+--- a/drivers/gpu/drm/amd/dal/dc/calcs/bandwidth_calcs.c
++++ b/drivers/gpu/drm/amd/dal/dc/calcs/bandwidth_calcs.c
+@@ -90,6 +90,7 @@ static void calculate_bandwidth(const struct bw_calcs_input_dceip *dceip,
+ 	const uint32_t low = 0;
+ 
+ 	uint32_t i, j, k;
++	uint64_t remainder;
+ 	struct bw_fixed yclk[3];
+ 	struct bw_fixed sclk[3];
+ 	bool d0_underlay_enable;
+@@ -1350,24 +1351,26 @@ static void calculate_bandwidth(const struct bw_calcs_input_dceip *dceip,
+ 		results->inefficient_underlay_pitch_in_pixels = bw_div(
+ 			results->inefficient_linear_pitch_in_bytes,
+ 			int_to_fixed(2));
+-	} else
+-	// case else
+-	{
++	} else {
+ 		results->inefficient_underlay_pitch_in_pixels = bw_div(
+ 			results->inefficient_linear_pitch_in_bytes,
+ 			int_to_fixed(4));
+ 	}
++
++	div64_u64_rem(mode_data->underlay_pitch_in_pixels.value,
++			results->inefficient_underlay_pitch_in_pixels.value,
++			&remainder);
++
+ 	if (mode_data->underlay_tiling_mode == linear
+ 		&& vbios->scatter_gather_enable == true
+-		&& mode_data->underlay_pitch_in_pixels.value
+-			% results->inefficient_underlay_pitch_in_pixels.value
+-			== false) {
++		&& remainder == 0) {
+ 		results->minimum_underlay_pitch_padding_recommended_for_efficiency =
+ 			int_to_fixed(256);
+ 	} else {
+ 		results->minimum_underlay_pitch_padding_recommended_for_efficiency =
+ 			int_to_fixed(0);
+ 	}
++
+ 	results->cursor_total_data = int_to_fixed(0);
+ 	results->cursor_total_request_groups = int_to_fixed(0);
+ 	results->scatter_gather_total_pte_requests = int_to_fixed(0);
+@@ -1410,6 +1413,13 @@ static void calculate_bandwidth(const struct bw_calcs_input_dceip *dceip,
+ 		int_to_fixed(0);
+ 	for (i = 0; i <= maximum_number_of_surfaces - 1; i += 1) {
+ 		if (results->enable[i]) {
++			uint64_t arg1 = mul(results->pitch_in_pixels_after_surface_type[i],
++						results->bytes_per_pixel[i]).value;
++
++			div64_u64_rem(arg1,
++					results->inefficient_linear_pitch_in_bytes.value,
++					&remainder);
++
+ 			if (results->scatter_gather_enable_for_pipe[i] == true
+ 				&& tiling_mode[i] != def_linear) {
+ 				results->bytes_per_page_close_open =
+@@ -1428,11 +1438,7 @@ static void calculate_bandwidth(const struct bw_calcs_input_dceip *dceip,
+ 								results->scatter_gather_page_width[i])));
+ 			} else if (results->scatter_gather_enable_for_pipe[i]
+ 				== true && tiling_mode[i] == def_linear
+-				&& (mul(
+-					results->pitch_in_pixels_after_surface_type[i],
+-					results->bytes_per_pixel[i])).value
+-					% results->inefficient_linear_pitch_in_bytes.value
+-					== false) {
++				&& remainder == 0) {
+ 				results->bytes_per_page_close_open =
+ 					dceip->linear_mode_line_request_alternation_slice;
+ 			} else {
+diff --git a/drivers/gpu/drm/amd/dal/dc/calcs/bw_fixed.c b/drivers/gpu/drm/amd/dal/dc/calcs/bw_fixed.c
+index 6bad7c6..1716808 100644
+--- a/drivers/gpu/drm/amd/dal/dc/calcs/bw_fixed.c
++++ b/drivers/gpu/drm/amd/dal/dc/calcs/bw_fixed.c
+@@ -92,8 +92,7 @@ struct bw_fixed frc_to_fixed(long long numerator, long long denominator)
+ 
+ 	arg1_value = abs_i64(numerator);
+ 	arg2_value = abs_i64(denominator);
+-	remainder = arg1_value % arg2_value;
+-	res_value = arg1_value / arg2_value;
++	res_value = div64_u64_rem(arg1_value, arg2_value, &remainder);
+ 
+ 	ASSERT(res_value <= MAX_I32);
+ 
+@@ -144,7 +143,8 @@ struct bw_fixed bw_max(const struct bw_fixed arg1, const struct bw_fixed arg2)
+ struct bw_fixed bw_floor(const struct bw_fixed arg, const struct bw_fixed significance)
+ {
+ 	struct bw_fixed result;
+-	signed long long multiplicand = arg.value / abs_i64(significance.value);
++	int64_t multiplicand;
++	multiplicand = div64_u64(arg.value, abs_i64(significance.value));
+ 	result.value = abs_i64(significance.value) * multiplicand;
+ 	ASSERT(abs_i64(result.value) <= abs_i64(arg.value));
+ 	return result;
+@@ -153,7 +153,8 @@ struct bw_fixed bw_floor(const struct bw_fixed arg, const struct bw_fixed signif
+ struct bw_fixed bw_ceil(const struct bw_fixed arg, const struct bw_fixed significance)
+ {
+ 	struct bw_fixed result;
+-	result.value = arg.value + arg.value % abs_i64(significance.value);
++	div64_u64_rem(arg.value, abs_i64(significance.value), &result.value);
++	result.value += arg.value;
+ 	if (result.value < significance.value)
+ 		result.value = significance.value;
+ 	return result;
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index 5803e22..082fb02 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -277,8 +277,10 @@ static void calculate_scaling_ratios(
+ 					== PLANE_STEREO_FORMAT_TOP_AND_BOTTOM)
+ 		stream->ratios.vert.value *= 2;
+ 
+-	stream->ratios.vert.value = stream->ratios.vert.value * in_h / out_h;
+-	stream->ratios.horz.value = stream->ratios.horz.value * in_w / out_w;
++	stream->ratios.vert.value = div64_u64(stream->ratios.vert.value * in_h,
++			out_h);
++	stream->ratios.horz.value = div64_u64(stream->ratios.horz.value * in_w ,
++			out_w);
+ 
+ 	stream->ratios.horz_c = stream->ratios.horz;
+ 	stream->ratios.vert_c = stream->ratios.vert;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
+index 7391a0a..50354a9 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
+@@ -705,7 +705,7 @@ void dce110_program_urgency_watermark(
+ 	uint32_t pstate_blackout_duration_ns)
+ {
+ 	struct dce110_mem_input *bm_dce110 = TO_DCE110_MEM_INPUT(mi);
+-	uint32_t total_dest_line_time_ns = 1000000ULL * h_total
++	uint32_t total_dest_line_time_ns = 1000000UL * h_total
+ 		/ pixel_clk_in_khz + pstate_blackout_duration_ns;
+ 
+ 	program_urgency_watermark(
+diff --git a/drivers/gpu/drm/amd/dal/dc/irq_types.h b/drivers/gpu/drm/amd/dal/dc/irq_types.h
+index 051a1f6..35a0991 100644
+--- a/drivers/gpu/drm/amd/dal/dc/irq_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/irq_types.h
+@@ -178,7 +178,7 @@ enum dc_interrupt_porlarity {
+ 	(int_polarity == INTERRUPT_POLARITY_BOTH) ? "Both" : "Invalid"
+ 
+ struct dc_timer_interrupt_params {
+-	uint64_t micro_sec_interval;
++	uint32_t micro_sec_interval;
+ 	enum dc_interrupt_context int_context;
+ };
+ 
+-- 
+2.7.4
+

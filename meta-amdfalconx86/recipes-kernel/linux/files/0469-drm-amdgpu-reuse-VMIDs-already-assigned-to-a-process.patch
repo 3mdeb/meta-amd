@@ -1,0 +1,138 @@
+From 9dd895105cf0da2b6d3cb8159b91e43ed420dd6a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 9 Mar 2016 22:11:53 +0100
+Subject: [PATCH 0469/1110] drm/amdgpu: reuse VMIDs already assigned to a
+ process
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+If we don't need to flush we can easily use another VMID
+already assigned to the process.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 77 ++++++++++++++++++++--------------
+ 1 file changed, 46 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 0da3fde..9444cbe 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -173,48 +173,63 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ {
+ 	uint64_t pd_addr = amdgpu_bo_gpu_offset(vm->page_directory);
+ 	struct amdgpu_device *adev = ring->adev;
+-	struct amdgpu_vm_id *id = vm->ids[ring->idx];
+ 	struct fence *updates = sync->last_vm_update;
++	struct amdgpu_vm_id *id;
++	unsigned i = ring->idx;
+ 	int r;
+ 
+ 	mutex_lock(&adev->vm_manager.lock);
+ 
+-	/* check if the id is still valid */
+-	if (id) {
+-		struct fence *flushed = id->flushed_updates;
+-		long owner = atomic_long_read(&id->owner);
+-		bool usable = pd_addr == id->pd_gpu_addr;
+-
+-		if (owner != (long)&vm->ids[ring->idx])
+-			usable = false;
+-		else if (!flushed)
+-			usable = false;
+-		else if (!updates)
+-			usable = true;
+-		else
+-			usable = !fence_is_later(updates, flushed);
++	/* Check if we can use a VMID already assigned to this VM */
++	do {
++		struct fence *flushed;
+ 
+-		if (usable) {
++		id = vm->ids[i++];
++		if (i == AMDGPU_MAX_RINGS)
++			i = 0;
+ 
+-			r = amdgpu_sync_fence(ring->adev, sync, id->first);
+-			if (r)
+-				goto error;
++		/* Check all the prerequisites to using this VMID */
++		if (!id)
++			continue;
+ 
+-			r = amdgpu_sync_fence(ring->adev, &id->active, fence);
++		if (atomic_long_read(&id->owner) != (long)vm)
++			continue;
++
++		if (pd_addr != id->pd_gpu_addr)
++			continue;
++
++		if (id != vm->ids[ring->idx] &&
++		    (!id->last_flush || !fence_is_signaled(id->last_flush)))
++			continue;
++
++		flushed  = id->flushed_updates;
++		if (updates && (!flushed || fence_is_later(updates, flushed)))
++			continue;
++
++		/* Good we can use this VMID */
++		if (id == vm->ids[ring->idx]) {
++			r = amdgpu_sync_fence(ring->adev, sync,
++					      id->first);
+ 			if (r)
+ 				goto error;
++		}
+ 
+-			list_move_tail(&id->list, &adev->vm_manager.ids_lru);
++		/* And remember this submission as user of the VMID */
++		r = amdgpu_sync_fence(ring->adev, &id->active, fence);
++		if (r)
++			goto error;
+ 
+-			*vm_id = id - adev->vm_manager.ids;
+-			*vm_pd_addr = AMDGPU_VM_NO_FLUSH;
+-			trace_amdgpu_vm_grab_id(vm, ring->idx, *vm_id,
+-						*vm_pd_addr);
++		list_move_tail(&id->list, &adev->vm_manager.ids_lru);
++		vm->ids[ring->idx] = id;
+ 
+-			mutex_unlock(&adev->vm_manager.lock);
+-			return 0;
+-		}
+-	}
++		*vm_id = id - adev->vm_manager.ids;
++		*vm_pd_addr = AMDGPU_VM_NO_FLUSH;
++		trace_amdgpu_vm_grab_id(vm, ring->idx, *vm_id, *vm_pd_addr);
++
++		mutex_unlock(&adev->vm_manager.lock);
++		return 0;
++
++	} while (i != ring->idx);
+ 
+ 	id = list_first_entry(&adev->vm_manager.ids_lru,
+ 			      struct amdgpu_vm_id,
+@@ -252,7 +267,7 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 	id->pd_gpu_addr = pd_addr;
+ 
+ 	list_move_tail(&id->list, &adev->vm_manager.ids_lru);
+-	atomic_long_set(&id->owner, (long)id);
++	atomic_long_set(&id->owner, (long)vm);
+ 	vm->ids[ring->idx] = id;
+ 
+ 	*vm_id = id - adev->vm_manager.ids;
+@@ -1468,7 +1483,7 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ 		if (!id)
+ 			continue;
+ 
+-		atomic_long_cmpxchg(&id->owner, (long)&vm->ids[i], 0);
++		atomic_long_cmpxchg(&id->owner, (long)vm, 0);
+ 	}
+ }
+ 
+-- 
+2.7.4
+

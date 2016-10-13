@@ -1,0 +1,118 @@
+From cee6a6cb58eba90c31ff50a76186c941085a164d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 16 Feb 2016 17:39:39 +0100
+Subject: [PATCH 0358/1110] drm/amdgpu: return the common fence from
+ amdgpu_fence_emit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Try to avoid using the hardware specific fences even more.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c | 27 ++++++++++++++-------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c    |  7 ++++---
+ 3 files changed, 20 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 866e790..b649a8f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -390,7 +390,7 @@ int amdgpu_fence_driver_start_ring(struct amdgpu_ring *ring,
+ 				   unsigned irq_type);
+ void amdgpu_fence_driver_suspend(struct amdgpu_device *adev);
+ void amdgpu_fence_driver_resume(struct amdgpu_device *adev);
+-int amdgpu_fence_emit(struct amdgpu_ring *ring, struct amdgpu_fence **fence);
++int amdgpu_fence_emit(struct amdgpu_ring *ring, struct fence **fence);
+ void amdgpu_fence_process(struct amdgpu_ring *ring);
+ int amdgpu_fence_wait_next(struct amdgpu_ring *ring);
+ int amdgpu_fence_wait_empty(struct amdgpu_ring *ring);
+@@ -726,7 +726,7 @@ struct amdgpu_ib {
+ 	uint32_t			length_dw;
+ 	uint64_t			gpu_addr;
+ 	uint32_t			*ptr;
+-	struct amdgpu_fence		*fence;
++        struct fence                    *fence;
+ 	struct amdgpu_user_fence        *user;
+ 	struct amdgpu_vm		*vm;
+         unsigned                        vm_id;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index d94b13a..83599f2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -91,28 +91,29 @@ static u32 amdgpu_fence_read(struct amdgpu_ring *ring)
+  * amdgpu_fence_emit - emit a fence on the requested ring
+  *
+  * @ring: ring the fence is associated with
+- * @fence: amdgpu fence object
++ * @f: resulting fence object
+  *
+  * Emits a fence command on the requested ring (all asics).
+  * Returns 0 on success, -ENOMEM on failure.
+  */
+-int amdgpu_fence_emit(struct amdgpu_ring *ring, struct amdgpu_fence **fence)
++int amdgpu_fence_emit(struct amdgpu_ring *ring, struct fence **f)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
++	struct amdgpu_fence *fence;
+ 
+-	*fence = kmem_cache_alloc(amdgpu_fence_slab, GFP_KERNEL);
+-	if ((*fence) == NULL) {
++	fence = kmem_cache_alloc(amdgpu_fence_slab, GFP_KERNEL);
++	if (fence == NULL)
+ 		return -ENOMEM;
+-	}
+-	(*fence)->seq = ++ring->fence_drv.sync_seq;
+-	(*fence)->ring = ring;
+-	fence_init(&(*fence)->base, &amdgpu_fence_ops,
+-		&ring->fence_drv.fence_queue.lock,
+-		adev->fence_context + ring->idx,
+-		(*fence)->seq);
++
++	fence->seq = ++ring->fence_drv.sync_seq;
++	fence->ring = ring;
++	fence_init(&fence->base, &amdgpu_fence_ops,
++		   &ring->fence_drv.fence_queue.lock,
++		   adev->fence_context + ring->idx,
++		   fence->seq);
+ 	amdgpu_ring_emit_fence(ring, ring->fence_drv.gpu_addr,
+-			       (*fence)->seq,
+-			       AMDGPU_FENCE_FLAG_INT);
++			       fence->seq, AMDGPU_FENCE_FLAG_INT);
++	*f = &fence->base;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index dc5683c..4d7b80b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -90,9 +90,8 @@ int amdgpu_ib_get(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+  */
+ void amdgpu_ib_free(struct amdgpu_device *adev, struct amdgpu_ib *ib)
+ {
+-	amdgpu_sa_bo_free(adev, &ib->sa_bo, &ib->fence->base);
+-	if (ib->fence)
+-		fence_put(&ib->fence->base);
++	amdgpu_sa_bo_free(adev, &ib->sa_bo, ib->fence);
++	fence_put(ib->fence);
+ }
+ 
+ /**
+@@ -196,6 +195,8 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 				       AMDGPU_FENCE_FLAG_64BIT);
+ 	}
+ 
++        *f = fence_get(ib->fence);	
++
+ 	amdgpu_ring_commit(ring);
+ 	return 0;
+ }
+-- 
+2.7.4
+

@@ -1,0 +1,188 @@
+From 26ec1581529fbccb5bfbf5ec61d2711dd9c38622 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 18 Jan 2016 17:01:42 +0100
+Subject: [PATCH 0238/1110] drm/amdgpu: merge vm_grab_id and vm_fence v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No need for an extra function any more.
+
+v2: comment cleanups
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |  5 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c | 13 +++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c    | 57 ++++++++++++++-----------------
+ 3 files changed, 30 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index f970afa..64784e4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -924,13 +924,10 @@ void amdgpu_vm_get_pt_bos(struct amdgpu_vm *vm, struct list_head *duplicates);
+ void amdgpu_vm_move_pt_bos_in_lru(struct amdgpu_device *adev,
+                                   struct amdgpu_vm *vm);
+ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+-		      struct amdgpu_sync *sync);
++                      struct amdgpu_sync *sync, struct fence *fence);
+ void amdgpu_vm_flush(struct amdgpu_ring *ring,
+ 		     struct amdgpu_vm *vm,
+ 		     struct fence *updates);
+-void amdgpu_vm_fence(struct amdgpu_device *adev,
+-		     struct amdgpu_vm *vm,
+-		     struct fence *fence);
+ uint64_t amdgpu_vm_map_gart(struct amdgpu_device *adev, uint64_t addr);
+ int amdgpu_vm_update_page_directory(struct amdgpu_device *adev,
+ 				    struct amdgpu_vm *vm);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+index b22a95f..76a1f82 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -38,19 +38,14 @@ static struct fence *amdgpu_sched_dependency(struct amd_sched_job *sched_job)
+ 
+ 	if (fence == NULL && vm && !job->ibs->grabbed_vmid) {
+ 		struct amdgpu_ring *ring = job->ibs->ring;
+-		struct amdgpu_device *adev = ring->adev;
+ 		int r;
+ 
+-		mutex_lock(&adev->vm_manager.lock);
+-		r = amdgpu_vm_grab_id(vm, ring, sync);
+-		if (r) {
++		r = amdgpu_vm_grab_id(vm, ring, sync,
++				      &job->base.s_fence->base);
++		if (r)
+ 			DRM_ERROR("Error getting VM ID (%d)\n", r);
+-		} else {
+-			fence = &job->base.s_fence->base;
+-			amdgpu_vm_fence(ring->adev, vm, fence);
++		else
+ 			job->ibs->grabbed_vmid = true;
+-		}
+-		mutex_unlock(&adev->vm_manager.lock);
+ 
+ 		fence = amdgpu_sync_get_fence(sync);
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index e688fcf..38ab4a5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -159,13 +159,14 @@ void amdgpu_vm_move_pt_bos_in_lru(struct amdgpu_device *adev,
+  * @vm: vm to allocate id for
+  * @ring: ring we want to submit job to
+  * @sync: sync object where we add dependencies
++ * @fence: fence protecting ID from reuse
+  *
+  * Allocate an id for the vm, adding fences to the sync obj as necessary.
+  *
+  * Global mutex must be locked!
+  */
+ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+-		      struct amdgpu_sync *sync)
++		      struct amdgpu_sync *sync, struct fence *fence)
+ {
+ 	struct fence *best[AMDGPU_MAX_RINGS] = {};
+ 	struct amdgpu_vm_id *vm_id = &vm->ids[ring->idx];
+@@ -174,6 +175,8 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 	unsigned choices[2] = {};
+ 	unsigned i;
+ 
++	mutex_lock(&adev->vm_manager.lock);
++
+ 	/* check if the id is still valid */
+ 	if (vm_id->id) {
+ 		unsigned id = vm_id->id;
+@@ -182,6 +185,9 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 		owner = atomic_long_read(&adev->vm_manager.ids[id].owner);
+ 		if (owner == (long)vm) {
+ 			trace_amdgpu_vm_grab_id(vm, vm_id->id, ring->idx);
++			fence_put(adev->vm_manager.ids[id].active);
++			adev->vm_manager.ids[id].active = fence_get(fence);
++			mutex_unlock(&adev->vm_manager.lock);
+ 			return 0;
+ 		}
+ 	}
+@@ -198,6 +204,7 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 			/* found a free one */
+ 			vm_id->id = i;
+ 			trace_amdgpu_vm_grab_id(vm, i, ring->idx);
++			mutex_unlock(&adev->vm_manager.lock);
+ 			return 0;
+ 		}
+ 
+@@ -210,19 +217,29 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 	}
+ 
+ 	for (i = 0; i < 2; ++i) {
+-		if (choices[i]) {
+-			struct fence *fence;
++		struct fence *active;
++		int r;
+ 
+-			fence  = adev->vm_manager.ids[choices[i]].active;
+-			vm_id->id = choices[i];
++		if (!choices[i])
++			continue;
+ 
+-			trace_amdgpu_vm_grab_id(vm, choices[i], ring->idx);
+-			return amdgpu_sync_fence(ring->adev, sync, fence);
+-		}
++		vm_id->id = choices[i];
++		active  = adev->vm_manager.ids[vm_id->id].active;
++		r = amdgpu_sync_fence(ring->adev, sync, active);
++
++		trace_amdgpu_vm_grab_id(vm, choices[i], ring->idx);
++		atomic_long_set(&adev->vm_manager.ids[vm_id->id].owner, (long)vm);
++
++		fence_put(adev->vm_manager.ids[vm_id->id].active);
++		adev->vm_manager.ids[vm_id->id].active = fence_get(fence);
++
++		mutex_unlock(&adev->vm_manager.lock);
++		return r;
+ 	}
+ 
+ 	/* should never happen */
+ 	BUG();
++	mutex_unlock(&adev->vm_manager.lock);
+ 	return -EINVAL;
+ }
+ 
+@@ -265,30 +282,6 @@ void amdgpu_vm_flush(struct amdgpu_ring *ring,
+ }
+ 
+ /**
+- * amdgpu_vm_fence - remember fence for vm
+- *
+- * @adev: amdgpu_device pointer
+- * @vm: vm we want to fence
+- * @fence: fence to remember
+- *
+- * Fence the vm (cayman+).
+- * Set the fence used to protect page table and id.
+- *
+- * Global and local mutex must be locked!
+- */
+-void amdgpu_vm_fence(struct amdgpu_device *adev,
+-		     struct amdgpu_vm *vm,
+-		     struct fence *fence)
+-{
+-	struct amdgpu_ring *ring = amdgpu_ring_from_fence(fence);
+-	unsigned vm_id = vm->ids[ring->idx].id;
+-
+-	fence_put(adev->vm_manager.ids[vm_id].active);
+-	adev->vm_manager.ids[vm_id].active = fence_get(fence);
+-	atomic_long_set(&adev->vm_manager.ids[vm_id].owner, (long)vm);
+-}
+-
+-/**
+  * amdgpu_vm_bo_find - find the bo_va for a specific vm & bo
+  *
+  * @vm: requested vm
+-- 
+2.7.4
+

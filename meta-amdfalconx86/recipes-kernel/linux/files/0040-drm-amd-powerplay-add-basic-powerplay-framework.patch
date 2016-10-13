@@ -1,0 +1,942 @@
+From eb6791939b3a50d7c764e43951da40cb5f8ead11 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Wed, 2 Dec 2015 17:46:21 -0500
+Subject: [PATCH 0040/1110] drm/amd/powerplay: add basic powerplay framework
+
+amdgpu_pp_ip_funcs is introduced to handle the two code paths,
+the legacy one and the new powerplay implementation.
+
+CONFIG_DRM_AMD_POWERPLAY kernel configuration option is
+introduced for the powerplay component.
+
+v4: squash in fixes
+v3: register debugfs file when powerplay module enable
+v2: add amdgpu_ucode_init_bo in hw init when amdgpu_powerplay enable.
+
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+Signed-off-by: Jammy Zhou <Jammy.Zhou@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile               |  12 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h               |   5 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c           |   1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c     | 280 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.h     |  33 +++
+ drivers/gpu/drm/amd/amdgpu/cik.c                  |  11 +-
+ drivers/gpu/drm/amd/amdgpu/vi.c                   |   7 +-
+ drivers/gpu/drm/amd/powerplay/Kconfig             |   6 +
+ drivers/gpu/drm/amd/powerplay/Makefile            |  15 ++
+ drivers/gpu/drm/amd/powerplay/amd_powerplay.c     | 194 +++++++++++++++
+ drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h | 162 +++++++++++++
+ 11 files changed, 717 insertions(+), 9 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.h
+ create mode 100644 drivers/gpu/drm/amd/powerplay/Kconfig
+ create mode 100644 drivers/gpu/drm/amd/powerplay/Makefile
+ create mode 100644 drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+ create mode 100644 drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index 178fa15..4c856fe 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -7,7 +7,8 @@ FULL_AMD_PATH=$(src)/..
+ ccflags-y := -Iinclude/drm -I$(FULL_AMD_PATH)/include/asic_reg \
+ 	-I$(FULL_AMD_PATH)/include \
+ 	-I$(FULL_AMD_PATH)/amdgpu \
+-	-I$(FULL_AMD_PATH)/scheduler
++	-I$(FULL_AMD_PATH)/scheduler \
++	-I$(FULL_AMD_PATH)/powerplay/inc
+ 
+ amdgpu-y := amdgpu_drv.o
+ 
+@@ -47,6 +48,7 @@ amdgpu-y += \
+ # add SMC block
+ amdgpu-y += \
+ 	amdgpu_dpm.o \
++	amdgpu_powerplay.o \
+ 	cz_smc.o cz_dpm.o \
+ 	tonga_smc.o tonga_dpm.o \
+ 	fiji_smc.o fiji_dpm.o \
+@@ -97,6 +99,14 @@ amdgpu-$(CONFIG_VGA_SWITCHEROO) += amdgpu_atpx_handler.o
+ amdgpu-$(CONFIG_ACPI) += amdgpu_acpi.o
+ amdgpu-$(CONFIG_MMU_NOTIFIER) += amdgpu_mn.o
+ 
++ifneq ($(CONFIG_DRM_AMD_POWERPLAY),)
++
++include drivers/gpu/drm/amd/powerplay/Makefile
++
++amdgpu-y += $(AMD_POWERPLAY_FILES)
++
++endif
++
+ obj-$(CONFIG_DRM_AMDGPU)+= amdgpu.o
+ 
+ CFLAGS_amdgpu_trace_points.o := -I$(src)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index a10f421..9387cce 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -52,6 +52,7 @@
+ #include "amdgpu_irq.h"
+ #include "amdgpu_ucode.h"
+ #include "amdgpu_gds.h"
++#include "amd_powerplay.h"
+ 
+ #include "gpu_scheduler.h"
+ 
+@@ -85,6 +86,7 @@ extern int amdgpu_enable_scheduler;
+ extern int amdgpu_sched_jobs;
+ extern int amdgpu_sched_hw_submission;
+ extern int amdgpu_enable_semaphores;
++extern int amdgpu_powerplay;
+ 
+ #define AMDGPU_WAIT_IDLE_TIMEOUT_IN_MS	        3000
+ #define AMDGPU_MAX_USEC_TIMEOUT			100000	/* 100 ms */
+@@ -2045,6 +2047,9 @@ struct amdgpu_device {
+ 	/* interrupts */
+ 	struct amdgpu_irq		irq;
+ 
++	/* powerplay */
++	struct amd_powerplay		powerplay;
++
+ 	/* dpm */
+ 	struct amdgpu_pm		pm;
+ 	u32				cg_flags;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 659300c..a318356 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -82,6 +82,7 @@ int amdgpu_enable_scheduler = 1;
+ int amdgpu_sched_jobs = 32;
+ int amdgpu_sched_hw_submission = 2;
+ int amdgpu_enable_semaphores = 0;
++int amdgpu_powerplay = 0;
+ 
+ MODULE_PARM_DESC(vramlimit, "Restrict VRAM for testing, in megabytes");
+ module_param_named(vramlimit, amdgpu_vram_limit, int, 0600);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
+new file mode 100644
+index 0000000..5dd2a4c
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
+@@ -0,0 +1,280 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++#include "atom.h"
++#include "amdgpu.h"
++#include "amd_shared.h"
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include "amdgpu_pm.h"
++#include <drm/amdgpu_drm.h>
++#include "amdgpu_powerplay.h"
++#include "cik_dpm.h"
++#include "vi_dpm.h"
++
++static int amdgpu_powerplay_init(struct amdgpu_device *adev)
++{
++	int ret = 0;
++	struct amd_powerplay *amd_pp;
++
++	amd_pp = &(adev->powerplay);
++
++	if (amdgpu_powerplay) {
++#ifdef CONFIG_DRM_AMD_POWERPLAY
++		struct amd_pp_init *pp_init;
++
++		pp_init = kzalloc(sizeof(struct amd_pp_init), GFP_KERNEL);
++
++		if (pp_init == NULL)
++			return -ENOMEM;
++
++		pp_init->chip_family = adev->family;
++		pp_init->chip_id = adev->asic_type;
++		pp_init->device = amdgpu_cgs_create_device(adev);
++
++		ret = amd_powerplay_init(pp_init, amd_pp);
++		kfree(pp_init);
++#endif
++	} else {
++		amd_pp->pp_handle = (void *)adev;
++
++		switch (adev->asic_type) {
++#ifdef CONFIG_DRM_AMDGPU_CIK
++		case CHIP_BONAIRE:
++		case CHIP_HAWAII:
++			amd_pp->ip_funcs = &ci_dpm_ip_funcs;
++			break;
++		case CHIP_KABINI:
++		case CHIP_MULLINS:
++		case CHIP_KAVERI:
++			amd_pp->ip_funcs = &kv_dpm_ip_funcs;
++			break;
++#endif
++		case CHIP_TOPAZ:
++			amd_pp->ip_funcs = &iceland_dpm_ip_funcs;
++			break;
++		case CHIP_TONGA:
++			amd_pp->ip_funcs = &tonga_dpm_ip_funcs;
++			break;
++		case CHIP_CARRIZO:
++			amd_pp->ip_funcs = &cz_dpm_ip_funcs;
++			break;
++		default:
++			ret = -EINVAL;
++			break;
++		}
++	}
++	return ret;
++}
++
++static int amdgpu_pp_early_init(void *handle)
++{
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++	int ret = 0;
++
++	ret = amdgpu_powerplay_init(adev);
++	if (ret)
++		return ret;
++
++	if (adev->powerplay.ip_funcs->early_init)
++		ret = adev->powerplay.ip_funcs->early_init(
++					adev->powerplay.pp_handle);
++	return ret;
++}
++
++static int amdgpu_pp_sw_init(void *handle)
++{
++	int ret = 0;
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (adev->powerplay.ip_funcs->sw_init)
++		ret = adev->powerplay.ip_funcs->sw_init(
++					adev->powerplay.pp_handle);
++
++#ifdef CONFIG_DRM_AMD_POWERPLAY
++	if (amdgpu_powerplay) {
++		adev->pm.dpm_enabled = true;
++		amdgpu_pm_sysfs_init(adev);
++	}
++#endif
++
++	return ret;
++}
++
++static int amdgpu_pp_sw_fini(void *handle)
++{
++	int ret = 0;
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (adev->powerplay.ip_funcs->sw_fini)
++		ret = adev->powerplay.ip_funcs->sw_fini(
++					adev->powerplay.pp_handle);
++	if (ret)
++		return ret;
++
++#ifdef CONFIG_DRM_AMD_POWERPLAY
++	if (amdgpu_powerplay) {
++		amdgpu_pm_sysfs_fini(adev);
++		amd_powerplay_fini(adev->powerplay.pp_handle);
++	}
++#endif
++
++	return ret;
++}
++
++static int amdgpu_pp_hw_init(void *handle)
++{
++	int ret = 0;
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (amdgpu_powerplay && adev->firmware.smu_load)
++		amdgpu_ucode_init_bo(adev);
++
++	if (adev->powerplay.ip_funcs->hw_init)
++		ret = adev->powerplay.ip_funcs->hw_init(
++					adev->powerplay.pp_handle);
++
++	return ret;
++}
++
++static int amdgpu_pp_hw_fini(void *handle)
++{
++	int ret = 0;
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (adev->powerplay.ip_funcs->hw_fini)
++		ret = adev->powerplay.ip_funcs->hw_fini(
++					adev->powerplay.pp_handle);
++
++	if (amdgpu_powerplay && adev->firmware.smu_load)
++		amdgpu_ucode_fini_bo(adev);
++
++	return ret;
++}
++
++static int amdgpu_pp_suspend(void *handle)
++{
++	int ret = 0;
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (adev->powerplay.ip_funcs->suspend)
++		ret = adev->powerplay.ip_funcs->suspend(
++					 adev->powerplay.pp_handle);
++	return ret;
++}
++
++static int amdgpu_pp_resume(void *handle)
++{
++	int ret = 0;
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (adev->powerplay.ip_funcs->resume)
++		ret = adev->powerplay.ip_funcs->resume(
++					adev->powerplay.pp_handle);
++	return ret;
++}
++
++static int amdgpu_pp_set_clockgating_state(void *handle,
++					enum amd_clockgating_state state)
++{
++	int ret = 0;
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (adev->powerplay.ip_funcs->set_clockgating_state)
++		ret = adev->powerplay.ip_funcs->set_clockgating_state(
++				adev->powerplay.pp_handle, state);
++	return ret;
++}
++
++static int amdgpu_pp_set_powergating_state(void *handle,
++					enum amd_powergating_state state)
++{
++	int ret = 0;
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (adev->powerplay.ip_funcs->set_powergating_state)
++		ret = adev->powerplay.ip_funcs->set_powergating_state(
++				 adev->powerplay.pp_handle, state);
++	return ret;
++}
++
++
++static bool amdgpu_pp_is_idle(void *handle)
++{
++	bool ret = true;
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (adev->powerplay.ip_funcs->is_idle)
++		ret = adev->powerplay.ip_funcs->is_idle(
++					adev->powerplay.pp_handle);
++	return ret;
++}
++
++static int amdgpu_pp_wait_for_idle(void *handle)
++{
++	int ret = 0;
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (adev->powerplay.ip_funcs->wait_for_idle)
++		ret = adev->powerplay.ip_funcs->wait_for_idle(
++					adev->powerplay.pp_handle);
++	return ret;
++}
++
++static int amdgpu_pp_soft_reset(void *handle)
++{
++	int ret = 0;
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (adev->powerplay.ip_funcs->soft_reset)
++		ret = adev->powerplay.ip_funcs->soft_reset(
++					adev->powerplay.pp_handle);
++	return ret;
++}
++
++static void amdgpu_pp_print_status(void *handle)
++{
++	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++
++	if (adev->powerplay.ip_funcs->print_status)
++		adev->powerplay.ip_funcs->print_status(
++					adev->powerplay.pp_handle);
++}
++
++const struct amd_ip_funcs amdgpu_pp_ip_funcs = {
++	.early_init = amdgpu_pp_early_init,
++	.late_init = NULL,
++	.sw_init = amdgpu_pp_sw_init,
++	.sw_fini = amdgpu_pp_sw_fini,
++	.hw_init = amdgpu_pp_hw_init,
++	.hw_fini = amdgpu_pp_hw_fini,
++	.suspend = amdgpu_pp_suspend,
++	.resume = amdgpu_pp_resume,
++	.is_idle = amdgpu_pp_is_idle,
++	.wait_for_idle = amdgpu_pp_wait_for_idle,
++	.soft_reset = amdgpu_pp_soft_reset,
++	.print_status = amdgpu_pp_print_status,
++	.set_clockgating_state = amdgpu_pp_set_clockgating_state,
++	.set_powergating_state = amdgpu_pp_set_powergating_state,
++};
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.h
+new file mode 100644
+index 0000000..da5cf47
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.h
+@@ -0,0 +1,33 @@
++/*
++ *  Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#ifndef __AMDGPU_POPWERPLAY_H__
++#define __AMDGPU_POPWERPLAY_H__
++
++#include "amd_shared.h"
++
++extern const struct amd_ip_funcs amdgpu_pp_ip_funcs;
++
++#endif /* __AMDSOC_DM_H__ */
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik.c b/drivers/gpu/drm/amd/amdgpu/cik.c
+index 61689f0..c7c298b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik.c
+@@ -65,6 +65,7 @@
+ #include "oss/oss_2_0_sh_mask.h"
+ 
+ #include "amdgpu_amdkfd.h"
++#include "amdgpu_powerplay.h"
+ 
+ /*
+  * Indirect registers accessor
+@@ -1953,7 +1954,7 @@ static const struct amdgpu_ip_block_version bonaire_ip_blocks[] =
+ 		.major = 7,
+ 		.minor = 0,
+ 		.rev = 0,
+-		.funcs = &ci_dpm_ip_funcs,
++		.funcs = &amdgpu_pp_ip_funcs,
+ 	},
+ 	{
+ 		.type = AMD_IP_BLOCK_TYPE_DCE,
+@@ -2021,7 +2022,7 @@ static const struct amdgpu_ip_block_version hawaii_ip_blocks[] =
+ 		.major = 7,
+ 		.minor = 0,
+ 		.rev = 0,
+-		.funcs = &ci_dpm_ip_funcs,
++		.funcs = &amdgpu_pp_ip_funcs,
+ 	},
+ 	{
+ 		.type = AMD_IP_BLOCK_TYPE_DCE,
+@@ -2089,7 +2090,7 @@ static const struct amdgpu_ip_block_version kabini_ip_blocks[] =
+ 		.major = 7,
+ 		.minor = 0,
+ 		.rev = 0,
+-		.funcs = &kv_dpm_ip_funcs,
++		.funcs = &amdgpu_pp_ip_funcs,
+ 	},
+ 	{
+ 		.type = AMD_IP_BLOCK_TYPE_DCE,
+@@ -2157,7 +2158,7 @@ static const struct amdgpu_ip_block_version mullins_ip_blocks[] =
+ 		.major = 7,
+ 		.minor = 0,
+ 		.rev = 0,
+-		.funcs = &kv_dpm_ip_funcs,
++		.funcs = &amdgpu_pp_ip_funcs,
+ 	},
+ 	{
+ 		.type = AMD_IP_BLOCK_TYPE_DCE,
+@@ -2225,7 +2226,7 @@ static const struct amdgpu_ip_block_version kaveri_ip_blocks[] =
+ 		.major = 7,
+ 		.minor = 0,
+ 		.rev = 0,
+-		.funcs = &kv_dpm_ip_funcs,
++		.funcs = &amdgpu_pp_ip_funcs,
+ 	},
+ 	{
+ 		.type = AMD_IP_BLOCK_TYPE_DCE,
+diff --git a/drivers/gpu/drm/amd/amdgpu/vi.c b/drivers/gpu/drm/amd/amdgpu/vi.c
+index 2f1c118..9e8a220 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vi.c
++++ b/drivers/gpu/drm/amd/amdgpu/vi.c
+@@ -72,6 +72,7 @@
+ #include "uvd_v5_0.h"
+ #include "uvd_v6_0.h"
+ #include "vce_v3_0.h"
++#include "amdgpu_powerplay.h"
+ 
+ /*
+  * Indirect registers accessor
+@@ -1131,7 +1132,7 @@ static const struct amdgpu_ip_block_version topaz_ip_blocks[] =
+ 		.major = 7,
+ 		.minor = 1,
+ 		.rev = 0,
+-		.funcs = &iceland_dpm_ip_funcs,
++		.funcs = &amdgpu_pp_ip_funcs,
+ 	},
+ 	{
+ 		.type = AMD_IP_BLOCK_TYPE_GFX,
+@@ -1178,7 +1179,7 @@ static const struct amdgpu_ip_block_version tonga_ip_blocks[] =
+ 		.major = 7,
+ 		.minor = 1,
+ 		.rev = 0,
+-		.funcs = &tonga_dpm_ip_funcs,
++		.funcs = &amdgpu_pp_ip_funcs,
+ 	},
+ 	{
+ 		.type = AMD_IP_BLOCK_TYPE_DCE,
+@@ -1314,7 +1315,7 @@ static const struct amdgpu_ip_block_version cz_ip_blocks[] =
+ 		.major = 8,
+ 		.minor = 0,
+ 		.rev = 0,
+-		.funcs = &cz_dpm_ip_funcs,
++		.funcs = &amdgpu_pp_ip_funcs
+ 	},
+ 	{
+ 		.type = AMD_IP_BLOCK_TYPE_DCE,
+diff --git a/drivers/gpu/drm/amd/powerplay/Kconfig b/drivers/gpu/drm/amd/powerplay/Kconfig
+new file mode 100644
+index 0000000..af38033
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/Kconfig
+@@ -0,0 +1,6 @@
++config DRM_AMD_POWERPLAY
++	bool  "Enable AMD powerplay component"
++	depends on DRM_AMDGPU
++	default n
++	help
++	  select this option will enable AMD powerplay component.
+diff --git a/drivers/gpu/drm/amd/powerplay/Makefile b/drivers/gpu/drm/amd/powerplay/Makefile
+new file mode 100644
+index 0000000..e7428a1
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/Makefile
+@@ -0,0 +1,15 @@
++
++subdir-ccflags-y += -Iinclude/drm  \
++		-Idrivers/gpu/drm/amd/powerplay/inc/  \
++		-Idrivers/gpu/drm/amd/include/asic_reg  \
++		-Idrivers/gpu/drm/amd/include
++
++AMD_PP_PATH = ../powerplay
++
++include $(AMD_POWERPLAY)
++
++POWER_MGR = amd_powerplay.o
++
++AMD_PP_POWER = $(addprefix $(AMD_PP_PATH)/,$(POWER_MGR))
++
++AMD_POWERPLAY_FILES += $(AMD_PP_POWER)
+diff --git a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+new file mode 100644
+index 0000000..39ffc5d
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+@@ -0,0 +1,194 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/gfp.h>
++#include "amd_shared.h"
++#include "amd_powerplay.h"
++
++static int pp_early_init(void *handle)
++{
++	return 0;
++}
++
++static int pp_sw_init(void *handle)
++{
++	return 0;
++}
++
++static int pp_sw_fini(void *handle)
++{
++	return 0;
++}
++
++static int pp_hw_init(void *handle)
++{
++	return 0;
++}
++
++static int pp_hw_fini(void *handle)
++{
++	return 0;
++}
++
++static bool pp_is_idle(void *handle)
++{
++	return 0;
++}
++
++static int pp_wait_for_idle(void *handle)
++{
++	return 0;
++}
++
++static int pp_sw_reset(void *handle)
++{
++	return 0;
++}
++
++static void pp_print_status(void *handle)
++{
++
++}
++
++static int pp_set_clockgating_state(void *handle,
++				    enum amd_clockgating_state state)
++{
++	return 0;
++}
++
++static int pp_set_powergating_state(void *handle,
++				    enum amd_powergating_state state)
++{
++	return 0;
++}
++
++static int pp_suspend(void *handle)
++{
++	return 0;
++}
++
++static int pp_resume(void *handle)
++{
++	return 0;
++}
++
++const struct amd_ip_funcs pp_ip_funcs = {
++	.early_init = pp_early_init,
++	.late_init = NULL,
++	.sw_init = pp_sw_init,
++	.sw_fini = pp_sw_fini,
++	.hw_init = pp_hw_init,
++	.hw_fini = pp_hw_fini,
++	.suspend = pp_suspend,
++	.resume = pp_resume,
++	.is_idle = pp_is_idle,
++	.wait_for_idle = pp_wait_for_idle,
++	.soft_reset = pp_sw_reset,
++	.print_status = pp_print_status,
++	.set_clockgating_state = pp_set_clockgating_state,
++	.set_powergating_state = pp_set_powergating_state,
++};
++
++static int pp_dpm_load_fw(void *handle)
++{
++	return 0;
++}
++
++static int pp_dpm_fw_loading_complete(void *handle)
++{
++	return 0;
++}
++
++static int pp_dpm_force_performance_level(void *handle,
++					enum amd_dpm_forced_level level)
++{
++	return 0;
++}
++static enum amd_dpm_forced_level pp_dpm_get_performance_level(
++								void *handle)
++{
++	return 0;
++}
++static int pp_dpm_get_sclk(void *handle, bool low)
++{
++	return 0;
++}
++static int pp_dpm_get_mclk(void *handle, bool low)
++{
++	return 0;
++}
++static int pp_dpm_powergate_vce(void *handle, bool gate)
++{
++	return 0;
++}
++static int pp_dpm_powergate_uvd(void *handle, bool gate)
++{
++	return 0;
++}
++
++int pp_dpm_dispatch_tasks(void *handle, enum amd_pp_event event_id, void *input, void *output)
++{
++	return 0;
++}
++enum amd_pm_state_type pp_dpm_get_current_power_state(void *handle)
++{
++	return 0;
++}
++static void
++pp_debugfs_print_current_performance_level(void *handle,
++					       struct seq_file *m)
++{
++	return;
++}
++const struct amd_powerplay_funcs pp_dpm_funcs = {
++	.get_temperature = NULL,
++	.load_firmware = pp_dpm_load_fw,
++	.wait_for_fw_loading_complete = pp_dpm_fw_loading_complete,
++	.force_performance_level = pp_dpm_force_performance_level,
++	.get_performance_level = pp_dpm_get_performance_level,
++	.get_current_power_state = pp_dpm_get_current_power_state,
++	.get_sclk = pp_dpm_get_sclk,
++	.get_mclk = pp_dpm_get_mclk,
++	.powergate_vce = pp_dpm_powergate_vce,
++	.powergate_uvd = pp_dpm_powergate_uvd,
++	.dispatch_tasks = pp_dpm_dispatch_tasks,
++	.print_current_performance_level = pp_debugfs_print_current_performance_level,
++};
++
++int amd_powerplay_init(struct amd_pp_init *pp_init,
++		       struct amd_powerplay *amd_pp)
++{
++	if (pp_init == NULL || amd_pp == NULL)
++		return -EINVAL;
++
++	amd_pp->ip_funcs = &pp_ip_funcs;
++	amd_pp->pp_funcs = &pp_dpm_funcs;
++
++	return 0;
++}
++
++int amd_powerplay_fini(void *handle)
++{
++	return 0;
++}
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+new file mode 100644
+index 0000000..09d9d5a
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+@@ -0,0 +1,162 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#ifndef _AMD_POWERPLAY_H_
++#define _AMD_POWERPLAY_H_
++
++#include <linux/seq_file.h>
++#include <linux/types.h>
++#include "amd_shared.h"
++#include "cgs_common.h"
++
++
++enum amd_pp_event {
++	AMD_PP_EVENT_INITIALIZE = 0,
++	AMD_PP_EVENT_UNINITIALIZE,
++	AMD_PP_EVENT_POWER_SOURCE_CHANGE,
++	AMD_PP_EVENT_SUSPEND,
++	AMD_PP_EVENT_RESUME,
++	AMD_PP_EVENT_ENTER_REST_STATE,
++	AMD_PP_EVENT_EXIT_REST_STATE,
++	AMD_PP_EVENT_DISPLAY_CONFIG_CHANGE,
++	AMD_PP_EVENT_THERMAL_NOTIFICATION,
++	AMD_PP_EVENT_VBIOS_NOTIFICATION,
++	AMD_PP_EVENT_ENTER_THERMAL_STATE,
++	AMD_PP_EVENT_EXIT_THERMAL_STATE,
++	AMD_PP_EVENT_ENTER_FORCED_STATE,
++	AMD_PP_EVENT_EXIT_FORCED_STATE,
++	AMD_PP_EVENT_ENTER_EXCLUSIVE_MODE,
++	AMD_PP_EVENT_EXIT_EXCLUSIVE_MODE,
++	AMD_PP_EVENT_ENTER_SCREEN_SAVER,
++	AMD_PP_EVENT_EXIT_SCREEN_SAVER,
++	AMD_PP_EVENT_VPU_RECOVERY_BEGIN,
++	AMD_PP_EVENT_VPU_RECOVERY_END,
++	AMD_PP_EVENT_ENABLE_POWER_PLAY,
++	AMD_PP_EVENT_DISABLE_POWER_PLAY,
++	AMD_PP_EVENT_CHANGE_POWER_SOURCE_UI_LABEL,
++	AMD_PP_EVENT_ENABLE_USER2D_PERFORMANCE,
++	AMD_PP_EVENT_DISABLE_USER2D_PERFORMANCE,
++	AMD_PP_EVENT_ENABLE_USER3D_PERFORMANCE,
++	AMD_PP_EVENT_DISABLE_USER3D_PERFORMANCE,
++	AMD_PP_EVENT_ENABLE_OVER_DRIVE_TEST,
++	AMD_PP_EVENT_DISABLE_OVER_DRIVE_TEST,
++	AMD_PP_EVENT_ENABLE_REDUCED_REFRESH_RATE,
++	AMD_PP_EVENT_DISABLE_REDUCED_REFRESH_RATE,
++	AMD_PP_EVENT_ENABLE_GFX_CLOCK_GATING,
++	AMD_PP_EVENT_DISABLE_GFX_CLOCK_GATING,
++	AMD_PP_EVENT_ENABLE_CGPG,
++	AMD_PP_EVENT_DISABLE_CGPG,
++	AMD_PP_EVENT_ENTER_TEXT_MODE,
++	AMD_PP_EVENT_EXIT_TEXT_MODE,
++	AMD_PP_EVENT_VIDEO_START,
++	AMD_PP_EVENT_VIDEO_STOP,
++	AMD_PP_EVENT_ENABLE_USER_STATE,
++	AMD_PP_EVENT_DISABLE_USER_STATE,
++	AMD_PP_EVENT_READJUST_POWER_STATE,
++	AMD_PP_EVENT_START_INACTIVITY,
++	AMD_PP_EVENT_STOP_INACTIVITY,
++	AMD_PP_EVENT_LINKED_ADAPTERS_READY,
++	AMD_PP_EVENT_ADAPTER_SAFE_TO_DISABLE,
++	AMD_PP_EVENT_COMPLETE_INIT,
++	AMD_PP_EVENT_CRITICAL_THERMAL_FAULT,
++	AMD_PP_EVENT_BACKLIGHT_CHANGED,
++	AMD_PP_EVENT_ENABLE_VARI_BRIGHT,
++	AMD_PP_EVENT_DISABLE_VARI_BRIGHT,
++	AMD_PP_EVENT_ENABLE_VARI_BRIGHT_ON_POWER_XPRESS,
++	AMD_PP_EVENT_DISABLE_VARI_BRIGHT_ON_POWER_XPRESS,
++	AMD_PP_EVENT_SET_VARI_BRIGHT_LEVEL,
++	AMD_PP_EVENT_VARI_BRIGHT_MONITOR_MEASUREMENT,
++	AMD_PP_EVENT_SCREEN_ON,
++	AMD_PP_EVENT_SCREEN_OFF,
++	AMD_PP_EVENT_PRE_DISPLAY_CONFIG_CHANGE,
++	AMD_PP_EVENT_ENTER_ULP_STATE,
++	AMD_PP_EVENT_EXIT_ULP_STATE,
++	AMD_PP_EVENT_REGISTER_IP_STATE,
++	AMD_PP_EVENT_UNREGISTER_IP_STATE,
++	AMD_PP_EVENT_ENTER_MGPU_MODE,
++	AMD_PP_EVENT_EXIT_MGPU_MODE,
++	AMD_PP_EVENT_ENTER_MULTI_GPU_MODE,
++	AMD_PP_EVENT_PRE_SUSPEND,
++	AMD_PP_EVENT_PRE_RESUME,
++	AMD_PP_EVENT_ENTER_BACOS,
++	AMD_PP_EVENT_EXIT_BACOS,
++	AMD_PP_EVENT_RESUME_BACO,
++	AMD_PP_EVENT_RESET_BACO,
++	AMD_PP_EVENT_PRE_DISPLAY_PHY_ACCESS,
++	AMD_PP_EVENT_POST_DISPLAY_PHY_CCESS,
++	AMD_PP_EVENT_START_COMPUTE_APPLICATION,
++	AMD_PP_EVENT_STOP_COMPUTE_APPLICATION,
++	AMD_PP_EVENT_REDUCE_POWER_LIMIT,
++	AMD_PP_EVENT_ENTER_FRAME_LOCK,
++	AMD_PP_EVENT_EXIT_FRAME_LOOCK,
++	AMD_PP_EVENT_LONG_IDLE_REQUEST_BACO,
++	AMD_PP_EVENT_LONG_IDLE_ENTER_BACO,
++	AMD_PP_EVENT_LONG_IDLE_EXIT_BACO,
++	AMD_PP_EVENT_HIBERNATE,
++	AMD_PP_EVENT_CONNECTED_STANDBY,
++	AMD_PP_EVENT_ENTER_SELF_REFRESH,
++	AMD_PP_EVENT_EXIT_SELF_REFRESH,
++	AMD_PP_EVENT_START_AVFS_BTC,
++	AMD_PP_EVENT_MAX
++};
++
++enum amd_dpm_forced_level {
++	AMD_DPM_FORCED_LEVEL_AUTO = 0,
++	AMD_DPM_FORCED_LEVEL_LOW = 1,
++	AMD_DPM_FORCED_LEVEL_HIGH = 2,
++};
++
++struct amd_pp_init {
++	struct cgs_device *device;
++	uint32_t chip_family;
++	uint32_t chip_id;
++	uint32_t rev_id;
++};
++
++struct amd_powerplay_funcs {
++	int (*get_temperature)(void *handle);
++	int (*load_firmware)(void *handle);
++	int (*wait_for_fw_loading_complete)(void *handle);
++	int (*force_performance_level)(void *handle, enum amd_dpm_forced_level level);
++	enum amd_dpm_forced_level (*get_performance_level)(void *handle);
++	enum amd_pm_state_type (*get_current_power_state)(void *handle);
++	int (*get_sclk)(void *handle, bool low);
++	int (*get_mclk)(void *handle, bool low);
++	int (*powergate_vce)(void *handle, bool gate);
++	int (*powergate_uvd)(void *handle, bool gate);
++	int (*dispatch_tasks)(void *handle, enum amd_pp_event event_id,
++				   void *input, void *output);
++	void (*print_current_performance_level)(void *handle,
++						      struct seq_file *m);
++};
++
++struct amd_powerplay {
++	void *pp_handle;
++	const struct amd_ip_funcs *ip_funcs;
++	const struct amd_powerplay_funcs *pp_funcs;
++};
++
++int amd_powerplay_init(struct amd_pp_init *pp_init,
++		       struct amd_powerplay *amd_pp);
++int amd_powerplay_fini(void *handle);
++
++#endif /* _AMD_POWERPLAY_H_ */
+-- 
+2.7.4
+

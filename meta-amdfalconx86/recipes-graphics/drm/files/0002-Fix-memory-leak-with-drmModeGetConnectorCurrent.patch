@@ -1,0 +1,77 @@
+From e342c0fc250f3f16b817c43e96ab9b839fcb15c2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Tue, 15 Dec 2015 14:18:32 +0200
+Subject: [PATCH 002/117] Fix memory leak with drmModeGetConnectorCurrent()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+drmModeGetConnectorCurrent() must provide temporary storage for the
+kernel to fill in at least one mode (asking for !=0 modes is how
+you prevent the heavyweight probe in the kernel). Currently we malloc
+that temp storage but we fail to free it before overwriting the
+pointer with the address of the actual storage we use to store the
+real mode list we get from the kernel in the second ioctl call.
+
+Let's just keep the temporary storage on the stack and thus we avoid the
+leak and also eliminate some pointless mallocs.
+
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Fixes: 5ed5fa10600f ("mode: Retrieve only the current information for a Connector")
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+---
+ xf86drmMode.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/xf86drmMode.c b/xf86drmMode.c
+index ab6b519..7710061 100644
+--- a/xf86drmMode.c
++++ b/xf86drmMode.c
+@@ -475,12 +475,13 @@ _drmModeGetConnector(int fd, uint32_t connector_id, int probe)
+ {
+ 	struct drm_mode_get_connector conn, counts;
+ 	drmModeConnectorPtr r = NULL;
++	struct drm_mode_modeinfo stack_mode;
+ 
+ 	memclear(conn);
+ 	conn.connector_id = connector_id;
+ 	if (!probe) {
+ 		conn.count_modes = 1;
+-		conn.modes_ptr = VOID2U64(drmMalloc(sizeof(struct drm_mode_modeinfo)));
++		conn.modes_ptr = VOID2U64(&stack_mode);
+ 	}
+ 
+ 	if (drmIoctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn))
+@@ -504,7 +505,7 @@ retry:
+ 			goto err_allocs;
+ 	} else {
+ 		conn.count_modes = 1;
+-		conn.modes_ptr = VOID2U64(drmMalloc(sizeof(struct drm_mode_modeinfo)));
++		conn.modes_ptr = VOID2U64(&stack_mode);
+ 	}
+ 
+ 	if (conn.count_encoders) {
+@@ -525,7 +526,8 @@ retry:
+ 	    counts.count_encoders < conn.count_encoders) {
+ 		drmFree(U642VOID(conn.props_ptr));
+ 		drmFree(U642VOID(conn.prop_values_ptr));
+-		drmFree(U642VOID(conn.modes_ptr));
++		if (U642VOID(conn.modes_ptr) != &stack_mode)
++			drmFree(U642VOID(conn.modes_ptr));
+ 		drmFree(U642VOID(conn.encoders_ptr));
+ 
+ 		goto retry;
+@@ -567,7 +569,8 @@ retry:
+ err_allocs:
+ 	drmFree(U642VOID(conn.prop_values_ptr));
+ 	drmFree(U642VOID(conn.props_ptr));
+-	drmFree(U642VOID(conn.modes_ptr));
++	if (U642VOID(conn.modes_ptr) != &stack_mode)
++		drmFree(U642VOID(conn.modes_ptr));
+ 	drmFree(U642VOID(conn.encoders_ptr));
+ 
+ 	return r;
+-- 
+2.7.4
+

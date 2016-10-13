@@ -1,0 +1,146 @@
+From f30dd83168f27183295c41c761935bc41c72073e Mon Sep 17 00:00:00 2001
+From: David Rokhvarg <David.Rokhvarg@amd.com>
+Date: Tue, 22 Dec 2015 17:57:28 -0500
+Subject: [PATCH 0649/1110] drm/amd/dal: Remove registration of Poll for
+ connector.
+
+Our display detection is interrupt-driven, no need to register for
+Poll from DRM.
+
+Also this results in:
+- less notifications from kernel to user mode about hpd events.
+- less contention on MST state is triggered from user-mode.
+
+Signed-off-by: David Rokhvarg <David.Rokhvarg@amd.com>
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c  | 29 +++++++++++++++++++---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      |  7 ++----
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    | 20 +++++----------
+ 3 files changed, 34 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
+index 0a05774..e856f0c 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dc_helpers.c
+@@ -471,6 +471,30 @@ void dc_helpers_dp_mst_handle_mst_hpd_rx_irq(void *param)
+ 	}
+ }
+ 
++/* Depending on Root connector state, update MST state of all connectors
++ * belonging to it. */
++static void set_mst_topology_state(struct drm_device *dev)
++{
++	struct drm_connector *connector;
++	struct amdgpu_connector *aconnector = NULL;
++
++	mutex_lock(&dev->mode_config.mutex);
++
++	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
++		mutex_unlock(&dev->mode_config.mutex);
++
++		aconnector = to_amdgpu_connector(connector);
++
++		if (aconnector->is_mst_connector)
++			drm_dp_mst_topology_mgr_set_mst(&aconnector->mst_mgr,
++					aconnector->is_mst_connector);
++
++		mutex_lock(&dev->mode_config.mutex);
++	}
++
++	mutex_unlock(&dev->mode_config.mutex);
++}
++
+ bool dc_helpers_dp_mst_start_top_mgr(
+ 		struct dc_context *ctx,
+ 		const struct dc_link *link)
+@@ -480,7 +504,7 @@ bool dc_helpers_dp_mst_start_top_mgr(
+ 	struct amdgpu_connector *aconnector = get_connector_for_link(dev, link);
+ 
+ 	aconnector->is_mst_connector = true;
+-
++	set_mst_topology_state(dev);
+ 	return true;
+ }
+ 
+@@ -492,9 +516,8 @@ void dc_helpers_dp_mst_stop_top_mgr(
+ 	struct drm_device *dev = adev->ddev;
+ 	struct amdgpu_connector *aconnector = get_connector_for_link(dev, link);
+ 
+-	drm_dp_mst_topology_mgr_set_mst(&aconnector->mst_mgr, false);
+-
+ 	aconnector->is_mst_connector = false;
++	set_mst_topology_state(dev);
+ }
+ 
+ bool dc_helper_dp_read_dpcd(
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index b2b7820..62df355 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -793,7 +793,7 @@ static void handle_hpd_irq(void *param)
+ 
+ 	dc_link_detect(aconnector->dc_link);
+ 	amdgpu_dm_update_connector_after_detect(aconnector);
+-	drm_helper_hpd_irq_event(dev);
++	drm_kms_helper_hotplug_event(dev);
+ }
+ 
+ static void handle_hpd_rx_irq(void *param)
+@@ -807,7 +807,7 @@ static void handle_hpd_rx_irq(void *param)
+ 		/* Downstream Port status changed. */
+ 		dc_link_detect(aconnector->dc_link);
+ 		amdgpu_dm_update_connector_after_detect(aconnector);
+-		drm_helper_hpd_irq_event(dev);
++		drm_kms_helper_hotplug_event(dev);
+ 	}
+ 
+ 	if (aconnector->is_mst_connector) {
+@@ -930,9 +930,6 @@ static int dce110_register_irq_handlers(struct amdgpu_device *adev)
+ 
+ 	register_hpd_handlers(adev);
+ 
+-	/* This is a part of HPD initialization. */
+-	drm_kms_helper_poll_init(adev->ddev);
+-
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index 33fe1a4..492939e 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -988,23 +988,15 @@ static enum drm_connector_status
+ amdgpu_dm_connector_detect(struct drm_connector *connector, bool force)
+ {
+ 	bool connected;
+-	struct amdgpu_connector *aconnector =
+-			to_amdgpu_connector(connector);
+-
+-	/*
+-	 * TODO: check whether we should lock here for mst_mgr.lock
+-	 */
+-	/* set root connector to disconnected */
+-	if (aconnector->is_mst_connector) {
+-		if (!aconnector->mst_mgr.mst_state)
+-			drm_dp_mst_topology_mgr_set_mst(
+-				&aconnector->mst_mgr,
+-				true);
++	struct amdgpu_connector *aconnector = to_amdgpu_connector(connector);
+ 
+-		return connector_status_disconnected;
+-	}
++	/* Notes:
++	 * 1. This interface is NOT called in context of HPD irq.
++	 * 2. This interface *is called* in context of user-mode ioctl. Which
++	 * makes it a bad place for *any* MST-related activit. */
+ 
+ 	connected = (NULL != aconnector->dc_sink);
++
+ 	return (connected ? connector_status_connected :
+ 			connector_status_disconnected);
+ }
+-- 
+2.7.4
+

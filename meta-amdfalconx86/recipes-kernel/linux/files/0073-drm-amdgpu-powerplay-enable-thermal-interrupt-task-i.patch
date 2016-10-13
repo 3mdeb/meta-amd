@@ -1,0 +1,159 @@
+From 7ebe355fcd71a1cf5c2108a286dd4d043acd3ae4 Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Fri, 16 Oct 2015 20:32:36 +0800
+Subject: [PATCH 0073/1110] drm/amdgpu/powerplay: enable thermal interrupt task
+ in eventmgr.
+
+Add thermal handling to the event manager.
+
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+Reviewed-by: Jammy Zhou <Jammy.Zhou@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/powerplay/eventmgr/eventactionchains.c |  1 +
+ drivers/gpu/drm/amd/powerplay/eventmgr/eventinit.c     | 17 ++++++++++++++++-
+ .../gpu/drm/amd/powerplay/eventmgr/eventsubchains.c    | 10 ++++++++++
+ .../gpu/drm/amd/powerplay/eventmgr/eventsubchains.h    |  3 ++-
+ drivers/gpu/drm/amd/powerplay/eventmgr/eventtasks.c    | 18 ++++++++++++++++--
+ drivers/gpu/drm/amd/powerplay/eventmgr/eventtasks.h    |  3 +++
+ 6 files changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/powerplay/eventmgr/eventactionchains.c b/drivers/gpu/drm/amd/powerplay/eventmgr/eventactionchains.c
+index e9fe85f..bbbb76c 100644
+--- a/drivers/gpu/drm/amd/powerplay/eventmgr/eventactionchains.c
++++ b/drivers/gpu/drm/amd/powerplay/eventmgr/eventactionchains.c
+@@ -33,6 +33,7 @@ static const pem_event_action *initialize_event[] = {
+ 	enable_clock_power_gatings_tasks,
+ 	get_2d_performance_state_tasks,
+ 	set_performance_state_tasks,
++	initialize_thermal_controller_tasks,
+ 	conditionally_force_3d_performance_state_tasks,
+ 	process_vbios_eventinfo_tasks,
+ 	broadcast_power_policy_tasks,
+diff --git a/drivers/gpu/drm/amd/powerplay/eventmgr/eventinit.c b/drivers/gpu/drm/amd/powerplay/eventmgr/eventinit.c
+index 0438442..d5ec8cc 100644
+--- a/drivers/gpu/drm/amd/powerplay/eventmgr/eventinit.c
++++ b/drivers/gpu/drm/amd/powerplay/eventmgr/eventinit.c
+@@ -22,6 +22,8 @@
+  */
+ #include "eventmgr.h"
+ #include "eventinit.h"
++#include "ppinterrupt.h"
++#include "hardwaremanager.h"
+ 
+ void pem_init_feature_info(struct pp_eventmgr *eventmgr)
+ {
+@@ -145,12 +147,25 @@ void pem_init_feature_info(struct pp_eventmgr *eventmgr)
+ 	eventmgr->features[PP_Feature_ViPG].enabled = false;
+ }
+ 
++static int thermal_interrupt_callback(void *private_data,
++				      unsigned src_id, const uint32_t *iv_entry)
++{
++	/* TO DO hanle PEM_Event_ThermalNotification (struct pp_eventmgr *)private_data*/
++	printk("current thermal is out of range \n");
++	return 0;
++}
++
+ int pem_register_interrupts(struct pp_eventmgr *eventmgr)
+ {
+ 	int result = 0;
++	struct pp_interrupt_registration_info info;
++
++	info.call_back = thermal_interrupt_callback;
++	info.context = eventmgr;
++
++	result = phm_register_thermal_interrupt(eventmgr->hwmgr, &info);
+ 
+ 	/* TODO:
+-	 * 1. Register thermal events interrupt
+ 	 * 2. Register CTF event interrupt
+ 	 * 3. Register for vbios events interrupt
+ 	 * 4. Register External Throttle Interrupt
+diff --git a/drivers/gpu/drm/amd/powerplay/eventmgr/eventsubchains.c b/drivers/gpu/drm/amd/powerplay/eventmgr/eventsubchains.c
+index e5dd86d..3dd671e 100644
+--- a/drivers/gpu/drm/amd/powerplay/eventmgr/eventsubchains.c
++++ b/drivers/gpu/drm/amd/powerplay/eventmgr/eventsubchains.c
+@@ -393,3 +393,13 @@ const pem_event_action create_new_user_performance_state_tasks[] = {
+ 	pem_task_create_user_performance_state,
+ 	NULL
+ };
++
++const pem_event_action initialize_thermal_controller_tasks[] = {
++	pem_task_initialize_thermal_controller,
++	NULL
++};
++
++const pem_event_action uninitialize_thermal_controller_tasks[] = {
++	pem_task_uninitialize_thermal_controller,
++	NULL
++};
+diff --git a/drivers/gpu/drm/amd/powerplay/eventmgr/eventsubchains.h b/drivers/gpu/drm/amd/powerplay/eventmgr/eventsubchains.h
+index 27e0e61..741ebfc 100644
+--- a/drivers/gpu/drm/amd/powerplay/eventmgr/eventsubchains.h
++++ b/drivers/gpu/drm/amd/powerplay/eventmgr/eventsubchains.h
+@@ -94,5 +94,6 @@ extern const pem_event_action enable_stutter_mode_tasks[];
+ extern const pem_event_action enable_disable_bapm_tasks[];
+ extern const pem_event_action reset_boot_state_tasks[];
+ extern const pem_event_action create_new_user_performance_state_tasks[];
+-
++extern const pem_event_action initialize_thermal_controller_tasks[];
++extern const pem_event_action uninitialize_thermal_controller_tasks[];
+ #endif /* _EVENT_SUB_CHAINS_H_ */
+diff --git a/drivers/gpu/drm/amd/powerplay/eventmgr/eventtasks.c b/drivers/gpu/drm/amd/powerplay/eventmgr/eventtasks.c
+index 8ca3280..fdd67c6 100644
+--- a/drivers/gpu/drm/amd/powerplay/eventmgr/eventtasks.c
++++ b/drivers/gpu/drm/amd/powerplay/eventmgr/eventtasks.c
+@@ -32,6 +32,9 @@
+ #include "amd_powerplay.h"
+ #include "psm.h"
+ 
++#define TEMP_RANGE_MIN (90 * 1000)
++#define TEMP_RANGE_MAX (120 * 1000)
++
+ int pem_task_update_allowed_performance_levels(struct pp_eventmgr *eventmgr, struct pem_event_data *event_data)
+ {
+ 
+@@ -104,8 +107,6 @@ int pem_task_unregister_interrupts(struct pp_eventmgr *eventmgr, struct pem_even
+ 	return pem_unregister_interrupts(eventmgr);
+ }
+ 
+-
+-
+ int pem_task_get_boot_state_id(struct pp_eventmgr *eventmgr, struct pem_event_data *event_data)
+ {
+ 	int result;
+@@ -415,3 +416,16 @@ restart_search:
+ 	return -1;
+ }
+ 
++int pem_task_initialize_thermal_controller(struct pp_eventmgr *eventmgr, struct pem_event_data *event_data)
++{
++	struct PP_TemperatureRange range;
++	range.max = TEMP_RANGE_MAX;
++	range.min = TEMP_RANGE_MIN;
++
++	return phm_start_thermal_controller(eventmgr->hwmgr, &range);
++}
++
++int pem_task_uninitialize_thermal_controller(struct pp_eventmgr *eventmgr, struct pem_event_data *event_data)
++{
++	return phm_stop_thermal_controller(eventmgr->hwmgr);
++}
+\ No newline at end of file
+diff --git a/drivers/gpu/drm/amd/powerplay/eventmgr/eventtasks.h b/drivers/gpu/drm/amd/powerplay/eventmgr/eventtasks.h
+index 287c87c..6c6297e 100644
+--- a/drivers/gpu/drm/amd/powerplay/eventmgr/eventtasks.h
++++ b/drivers/gpu/drm/amd/powerplay/eventmgr/eventtasks.h
+@@ -81,5 +81,8 @@ int pem_task_conditionally_force_3d_performance_state(struct pp_eventmgr *eventm
+ int pem_task_get_2D_performance_state_id(struct pp_eventmgr *eventmgr, struct pem_event_data *event_data);
+ int pem_task_create_user_performance_state(struct pp_eventmgr *eventmgr, struct pem_event_data *event_data);
+ int pem_task_update_allowed_performance_levels(struct pp_eventmgr *eventmgr, struct pem_event_data *event_data);
++/*thermal */
++int pem_task_initialize_thermal_controller(struct pp_eventmgr *eventmgr, struct pem_event_data *event_data);
++int pem_task_uninitialize_thermal_controller(struct pp_eventmgr *eventmgr, struct pem_event_data *event_data);
+ 
+ #endif /* _EVENT_TASKS_H_ */
+-- 
+2.7.4
+

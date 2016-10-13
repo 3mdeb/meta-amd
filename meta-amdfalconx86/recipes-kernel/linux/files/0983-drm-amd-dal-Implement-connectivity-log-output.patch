@@ -1,0 +1,459 @@
+From 4f6313afbf2678adc26831f856b68bbf6dfc3546 Mon Sep 17 00:00:00 2001
+From: Yongqiang Sun <yongqiang.sun@amd.com>
+Date: Wed, 16 Mar 2016 11:11:52 -0400
+Subject: [PATCH 0983/1110] drm/amd/dal: Implement connectivity log output.
+
+message format:
+[time stamp]   [drm] [Major_minor] [connector name] message......
+eg:
+[   26.590965] [drm] [Conn_LKTN]  [DP-1] HBRx4 pass VS=0, PE=0^
+[   26.881060] [drm] [Conn_Mode]  [DP-1] {2560x1080, 2784x1111@185580Khz}^
+
+Signed-off-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c  | 51 ++++++++++++++++++
+ drivers/gpu/drm/amd/dal/dc/basics/logger.c         | 11 +++-
+ drivers/gpu/drm/amd/dal/dc/basics/logger.h         |  6 ++-
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 10 ++++
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          |  6 +++
+ drivers/gpu/drm/amd/dal/dc/core/dc_link_ddc.c      | 61 +++++++++++-----------
+ drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c       | 35 ++++++++-----
+ drivers/gpu/drm/amd/dal/dc/dm_helpers.h            | 39 ++++++++++++++
+ drivers/gpu/drm/amd/dal/include/logger_types.h     | 13 +++++
+ 9 files changed, 186 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c
+index 8688ca2..c6d6267 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_helpers.c
+@@ -42,6 +42,12 @@
+ 
+ #include "dm_helpers.h"
+ 
++/* Maximum line char number for connectivity log,
++ * in case of output EDID, needs at least 256x3 bytes plus some other
++ * message, so set line size to 896.
++ */
++#define CONN_MAX_LINE_SIZE 896
++
+ /* dm_helpers_parse_edid_caps
+  *
+  * Parse edid caps
+@@ -513,3 +519,48 @@ bool dm_helpers_submit_i2c(
+ 	return result;
+ }
+ 
++void dm_helper_conn_log(struct dc_context *ctx,
++		const struct dc_link *link,
++		uint8_t *hex_data,
++		int hex_data_count,
++		enum conn_event event,
++		const char *msg,
++		...)
++{
++	struct amdgpu_device *adev = ctx->driver_context;
++	struct drm_device *dev = adev->ddev;
++	struct amdgpu_connector *aconnector = get_connector_for_link(dev, link);
++	char buffer[CONN_MAX_LINE_SIZE] = { 0 };
++	va_list args;
++	int size;
++	enum log_minor minor = event;
++
++	va_start(args, msg);
++
++	sprintf(buffer, "[%s] ", aconnector->base.name);
++
++	size = strlen(buffer);
++
++	size += dm_log_to_buffer(
++		&buffer[size], CONN_MAX_LINE_SIZE, msg, args);
++
++	if (buffer[strlen(buffer) - 1] == '\n') {
++		buffer[strlen(buffer) - 1] = '\0';
++		size--;
++	}
++
++	if (hex_data) {
++		int i;
++
++		for (i = 0; i < hex_data_count; i++)
++			sprintf(&buffer[size + i * 3], "%2.2X ", hex_data[i]);
++	}
++
++	strcat(buffer, "^\n");
++
++	dal_logger_write(ctx->logger,
++					LOG_MAJOR_CONNECTIVITY,
++					minor,
++					buffer);
++	va_end(args);
++}
+diff --git a/drivers/gpu/drm/amd/dal/dc/basics/logger.c b/drivers/gpu/drm/amd/dal/dc/basics/logger.c
+index f637c3f..93d4185 100644
+--- a/drivers/gpu/drm/amd/dal/dc/basics/logger.c
++++ b/drivers/gpu/drm/amd/dal/dc/basics/logger.c
+@@ -207,6 +207,14 @@ static const struct log_minor_info ds_minor_info_tbl[] = {
+ 	{LOG_MINOR_DS_MODE_SETTING, "Mode_Setting"},
+ };
+ 
++static const struct log_minor_info connectivity_minor_info_tbl[] = {
++	{LOG_MINOR_CONNECTIVITY_MODE_SET,  "Mode"},
++	{LOG_MINOR_CONNECTIVITY_DETECTION, "Detect"},
++	{LOG_MINOR_CONNECTIVITY_LINK_TRAINING, "LKTN"},
++	{LOG_MINOR_CONNECTIVITY_LINK_LOSS, "LinkLoss"},
++	{LOG_MINOR_CONNECTIVITY_UNDERFLOW, "Underflow"},
++};
++
+ struct log_major_mask_info {
+ 	struct log_major_info major_info;
+ 	uint32_t default_mask;
+@@ -270,6 +278,7 @@ static const struct log_major_mask_info log_major_mask_info_tbl[] = {
+ 	{{LOG_MAJOR_DISPLAY_SERVICE, "DS"          }, LG_ALL_MSK, ds_minor_info_tbl,           NUM_ELEMENTS(ds_minor_info_tbl)},
+ 	{{LOG_MAJOR_FEATURE_OVERRIDE, "FeatureOverride" }, LG_ALL_MSK, override_feature_minor_info_tbl, NUM_ELEMENTS(override_feature_minor_info_tbl)},
+ 	{{LOG_MAJOR_DETECTION,       "Detection"   }, LG_ALL_MSK,  detection_minor_info_tbl,    NUM_ELEMENTS(detection_minor_info_tbl)},
++	{{LOG_MAJOR_CONNECTIVITY,    "Conn"		   }, LG_ALL_MSK,  connectivity_minor_info_tbl, NUM_ELEMENTS(connectivity_minor_info_tbl)},
+ };
+ 
+ /* ----------- Object init and destruction ----------- */
+@@ -511,7 +520,7 @@ static void log_to_internal_buffer(struct log_entry *entry)
+ 
+ static void log_timestamp(struct log_entry *entry)
+ {
+-	dal_logger_append(entry, "00:00:00 ");
++/*	dal_logger_append(entry, "00:00:00 ");*/
+ }
+ 
+ static void log_major_minor(struct log_entry *entry)
+diff --git a/drivers/gpu/drm/amd/dal/dc/basics/logger.h b/drivers/gpu/drm/amd/dal/dc/basics/logger.h
+index c2aea53..12d8ae6 100644
+--- a/drivers/gpu/drm/amd/dal/dc/basics/logger.h
++++ b/drivers/gpu/drm/amd/dal/dc/basics/logger.h
+@@ -29,7 +29,11 @@
+ /* Structure for keeping track of offsets, buffer, etc */
+ 
+ #define DAL_LOGGER_BUFFER_MAX_SIZE 2048
+-#define DAL_LOGGER_BUFFER_MAX_LOG_LINE_SIZE 256
++
++/*Connectivity log needs to output EDID, which needs at lease 256x3 bytes,
++ * change log line size to 896 to meet the request.
++ */
++#define DAL_LOGGER_BUFFER_MAX_LOG_LINE_SIZE 896
+ 
+ #include "include/logger_types.h"
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index f3a59aa..da50d25 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -46,6 +46,7 @@
+ #include "link_encoder.h"
+ 
+ #include "dc_link_ddc.h"
++#include "dm_helpers.h"
+ 
+ /*******************************************************************************
+  * Private structures
+@@ -747,8 +748,17 @@ bool dc_commit_targets(
+ 
+ 	for (i = 0; i < context->target_count; i++) {
+ 		struct dc_target *dc_target = &context->targets[i]->public;
++		struct core_sink *sink = DC_SINK_TO_CORE(dc_target->streams[0]->sink);
++
+ 		if (context->target_status[i].surface_count > 0)
+ 			target_enable_memory_requests(dc_target, &core_dc->current_context.res_ctx);
++
++		CONN_MSG_MODE(sink->link, "{%dx%d, %dx%d@%dKhz}",
++				dc_target->streams[0]->timing.h_addressable,
++				dc_target->streams[0]->timing.v_addressable,
++				dc_target->streams[0]->timing.h_total,
++				dc_target->streams[0]->timing.v_total,
++				dc_target->streams[0]->timing.pix_clk_khz);
+ 	}
+ 
+ 	program_timing_sync(core_dc, context);
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 97d6f93..06c8fa6 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -679,6 +679,12 @@ bool dc_link_detect(const struct dc_link *dc_link, bool boot)
+ 			break;
+ 		}
+ 
++		/* Connectivity log: detection */
++		CONN_DATA_DETECT(link, sink->public.dc_edid.raw_edid,
++				sink->public.dc_edid.length,
++				"%s: ",
++				sink->public.edid_caps.display_name);
++
+ 		dal_logger_write(link->ctx->logger,
+ 			LOG_MAJOR_DETECTION,
+ 			LOG_MINOR_DETECTION_EDID_PARSER,
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link_ddc.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link_ddc.c
+index 698a34e..c38e60e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link_ddc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link_ddc.c
+@@ -768,12 +768,12 @@ void dal_ddc_service_i2c_query_dp_dual_mode_adaptor(
+ 		DP_HDMI_DONGLE_ADDRESS,
+ 		type2_dongle_buf,
+ 		sizeof(type2_dongle_buf))) {
+-		dal_logger_write(ddc->ctx->logger,
+-			LOG_MAJOR_DCS,
+-			LOG_MINOR_DCS_DONGLE_DETECTION,
+-			"Detected DP-DVI dongle.\n");
+ 		*dongle = DISPLAY_DONGLE_DP_DVI_DONGLE;
+ 		sink_cap->max_hdmi_pixel_clock = DP_ADAPTOR_DVI_MAX_TMDS_CLK;
++
++		CONN_DATA_DETECT(ddc->link, type2_dongle_buf, sizeof(type2_dongle_buf),
++				"DP-DVI passive dongle %dMhz: ",
++				DP_ADAPTOR_DVI_MAX_TMDS_CLK / 1000);
+ 		return;
+ 	}
+ 
+@@ -815,29 +815,28 @@ void dal_ddc_service_i2c_query_dp_dual_mode_adaptor(
+ 		if (0 == max_tmds_clk ||
+ 				max_tmds_clk < DP_ADAPTOR_TYPE2_MIN_TMDS_CLK ||
+ 				max_tmds_clk > DP_ADAPTOR_TYPE2_MAX_TMDS_CLK) {
+-			dal_logger_write(ddc->ctx->logger,
+-				LOG_MAJOR_DCS,
+-				LOG_MINOR_DCS_DONGLE_DETECTION,
+-				"Invalid Maximum TMDS clock");
+ 			*dongle = DISPLAY_DONGLE_DP_DVI_DONGLE;
++
++			CONN_DATA_DETECT(ddc->link, type2_dongle_buf,
++					sizeof(type2_dongle_buf),
++					"DP-DVI passive dongle %dMhz: ",
++					DP_ADAPTOR_DVI_MAX_TMDS_CLK / 1000);
+ 		} else {
+ 			if (is_valid_hdmi_signature == true) {
+ 				*dongle = DISPLAY_DONGLE_DP_HDMI_DONGLE;
+-				dal_logger_write(ddc->ctx->logger,
+-					LOG_MAJOR_DCS,
+-					LOG_MINOR_DCS_DONGLE_DETECTION,
+-					"Detected Type 2 DP-HDMI Maximum TMDS "
+-					"clock, max TMDS clock: %d MHz",
+-					max_tmds_clk);
++
++				CONN_DATA_DETECT(ddc->link, type2_dongle_buf,
++						sizeof(type2_dongle_buf),
++						"Type 2 DP-HDMI passive dongle %dMhz: ",
++						max_tmds_clk);
+ 			} else {
+ 				*dongle = DISPLAY_DONGLE_DP_HDMI_MISMATCHED_DONGLE;
+-				dal_logger_write(ddc->ctx->logger,
+-					LOG_MAJOR_DCS,
+-					LOG_MINOR_DCS_DONGLE_DETECTION,
+-					"Detected Type 2 DP-HDMI (no valid HDMI"
+-					" signature) Maximum TMDS clock, max "
+-					"TMDS clock: %d MHz",
+-					max_tmds_clk);
++
++				CONN_DATA_DETECT(ddc->link, type2_dongle_buf,
++						sizeof(type2_dongle_buf),
++						"Type 2 DP-HDMI passive dongle (no signature) %dMhz: ",
++						max_tmds_clk);
++
+ 			}
+ 
+ 			/* Multiply by 1000 to convert to kHz. */
+@@ -847,19 +846,19 @@ void dal_ddc_service_i2c_query_dp_dual_mode_adaptor(
+ 
+ 	} else {
+ 		if (is_valid_hdmi_signature == true) {
+-			dal_logger_write(ddc->ctx->logger,
+-				LOG_MAJOR_DCS,
+-				LOG_MINOR_DCS_DONGLE_DETECTION,
+-				"Detected Type 1 DP-HDMI dongle.\n");
+ 			*dongle = DISPLAY_DONGLE_DP_HDMI_DONGLE;
+-		} else {
+-			dal_logger_write(ddc->ctx->logger,
+-				LOG_MAJOR_DCS,
+-				LOG_MINOR_DCS_DONGLE_DETECTION,
+-				"Detected Type 1 DP-HDMI dongle (no valid HDMI "
+-				"signature).\n");
+ 
++			CONN_DATA_DETECT(ddc->link, type2_dongle_buf,
++					sizeof(type2_dongle_buf),
++					"Type 1 DP-HDMI passive dongle %dMhz: ",
++					sink_cap->max_hdmi_pixel_clock / 1000);
++		} else {
+ 			*dongle = DISPLAY_DONGLE_DP_HDMI_MISMATCHED_DONGLE;
++
++			CONN_DATA_DETECT(ddc->link, type2_dongle_buf,
++					sizeof(type2_dongle_buf),
++					"Type 1 DP-HDMI passive dongle (no signature) %dMhz: ",
++					sink_cap->max_hdmi_pixel_clock / 1000);
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
+index 8fe0314..c83a754 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
+@@ -1009,33 +1009,31 @@ bool perform_link_training(
+ 	switch (lt_settings.link_settings.link_rate) {
+ 
+ 	case LINK_RATE_LOW:
+-		link_rate = "Low";
++		link_rate = "RBR";
+ 		break;
+ 	case LINK_RATE_HIGH:
+-		link_rate = "High";
++		link_rate = "HBR";
+ 		break;
+ 	case LINK_RATE_HIGH2:
+-		link_rate = "High2";
++		link_rate = "HBR2";
+ 		break;
+ 	case LINK_RATE_RBR2:
+ 		link_rate = "RBR2";
+ 		break;
+ 	case LINK_RATE_HIGH3:
+-		link_rate = "High3";
++		link_rate = "HBR3";
+ 		break;
+ 	default:
+ 		break;
+ 	}
+ 
+-	dal_logger_write(link->ctx->logger,
+-		LOG_MAJOR_MST,
+-		LOG_MINOR_MST_PROGRAMMING,
+-		"Link training for %d lanes at %s rate %s with PE %d, VS %d\n",
+-		lt_settings.link_settings.lane_count,
+-		link_rate,
+-		status ? "succeeded" : "failed",
+-		lt_settings.lane_settings[0].PRE_EMPHASIS,
+-		lt_settings.lane_settings[0].VOLTAGE_SWING);
++	/* Connectivity log: link training */
++	CONN_MSG_LT(link, "%sx%d %s VS=%d, PE=%d",
++			link_rate,
++			lt_settings.link_settings.lane_count,
++			status ? "pass" : "fail",
++			lt_settings.lane_settings[0].VOLTAGE_SWING,
++			lt_settings.lane_settings[0].PRE_EMPHASIS);
+ 
+ 	return status;
+ }
+@@ -1540,8 +1538,15 @@ bool dc_link_handle_hpd_rx_irq(const struct dc_link *dc_link)
+ 	if (hpd_rx_irq_check_link_loss_status(
+ 		link,
+ 		&hpd_irq_dpcd_data)) {
++		/* Connectivity log: link loss */
++		CONN_DATA_LINK_LOSS(link,
++							hpd_irq_dpcd_data.raw,
++							sizeof(hpd_irq_dpcd_data),
++							"Status: ");
++
+ 		perform_link_training_with_retries(link,
+ 			&link->public.cur_link_settings, true, 3);
++
+ 		status = false;
+ 	}
+ 
+@@ -1794,6 +1799,10 @@ static void retrieve_link_cap(struct core_link *link)
+ 			(uint8_t *)(&link->edp_revision),
+ 			sizeof(link->edp_revision));
+ 	}
++
++	/* Connectivity log: detection */
++	CONN_DATA_DETECT(link, dpcd_data, sizeof(dpcd_data), "Rx Caps: ");
++
+ 	/* TODO: Confirm if need retrieve_psr_link_cap */
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dm_helpers.h b/drivers/gpu/drm/amd/dal/dc/dm_helpers.h
+index 350dd11..151c1ef 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dm_helpers.h
++++ b/drivers/gpu/drm/amd/dal/dc/dm_helpers.h
+@@ -35,11 +35,42 @@
+ 
+ struct dp_mst_stream_allocation_table;
+ 
++enum conn_event {
++	CONN_EVENT_MODE_SET,
++	CONN_EVENT_DETECTION,
++	CONN_EVENT_LINK_TRAINING,
++	CONN_EVENT_LINK_LOSS,
++	CONN_EVENT_UNDERFLOW,
++};
++
+ enum dc_edid_status dm_helpers_parse_edid_caps(
+ 	struct dc_context *ctx,
+ 	const struct dc_edid *edid,
+ 	struct dc_edid_caps *edid_caps);
+ 
++
++/* Connectivity log format:
++ * [time stamp]   [drm] [Major_minor] [connector name] message.....
++ * eg:
++ * [   26.590965] [drm] [Conn_LKTN]	  [DP-1] HBRx4 pass VS=0, PE=0^
++ * [   26.881060] [drm] [Conn_Mode]	  [DP-1] {2560x1080, 2784x1111@185580Khz}^
++ */
++
++#define CONN_DATA_DETECT(link, hex_data, hex_len, ...) \
++		dm_helper_conn_log(link->ctx, &link->public, hex_data, hex_len, \
++				CONN_EVENT_DETECTION, ##__VA_ARGS__)
++
++#define CONN_DATA_LINK_LOSS(link, hex_data, hex_len, ...) \
++		dm_helper_conn_log(link->ctx, &link->public, hex_data, hex_len, \
++				CONN_EVENT_LINK_LOSS, ##__VA_ARGS__)
++
++#define CONN_MSG_LT(link, ...) \
++		dm_helper_conn_log(link->ctx, &link->public, NULL, 0, \
++				CONN_EVENT_LINK_TRAINING, ##__VA_ARGS__)
++
++#define CONN_MSG_MODE(link, ...) \
++		dm_helper_conn_log(link->ctx, &link->public, NULL, 0, \
++				CONN_EVENT_MODE_SET, ##__VA_ARGS__)
+ /*
+  * Writes payload allocation table in immediate downstream device.
+  */
+@@ -100,4 +131,12 @@ bool dm_helpers_submit_i2c(
+ 		const struct dc_link *link,
+ 		struct i2c_command *cmd);
+ 
++void dm_helper_conn_log(struct dc_context *ctx,
++		const struct dc_link *link,
++		uint8_t *hex_data,
++		int hex_data_count,
++		enum conn_event event,
++		const char *msg,
++		...);
++
+ #endif /* __DM_HELPERS__ */
+diff --git a/drivers/gpu/drm/amd/dal/include/logger_types.h b/drivers/gpu/drm/amd/dal/include/logger_types.h
+index 759542a..26960e8 100644
+--- a/drivers/gpu/drm/amd/dal/include/logger_types.h
++++ b/drivers/gpu/drm/amd/dal/include/logger_types.h
+@@ -65,6 +65,7 @@ enum log_major {
+ /*23*/  LOG_MAJOR_DISPLAY_SERVICE, /*< related to Display Service*/
+ /*24*/	LOG_MAJOR_FEATURE_OVERRIDE,	/*< related to features*/
+ /*25*/	LOG_MAJOR_DETECTION,	/*< related to detection*/
++/*26*/	LOG_MAJOR_CONNECTIVITY,	/*< related to connectivity*/
+ 	LOG_MAJOR_COUNT,	/*< count of the Major categories*/
+ };
+ 
+@@ -311,6 +312,18 @@ enum log_minor {
+ */
+ 	LOG_MINOR_DETECTION_EDID_PARSER = 0,
+ 	LOG_MINOR_DETECTION_DP_CAPS,
++
++/**
++* @brief defines minor category for LOG_MAJOR_CONNECTIVITY
++*
++* @note define sub functionality related to connectivity
++*/
++	LOG_MINOR_CONNECTIVITY_MODE_SET = 0,
++	LOG_MINOR_CONNECTIVITY_DETECTION,
++	LOG_MINOR_CONNECTIVITY_LINK_TRAINING,
++	LOG_MINOR_CONNECTIVITY_LINK_LOSS,
++	LOG_MINOR_CONNECTIVITY_UNDERFLOW,
++
+ };
+ 
+ union logger_flags {
+-- 
+2.7.4
+

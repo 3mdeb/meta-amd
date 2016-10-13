@@ -1,0 +1,361 @@
+From 8d6e803a45354f029da49dc60eb2d3669859a4ea Mon Sep 17 00:00:00 2001
+From: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Date: Mon, 8 Feb 2016 13:39:40 -0500
+Subject: [PATCH 0780/1110] drm/amd/dal: enable HBR3 link training
+
+Signed-off-by: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Acked-by: Jordan Lazare <Jordan.Lazare@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          |   5 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c       | 131 +++++++++++++--------
+ drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c     |   9 +-
+ drivers/gpu/drm/amd/dal/include/dpcd_defs.h        |  29 ++++-
+ .../drm/amd/dal/include/grph_object_ctrl_defs.h    |   3 +
+ 5 files changed, 112 insertions(+), 65 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 84ee1b4..9a5eadf 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -1276,7 +1276,10 @@ static enum dc_status enable_link(struct core_stream *stream)
+ 
+ static void disable_link(struct core_stream *stream)
+ {
+-	/* TODO  dp_set_hw_test_pattern */
++	/*
++	 * TODO: implement call for dp_set_hw_test_pattern
++	 * it is needed for compliance testing
++	 */
+ 
+ 	/* here we need to specify that encoder output settings
+ 	 * need to be calculated as for the set mode,
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
+index f69743a..1cf7ca2 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link_dp.c
+@@ -54,7 +54,7 @@ static void wait_for_training_aux_rd_interval(
+ 	struct core_link* link,
+ 	uint32_t default_wait_in_micro_secs)
+ {
+-	uint8_t training_rd_interval;
++	union training_aux_rd_interval training_rd_interval;
+ 
+ 	/* overwrite the delay if rev > 1.1*/
+ 	if (link->dpcd_caps.dpcd_rev.raw >= DPCD_REV_12) {
+@@ -63,11 +63,12 @@ static void wait_for_training_aux_rd_interval(
+ 		core_link_read_dpcd(
+ 			link,
+ 			DPCD_ADDRESS_TRAINING_AUX_RD_INTERVAL,
+-			&training_rd_interval,
++			(uint8_t *)&training_rd_interval,
+ 			sizeof(training_rd_interval));
+-		default_wait_in_micro_secs = training_rd_interval ?
+-			(training_rd_interval * 4000) :
+-			default_wait_in_micro_secs;
++
++		if (training_rd_interval.bits.TRAINIG_AUX_RD_INTERVAL)
++			default_wait_in_micro_secs =
++				training_rd_interval.bits.TRAINIG_AUX_RD_INTERVAL * 4000;
+ 	}
+ 
+ 	dm_delay_in_microseconds(link->ctx, default_wait_in_micro_secs);
+@@ -96,7 +97,7 @@ static void dpcd_set_training_pattern(
+ 		"%s\n %x pattern = %x\n",
+ 		__func__,
+ 		DPCD_ADDRESS_TRAINING_PATTERN_SET,
+-		dpcd_pattern.bits.TRAINING_PATTERN_SET);
++		dpcd_pattern.v1_4.TRAINING_PATTERN_SET);
+ }
+ 
+ static void dpcd_set_link_settings(
+@@ -196,7 +197,7 @@ static void dpcd_set_lt_pattern_and_lane_settings(
+ 	/*****************************************************************
+ 	* DpcdAddress_TrainingPatternSet
+ 	*****************************************************************/
+-	dpcd_pattern.bits.TRAINING_PATTERN_SET =
++	dpcd_pattern.v1_4.TRAINING_PATTERN_SET =
+ 		hw_training_pattern_to_dpcd_training_pattern(link, pattern);
+ 
+ 	dpcd_lt_buffer[DPCD_ADDRESS_TRAINING_PATTERN_SET - dpcd_base_lt_offset]
+@@ -208,7 +209,7 @@ static void dpcd_set_lt_pattern_and_lane_settings(
+ 		"%s\n %x pattern = %x\n",
+ 		__func__,
+ 		DPCD_ADDRESS_TRAINING_PATTERN_SET,
+-		dpcd_pattern.bits.TRAINING_PATTERN_SET);
++		dpcd_pattern.v1_4.TRAINING_PATTERN_SET);
+ 
+ 
+ 	/*****************************************************************
+@@ -922,14 +923,54 @@ static bool perform_clock_recovery_sequence(
+ 	return false;
+ }
+ 
+- bool perform_link_training(
++static inline bool perform_link_training_int(
++	struct core_link *link,
++	struct link_training_settings *lt_settings,
++	bool status)
++{
++	union lane_count_set lane_count_set = { {0} };
++	union dpcd_training_pattern dpcd_pattern = { {0} };
++
++	/* 3. set training not in progress*/
++	dpcd_pattern.v1_4.TRAINING_PATTERN_SET = DPCD_TRAINING_PATTERN_VIDEOIDLE;
++	dpcd_set_training_pattern(link, dpcd_pattern);
++
++	/* 4. mainlink output idle pattern*/
++	dp_set_hw_test_pattern(link, DP_TEST_PATTERN_VIDEO_MODE);
++
++	/*
++	 * 5. post training adjust if required
++	 * If the upstream DPTX and downstream DPRX both support TPS4,
++	 * TPS4 must be used instead of POST_LT_ADJ_REQ.
++	 */
++	if (link->dpcd_caps.max_ln_count.bits.POST_LT_ADJ_REQ_SUPPORTED != 1 &&
++		get_supported_tp(link) == HW_DP_TRAINING_PATTERN_4)
++		return status;
++
++	if (status &&
++		perform_post_lt_adj_req_sequence(link, lt_settings) == false)
++		status = false;
++
++	lane_count_set.bits.LANE_COUNT_SET = lt_settings->link_settings.lane_count;
++	lane_count_set.bits.ENHANCED_FRAMING = 1;
++	lane_count_set.bits.POST_LT_ADJ_REQ_GRANTED = 0;
++
++	core_link_write_dpcd(
++		link,
++		DPCD_ADDRESS_LANE_COUNT_SET,
++		&lane_count_set.raw,
++		sizeof(lane_count_set));
++
++	return status;
++}
++
++bool perform_link_training(
+ 	struct core_link *link,
+ 	const struct dc_link_settings *link_setting,
+ 	bool skip_video_pattern)
+ {
+ 	bool status;
+-	union dpcd_training_pattern dpcd_pattern = {{0}};
+-	union lane_count_set lane_count_set = {{0}};
++
+ 	const int8_t *link_rate = "Unknown";
+ 	struct link_training_settings lt_settings;
+ 
+@@ -961,37 +1002,8 @@ static bool perform_clock_recovery_sequence(
+ 			status = true;
+ 	}
+ 
+-	if (status || !skip_video_pattern) {
+-
+-		/* 3. set training not in progress*/
+-		dpcd_pattern.bits.TRAINING_PATTERN_SET =
+-			DPCD_TRAINING_PATTERN_VIDEOIDLE;
+-		dpcd_set_training_pattern(link, dpcd_pattern);
+-
+-		/* 4. mainlink output idle pattern*/
+-		dp_set_hw_test_pattern(link, DP_TEST_PATTERN_VIDEO_MODE);
+-
+-		/* 5. post training adjust if required*/
+-		if (link->dpcd_caps.max_ln_count.bits.POST_LT_ADJ_REQ_SUPPORTED
+-			== 1) {
+-			if (status == true) {
+-				if (perform_post_lt_adj_req_sequence(
+-					link, &lt_settings) == false)
+-					status = false;
+-			}
+-
+-			lane_count_set.bits.LANE_COUNT_SET =
+-				lt_settings.link_settings.lane_count;
+-			lane_count_set.bits.ENHANCED_FRAMING = 1;
+-			lane_count_set.bits.POST_LT_ADJ_REQ_GRANTED = 0;
+-
+-			core_link_write_dpcd(
+-				link,
+-				DPCD_ADDRESS_LANE_COUNT_SET,
+-				&lane_count_set.raw,
+-				sizeof(lane_count_set));
+-		}
+-	}
++	if (status || !skip_video_pattern)
++		status = perform_link_training_int(link, &lt_settings, status);
+ 
+ 	/* 6. print status message*/
+ 	switch (lt_settings.link_settings.link_rate) {
+@@ -1008,6 +1020,9 @@ static bool perform_clock_recovery_sequence(
+ 	case LINK_RATE_RBR2:
+ 		link_rate = "RBR2";
+ 		break;
++	case LINK_RATE_HIGH3:
++		link_rate = "High3";
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -1674,9 +1689,7 @@ static void dp_wa_power_up_0010FA(struct core_link *link, uint8_t *dpcd_data,
+ 
+ static void retrieve_link_cap(struct core_link *link)
+ {
+-	uint8_t dpcd_data[
+-			DPCD_ADDRESS_EDP_CONFIG_CAP -
+-			DPCD_ADDRESS_DPCD_REV + 1];
++	uint8_t dpcd_data[DPCD_ADDRESS_TRAINING_AUX_RD_INTERVAL - DPCD_ADDRESS_DPCD_REV + 1];
+ 
+ 	union down_stream_port_count down_strm_port_count;
+ 	union edp_configuration_cap edp_config_cap;
+@@ -1688,11 +1701,29 @@ static void retrieve_link_cap(struct core_link *link)
+ 	dm_memset(&edp_config_cap, '\0',
+ 		sizeof(union edp_configuration_cap));
+ 
+-	core_link_read_dpcd(link, DPCD_ADDRESS_DPCD_REV,
+-			dpcd_data, sizeof(dpcd_data));
+-	link->dpcd_caps.dpcd_rev.raw = dpcd_data[
+-		DPCD_ADDRESS_DPCD_REV -
+-		DPCD_ADDRESS_DPCD_REV];
++	core_link_read_dpcd(
++		link,
++		DPCD_ADDRESS_DPCD_REV,
++		dpcd_data,
++		sizeof(dpcd_data));
++
++	link->dpcd_caps.dpcd_rev.raw =
++		dpcd_data[DPCD_ADDRESS_DPCD_REV - DPCD_ADDRESS_DPCD_REV];
++
++	{
++		union training_aux_rd_interval aux_rd_interval;
++
++		aux_rd_interval.raw =
++			dpcd_data[DPCD_ADDRESS_TRAINING_AUX_RD_INTERVAL];
++
++		if (aux_rd_interval.bits.EXT_RECIEVER_CAP_FIELD_PRESENT == 1) {
++			core_link_read_dpcd(
++				link,
++				DPCD_ADDRESS_DP13_DPCD_REV,
++				dpcd_data,
++				sizeof(dpcd_data));
++		}
++	}
+ 
+ 	ds_port.byte = dpcd_data[DPCD_ADDRESS_DOWNSTREAM_PORT_PRESENT -
+ 				 DPCD_ADDRESS_DPCD_REV];
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
+index a3e0da9..92d70ed 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link_hwss.c
+@@ -107,8 +107,6 @@ bool dp_set_hw_training_pattern(
+ 	enum hw_dp_training_pattern pattern)
+ {
+ 	enum dp_test_pattern test_pattern = DP_TEST_PATTERN_UNSUPPORTED;
+-	struct encoder_set_dp_phy_pattern_param pattern_param = {0};
+-	struct link_encoder *encoder = link->link_enc;
+ 
+ 	switch (pattern) {
+ 	case HW_DP_TRAINING_PATTERN_1:
+@@ -127,12 +125,7 @@ bool dp_set_hw_training_pattern(
+ 		break;
+ 	}
+ 
+-	pattern_param.dp_phy_pattern = test_pattern;
+-	pattern_param.custom_pattern = NULL;
+-	pattern_param.custom_pattern_size = 0;
+-	pattern_param.dp_panel_mode = dp_get_panel_mode(link);
+-
+-	encoder->funcs->dp_set_phy_pattern(encoder, &pattern_param);
++	dp_set_hw_test_pattern(link, test_pattern);
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/include/dpcd_defs.h b/drivers/gpu/drm/amd/dal/include/dpcd_defs.h
+index deaf506..2e9672b 100644
+--- a/drivers/gpu/drm/amd/dal/include/dpcd_defs.h
++++ b/drivers/gpu/drm/amd/dal/include/dpcd_defs.h
+@@ -188,6 +188,7 @@ enum dpcd_address {
+ 	DPCD_ADDRESS_EDP_GENERAL_CAP2 = 0x0703,
+ 
+ 	DPCD_ADDRESS_EDP_DISPLAY_CONTROL = 0x0720,
++	DPCD_ADDRESS_SUPPORTED_LINK_RATES = 0x00010, /* edp 1.4 */
+ 	DPCD_ADDRESS_EDP_BACKLIGHT_SET = 0x0721,
+ 	DPCD_ADDRESS_EDP_BACKLIGHT_BRIGHTNESS_MSB = 0x0722,
+ 	DPCD_ADDRESS_EDP_BACKLIGHT_BRIGHTNESS_LSB = 0x0723,
+@@ -232,6 +233,9 @@ enum dpcd_address {
+ 	DPCD_ADDRESS_PSR_DBG_REGISTER0 = 0x2009,
+ 	DPCD_ADDRESS_PSR_DBG_REGISTER1 = 0x200A,
+ 
++	DPCD_ADDRESS_DP13_DPCD_REV = 0x2200,
++	DPCD_ADDRESS_DP13_MAX_LINK_RATE = 0x2201,
++
+ 	/* Travis specific addresses */
+ 	DPCD_ADDRESS_TRAVIS_SINK_DEV_SEL = 0x5f0,
+ 	DPCD_ADDRESS_TRAVIS_SINK_ACCESS_OFFSET	= 0x5f1,
+@@ -242,7 +246,8 @@ enum dpcd_revision {
+ 	DPCD_REV_10 = 0x10,
+ 	DPCD_REV_11 = 0x11,
+ 	DPCD_REV_12 = 0x12,
+-	DPCD_REV_13 = 0x13
++	DPCD_REV_13 = 0x13,
++	DPCD_REV_14 = 0x14
+ };
+ 
+ enum dp_pwr_state {
+@@ -595,7 +600,7 @@ union audio_test_mode {
+ 	uint8_t raw;
+ };
+ 
+-union audio_tes_tpattern_period {
++union audio_test_pattern_period {
+ 	struct {
+ 		uint8_t PATTERN_PERIOD:4;
+ 		uint8_t RESERVED:4;
+@@ -609,12 +614,16 @@ struct audio_test_pattern_type {
+ 
+ union dpcd_training_pattern {
+ 	struct {
+-		uint8_t TRAINING_PATTERN_SET:2;
+-		uint8_t LINK_QUAL_PATTERN_SET:2;
++		uint8_t TRAINING_PATTERN_SET:4;
+ 		uint8_t RECOVERED_CLOCK_OUT_EN:1;
+ 		uint8_t SCRAMBLING_DISABLE:1;
+-		uint8_t RESERVED:2;
+-	} bits;
++		uint8_t SYMBOL_ERROR_COUNT_SEL:2;
++	} v1_4;
++	struct {
++		uint8_t TRAINING_PATTERN_SET:2;
++		uint8_t LINK_QUAL_PATTERN_SET:2;
++		uint8_t RESERVED:4;
++	} v1_3;
+ 	uint8_t raw;
+ };
+ 
+@@ -872,4 +881,12 @@ union psr_capabilities {
+ 	uint8_t raw;
+ };
+ 
++union training_aux_rd_interval {
++	struct {
++		uint8_t TRAINIG_AUX_RD_INTERVAL:7;
++		uint8_t EXT_RECIEVER_CAP_FIELD_PRESENT:1;
++	} bits;
++	uint8_t raw;
++};
++
+ #endif /* __DAL_DPCD_DEFS_H__ */
+diff --git a/drivers/gpu/drm/amd/dal/include/grph_object_ctrl_defs.h b/drivers/gpu/drm/amd/dal/include/grph_object_ctrl_defs.h
+index 2ed01bd..fe65b18 100644
+--- a/drivers/gpu/drm/amd/dal/include/grph_object_ctrl_defs.h
++++ b/drivers/gpu/drm/amd/dal/include/grph_object_ctrl_defs.h
+@@ -291,6 +291,9 @@ struct spread_spectrum_info {
+ struct graphics_object_encoder_cap_info {
+ 	uint32_t dp_hbr2_cap:1;
+ 	uint32_t dp_hbr2_validated:1;
++	/*
++	 * TODO: added MST and HDMI 6G capable flags
++	 */
+ 	uint32_t reserved:15;
+ };
+ 
+-- 
+2.7.4
+

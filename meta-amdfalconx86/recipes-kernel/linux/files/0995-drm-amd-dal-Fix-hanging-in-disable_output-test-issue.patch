@@ -1,0 +1,258 @@
+From 52852a1a03bb3a608af9a56a88c250915ea7b37a Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Wed, 30 Mar 2016 18:05:49 -0400
+Subject: [PATCH 0995/1110] drm/amd/dal: Fix hanging in disable_output test
+ issue.
+
+Add waiting for pflip submission done before commiting surface.
+Add debug prints on pflip status and surface address.
+
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c      | 30 ++++++++---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    | 60 +++++++++++++++++++---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |  8 ++-
+ 3 files changed, 85 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index 038dea4..4defc70 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -149,8 +149,10 @@ static struct amdgpu_crtc *get_crtc_by_target(
+ 	 * following if is check inherited from both functions where this one is
+ 	 * used now. Need to be checked why it could happen.
+ 	 */
+-	if (dc_target == NULL)
++	if (dc_target == NULL) {
++		WARN_ON(1);
+ 		return adev->mode_info.crtcs[0];
++	}
+ 
+ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
+ 		amdgpu_crtc = to_amdgpu_crtc(crtc);
+@@ -176,16 +178,21 @@ static void dm_pflip_high_irq(void *interrupt_params)
+ 	amdgpu_crtc = get_crtc_by_target(adev, dc_target);
+ 
+ 	/* IRQ could occur when in initial stage */
+-	if(amdgpu_crtc == NULL)
++	/*TODO work and BO cleanup */
++	if (amdgpu_crtc == NULL) {
++		DRM_DEBUG_DRIVER("CRTC is null, returning.\n");
+ 		return;
++	}
+ 
+ 	spin_lock_irqsave(&adev->ddev->event_lock, flags);
+ 	works = amdgpu_crtc->pflip_works;
++
+ 	if (amdgpu_crtc->pflip_status != AMDGPU_FLIP_SUBMITTED){
+-		DRM_DEBUG_DRIVER("amdgpu_crtc->pflip_status = %d != "
+-						 "AMDGPU_FLIP_SUBMITTED(%d)\n",
++		DRM_DEBUG_DRIVER("amdgpu_crtc->pflip_status = %d !=AMDGPU_FLIP_SUBMITTED(%d) on crtc:%d[%p] \n",
+ 						 amdgpu_crtc->pflip_status,
+-						 AMDGPU_FLIP_SUBMITTED);
++						 AMDGPU_FLIP_SUBMITTED,
++						 amdgpu_crtc->crtc_id,
++						 amdgpu_crtc);
+ 		spin_unlock_irqrestore(&adev->ddev->event_lock, flags);
+ 		return;
+ 	}
+@@ -203,6 +210,9 @@ static void dm_pflip_high_irq(void *interrupt_params)
+ 
+ 	spin_unlock_irqrestore(&adev->ddev->event_lock, flags);
+ 
++	DRM_DEBUG_DRIVER("%s - crtc :%d[%p], pflip_stat:AMDGPU_FLIP_NONE, work: %p,\n",
++					__func__, amdgpu_crtc->crtc_id, amdgpu_crtc, works);
++
+ 	drm_crtc_vblank_put(&amdgpu_crtc->base);
+ 	schedule_work(&works->unpin_work);
+ }
+@@ -1131,12 +1141,20 @@ static void dm_page_flip(struct amdgpu_device *adev,
+ 	 * Received a page flip call after the display has been reset.
+ 	 * Just return in this case. Everything should be clean-up on reset.
+ 	 */
+-	if (!target)
++
++	if (!target) {
++		WARN_ON(1);
+ 		return;
++	}
+ 
+ 	addr.address.grph.addr.low_part = lower_32_bits(crtc_base);
+ 	addr.address.grph.addr.high_part = upper_32_bits(crtc_base);
+ 
++	DRM_DEBUG_DRIVER("%s Flipping to hi: 0x%x, low: 0x%x \n",
++			 __func__,
++			 addr.address.grph.addr.high_part,
++			 addr.address.grph.addr.low_part);
++
+ 	dc_flip_surface_addrs(
+ 			adev->dm.dc,
+ 			dc_target_get_status(target)->surfaces,
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index 9f02d3e..d2548b6 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -624,7 +624,8 @@ static void calculate_stream_scaling_settings(
+ static void dm_dc_surface_commit(
+ 		struct dc *dc,
+ 		struct drm_crtc *crtc,
+-		struct dm_connector_state *dm_state)
++		struct dm_connector_state *dm_state
++		)
+ {
+ 	struct dc_surface *dc_surface;
+ 	const struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+@@ -2023,6 +2024,38 @@ static enum dm_commit_action get_dm_commit_action(struct drm_crtc_state *state)
+ 	}
+ }
+ 
++
++typedef bool (*predicate)(struct amdgpu_crtc *acrtc);
++
++static void wait_while_pflip_status(struct amdgpu_device *adev,
++		struct amdgpu_crtc *acrtc, predicate f) {
++	int count = 0;
++	while (f(acrtc)) {
++		/* Spin Wait*/
++		msleep(1);
++		count++;
++		if (count == 1000) {
++			DRM_ERROR("%s - crtc:%d[%p], pflip_stat:%d, probable hang!\n",
++										__func__, acrtc->crtc_id,
++										acrtc,
++										acrtc->pflip_status);
++			BUG_ON(1);
++		}
++	}
++
++	DRM_DEBUG_DRIVER("%s - Finished waiting for:%d msec, crtc:%d[%p], pflip_stat:%d \n",
++											__func__,
++											count,
++											acrtc->crtc_id,
++											acrtc,
++											acrtc->pflip_status);
++}
++
++static bool pflip_in_progress_predicate(struct amdgpu_crtc *acrtc)
++{
++	return acrtc->pflip_status != AMDGPU_FLIP_NONE;
++}
++
+ static void manage_dm_interrupts(
+ 	struct amdgpu_device *adev,
+ 	struct amdgpu_crtc *acrtc,
+@@ -2044,9 +2077,8 @@ static void manage_dm_interrupts(
+ 			&adev->pageflip_irq,
+ 			irq_type);
+ 	} else {
+-		while (acrtc->pflip_status != AMDGPU_FLIP_NONE) {
+-			msleep(1);
+-		}
++		wait_while_pflip_status(adev, acrtc,
++				pflip_in_progress_predicate);
+ 
+ 		amdgpu_irq_put(
+ 			adev,
+@@ -2056,6 +2088,12 @@ static void manage_dm_interrupts(
+ 	}
+ }
+ 
++
++static bool pflip_pending_predicate(struct amdgpu_crtc *acrtc)
++{
++	return acrtc->pflip_status == AMDGPU_FLIP_PENDING;
++}
++
+ int amdgpu_dm_atomic_commit(
+ 	struct drm_device *dev,
+ 	struct drm_atomic_state *state,
+@@ -2130,7 +2168,7 @@ int amdgpu_dm_atomic_commit(
+ 					aconnector,
+ 					&crtc->state->mode);
+ 
+-			DRM_INFO("Atomic commit: SET.\n");
++			DRM_INFO("Atomic commit: SET crtc id %d: [%p]\n", acrtc->crtc_id, acrtc);
+ 
+ 			if (!new_target) {
+ 				/*
+@@ -2182,7 +2220,7 @@ int amdgpu_dm_atomic_commit(
+ 
+ 		case DM_COMMIT_ACTION_DPMS_OFF:
+ 		case DM_COMMIT_ACTION_RESET:
+-			DRM_INFO("Atomic commit: RESET.\n");
++			DRM_INFO("Atomic commit: RESET. crtc id %d:[%p]\n", acrtc->crtc_id, acrtc);
+ 			/* i.e. reset mode */
+ 			if (acrtc->target) {
+ 				manage_dm_interrupts(adev, acrtc, false);
+@@ -2214,6 +2252,7 @@ int amdgpu_dm_atomic_commit(
+ 	for_each_plane_in_state(state, plane, old_plane_state, i) {
+ 		struct drm_plane_state *plane_state = plane->state;
+ 		struct drm_crtc *crtc = plane_state->crtc;
++		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 		struct drm_framebuffer *fb = plane_state->fb;
+ 		struct drm_connector *connector;
+ 		struct dm_connector_state *dm_state = NULL;
+@@ -2258,6 +2297,14 @@ int amdgpu_dm_atomic_commit(
+ 			if (!dm_state)
+ 				continue;
+ 
++			/*
++			 * if flip is pending (ie, still waiting for fence to return
++			 * before address is submitted) here, we cannot commit_surface
++			 * as commit_surface will pre-maturely write out the future
++			 * address. wait until flip is submitted before proceeding.
++			 */
++			wait_while_pflip_status(adev, acrtc, pflip_pending_predicate);
++
+ 			dm_dc_surface_commit(
+ 				dm->dc,
+ 				crtc,
+@@ -2367,6 +2414,7 @@ void dm_restore_drm_connector_state(struct drm_device *dev, struct drm_connector
+ 		/* DC is optimized not to do anything if 'targets' didn't change. */
+ 		dc_commit_targets(dc, commit_targets, commit_targets_count);
+ 
++
+ 		dm_dc_surface_commit(dc, &disconnected_acrtc->base,
+ 				to_dm_connector_state(
+ 				connector->state));
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index c5aa460..e71088d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -825,6 +825,7 @@ bool dc_commit_surfaces_to_target(
+ 	if (core_dc->current_context.target_count == 0)
+ 		return false;
+ 
++
+ 	context = dm_alloc(sizeof(struct validate_context));
+ 
+ 	resource_validate_ctx_copy_construct(&core_dc->current_context, context);
+@@ -916,10 +917,14 @@ bool dc_commit_surfaces_to_target(
+ 			dal_logger_write(core_dc->ctx->logger,
+ 						LOG_MAJOR_INTERFACE_TRACE,
+ 						LOG_MINOR_COMPONENT_DC,
+-						"Pipe:%d 0x%x: src: %d, %d, %d,"
++					   "Pipe:%d 0x%x: addr hi:0x%x, "
++					   "addr low:0x%x, "
++					   "src: %d, %d, %d,"
+ 						" %d; dst: %d, %d, %d, %d;\n",
+ 						pipe_ctx->pipe_idx,
+ 						dc_surface,
++					    dc_surface->address.grph.addr.high_part,
++					    dc_surface->address.grph.addr.low_part,
+ 						dc_surface->src_rect.x,
+ 						dc_surface->src_rect.y,
+ 						dc_surface->src_rect.width,
+@@ -951,6 +956,7 @@ bool dc_commit_surfaces_to_target(
+ 						&context->pp_display_cfg);
+ 	}
+ 
++
+ 	resource_validate_ctx_destruct(&(core_dc->current_context));
+ 	core_dc->current_context = *context;
+ 	dm_free(context);
+-- 
+2.7.4
+
