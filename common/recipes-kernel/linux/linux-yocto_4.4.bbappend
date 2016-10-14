@@ -4,6 +4,9 @@ PR := "${INC_PR}.1"
 
 KBRANCH_amdx86 ?= "standard/base"
 KMACHINE_amdx86 ?= "common-pc-64"
+
+SRCREV_machine_amdx86 ?= "7d1401a0dd9bebfe49937ca7d9785972e0cc76d0"
+SRCREV_meta_amdx86 ?= "e66032e2d93da24c6b9137dbbe66008c77f6d4aa"
 LINUX_VERSION_amdx86 ?= "4.4.20"
 
 SRC_URI_append_amdx86 += " \
