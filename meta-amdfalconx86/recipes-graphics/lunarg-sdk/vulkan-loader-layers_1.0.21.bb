@@ -48,6 +48,8 @@ INSANE_SKIP_${PN} = "dev-so"
 do_install_append() {
     cp -f ${B}/demos/*.spv ${D}${bindir}
     cp -f ${B}/demos/*.ppm ${D}${bindir}
+    mv ${D}${bindir}/tri ${D}${bindir}/tri-vulkan
+    mv ${D}${bindir}/cube ${D}${bindir}/cube-vulkan
 
     install -d ${D}${sysconfdir}/explicit_layer.d
     cp -f ${B}/layers/*.json ${D}${sysconfdir}/explicit_layer.d
