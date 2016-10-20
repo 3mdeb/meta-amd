@@ -2,18 +2,19 @@ FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 SRCREV_amd = "b9b19162ee3f8d68be76b71adf2a290cbb675660"
 LIC_FILES_CHKSUM_amd = "file://docs/license.html;md5=6a23445982a7a972ac198e93cc1cb3de"
 PV_amd = "11.0.8+git${SRCPV}"
-DEPENDS_append_amd = " libvdpau libomxil python-mako-native libdrm nettle"
-GALLIUMDRIVERS_append_amd = ",r300,r600,radeonsi"
-GALLIUMDRIVERS_LLVM_amd = "r300,svga${@',${GALLIUMDRIVERS_LLVM33}' if ${GALLIUMDRIVERS_LLVM33_ENABLED} else ',nouveau'}"
-PACKAGECONFIG_append_amd = " xvmc gallium r600 gallium-llvm"
+DEPENDS_append_amd = " libvdpau libomxil python-mako-native"
 
+PACKAGECONFIG[va] = "--enable-va,--disable-va,libva"
+PACKAGECONFIG_append_amd = " xvmc gallium r600 gallium-llvm xa"
 PACKAGECONFIG_append_radeon = " va"
 PACKAGECONFIG_append_amdgpu = " va"
+PACKAGECONFIG_remove_amd = "dri3"
+PACKAGECONFIG_remove_amdfalconx86 = "xvmc"
+
 LIBVA_PLATFORMS  = "libva"
 LIBVA_PLATFORMS .= "${@bb.utils.contains('DISTRO_FEATURES', 'x11', ' libva-x11', '', d)}"
 LIBVA_PLATFORMS .= "${@bb.utils.contains('DISTRO_FEATURES', 'wayland', ' libva-wayland', '', d)}"
 LIBVA_PLATFORMS .= "${@bb.utils.contains('DISTRO_FEATURES', 'opengl', ' libva-gl', '', d)}"
-PACKAGECONFIG[va] = "--enable-va,--disable-va,libva"
 RDEPENDS_mesa-megadriver += "${@bb.utils.contains('PACKAGECONFIG', 'va', '${LIBVA_PLATFORMS}', '', d)}"
 
 MESA_LLVM_RELEASE_amd = "3.7.1"
@@ -30,19 +31,15 @@ SRC_URI_amd = "\
 "
 
 EXTRA_OECONF_append_amd = " \
-		 --disable-dri3 \
 		 --enable-vdpau \
 		 --enable-osmesa \
-		 --enable-xa \
 		 --enable-glx \
 		 --enable-omx \
 		 --enable-r600-llvm-compiler \
-		 --enable-llvm-shared-libs \
 		 --with-omx-libdir=${libdir}/bellagio \
 		"
 
 EXTRA_OECONF_append_amdfalconx86 = " \
-		 --disable-xvmc \
 		 --enable-texture-float \
 		"
 
@@ -60,16 +57,6 @@ FILES_libvdpau-${PN}-dev = "${libdir}/vdpau/libvdpau*${SOLIBSDEV} \
                             ${libdir}/vdpau/libvdpau*.la"
 FILES_${PN}-dbg += "${libdir}/vdpau/.debug"
 
-PACKAGES =+ "libxatracker-${PN} libxatracker-${PN}-dev"
-FILES_libxatracker-${PN} = "${libdir}/libxatracker${SOLIBS}"
-FILES_libxatracker-${PN}-dev = "${includedir}/xa_tracker.h \
-                                ${includedir}/xa_composite.h \
-                                ${includedir}/xa_context.h \
-                                ${libdir}/pkgconfig/xatracker.pc \
-                                ${libdir}/libxatracker${SOLIBSDEV} \
-                                ${libdir}/libxatracker.la \
-                                "
-
 #
 # libomx files are non-versioned so we put *.so directly in the
 # main package as opposed to the -dev package.
@@ -81,8 +68,9 @@ FILES_${PN}-dbg += "${libdir}/bellagio/.debug"
 
 # Set DRIDRIVERS with anonymous python so we can effectively
 # override the _append_x86-64 assignement from mesa.inc.
-python __anonymous () {
-    d.setVar("DRIDRIVERS_amd", "radeon")
+python () {
+    d.setVar("DRIDRIVERS", "swrast,radeon")
+    d.setVar("GALLIUMDRIVERS", "swrast,r300,r600,radeonsi")
 }
 
 # We'll need to setup some symlinks for the va enabled
@@ -95,10 +83,7 @@ INSANE_SKIP_${PN}-megadriver += "${@bb.utils.contains('PACKAGECONFIG', 'va', 'de
 # and generates warnings so disable it.
 MESA_CRYPTO = ""
 
-# Install override from mesa.inc
 do_install_append_amd() {
-	cp ${S}/include/EGL/eglplatform.h ${D}${includedir}/EGL/eglplatform.h
-
 	# Create symlinks for the gallium drivers to be able to play
 	# through the va enabled driver by default.
 	if ${@bb.utils.contains('PACKAGECONFIG','va','true','false',d)}; then
