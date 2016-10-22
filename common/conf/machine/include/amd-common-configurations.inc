@@ -25,6 +25,9 @@ MACHINE_EXTRA_RRECOMMENDS += "${@bb.utils.contains_any("DISTRO", "mel mel-lite",
 
 RELEASE_IMAGE ?= "core-image-sato"
 
+# Add serial consoles to kernel commandline, these should occur before the tty0
+APPEND += "${KERNEL_SERIAL_CONSOLE}"
+
 # Make sure the kernel messages go to the VGA console
 APPEND += "console=tty0"
 
