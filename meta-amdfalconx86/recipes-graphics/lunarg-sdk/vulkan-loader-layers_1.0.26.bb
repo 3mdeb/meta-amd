@@ -19,15 +19,13 @@ LIC_FILES_CHKSUM = "file://LICENSE.txt;md5=99c647ca3d4f6a4b9d8628f757aad156"
 
 S = "${WORKDIR}/git"
 
-SRCREV = "97e3b677d9681aa8d420c314edae96c4bf72246d"
+SRCREV = "ebf46deb849a2d4cab3382c606a9fe36699dfa78"
 SRC_URI = "git://github.com/KhronosGroup/Vulkan-LoaderAndValidationLayers;branch=sdk-${PV} \
            file://0001-CMakeLists-add-include-path-so-Xlib.h-is-found-as-ne.patch \
-           file://0002-layers-obey-CXX_FLAGS.patch \
            file://0003-obey-CMAKE_INSTALL_LIBDIR.patch \
            file://0004-install-the-vulkan-loader.patch \
            file://0005-install-demos.patch \
            file://0006-json-correct-layer-lib-paths.patch \
-           file://0007-obey-CMAKE_INSTALL_PREFIX.patch \
            file://0008-demos-make-shader-location-relative.patch"
 
 EXTRA_OECMAKE = " \

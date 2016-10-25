@@ -14,11 +14,12 @@ S = "${WORKDIR}/git"
 SPIRV_HEADERS_LOCATION = "${S}/external/spirv-headers"
 HEADERS_VERSION = "1.1"
 
-SRCREV_spirv-tools = "6c61bf2dfadf70ab5fe1b0fb918ba03b7afa2396"
-SRCREV_spirv-headers = "3814effb879ab5a98a7b9288a4b4c7849d2bc8ac"
+SRCREV_spirv-tools = "923a4596b44831a07060df45caacb522613730c9"
+SRCREV_spirv-headers = "33d41376d378761ed3a4c791fc4b647761897f26"
 SRC_URI = "git://github.com/KhronosGroup/SPIRV-Tools;protocol=http;name=spirv-tools \
            git://github.com/KhronosGroup/SPIRV-Headers;name=spirv-headers;destsuffix=${SPIRV_HEADERS_LOCATION} \
-           file://0001-obey-CMAKE_INSTALL_LIBDIR.patch"
+           file://0001-obey-CMAKE_INSTALL_LIBDIR.patch \
+           file://0002-spirv-lesspipe.sh-allow-using-generic-shells.patch"
 
 do_install_append() {
     if test -d ${SPIRV_HEADERS_LOCATION}/include/spirv/${HEADERS_VERSION}; then
