@@ -14,11 +14,10 @@ LIC_FILES_CHKSUM = "file://LICENSE.txt;md5=99c647ca3d4f6a4b9d8628f757aad156"
 
 S = "${WORKDIR}/git"
 
-SRCREV = "769f8c8455be6a131aa976a19d07d531bed9291e"
+SRCREV = "8a3afccb56cfc03d4afb06819f2b8db4bbf3364d"
 SRC_URI = "git://github.com/LunarG/VulkanSamples;branch=sdk-${PV} \
            file://0001-Layer-Samples-fix-build-without-BUILD_LAYERS.patch \
-           file://0002-install-samples.patch \
-           file://0003-obey-CMAKE_INSTALL_PREFIX.patch"
+           file://0002-install-samples.patch"
 
 EXTRA_OECMAKE = " \
     -DBUILD_LOADER=0 \

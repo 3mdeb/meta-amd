@@ -14,7 +14,7 @@ LIC_FILES_CHKSUM = "file://glslang/Include/Types.h;beginline=1;endline=36;md5=66
 
 S = "${WORKDIR}/git"
 
-SRCREV = "e4821e43c86d97bcf65fb07c1f70471b7102978d"
+SRCREV = "81cd764b5ffc475bc73f1fb35f75fd1171bb2343"
 SRC_URI = "git://github.com/KhronosGroup/glslang \
            file://0001-CMakeLists.txt-obey-CMAKE_INSTALL_LIBDIR.patch"
 
