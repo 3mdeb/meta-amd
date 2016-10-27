@@ -1,0 +1,251 @@
+From 13a790e8d490f59170004fd20d74c0267d08c69e Mon Sep 17 00:00:00 2001
+From: Maruthi Srinivas Bayyavarapu <Maruthi.Bayyavarapu@amd.com>
+Date: Fri, 1 Jul 2016 12:47:49 +0530
+Subject: [PATCH 05/17] ASoc: AMD: Machine driver for AMD ACP Audio engine
+ using Realtek RT286 codec
+
+Added machine driver support in the Kconfig file and the Makefile
+
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ sound/soc/Kconfig         |   1 +
+ sound/soc/Makefile        |   1 +
+ sound/soc/amd/Kconfig     |   7 ++
+ sound/soc/amd/Makefile    |   2 +
+ sound/soc/amd/acp-rt286.c | 175 ++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 186 insertions(+)
+ create mode 100644 sound/soc/amd/acp-rt286.c
+
+diff --git a/sound/soc/Kconfig b/sound/soc/Kconfig
+index 7ff7d88..a34e9e9 100644
+--- a/sound/soc/Kconfig
++++ b/sound/soc/Kconfig
+@@ -38,6 +38,7 @@ config SND_SOC_TOPOLOGY
+ 
+ # All the supported SoCs
+ source "sound/soc/adi/Kconfig"
++source "sound/soc/amd/Kconfig"
+ source "sound/soc/atmel/Kconfig"
+ source "sound/soc/au1x/Kconfig"
+ source "sound/soc/bcm/Kconfig"
+diff --git a/sound/soc/Makefile b/sound/soc/Makefile
+index 8eb06db..3ab378b 100644
+--- a/sound/soc/Makefile
++++ b/sound/soc/Makefile
+@@ -18,6 +18,7 @@ obj-$(CONFIG_SND_SOC)	+= snd-soc-core.o
+ obj-$(CONFIG_SND_SOC)	+= codecs/
+ obj-$(CONFIG_SND_SOC)	+= generic/
+ obj-$(CONFIG_SND_SOC)	+= adi/
++obj-$(CONFIG_SND_SOC)   += amd/
+ obj-$(CONFIG_SND_SOC)	+= atmel/
+ obj-$(CONFIG_SND_SOC)	+= au1x/
+ obj-$(CONFIG_SND_SOC)	+= bcm/
+diff --git a/sound/soc/amd/Kconfig b/sound/soc/amd/Kconfig
+index 78187eb..3724f54 100644
+--- a/sound/soc/amd/Kconfig
++++ b/sound/soc/amd/Kconfig
+@@ -1,3 +1,10 @@
++config SND_SOC_AMD_CZ_RT286_MACH
++        tristate "AMD ASoC Audio driver for Carrizo with rt286 codec"
++       select SND_SOC_RT286
++       select SND_SOC_AMD_ACP
++        depends on I2C_DESIGNWARE_PLATFORM
++        help
++           This option enables AMD I2S Audio support on Carrizo with ALC288 codec.
+ config SND_SOC_AMD_ACP
+ 	tristate "AMD Audio Coprocessor support"
+ 	help
+diff --git a/sound/soc/amd/Makefile b/sound/soc/amd/Makefile
+index 1a66ec0..a75574d 100644
+--- a/sound/soc/amd/Makefile
++++ b/sound/soc/amd/Makefile
+@@ -1,3 +1,5 @@
+ snd-soc-acp-pcm-objs	:= acp-pcm-dma.o
++snd-soc-acp-rt286-mach-objs := acp-rt286.o
+ 
+ obj-$(CONFIG_SND_SOC_AMD_ACP) += snd-soc-acp-pcm.o
++obj-$(CONFIG_SND_SOC_AMD_CZ_RT286_MACH) += snd-soc-acp-rt286-mach.o
+diff --git a/sound/soc/amd/acp-rt286.c b/sound/soc/amd/acp-rt286.c
+new file mode 100644
+index 0000000..3fa714e
+--- /dev/null
++++ b/sound/soc/amd/acp-rt286.c
+@@ -0,0 +1,175 @@
++/*
++ * Machine driver for AMD ACP Audio engine using Realtek RT286 codec
++ *
++ * Copyright 2014-2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ *
++ */
++
++#include <sound/core.h>
++#include <sound/soc.h>
++#include <sound/pcm.h>
++#include <sound/pcm_params.h>
++#include <sound/soc-dapm.h>
++#include <sound/jack.h>
++#include <linux/gpio.h>
++#include <linux/module.h>
++#include <linux/i2c.h>
++#include <linux/acpi.h>
++
++#include "../codecs/rt286.h"
++
++static struct snd_soc_jack cz_jack;
++static struct snd_soc_jack_pin cz_pins[] = {
++	{
++		.pin = "Analog Mic",
++		.mask = SND_JACK_MICROPHONE,
++	},
++	{
++		.pin = "Headphones",
++		.mask = SND_JACK_HEADPHONE,
++	},
++};
++
++static int cz_init(struct snd_soc_pcm_runtime *rtd)
++{
++	int ret;
++	struct snd_soc_card *card;
++	struct snd_soc_codec *codec;
++	struct snd_soc_dai *codec_dai = rtd->codec_dai;
++
++	codec = rtd->codec;
++	card = rtd->card;
++
++	ret = snd_soc_dai_set_sysclk(codec_dai, RT286_SCLK_S_PLL, 24000000,
++					SND_SOC_CLOCK_OUT);
++	if (ret < 0) {
++		dev_err(card->dev, "unable to set codec dai clock\n");
++		return ret;
++	}
++	ret = snd_soc_card_jack_new(card, "Headset",
++		SND_JACK_HEADSET, &cz_jack, cz_pins, ARRAY_SIZE(cz_pins));
++
++	if (ret)
++		return ret;
++
++	rt286_mic_detect(codec, &cz_jack);
++	return 0;
++}
++
++static struct snd_soc_dai_link cz_dai_rt286[] = {
++	{
++		.name = "amd-rt286-play",
++		.stream_name = "RT286_AIF1",
++		.platform_name = "acp_audio_dma.0.auto",
++		.cpu_dai_name = "designware-i2s.1.auto",
++		.codec_dai_name = "rt286-aif1",
++		.codec_name = "i2c-RTK0000:00",
++		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF
++				| SND_SOC_DAIFMT_CBM_CFM,
++		.init = cz_init,
++	},
++	{
++
++		.name = "amd-rt286-cap",
++		.stream_name = "RT286_AIF1",
++		.platform_name = "acp_audio_dma.0.auto",
++		.cpu_dai_name = "designware-i2s.2.auto",
++		.codec_dai_name = "rt286-aif1",
++		.codec_name = "i2c-RTK0000:00",
++		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF
++				| SND_SOC_DAIFMT_CBM_CFM,
++		.init = cz_init,
++	},
++
++};
++
++static const struct snd_soc_dapm_widget cz_widgets[] = {
++	SND_SOC_DAPM_HP("Headphones", NULL),
++	SND_SOC_DAPM_MIC("Analog Mic", NULL),
++};
++
++static const struct snd_soc_dapm_route cz_audio_route[] = {
++	{"Headphones", NULL, "HPO L"},
++	{"Headphones", NULL, "HPO R"},
++	{"MIC1", NULL, "Analog Mic"},
++};
++
++static struct snd_soc_card cz_card = {
++	.name = "acp-rt286",
++	.owner = THIS_MODULE,
++	.dai_link = cz_dai_rt286,
++	.num_links = 2,
++
++	.dapm_widgets = cz_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(cz_widgets),
++	.dapm_routes = cz_audio_route,
++	.num_dapm_routes = ARRAY_SIZE(cz_audio_route),
++};
++
++static int cz_probe(struct platform_device *pdev)
++{
++	int ret;
++	struct snd_soc_card *card;
++
++	card = &cz_card;
++	cz_card.dev = &pdev->dev;
++	platform_set_drvdata(pdev, card);
++	ret = snd_soc_register_card(card);
++	if (ret) {
++		dev_err(&pdev->dev,
++				"snd_soc_register_card(%s) failed: %d\n",
++				cz_card.name, ret);
++		return ret;
++	}
++	return 0;
++}
++
++static int cz_remove(struct platform_device *pdev)
++{
++	struct snd_soc_card *card;
++
++	card = platform_get_drvdata(pdev);
++	snd_soc_unregister_card(card);
++
++	return 0;
++}
++
++static const struct acpi_device_id cz_audio_acpi_match[] = {
++	{ "I2SC1002", 0 },
++	{},
++};
++
++static struct platform_driver cz_pcm_driver = {
++	.driver = {
++		.name = "cz-rt288",
++		.acpi_match_table = ACPI_PTR(cz_audio_acpi_match),
++		.pm = &snd_soc_pm_ops,
++	},
++	.probe = cz_probe,
++	.remove = cz_remove,
++};
++
++module_platform_driver(cz_pcm_driver);
++
++MODULE_AUTHOR("Maruthi.Bayyavarapu@amd.com");
++MODULE_DESCRIPTION("cz-rt288 audio support");
++MODULE_LICENSE("GPL v2");
+-- 
+2.7.4
+

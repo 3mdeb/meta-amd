@@ -1,0 +1,370 @@
+From b4b235644a4e6a1d81da5c40dc492f1be70dcaeb Mon Sep 17 00:00:00 2001
+From: Maruthi Srinivas Bayyavarapu <Maruthi.Bayyavarapu@amd.com>
+Date: Fri, 1 Jul 2016 13:33:43 +0530
+Subject: [PATCH 11/17] ALSA:Soc:RT286Codec :Modifications to ALSA SOC Audio
+
+Codec Driver.
+
+Signed-off-by: Maruthi Bayyavarapu <maruthi.bayyavarapu@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ sound/soc/codecs/rt286.c | 197 ++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 169 insertions(+), 28 deletions(-)
+
+diff --git a/sound/soc/codecs/rt286.c b/sound/soc/codecs/rt286.c
+index af2ed77..c67317b 100644
+--- a/sound/soc/codecs/rt286.c
++++ b/sound/soc/codecs/rt286.c
+@@ -19,6 +19,7 @@
+ #include <linux/spi/spi.h>
+ #include <linux/dmi.h>
+ #include <linux/acpi.h>
++#include <linux/gpio.h>
+ #include <sound/core.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+@@ -29,16 +30,14 @@
+ #include <sound/jack.h>
+ #include <linux/workqueue.h>
+ #include <sound/rt286.h>
++#include <sound/hda_verbs.h>
+ 
+-#include "rl6347a.h"
+ #include "rt286.h"
+ 
+ #define RT286_VENDOR_ID 0x10ec0286
+ #define RT288_VENDOR_ID 0x10ec0288
+ 
+ struct rt286_priv {
+-	struct reg_default *index_cache;
+-	int index_cache_size;
+ 	struct regmap *regmap;
+ 	struct snd_soc_codec *codec;
+ 	struct rt286_platform_data pdata;
+@@ -47,9 +46,10 @@ struct rt286_priv {
+ 	struct delayed_work jack_detect_work;
+ 	int sys_clk;
+ 	int clk_id;
++	struct reg_default *index_cache;
+ };
+ 
+-static const struct reg_default rt286_index_def[] = {
++static struct reg_default rt286_index_def[] = {
+ 	{ 0x01, 0xaaaa },
+ 	{ 0x02, 0x8aaa },
+ 	{ 0x03, 0x0002 },
+@@ -186,6 +186,94 @@ static bool rt286_readable_register(struct device *dev, unsigned int reg)
+ 	}
+ }
+ 
++static int rt286_hw_write(void *context, unsigned int reg, unsigned int value)
++{
++	struct i2c_client *client = context;
++	struct rt286_priv *rt286 = i2c_get_clientdata(client);
++	u8 data[4];
++	int ret, i;
++
++	/* handle index registers */
++	if (reg <= 0xff) {
++		rt286_hw_write(client, RT286_COEF_INDEX, reg);
++		for (i = 0; i < INDEX_CACHE_SIZE; i++) {
++			if (reg == rt286->index_cache[i].reg) {
++				rt286->index_cache[i].def = value;
++				break;
++			}
++
++		}
++		reg = RT286_PROC_COEF;
++	}
++
++	data[0] = (reg >> 24) & 0xff;
++	data[1] = (reg >> 16) & 0xff;
++	/*
++	 * 4 bit VID: reg should be 0
++	 * 12 bit VID: value should be 0
++	 * So we use an OR operator to handle it rather than use if condition.
++	 */
++	data[2] = ((reg >> 8) & 0xff) | ((value >> 8) & 0xff);
++	data[3] = value & 0xff;
++
++	ret = i2c_master_send(client, data, 4);
++
++	if (ret == 4)
++		return 0;
++	else
++		pr_err("ret=%d\n", ret);
++	if (ret < 0)
++		return ret;
++	else
++		return -EIO;
++}
++
++static int rt286_hw_read(void *context, unsigned int reg, unsigned int *value)
++{
++	struct i2c_client *client = context;
++	struct i2c_msg xfer[2];
++	int ret;
++	__be32 be_reg;
++	unsigned int index, vid, buf = 0x0;
++
++	/* handle index registers */
++	if (reg <= 0xff) {
++		rt286_hw_write(client, RT286_COEF_INDEX, reg);
++		reg = RT286_PROC_COEF;
++	}
++
++	reg = reg | 0x80000;
++	vid = (reg >> 8) & 0xfff;
++
++	if (AC_VERB_GET_AMP_GAIN_MUTE == (vid & 0xf00)) {
++		index = (reg >> 8) & 0xf;
++		reg = (reg & ~0xf0f) | index;
++	}
++	be_reg = cpu_to_be32(reg);
++
++	/* Write register */
++	xfer[0].addr = client->addr;
++	xfer[0].flags = 0;
++	xfer[0].len = 4;
++	xfer[0].buf = (u8 *)&be_reg;
++
++	/* Read data */
++	xfer[1].addr = client->addr;
++	xfer[1].flags = I2C_M_RD;
++	xfer[1].len = 4;
++	xfer[1].buf = (u8 *)&buf;
++
++	ret = i2c_transfer(client->adapter, xfer, 2);
++	if (ret < 0)
++		return ret;
++	else if (ret != 2)
++		return -EIO;
++
++	*value = be32_to_cpu(buf);
++
++	return 0;
++}
++
+ #ifdef CONFIG_PM
+ static void rt286_index_sync(struct snd_soc_codec *codec)
+ {
+@@ -272,6 +360,15 @@ static int rt286_jack_detect(struct rt286_priv *rt286, bool *hp, bool *mic)
+ 		*hp = buf & 0x80000000;
+ 		regmap_read(rt286->regmap, RT286_GET_MIC1_SENSE, &buf);
+ 		*mic = buf & 0x80000000;
++		if (*mic) {
++			regmap_write(rt286->regmap, RT286_SET_MIC1, 0x24);
++			msleep(50);
++
++			regmap_update_bits(rt286->regmap,
++						RT286_CBJ_CTRL1,
++						0xfcc0, 0xd400);
++			msleep(300);
++		}
+ 	}
+ 
+ 	snd_soc_dapm_disable_pin(dapm, "HV");
+@@ -695,6 +792,7 @@ static int rt286_hw_params(struct snd_pcm_substream *substream,
+ 	unsigned int val = 0;
+ 	int d_len_code;
+ 
++	pr_err("%s : rate : %d clk %d ch %d width %d\n",__func__,params_rate(params),rt286->sys_clk, params_channels(params), params_width(params));
+ 	switch (params_rate(params)) {
+ 	/* bit 14 0:48K 1:44.1K */
+ 	case 44100:
+@@ -763,7 +861,8 @@ static int rt286_hw_params(struct snd_pcm_substream *substream,
+ 
+ 	snd_soc_update_bits(codec,
+ 		RT286_I2S_CTRL1, 0x0018, d_len_code << 3);
+-	dev_dbg(codec->dev, "format val = 0x%x\n", val);
++	//dev_dbg(codec->dev, "format val = 0x%x\n", val);
++	pr_err("format val = 0x%x\n", val);
+ 
+ 	snd_soc_update_bits(codec, RT286_DAC_FORMAT, 0x407f, val);
+ 	snd_soc_update_bits(codec, RT286_ADC_FORMAT, 0x407f, val);
+@@ -927,6 +1026,7 @@ static int rt286_set_bias_level(struct snd_soc_codec *codec,
+ 	default:
+ 		break;
+ 	}
++	//codec->dapm.bias_level = level;
+ 
+ 	return 0;
+ }
+@@ -992,7 +1092,6 @@ static int rt286_suspend(struct snd_soc_codec *codec)
+ 
+ 	regcache_cache_only(rt286->regmap, true);
+ 	regcache_mark_dirty(rt286->regmap);
+-
+ 	return 0;
+ }
+ 
+@@ -1003,7 +1102,6 @@ static int rt286_resume(struct snd_soc_codec *codec)
+ 	regcache_cache_only(rt286->regmap, false);
+ 	rt286_index_sync(codec);
+ 	regcache_sync(rt286->regmap);
+-
+ 	return 0;
+ }
+ #else
+@@ -1013,7 +1111,8 @@ static int rt286_resume(struct snd_soc_codec *codec)
+ 
+ #define RT286_STEREO_RATES (SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000)
+ #define RT286_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_3LE | \
+-			SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S8)
++			SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S8) | \
++			SNDRV_PCM_FMTBIT_S32_LE
+ 
+ static const struct snd_soc_dai_ops rt286_aif_dai_ops = {
+ 	.hw_params = rt286_hw_params,
+@@ -1087,8 +1186,8 @@ static const struct regmap_config rt286_regmap = {
+ 	.max_register = 0x02370100,
+ 	.volatile_reg = rt286_volatile_register,
+ 	.readable_reg = rt286_readable_register,
+-	.reg_write = rl6347a_hw_write,
+-	.reg_read = rl6347a_hw_read,
++	.reg_write = rt286_hw_write,
++	.reg_read = rt286_hw_read,
+ 	.cache_type = REGCACHE_RBTREE,
+ 	.reg_defaults = rt286_reg,
+ 	.num_reg_defaults = ARRAY_SIZE(rt286_reg),
+@@ -1103,11 +1202,12 @@ MODULE_DEVICE_TABLE(i2c, rt286_i2c_id);
+ 
+ static const struct acpi_device_id rt286_acpi_match[] = {
+ 	{ "INT343A", 0 },
++	{ "RTK0000", 0},
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(acpi, rt286_acpi_match);
+ 
+-static const struct dmi_system_id force_combo_jack_table[] = {
++static struct dmi_system_id force_combo_jack_table[] = {
+ 	{
+ 		.ident = "Intel Wilson Beach",
+ 		.matches = {
+@@ -1117,7 +1217,7 @@ static const struct dmi_system_id force_combo_jack_table[] = {
+ 	{ }
+ };
+ 
+-static const struct dmi_system_id dmi_dell_dino[] = {
++static struct dmi_system_id dmi_dell_dino[] = {
+ 	{
+ 		.ident = "Dell Dino",
+ 		.matches = {
+@@ -1128,13 +1228,53 @@ static const struct dmi_system_id dmi_dell_dino[] = {
+ 	{ }
+ };
+ 
++static struct rt286_platform_data rt286_acpi_data = {
++	.cbj_en = false,
++	.gpio2_en = false,
++};
++
++#if defined(CONFIG_ACPI) && defined(CONFIG_GPIOLIB)
++
++static int get_gpio_irq(struct acpi_resource *ares, void *data)
++{
++	if ((ares->type == ACPI_RESOURCE_GPIO_TYPE_INT) ||
++		(ares->type == ACPI_RESOURCE_TYPE_GPIO)) {
++		int *irq = data;
++		*irq = gpio_to_irq(ares->data.gpio.pin_table[0]);
++	}
++	return 1;
++}
++
++static int acpi_get_gpio_irq_res(struct device *idev)
++{
++	int irq;
++	struct acpi_device *adev;
++	struct list_head resource_list;
++	acpi_handle handle;
++
++	INIT_LIST_HEAD(&resource_list);
++	handle = ACPI_HANDLE(idev);
++
++	if (!handle || acpi_bus_get_device(handle, &adev))
++		return -ENODEV;
++
++	acpi_dev_get_resources(adev, &resource_list,
++				get_gpio_irq, &irq);
++	acpi_dev_free_resource_list(&resource_list);
++
++	return irq;
++}
++
++#endif
++
+ static int rt286_i2c_probe(struct i2c_client *i2c,
+ 			   const struct i2c_device_id *id)
+ {
+-	struct rt286_platform_data *pdata = dev_get_platdata(&i2c->dev);
++	struct rt286_platform_data *pdata = &rt286_acpi_data;
+ 	struct rt286_priv *rt286;
+ 	int i, ret, val;
+ 
++	pr_err("%s : called\n",__func__);
+ 	rt286 = devm_kzalloc(&i2c->dev,	sizeof(*rt286),
+ 				GFP_KERNEL);
+ 	if (NULL == rt286)
+@@ -1156,16 +1296,11 @@ static int rt286_i2c_probe(struct i2c_client *i2c,
+ 	}
+ 	if (val != RT286_VENDOR_ID && val != RT288_VENDOR_ID) {
+ 		dev_err(&i2c->dev,
+-			"Device with ID register %#x is not rt286\n", val);
++			"Device with ID register %x is not rt286\n", val);
+ 		return -ENODEV;
+ 	}
+ 
+-	rt286->index_cache = devm_kmemdup(&i2c->dev, rt286_index_def,
+-					  sizeof(rt286_index_def), GFP_KERNEL);
+-	if (!rt286->index_cache)
+-		return -ENOMEM;
+-
+-	rt286->index_cache_size = INDEX_CACHE_SIZE;
++	rt286->index_cache = rt286_index_def;
+ 	rt286->i2c = i2c;
+ 	i2c_set_clientdata(i2c, rt286);
+ 
+@@ -1231,19 +1366,24 @@ static int rt286_i2c_probe(struct i2c_client *i2c,
+ 			RT286_GPIO_CTRL, 0xc, 0x8);
+ 	}
+ 
+-	if (rt286->i2c->irq) {
+-		ret = request_threaded_irq(rt286->i2c->irq, NULL, rt286_irq,
+-			IRQF_TRIGGER_HIGH | IRQF_ONESHOT, "rt286", rt286);
+-		if (ret != 0) {
+-			dev_err(&i2c->dev,
+-				"Failed to reguest IRQ: %d\n", ret);
+-			return ret;
+-		}
++	if (rt286->i2c->irq < 0) {
++		rt286->i2c->irq = acpi_get_gpio_irq_res(&rt286->i2c->dev);
++		if (rt286->i2c->irq < 0)
++			return -ENODEV;
++	}
++	ret = request_threaded_irq(rt286->i2c->irq, NULL, rt286_irq,
++		IRQF_TRIGGER_RISING | IRQF_ONESHOT, "rt286", rt286);
++	if (ret != 0) {
++		dev_err(&i2c->dev,
++			"Failed to reguest IRQ: %d\n", ret);
++		return ret;
+ 	}
+ 
+ 	ret = snd_soc_register_codec(&i2c->dev, &soc_codec_dev_rt286,
+ 				     rt286_dai, ARRAY_SIZE(rt286_dai));
+ 
++	pr_err("%s : ret = %d\n",__func__,ret);
++
+ 	return ret;
+ }
+ 
+@@ -1262,6 +1402,7 @@ static int rt286_i2c_remove(struct i2c_client *i2c)
+ static struct i2c_driver rt286_i2c_driver = {
+ 	.driver = {
+ 		   .name = "rt286",
++		   .owner = THIS_MODULE,
+ 		   .acpi_match_table = ACPI_PTR(rt286_acpi_match),
+ 		   },
+ 	.probe = rt286_i2c_probe,
+-- 
+2.7.4
+
