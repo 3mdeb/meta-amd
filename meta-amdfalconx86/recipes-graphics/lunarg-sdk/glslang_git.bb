@@ -20,7 +20,7 @@ SRC_URI = "git://github.com/KhronosGroup/glslang \
 
 FILES_${PN} += "${libdir}/*"
 
-BBCLASSEXTEND = "native"
+BBCLASSEXTEND = "native nativesdk"
 
 do_install_append() {
     # Some of the vulkan samples/test require these headers
