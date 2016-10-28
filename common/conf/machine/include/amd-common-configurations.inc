@@ -34,6 +34,9 @@ APPEND += "console=tty0"
 # Make sure the VESA VGA driver goes up on boot, we provide a generic mode here
 APPEND += "vga=802"
 
+# We use ext4 rootfs normally so give it priority rather than trying other FS first
+APPEND += "rootfstype=ext4,ext3,ext2"
+
 EXTRA_OECONF_append_pn-matchbox-panel-2 = " --with-battery=acpi"
 
 # Once we switch to using the xserver-nodm-init version
