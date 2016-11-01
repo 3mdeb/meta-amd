@@ -1,6 +1,6 @@
 #
 # Workaround grub boot failure by building for core2
-# rather than bdver3(baldeagle) or btver2(steppeeagle)
+# rather than or btver2(steppeeagle)
 #
 TUNE_CCARGS_append_amd += "-march=core2"
 
