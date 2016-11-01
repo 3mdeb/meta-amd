@@ -86,7 +86,6 @@ may take longer.
 The per layer gatekeepers are the following.
 
 - amdfalconx86: Drew Moseley, drew_moseley@mentor.com
-- baldeagle: Drew Moseley, drew_moseley@mentor.com
 - common: Drew Moseley, drew_moseley@mentor.com
 - steppeeagle: Drew Moseley, drew_moseley@mentor.com
 - seattle: Adrian Calianu, adrian.calianu@enea.com
