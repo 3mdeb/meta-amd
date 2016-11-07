@@ -23,3 +23,8 @@ SRC_URI_append_amdx86 += " \
 "
 
 KERNEL_FEATURES_append_amdx86 = " cfg/smp.scc cfg/sound.scc"
+
+do_validate_branches_append() {
+    # Drop a config generating spurious warnings
+    sed -i '/CONFIG_DRM_I915_PRELIMINARY_HW_SUPPORT/d' ${WORKDIR}/${KMETA}/features/i915/i915.cfg
+}
