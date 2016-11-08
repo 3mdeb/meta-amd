@@ -37,6 +37,8 @@ APPEND += "vga=802"
 # We use ext4 rootfs normally so give it priority rather than trying other FS first
 APPEND += "rootfstype=ext4,ext3,ext2"
 
+APPEND += "${APPEND_ADDITIONAL}"
+
 EXTRA_OECONF_append_pn-matchbox-panel-2 = " --with-battery=acpi"
 
 # Once we switch to using the xserver-nodm-init version
