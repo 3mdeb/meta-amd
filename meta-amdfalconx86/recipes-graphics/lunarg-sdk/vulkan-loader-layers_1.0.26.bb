@@ -26,7 +26,8 @@ SRC_URI = "git://github.com/KhronosGroup/Vulkan-LoaderAndValidationLayers;branch
            file://0004-install-the-vulkan-loader.patch \
            file://0005-install-demos.patch \
            file://0006-json-correct-layer-lib-paths.patch \
-           file://0008-demos-make-shader-location-relative.patch"
+           file://0008-demos-make-shader-location-relative.patch \
+           file://0009-vulkaninfo.c-fix-segfault-when-DISPLAY-is-not-set.patch"
 
 EXTRA_OECMAKE = " \
     -DCUSTOM_GLSLANG_BIN_ROOT=1 \
