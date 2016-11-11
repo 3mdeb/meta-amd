@@ -31,8 +31,10 @@ APPEND += "${KERNEL_SERIAL_CONSOLE}"
 # Make sure the kernel messages go to the VGA console
 APPEND += "console=tty0"
 
-# Make sure the VESA VGA driver goes up on boot, we provide a generic mode here
-APPEND += "vga=802"
+# Set a generic video mode, use vga=xxx for syslinux and
+# gfxpayload=wxh for grub2
+SYSLINUX_KERNEL_ARGS += "vga=803"
+GRUB_OPTS_append = ";set gfxpayload=1024x768"
 
 # We use ext4 rootfs normally so give it priority rather than trying other FS first
 APPEND += "rootfstype=ext4,ext3,ext2"
