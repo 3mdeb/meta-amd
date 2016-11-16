@@ -41,6 +41,11 @@ SRC_URI = " \
      file://0015-add-build-control-flag-CXL_RA_only.patch \
      file://0016-add-build-control-flag-CXL_sysroot_dir.patch \
      file://0017-add-tinxml-to-list-of-LIBS-for-CapturePlayer.patch \
+     file://0018-AMDTAPIClasses-fix-build-with-gcc6.patch \
+     file://0019-Miniz-fix-build-with-gcc6.patch \
+     file://0020-WebServer-fix-misleading-cleanup-under-RemoveHandler.patch \
+     file://0021-AMDTPowerProfileApi-fix-build-issues.patch \
+     file://0022-GpuProfiling-disable-ignored-attributes-checks.patch \
      file://amdtPwrProf_mknod.sh \
      file://amdtPwrProf.rules \
      file://codexl_remote_agent.sh \
