@@ -26,6 +26,7 @@ MACHINE_EXTRA_RRECOMMENDS += "${@bb.utils.contains_any("DISTRO", "mel mel-lite",
 RELEASE_IMAGE ?= "core-image-sato"
 
 # Add serial consoles to kernel commandline, these should occur before the tty0
+KERNEL_SERIAL_CONSOLE ??= ""
 APPEND += "${KERNEL_SERIAL_CONSOLE}"
 
 # Make sure the kernel messages go to the VGA console
@@ -39,6 +40,7 @@ GRUB_OPTS_append = ";set gfxpayload=1024x768"
 # We use ext4 rootfs normally so give it priority rather than trying other FS first
 APPEND += "rootfstype=ext4,ext3,ext2"
 
+APPEND_ADDITIONAL ??= ""
 APPEND += "${APPEND_ADDITIONAL}"
 
 EXTRA_OECONF_append_pn-matchbox-panel-2 = " --with-battery=acpi"
