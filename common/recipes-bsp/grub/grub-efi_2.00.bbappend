@@ -10,3 +10,6 @@ TUNE_CCARGS_append_amd += "-march=core2"
 # the wrong grub.cfg at boot time.
 #
 FILESPATH_prepend := "${THISDIR}/files:"
+
+SRC_URI_append_mel = " file://0001-grub-core-kern-efi-mm.c-grub_efi_finish_boot_service.patch \
+                       file://0002-grub-core-kern-efi-mm.c-grub_efi_get_memory_map-Neve.patch"
