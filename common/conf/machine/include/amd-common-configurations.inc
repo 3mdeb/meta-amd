@@ -7,6 +7,8 @@ PREFERRED_VERSION_linux-yocto ?= "4.4%"
 PREFERRED_VERSION_mesa ?= "11.0.8+git%"
 PREFERRED_VERSION_gstreamer1.0-omx ?= "git+git%"
 PREFERRED_VERSION_libav ?= "9.18"
+PREFERRED_VERSION_grub ?= "2.00+AUTOINC+%"
+PREFERRED_VERSION_grub-efi ?= "2.00+AUTOINC+%"
 
 MULTILIBS ?= ""
 require conf/multilib.conf
