@@ -17,13 +17,13 @@ PACKAGECONFIG[udev] = "--enable-udev,--disable-udev,udev"
 PACKAGECONFIG[glamor] = "--enable-glamor,--disable-glamor"
 
 SRC_URI_radeon = "git://anongit.freedesktop.org/git/xorg/driver/xf86-video-ati"
-SRCREV_radeon = "99cb8c3faf1a4ce368b7500f17a2a7868c15e8e8"
-PV_radeon = "radeon-7.6.1"
+SRCREV_radeon = "5cbe1ee8e499e1b6b2646e341946292721d07e69"
+PV_radeon = "radeon-7.8.0"
 PACKAGECONFIG_append_radeon = " udev glamor"
 
-SRC_URI_amdgpu = "git://anongit.freedesktop.org/xorg/driver/xf86-video-amdgpu;branch=1.1"
-SRCREV_amdgpu = "b407c1244d28a80f76275abca2239cdd4120f017"
-PV_amdgpu = "amdgpu-1.1.0"
+SRC_URI_amdgpu = "git://anongit.freedesktop.org/xorg/driver/xf86-video-amdgpu"
+SRCREV_amdgpu = "a00032050873fc99f3ceaa3293468dad1d94d4b1"
+PV_amdgpu = "amdgpu-1.2.0"
 PACKAGECONFIG_append_amdgpu = " udev glamor"
 
 PV = "git${SRCPV}"
