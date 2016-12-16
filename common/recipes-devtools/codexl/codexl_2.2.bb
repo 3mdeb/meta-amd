@@ -126,7 +126,6 @@ do_install() {
     install -m 755 ${S}/${OUTPUT_PREFIX}/CodeXLGpuProfilerRun ${D}${INSTALL_PREFIX}/
     install -m 755 ${S}/${OUTPUT_PREFIX}/CodeXLRemoteAgent ${D}${INSTALL_PREFIX}/
     install -m 755 ${S}/${OUTPUT_PREFIX}/CodeXLRemoteAgent-bin ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/CodeXLRemoteAgentConfig.xml ${D}${INSTALL_PREFIX}/
     install -m 755 ${S}/${OUTPUT_PREFIX}/CXLGraphicsServer ${D}${INSTALL_PREFIX}/
     install -m 755 ${S}/${OUTPUT_PREFIX}/CXLRemoteDebuggingServer ${D}${INSTALL_PREFIX}/
     install -m 755 ${S}/${OUTPUT_PREFIX}/CXLGraphicsServerPlayer ${D}${INSTALL_PREFIX}/
@@ -145,7 +144,8 @@ do_install() {
     install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLRemoteClient.so ${D}${INSTALL_PREFIX}/
     install -m 755 ${S}/${OUTPUT_PREFIX}/libGPUPerfAPICL.so ${D}${INSTALL_PREFIX}/
     install -m 755 ${S}/${OUTPUT_PREFIX}/libGPUPerfAPICounters.so ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/amdtPwrProf-5.10/amdtPwrProf.ko ${D}${INSTALL_PREFIX}/
+    install -m 644 ${S}/${OUTPUT_PREFIX}/CodeXLRemoteAgentConfig.xml ${D}${INSTALL_PREFIX}/
+    install -m 644 ${S}/${OUTPUT_PREFIX}/amdtPwrProf-5.10/amdtPwrProf.ko ${D}${INSTALL_PREFIX}/
 
     install -m 755 ${WORKDIR}/amdtPwrProf_mknod.sh ${D}${INSTALL_PREFIX}/
     install -d ${D}/${sysconfdir}/udev/rules.d/
@@ -158,21 +158,44 @@ do_install() {
            -e 's,@SYSCONFDIR@,${sysconfdir},g' \
            ${D}${systemd_unitdir}/system/*.service
 
-    install -d ${D}${INSTALL_PREFIX}/CXLActivityLogger
-    cp -r ${S}/${OUTPUT_PREFIX}/CXLActivityLogger/* ${D}${INSTALL_PREFIX}/CXLActivityLogger
+    install -d ${D}${INSTALL_PREFIX}/CXLActivityLogger/doc
+    find ${S}${OUTPUT_PREFIX}/CXLActivityLogger/doc/ -type f -exec install -m 644 {} ${D}${INSTALL_PREFIX}/CXLActivityLogger/doc/ \;
+
+    install -d ${D}${INSTALL_PREFIX}/CXLActivityLogger/include
+    find ${S}${OUTPUT_PREFIX}/CXLActivityLogger/include/ -type f -exec install -m 644 {} ${D}${INSTALL_PREFIX}/CXLActivityLogger/include/ \;
+
+    install -d ${D}${INSTALL_PREFIX}/CXLActivityLogger/bin/x86
+    find ${S}${OUTPUT_PREFIX}/CXLActivityLogger/bin/x86/ -type f -exec install -m 755 {} ${D}${INSTALL_PREFIX}/CXLActivityLogger/bin/x86/ \;
+
+    install -d ${D}${INSTALL_PREFIX}/CXLActivityLogger/bin/x86_64
+    find ${S}${OUTPUT_PREFIX}/CXLActivityLogger/bin/x86_64/ -type f -exec install -m 755 {} ${D}${INSTALL_PREFIX}/CXLActivityLogger/bin/x86_64/ \;
 
     install -d ${D}${INSTALL_PREFIX}/Plugins
-    cp -r ${S}/${OUTPUT_PREFIX}/Plugins/* ${D}${INSTALL_PREFIX}/Plugins
+    find ${S}${OUTPUT_PREFIX}/Plugins/ -type f -name *.so -exec install -m 755 {} ${D}${INSTALL_PREFIX}/Plugins/ \;
+    find ${S}${OUTPUT_PREFIX}/Plugins/ -type f -name *.json -exec install -m 755 {} ${D}${INSTALL_PREFIX}/Plugins/ \;
 
     install -d ${D}${INSTALL_PREFIX}/Legal/Public
     cp -r ${S}/${OUTPUT_PREFIX}/Legal/Public/CodeXLEndUserLicenseAgreement-Linux.htm ${D}${INSTALL_PREFIX}/Legal/Public
     cp -r ${S}/${OUTPUT_PREFIX}/Legal/GNU_LESSER_GENERAL_PUBLIC_LICENSE2_1.pdf ${D}${INSTALL_PREFIX}/Legal
 
     install -d ${D}${INSTALL_PREFIX}/examples/Teapot/res
-    install -m 755 ${S}/${OUTPUT_PREFIX}/examples/Teapot/release/CXLTeaPot-bin ${D}${INSTALL_PREFIX}/examples/Teapot
+    install -m 644 ${S}/${OUTPUT_PREFIX}/examples/Teapot/release/CXLTeaPot-bin ${D}${INSTALL_PREFIX}/examples/Teapot
     cp -r ${S}/${OUTPUT_PREFIX}/examples/Teapot/release/res/* ${D}${INSTALL_PREFIX}/examples/Teapot/res
-    install -m 755 ${S}/${OUTPUT_PREFIX}/examples/Teapot/CXLTeapotLicense.txt ${D}${INSTALL_PREFIX}/examples/Teapot
-    install -m 755 ${S}/${OUTPUT_PREFIX}/CXLClassicMatMul-bin ${D}${INSTALL_PREFIX}/examples/
+    install -m 644 ${S}/${OUTPUT_PREFIX}/examples/Teapot/CXLTeapotLicense.txt ${D}${INSTALL_PREFIX}/examples/Teapot
+    install -m 644 ${S}/${OUTPUT_PREFIX}/CXLClassicMatMul-bin ${D}${INSTALL_PREFIX}/examples/
+}
+
+do_package_append() {
+    # change examples binaries mode back to executable, this hack is required to avoid auto strip of these binaries
+    pkgdest_dir = d.getVar('PKGDEST', True)
+
+    cmd = "find %s -name %s -exec chmod 755 {} \;" \
+           % (pkgdest_dir, "CXLTeaPot-bin")
+    os.system(cmd);
+
+    cmd = "find %s -name %s -exec chmod 755 {} \;" \
+           % (pkgdest_dir, "CXLClassicMatMul-bin")
+    os.system(cmd);
 }
 
 PACKAGES += "${PN}-examples"
@@ -218,5 +241,5 @@ FILES_${PN}-examples += " \
     ${INSTALL_PREFIX}/examples/Teapot/CXLTeapotLicense.txt \
     ${INSTALL_PREFIX}/examples/CXLClassicMatMul-bin \
 "
-INHIBIT_PACKAGE_STRIP = "1"
-INSANE_SKIP_${PN} = "already-stripped ldflags dev-so"
+
+INSANE_SKIP_${PN} = "ldflags dev-so"
