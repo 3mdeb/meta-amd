@@ -17,7 +17,7 @@ LIBVA_PLATFORMS .= "${@bb.utils.contains('DISTRO_FEATURES', 'wayland', ' libva-w
 LIBVA_PLATFORMS .= "${@bb.utils.contains('DISTRO_FEATURES', 'opengl', ' libva-gl', '', d)}"
 RDEPENDS_mesa-megadriver += "${@bb.utils.contains('PACKAGECONFIG', 'va', '${LIBVA_PLATFORMS}', '', d)}"
 
-MESA_LLVM_RELEASE_amd = "3.7.1"
+MESA_LLVM_RELEASE_amd = "3.9.1"
 
 SRC_URI_amd = "\
 			git://anongit.freedesktop.org/git/mesa/mesa;branch=12.0 \
