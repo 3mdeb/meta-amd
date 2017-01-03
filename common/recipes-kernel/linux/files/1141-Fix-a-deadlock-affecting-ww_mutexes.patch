@@ -1,0 +1,121 @@
+From 5f3c992c00f95a483cf01d55b8ff0fa1fe6df216 Mon Sep 17 00:00:00 2001
+From: Sanjay R Mehta <sanju.mehta@amd.com>
+Date: Wed, 23 Nov 2016 14:54:46 +0530
+Subject: [PATCH 03/10] Fix a deadlock affecting ww_mutexes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+his patch fixes a race condition involving 4 threads and 2 ww_mutexes
+as indicated in the following example. Acquire context stamps are ordered
+like the thread numbers, i.e. thread #1 should back off when it encounters
+a mutex locked by thread #0 etc.
+
+Thread #0    Thread #1    Thread #2    Thread #3
+---------    ---------    ---------    ---------
+                                        lock(ww)
+              lock(ww')
+                           lock(ww)
+              lock(ww)
+                                        unlock(ww) part 1
+lock(ww)
+                                        unlock(ww) part 2
+                           back off
+lock(ww')
+
+Here, unlock(ww) part 1 is the part that sets lock->base.count to 1
+(without being protected by lock->base.wait_lock), meaning that thread #0
+can acquire ww in the fast path. Since lock->base.count == 0, thread #0
+won't wake up any of the waiters.
+
+Then, unlock(ww) part 2 wakes up _only_the_first_ waiter of ww. This is
+thread #2, since waiters are added at the tail. Thread #2 wakes up and
+backs off since it sees ww owned by a context with a lower stamp.
+
+Meanwhile, thread #1 is never woken up, and so it won't back off its lock
+on ww'. So thread #0 gets stuck waiting for ww' to be released.
+
+This patch fixes the deadlock by waking up all waiters in the slow path
+of ww_mutex_unlock.
+
+We have an internal test case for amdgpu which continuously submits
+command streams from tens of threads, where all command stream reference
+hundreds of GPU buffer objects with a lot of overlap in the buffer lists
+between command streams. This test reliably caused a deadlock, and while I
+haven't completely confirmed that it is exactly the scenario outlined
+above, this patch does fix the test case.
+
+Signed-off-by: Nicolai Hähnle <nicolai.haehnle@amd.com>
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+---
+ kernel/locking/mutex.c | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/locking/mutex.c b/kernel/locking/mutex.c
+index 0551c21..39fa58a 100644
+--- a/kernel/locking/mutex.c
++++ b/kernel/locking/mutex.c
+@@ -409,6 +409,10 @@ static bool mutex_optimistic_spin(struct mutex *lock,
+ __visible __used noinline
+ void __sched __mutex_unlock_slowpath(atomic_t *lock_count);
+ 
++static __used noinline
++void __sched __mutex_unlock_slowpath_wakeall(atomic_t *lock_count);
++
++
+ /**
+  * mutex_unlock - release the mutex
+  * @lock: the mutex to be released
+@@ -473,7 +477,7 @@ void __sched ww_mutex_unlock(struct ww_mutex *lock)
+ 	 */
+ 	mutex_clear_owner(&lock->base);
+ #endif
+-	__mutex_fastpath_unlock(&lock->base.count, __mutex_unlock_slowpath);
++	__mutex_fastpath_unlock(&lock->base.count, __mutex_unlock_slowpath_wakeall);
+ }
+ EXPORT_SYMBOL(ww_mutex_unlock);
+ 
+@@ -713,7 +717,7 @@ EXPORT_SYMBOL_GPL(__ww_mutex_lock_interruptible);
+  * Release the lock, slowpath:
+  */
+ static inline void
+-__mutex_unlock_common_slowpath(struct mutex *lock, int nested)
++__mutex_unlock_common_slowpath(struct mutex *lock, int nested, int wake_all)
+ {
+ 	unsigned long flags;
+ 
+@@ -736,7 +740,13 @@ __mutex_unlock_common_slowpath(struct mutex *lock, int nested)
+ 	mutex_release(&lock->dep_map, nested, _RET_IP_);
+ 	debug_mutex_unlock(lock);
+ 
+-	if (!list_empty(&lock->wait_list)) {
++	if (wake_all) {
++		struct mutex_waiter *waiter;
++		list_for_each_entry(waiter, &lock->wait_list, list) {
++			debug_mutex_wake_waiter(lock, waiter);
++			wake_up_process(waiter->task);
++		}
++	} else if (!list_empty(&lock->wait_list)) {
+ 		/* get the first entry from the wait-list: */
+ 		struct mutex_waiter *waiter =
+ 				list_entry(lock->wait_list.next,
+@@ -758,7 +768,15 @@ __mutex_unlock_slowpath(atomic_t *lock_count)
+ {
+ 	struct mutex *lock = container_of(lock_count, struct mutex, count);
+ 
+-	__mutex_unlock_common_slowpath(lock, 1);
++	__mutex_unlock_common_slowpath(lock, 1, 0);
++}
++
++static void
++__mutex_unlock_slowpath_wakeall(atomic_t *lock_count)
++{
++	struct mutex *lock = container_of(lock_count, struct mutex, count);
++
++	__mutex_unlock_common_slowpath(lock, 1, 1);
+ }
+ 
+ #ifndef CONFIG_DEBUG_LOCK_ALLOC
+-- 
+2.7.4
+
