@@ -1,0 +1,504 @@
+From d29a89414316f4c54a1a619527398714b091d3db Mon Sep 17 00:00:00 2001
+From: Sanjay R Mehta <sanju.mehta@amd.com>
+Date: Mon, 14 Nov 2016 12:26:18 +0530
+Subject: [PATCH] add new semaphore object in kernel side
+
+So that semaphore can be shared across porcess across devices.
+
+Change-Id: Ie82cace6af81e2ddf45f4bbf9f3c0dafd6bcc499
+Signed-off-by: Chunming Zhou <David1.Zhou@amd.com>
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile               |   3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h               |  11 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c            |   2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c           |   6 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c           |   3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sem.c           | 267 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sem.h           |  44 ++++
+ drivers/gpu/drm/amd/include/uapi/drm/amdgpu_drm.h |  29 +++
+ 8 files changed, 361 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_sem.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_sem.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index 28e8e4c..2acc7c1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -31,7 +31,8 @@ amdgpu-y += amdgpu_device.o amdgpu_kms.o \
+ 	amdgpu_pm.o atombios_dp.o amdgpu_afmt.o amdgpu_trace_points.o \
+ 	atombios_encoders.o amdgpu_sa.o atombios_i2c.o \
+ 	amdgpu_prime.o amdgpu_vm.o amdgpu_ib.o amdgpu_pll.o \
+-	amdgpu_ucode.o amdgpu_bo_list.o amdgpu_ctx.o amdgpu_sync.o
++	amdgpu_ucode.o amdgpu_bo_list.o amdgpu_ctx.o amdgpu_sync.o \
++	amdgpu_sem.o
+ 
+ # add asic specific block
+ amdgpu-$(CONFIG_DRM_AMDGPU_CIK)+= cik.o cik_ih.o kv_smc.o kv_dpm.o \
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index d3de21d..3f5d2ad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1000,6 +1000,8 @@ struct amdgpu_ctx_ring {
+ 	uint64_t		sequence;
+ 	struct fence		**fences;
+ 	struct amd_sched_entity	entity;
++	struct list_head	sem_list;
++	struct mutex		sem_lock;
+ 	/* client id */
+ 	u64			client_id;
+ };
+@@ -1699,6 +1701,8 @@ struct amdgpu_vce {
+ 	struct amdgpu_irq_src	irq;
+ 	unsigned		harvest_config;
+ 	struct amd_sched_entity	entity;
++	struct list_head	sem_list;
++	struct mutex            sem_lock;
+ };
+ 
+ /*
+@@ -1872,6 +1876,13 @@ int amdgpu_gem_metadata_ioctl(struct drm_device *dev, void *data,
+ int amdgpu_freesync_ioctl(struct drm_device *dev, void *data,
+ 			    struct drm_file *filp);
+ 
++int amdgpu_sem_ioctl(struct drm_device *dev, void *data,
++		    struct drm_file *filp);
++
++int amdgpu_sem_add_cs(struct amdgpu_ctx *ctx, struct amdgpu_ring *ring,
++		     struct amdgpu_sync *sync);
++
++
+ /* VRAM scratch page for HDP bug, default vram page */
+ struct amdgpu_vram_scratch {
+ 	struct amdgpu_bo		*robj;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 0d1346c..bb6057a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -882,7 +882,7 @@ static int amdgpu_cs_dependencies(struct amdgpu_device *adev,
+ 		}
+ 	}
+ 
+-	return 0;
++	return amdgpu_sem_add_cs(p->ctx, p->job->ring, &p->job->sync);
+ }
+ 
+ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index 17e1362..a020e22 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -42,6 +42,8 @@ static int amdgpu_ctx_init(struct amdgpu_device *adev, struct amdgpu_ctx *ctx)
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+ 		ctx->rings[i].sequence = 1;
+ 		ctx->rings[i].fences = &ctx->fences[amdgpu_sched_jobs * i];
++		INIT_LIST_HEAD(&ctx->rings[i].sem_list);
++		mutex_init(&ctx->rings[i].sem_lock);
+ 	}
+ 	/* create context entity for each ring */
+ 	for (i = 0; i < adev->num_rings; i++) {
+@@ -74,8 +76,10 @@ static void amdgpu_ctx_fini(struct amdgpu_ctx *ctx)
+ 		return;
+ 
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; ++i)
+-		for (j = 0; j < amdgpu_sched_jobs; ++j)
++		for (j = 0; j < amdgpu_sched_jobs; ++j) {
+ 			fence_put(ctx->rings[i].fences[j]);
++			mutex_destroy(&ctx->rings[i].sem_lock);
++		}
+ 	kfree(ctx->fences);
+ 
+ 	for (i = 0; i < adev->num_rings; i++)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index f6ae587..a48783e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -786,6 +786,7 @@ const struct drm_ioctl_desc amdgpu_ioctls_kms[] = {
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_VA, amdgpu_gem_va_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_OP, amdgpu_gem_op_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_USERPTR, amdgpu_gem_userptr_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+-	DRM_IOCTL_DEF_DRV(AMDGPU_FREESYNC, amdgpu_freesync_ioctl, DRM_MASTER)
++	DRM_IOCTL_DEF_DRV(AMDGPU_FREESYNC, amdgpu_freesync_ioctl, DRM_MASTER),
++	DRM_IOCTL_DEF_DRV(AMDGPU_SEM, amdgpu_sem_ioctl, DRM_AUTH|DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ };
+ const int amdgpu_max_kms_ioctl = ARRAY_SIZE(amdgpu_ioctls_kms);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.c
+new file mode 100644
+index 0000000..db16baa
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.c
+@@ -0,0 +1,267 @@
++/*
++ * Copyright 2016 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors:
++ *    Chunming Zhou <david1.zhou@amd.com>
++ */
++#include <linux/file.h>
++#include <linux/fs.h>
++#include <linux/kernel.h>
++#include <linux/poll.h>
++#include <linux/seq_file.h>
++#include <linux/export.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/anon_inodes.h>
++#include "amdgpu_sem.h"
++#include "amdgpu.h"
++#include <drm/drmP.h>
++
++static int amdgpu_sem_cring_add(struct amdgpu_fpriv *fpriv,
++				struct drm_amdgpu_sem_in *in,
++				struct amdgpu_sem *sem);
++
++static const struct file_operations amdgpu_sem_fops;
++
++static struct amdgpu_sem *amdgpu_sem_alloc(struct fence *fence)
++{
++	struct amdgpu_sem *sem;
++
++	sem = kzalloc(sizeof(struct amdgpu_sem), GFP_KERNEL);
++	if (!sem)
++		return NULL;
++
++	sem->file = anon_inode_getfile("sem_file",
++				       &amdgpu_sem_fops,
++				       sem, 0);
++	if (IS_ERR(sem->file))
++		goto err;
++
++	kref_init(&sem->kref);
++	INIT_LIST_HEAD(&sem->list);
++	/* fence should be get before passing here */
++	sem->fence = fence;
++
++	return sem;
++err:
++	kfree(sem);
++	return NULL;
++}
++
++static void amdgpu_sem_free(struct kref *kref)
++{
++	struct amdgpu_sem *sem = container_of(
++		kref, struct amdgpu_sem, kref);
++
++	fence_put(sem->fence);
++	kfree(sem);
++}
++
++static int amdgpu_sem_release(struct inode *inode, struct file *file)
++{
++	struct amdgpu_sem *sem = file->private_data;
++
++	kref_put(&sem->kref, amdgpu_sem_free);
++	return 0;
++}
++
++static unsigned int amdgpu_sem_poll(struct file *file, poll_table *wait)
++{
++	return 0;
++}
++
++static long amdgpu_sem_file_ioctl(struct file *file, unsigned int cmd,
++				   unsigned long arg)
++{
++	return 0;
++}
++
++static const struct file_operations amdgpu_sem_fops = {
++	.release = amdgpu_sem_release,
++	.poll = amdgpu_sem_poll,
++	.unlocked_ioctl = amdgpu_sem_file_ioctl,
++	.compat_ioctl = amdgpu_sem_file_ioctl,
++};
++
++static int amdgpu_sem_create(void)
++{
++	return get_unused_fd_flags(O_CLOEXEC);
++}
++
++static int amdgpu_sem_signal(int fd, struct fence *fence)
++{
++	struct amdgpu_sem *sem;
++
++	sem = amdgpu_sem_alloc(fence);
++	if (!sem)
++		return -ENOMEM;
++	fd_install(fd, sem->file);
++
++	return 0;
++}
++
++static int amdgpu_sem_wait(int fd, struct amdgpu_fpriv *fpriv,
++			  struct drm_amdgpu_sem_in *in)
++{
++	struct file *file = fget(fd);
++	struct amdgpu_sem *sem;
++	int r;
++
++	if (!file)
++		return -EINVAL;
++
++	sem = file->private_data;
++	if (!sem) {
++		r = -EINVAL;
++		goto err;
++	}
++	r = amdgpu_sem_cring_add(fpriv, in, sem);
++err:
++	fput(file);
++	return r;
++}
++
++static void amdgpu_sem_destroy(void)
++{
++	/* userspace should close fd when they try to destroy sem,
++	 * closing fd will free semaphore object.
++	 */
++}
++
++static struct fence *amdgpu_sem_get_fence(struct amdgpu_fpriv *fpriv,
++					 struct drm_amdgpu_sem_in *in)
++{
++	struct amdgpu_ring *out_ring;
++	struct amdgpu_ctx *ctx;
++	struct fence *fence;
++	uint32_t ctx_id, ip_type, ip_instance, ring;
++	int r;
++
++	ctx_id = in->ctx_id;
++	ip_type = in->ip_type;
++	ip_instance = in->ip_instance;
++	ring = in->ring;
++	ctx = amdgpu_ctx_get(fpriv, ctx_id);
++	if (!ctx)
++		return NULL;
++	r = amdgpu_cs_get_ring(ctx->adev, ip_type, ip_instance, ring,
++			       &out_ring);
++	if (r) {
++		amdgpu_ctx_put(ctx);
++		return NULL;
++	}
++	/* get the last fence of this entity */
++	fence = amdgpu_ctx_get_fence(ctx, out_ring,
++				     in->seq ? in->seq :
++				     ctx->rings[out_ring->idx].sequence - 1);
++	amdgpu_ctx_put(ctx);
++
++	return fence;
++}
++
++static int amdgpu_sem_cring_add(struct amdgpu_fpriv *fpriv,
++				struct drm_amdgpu_sem_in *in,
++				struct amdgpu_sem *sem)
++{
++	struct amdgpu_ring *out_ring;
++	struct amdgpu_ctx *ctx;
++	uint32_t ctx_id, ip_type, ip_instance, ring;
++	int r;
++
++	ctx_id = in->ctx_id;
++	ip_type = in->ip_type;
++	ip_instance = in->ip_instance;
++	ring = in->ring;
++	ctx = amdgpu_ctx_get(fpriv, ctx_id);
++	if (!ctx)
++		return -EINVAL;
++	r = amdgpu_cs_get_ring(ctx->adev, ip_type, ip_instance, ring,
++			       &out_ring);
++	if (r)
++		goto err;
++	mutex_lock(&ctx->rings[out_ring->idx].sem_lock);
++	list_add(&sem->list, &ctx->rings[out_ring->idx].sem_list);
++	mutex_unlock(&ctx->rings[out_ring->idx].sem_lock);
++
++err:
++	amdgpu_ctx_put(ctx);
++	return r;
++}
++
++int amdgpu_sem_add_cs(struct amdgpu_ctx *ctx, struct amdgpu_ring *ring,
++		     struct amdgpu_sync *sync)
++{
++	struct amdgpu_sem *sem, *tmp;
++	int r = 0;
++
++	if (list_empty(&ctx->rings[ring->idx].sem_list))
++		return 0;
++
++	mutex_lock(&ctx->rings[ring->idx].sem_lock);
++	list_for_each_entry_safe(sem, tmp, &ctx->rings[ring->idx].sem_list,
++				 list) {
++		r = amdgpu_sync_fence(ctx->adev, sync, sem->fence);
++		fence_put(sem->fence);
++		if (r)
++			goto err;
++		list_del(&sem->list);
++		kfree(sem);
++	}
++err:
++	mutex_unlock(&ctx->rings[ring->idx].sem_lock);
++	return r;
++}
++
++int amdgpu_sem_ioctl(struct drm_device *dev, void *data,
++		     struct drm_file *filp)
++{
++	union drm_amdgpu_sem *args = data;
++	struct amdgpu_fpriv *fpriv = filp->driver_priv;
++	struct fence *fence;
++	int r = 0;
++	int fd = args->in.fd;
++
++	switch (args->in.op) {
++	case AMDGPU_SEM_OP_CREATE_SEM:
++		args->out.fd = amdgpu_sem_create();
++		break;
++	case AMDGPU_SEM_OP_WAIT_SEM:
++		r = amdgpu_sem_wait(fd, fpriv, &args->in);
++		break;
++	case AMDGPU_SEM_OP_SIGNAL_SEM:
++		fence = amdgpu_sem_get_fence(fpriv, &args->in);
++		if (IS_ERR(fence)) {
++			r = PTR_ERR(fence);
++			return r;
++		}
++		r = amdgpu_sem_signal(fd, fence);
++		fence_put(fence);
++		break;
++	case AMDGPU_SEM_OP_DESTROY_SEM:
++		amdgpu_sem_destroy();
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return r;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.h
+new file mode 100644
+index 0000000..56d59d3
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.h
+@@ -0,0 +1,44 @@
++/*
++ * Copyright 2016 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: Chunming Zhou <david1.zhou@amd.com>
++ *
++ */
++
++
++#ifndef _LINUX_AMDGPU_SEM_H
++#define _LINUX_AMDGPU_SEM_H
++
++#include <linux/types.h>
++#include <linux/kref.h>
++#include <linux/ktime.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/fence.h>
++
++struct amdgpu_sem {
++	struct file		*file;
++	struct kref		kref;
++	struct fence            *fence;
++	struct list_head        list;
++};
++
++#endif /* _LINUX_AMDGPU_SEM_H */
+diff --git a/drivers/gpu/drm/amd/include/uapi/drm/amdgpu_drm.h b/drivers/gpu/drm/amd/include/uapi/drm/amdgpu_drm.h
+index b06e3dc..65153bf 100644
+--- a/drivers/gpu/drm/amd/include/uapi/drm/amdgpu_drm.h
++++ b/drivers/gpu/drm/amd/include/uapi/drm/amdgpu_drm.h
+@@ -46,6 +46,7 @@
+ #define DRM_AMDGPU_WAIT_CS		0x09
+ #define DRM_AMDGPU_GEM_OP		0x10
+ #define DRM_AMDGPU_GEM_USERPTR		0x11
++#define DRM_AMDGPU_SEM			0x5b
+ #define DRM_AMDGPU_FREESYNC	        0x14
+ 
+ #define DRM_AMDGPU_WAIT_FENCES		0x5e
+@@ -64,6 +65,7 @@
+ #define DRM_IOCTL_AMDGPU_GEM_USERPTR	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_USERPTR, struct drm_amdgpu_gem_userptr)
+ #define DRM_IOCTL_AMDGPU_WAIT_FENCES	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_WAIT_FENCES, union drm_amdgpu_wait_fences)
+ #define DRM_IOCTL_AMDGPU_FREESYNC	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_FREESYNC, struct drm_amdgpu_freesync)
++#define DRM_IOCTL_AMDGPU_SEM		DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_SEM, union drm_amdgpu_sem)
+ 
+ #define AMDGPU_GEM_DOMAIN_CPU		0x1
+ #define AMDGPU_GEM_DOMAIN_GTT		0x2
+@@ -185,6 +187,33 @@ union drm_amdgpu_ctx {
+ 	union drm_amdgpu_ctx_out out;
+ };
+ 
++/* sem related */
++#define AMDGPU_SEM_OP_CREATE_SEM        1
++#define AMDGPU_SEM_OP_WAIT_SEM	        2
++#define AMDGPU_SEM_OP_SIGNAL_SEM        3
++#define AMDGPU_SEM_OP_DESTROY_SEM       4
++
++struct drm_amdgpu_sem_in {
++	/** AMDGPU_SEM_OP_* */
++	uint32_t	op;
++	int32_t         fd;
++	uint32_t	ctx_id;
++	uint32_t        ip_type;
++	uint32_t        ip_instance;
++	uint32_t        ring;
++	uint64_t        seq;
++};
++
++union drm_amdgpu_sem_out {
++	int32_t         fd;
++	uint32_t	_pad;
++};
++
++union drm_amdgpu_sem {
++	struct drm_amdgpu_sem_in in;
++	union drm_amdgpu_sem_out out;
++};
++
+ /*
+  * This is not a reliable API and you should expect it to fail for any
+  * number of reasons and have fallback path that do not use userptr to
+-- 
+2.7.4
+
