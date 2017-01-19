@@ -54,3 +54,5 @@ VIRTUAL-RUNTIME_xserver_common_pn-packagegroup-core-x11 = "xserver-common"
 PREFERRED_VERSION_xserver-nodm-init ?= "2.0"
 
 SPLASH ?= "psplash"
+
+IMAGE_FSTYPES += "hddimg iso"
