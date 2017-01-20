@@ -50,6 +50,7 @@ SRC_URI = " \
      file://amdtPwrProf.rules \
      file://codexl_remote_agent.sh \
      file://codexl-remote-agent.service \
+     file://makefile-mkdir-ordering.patch;striplevel=0 \
 "
 
 inherit scons module systemd
