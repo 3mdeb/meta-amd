@@ -6,7 +6,7 @@ HOMEPAGE = "http://llvm.org"
 LICENSE = "NCSA"
 LIC_FILES_CHKSUM = "file://LICENSE.TXT;md5=b99eb43c934ceebecab85c6b9b1a08be"
 
-DEPENDS = "libffi libxml2-native llvm-common zlib"
+DEPENDS = "libffi libxml2-native llvm-common zlib ninja-native"
 RDEPENDS_${PN} += "ncurses-terminfo"
 
 inherit perlnative pythonnative cmake
@@ -20,7 +20,9 @@ SRCREV = "a093ef43dd592b729da46db4ff3057fef9a46023"
 PV = "3.9.1"
 SRC_URI = "git://llvm.org/git/llvm.git;branch=release_39;protocol=http \
            file://0001-CrossCompile.cmake-adjust-build-for-OE.patch \
-           file://0002-CrossCompile.cmake-use-target-BuildVariables-include.patch"
+           file://0002-CrossCompile.cmake-use-target-BuildVariables-include.patch \
+           file://0003-Cleanup-LLVM_OPTIMIZED_TABLEGEN.patch \
+           file://0004-Dont-build-llvm-config-and-tblgen-concurrently.patch"
 S = "${WORKDIR}/git"
 
 LLVM_INSTALL_DIR = "${WORKDIR}/llvm-install"
@@ -33,17 +35,39 @@ EXTRA_OECMAKE += "-DLLVM_ENABLE_ASSERTIONS=OFF \
                   -DLLVM_OPTIMIZED_TABLEGEN=ON \
                   -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86""
 
-EXTRA_OEMAKE += "REQUIRES_RTTI=1 VERBOSE=1"
-
-do_configure_prepend() {
+do_configure() {
     # Fix paths in llvm-config
     sed -i "s|sys::path::parent_path(CurrentPath))\.str()|sys::path::parent_path(sys::path::parent_path(CurrentPath))).str()|g" ${S}/tools/llvm-config/llvm-config.cpp
     sed -ri "s#/(bin|include|lib)(/?\")#/\1/${LLVM_DIR}\2#g" ${S}/tools/llvm-config/llvm-config.cpp
     sed -ri "s#lib/${LLVM_DIR}#${baselib}/${LLVM_DIR}#g" ${S}/tools/llvm-config/llvm-config.cpp
+    cd ${B}
+    cmake \
+      -G Ninja \
+      ${S} \
+      -DCMAKE_INSTALL_PREFIX:PATH=/usr \
+      -DCMAKE_INSTALL_BINDIR:PATH=bin \
+      -DCMAKE_INSTALL_SBINDIR:PATH=sbin \
+      -DCMAKE_INSTALL_LIBEXECDIR:PATH=libexec \
+      -DCMAKE_INSTALL_SYSCONFDIR:PATH=/etc \
+      -DCMAKE_INSTALL_SHAREDSTATEDIR:PATH=../com \
+      -DCMAKE_INSTALL_LOCALSTATEDIR:PATH=/var \
+      -DCMAKE_INSTALL_LIBDIR:PATH=lib64 \
+      -DCMAKE_INSTALL_INCLUDEDIR:PATH=include \
+      -DCMAKE_INSTALL_DATAROOTDIR:PATH=share \
+      -DCMAKE_INSTALL_SO_NO_EXE=0 \
+      -DCMAKE_TOOLCHAIN_FILE=${WORKDIR}/toolchain.cmake \
+      -DCMAKE_VERBOSE_MAKEFILE=1 \
+      -DCMAKE_NO_SYSTEM_FROM_IMPORTED=1 \
+      ${EXTRA_OECMAKE}
+}
+
+do_compile() {
+    cd ${B}
+    NINJA_STATUS="[%p] " ninja -v
 }
 
 do_install() {
-    oe_runmake DESTDIR=${LLVM_INSTALL_DIR} install
+    DESTDIR=${LLVM_INSTALL_DIR} ninja -v install
 
     install ${B}/NATIVE/bin/llvm-config ${LLVM_INSTALL_DIR}/llvm-config-host
 
