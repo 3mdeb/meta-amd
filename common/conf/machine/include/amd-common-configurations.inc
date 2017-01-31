@@ -44,3 +44,6 @@ APPEND_ADDITIONAL ??= ""
 APPEND += "${APPEND_ADDITIONAL}"
 
 EXTRA_OECONF_append_pn-matchbox-panel-2 = " --with-battery=acpi"
+
+IMAGE_FSTYPES += "hddimg iso"
+
