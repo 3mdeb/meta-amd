@@ -92,6 +92,9 @@ do_install() {
     rm -rf ${D}${libdir}/${LLVM_DIR}/cmake
 
     ln -s ${LLVM_DIR}/libLLVM-${PV}${SOLIBSDEV} ${D}${libdir}/libLLVM-${PV}${SOLIBSDEV}
+
+    # We'll have to delete the libLLVM.so due to multiple reasons...
+    rm -rf ${D}${libdir}/${LLVM_DIR}/libLLVM.so
 }
 
 SYSROOT_PREPROCESS_FUNCS += "llvm_sysroot_preprocess"
