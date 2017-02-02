@@ -1,4 +1,4 @@
-require gstreamer-vaapi.inc
+require gstreamer1.0-vaapi.inc
 
 DEPENDS += "gstreamer1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-bad"
 
