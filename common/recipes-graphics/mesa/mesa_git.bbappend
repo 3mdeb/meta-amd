@@ -21,6 +21,7 @@ MESA_LLVM_RELEASE_amd = "3.9.1"
 
 SRC_URI_amd = "\
 			git://anongit.freedesktop.org/git/mesa/mesa;branch=12.0 \
+			file://0001-fix-building-with-flex-2.6.2.patch \
 "
 
 EXTRA_OECONF_append_amd = " \

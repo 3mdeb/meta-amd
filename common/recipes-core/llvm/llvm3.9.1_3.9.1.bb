@@ -22,11 +22,14 @@ SRC_URI = "git://llvm.org/git/llvm.git;branch=release_39;protocol=http \
            file://0001-CrossCompile.cmake-adjust-build-for-OE.patch \
            file://0002-CrossCompile.cmake-use-target-BuildVariables-include.patch \
            file://0003-Cleanup-LLVM_OPTIMIZED_TABLEGEN.patch \
-           file://0004-Dont-build-llvm-config-and-tblgen-concurrently.patch"
+           file://0004-Dont-build-llvm-config-and-tblgen-concurrently.patch \
+           file://0005-CrossCompile.cmake-strip-sysroot-info-from-build-var.patch"
 S = "${WORKDIR}/git"
 
 LLVM_INSTALL_DIR = "${WORKDIR}/llvm-install"
 
+CXXFLAGS_remove = "${HOST_CC_ARCH} ${TOOLCHAIN_OPTIONS}"
+CFLAGS_remove = "${HOST_CC_ARCH} ${TOOLCHAIN_OPTIONS}"
 EXTRA_OECMAKE += "-DLLVM_ENABLE_ASSERTIONS=OFF \
                   -DLLVM_ENABLE_EXPENSIVE_CHECKS=OFF \
                   -DLLVM_BINDINGS_LIST="" \
