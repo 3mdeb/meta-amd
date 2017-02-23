@@ -20,7 +20,7 @@ MACHINE_FEATURES += "wifi efi pcbios alsa"
 MACHINE_FEATURES_remove = "qemu-usermode"
 
 MACHINE_EXTRA_RRECOMMENDS += "kernel-modules alsa-utils"
-MACHINE_EXTRA_RRECOMMENDS += "vdpauinfo grub parted util-linux-blkid"
+MACHINE_EXTRA_RRECOMMENDS += "vdpauinfo util-linux-blkid"
 MACHINE_EXTRA_RRECOMMENDS += "rtc-test watchdog-test spi-test smbus-test gpio-test"
 MACHINE_EXTRA_RRECOMMENDS += "amd-wdt amd-spi"
 MACHINE_EXTRA_RRECOMMENDS += "${@bb.utils.contains_any("DISTRO", "mel mel-lite", "firmware-wireless", "", d)}"
