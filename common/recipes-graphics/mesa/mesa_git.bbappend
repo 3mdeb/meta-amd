@@ -22,6 +22,10 @@ MESA_LLVM_RELEASE_amd = "3.9.1"
 SRC_URI_amd = "\
 			git://anongit.freedesktop.org/git/mesa/mesa;branch=12.0 \
 			file://0001-fix-building-with-flex-2.6.2.patch \
+			file://0001-reverse-the-patch-radeonsi-rework-clear_buffer-flags.patch \
+			file://0002-radeonsi-silence-runtime-warnings-with-LLVM-3.9.patch \
+			file://0003-st-mesa-Revert-patches-solves-perf-issues-with-mesa-.patch \
+			file://0004-st-mesa-fix-swizzle-issue-in-st_create_sampler_view_.patch \
 "
 
 EXTRA_OECONF_append_amd = " \
