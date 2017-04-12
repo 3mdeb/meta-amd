@@ -28,6 +28,8 @@ SRC_URI_amd = "\
 			file://0004-st-mesa-fix-swizzle-issue-in-st_create_sampler_view_.patch \
 "
 
+EXTRA_OECONF_remove_amd = "--with-llvm-prefix=${STAGING_BINDIR_NATIVE}"
+
 EXTRA_OECONF_append_amd = " \
 		 --enable-vdpau \
 		 --enable-osmesa \
