@@ -5,7 +5,6 @@ PREFERRED_PROVIDER_jpeg-native ?= "jpeg-native"
 PREFERRED_PROVIDER_llvm ?= "llvm3.9.1"
 PREFERRED_VERSION_linux-yocto ?= "4.4%"
 PREFERRED_VERSION_mesa ?= "12.0.3+git%"
-PREFERRED_VERSION_gstreamer1.0-omx ?= "git+git%"
 PREFERRED_VERSION_libav ?= "9.18"
 
 MULTILIBS ?= ""
