@@ -113,6 +113,16 @@ SRC_URI_amd = "http://dri.freedesktop.org/libdrm/${BP}.tar.bz2 \
                file://0115-amdgpu-implement-direct-gma.patch \
                file://0116-tests-amdgpu-add-direct-gma-test.patch \
                file://0117-Hybrid-Version-16.50.2.patch \
+               file://0118-amdgpu-add-SI-support.patch \
+               file://0119-amdgpu-add-vram-memory-info.patch \
+               file://0120-tests-amdgpu-add-vram-memory-info-test.patch \
+               file://0121-amdgpu-add-info-about-vram-and-gtt-total-size.patch \
+               file://0122-amdgpu-add-info-about-vram-and-gtt-max-allocation-si.patch \
+               file://0123-amdgpu-unify-memory-query-info-interface.patch \
+               file://0124-amdgpu-remove-redundant-wrong-marketing-name.patch \
+               file://0125-amdgpu-add-new-semaphore-support.patch \
+               file://0126-amdgpu-new-ids-flag-for-preempt.patch \
+               file://0127-amdgpu-sync-amdgpu_drm.h-with-the-kernel.patch \
 "
 SRC_URI[md5sum] = "c6809c48538d6e5999588832045ff014"
 SRC_URI[sha256sum] = "79cb8e988749794edfb2d777b298d5292eff353bbbb71ed813589e61d2bc2d76"
