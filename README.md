@@ -88,4 +88,5 @@ The per layer gatekeepers are the following.
 - amdfalconx86: Wade Farnsworth, wade_farnsworth@mentor.com
 - common: Wade Farnsworth, wade_farnsworth@mentor.com
 - steppeeagle: Wade Farnsworth, wade_farnsworth@mentor.com
+- snowyowl: Wade Farnsworth, wade_farnsworth@mentor.com
 - seattle: Adrian Calianu, adrian.calianu@enea.com
