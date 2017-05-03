@@ -47,7 +47,7 @@ do_install_append() {
     install -d ${D}${libdir}
     cp -f ${B}/vktrace/libVkLayer_vktrace_layer.so ${D}${libdir}
 
-    install -d ${D}${sysconfdir}/explicit_layer.d
-    cp -f ${S}/layersvt/${HOST_OS}/*.json ${D}${sysconfdir}/explicit_layer.d
-    cp -f ${S}/vktrace/src/vktrace_layer/${HOST_OS}/*.json ${D}${sysconfdir}/explicit_layer.d
+    install -d ${D}${sysconfdir}/vulkan/explicit_layer.d
+    cp -f ${S}/layersvt/${HOST_OS}/*.json ${D}${sysconfdir}/vulkan/explicit_layer.d
+    cp -f ${S}/vktrace/src/vktrace_layer/${HOST_OS}/*.json ${D}${sysconfdir}/vulkan/explicit_layer.d
 }
