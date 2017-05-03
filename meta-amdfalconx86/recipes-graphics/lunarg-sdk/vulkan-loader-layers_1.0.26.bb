@@ -50,8 +50,8 @@ do_install_append() {
     mv ${D}${bindir}/tri ${D}${bindir}/tri-vulkan
     mv ${D}${bindir}/cube ${D}${bindir}/cube-vulkan
 
-    install -d ${D}${sysconfdir}/explicit_layer.d
-    cp -f ${B}/layers/*.json ${D}${sysconfdir}/explicit_layer.d
+    install -d ${D}${sysconfdir}/vulkan/explicit_layer.d
+    cp -f ${B}/layers/*.json ${D}${sysconfdir}/vulkan/explicit_layer.d
 
     install -d ${D}${includedir}
     cp -rf ${S}/include/vulkan ${D}${includedir}
