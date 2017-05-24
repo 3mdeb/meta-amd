@@ -1,0 +1,139 @@
+From 461eeb9aac14c48fb544e4239af72a8f5ab16c1c Mon Sep 17 00:00:00 2001
+From: Jim Qu <Jim.Qu@amd.com>
+Date: Fri, 10 Feb 2017 15:59:59 +0800
+Subject: [PATCH 2221/3082] drm/amd/amdgpu: post card if there is real hw
+ resetting performed
+
+Change-Id: I1e5ecd33f84c4dca968103e3c06580a684705281
+Signed-off-by: Jim Qu <Jim.Qu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  5 ++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_bios.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 22 +++++++++++++---------
+ drivers/gpu/drm/amd/amdgpu/cik.c           |  1 +
+ drivers/gpu/drm/amd/amdgpu/vi.c            |  1 +
+ 5 files changed, 20 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 0d8a33f..9532b43 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1498,6 +1498,9 @@ struct amdgpu_device {
+ 	spinlock_t			gtt_list_lock;
+ 	struct list_head                gtt_list;
+ 
++	/* record hw reset is performed */
++	bool has_hw_reset;
++
+ };
+ 
+ static inline struct amdgpu_device *amdgpu_ttm_adev(struct ttm_bo_device *bdev)
+@@ -1724,7 +1727,7 @@ amdgpu_get_sdma_instance(struct amdgpu_ring *ring)
+ int amdgpu_gpu_reset(struct amdgpu_device *adev);
+ bool amdgpu_need_backup(struct amdgpu_device *adev);
+ void amdgpu_pci_config_reset(struct amdgpu_device *adev);
+-bool amdgpu_card_posted(struct amdgpu_device *adev);
++bool amdgpu_need_post(struct amdgpu_device *adev);
+ void amdgpu_update_display_priority(struct amdgpu_device *adev);
+ 
+ int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_bios.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_bios.c
+index 7900511..46ce883 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_bios.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_bios.c
+@@ -100,7 +100,7 @@ static bool igp_read_bios_from_vram(struct amdgpu_device *adev)
+ 	resource_size_t size = 256 * 1024; /* ??? */
+ 
+ 	if (!(adev->flags & AMD_IS_APU))
+-		if (!amdgpu_card_posted(adev))
++		if (amdgpu_need_post(adev))
+ 			return false;
+ 
+ 	adev->bios = NULL;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index d63c443..ee8c4a0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -620,25 +620,29 @@ void amdgpu_gtt_location(struct amdgpu_device *adev, struct amdgpu_mc *mc)
+  * GPU helpers function.
+  */
+ /**
+- * amdgpu_card_posted - check if the hw has already been initialized
++ * amdgpu_need_post - check if the hw need post or not
+  *
+  * @adev: amdgpu_device pointer
+  *
+- * Check if the asic has been initialized (all asics).
+- * Used at driver startup.
+- * Returns true if initialized or false if not.
++ * Check if the asic has been initialized (all asics) at driver startup
++ * or post is needed if  hw reset is performed.
++ * Returns true if need or false if not.
+  */
+-bool amdgpu_card_posted(struct amdgpu_device *adev)
++bool amdgpu_need_post(struct amdgpu_device *adev)
+ {
+ 	uint32_t reg;
+ 
++	if (adev->has_hw_reset) {
++		adev->has_hw_reset = false;
++		return true;
++	}
+ 	/* then check MEM_SIZE, in case the crtcs are off */
+ 	reg = RREG32(mmCONFIG_MEMSIZE);
+ 
+ 	if (reg)
+-		return true;
++		return false;
+ 
+-	return false;
++	return true;
+ 
+ }
+ 
+@@ -666,7 +670,7 @@ static bool amdgpu_vpost_needed(struct amdgpu_device *adev)
+ 				return true;
+ 		}
+ 	}
+-	return !amdgpu_card_posted(adev);
++	return amdgpu_need_post(adev);
+ }
+ 
+ /**
+@@ -2160,7 +2164,7 @@ int amdgpu_device_resume(struct drm_device *dev, bool resume, bool fbcon)
+ 	amdgpu_atombios_scratch_regs_restore(adev);
+ 
+ 	/* post card */
+-	if (!amdgpu_card_posted(adev) || !resume) {
++	if (amdgpu_need_post(adev)) {
+ 		r = amdgpu_atom_asic_init(adev->mode_info.atom_context);
+ 		if (r)
+ 			DRM_ERROR("amdgpu asic init failed\n");
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik.c b/drivers/gpu/drm/amd/amdgpu/cik.c
+index e885db4..fb17ad0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik.c
+@@ -1177,6 +1177,7 @@ static int cik_gpu_pci_config_reset(struct amdgpu_device *adev)
+ 		if (RREG32(mmCONFIG_MEMSIZE) != 0xffffffff) {
+ 			/* enable BM */
+ 			pci_set_master(adev->pdev);
++			adev->has_hw_reset = true;
+ 			r = 0;
+ 			break;
+ 		}
+diff --git a/drivers/gpu/drm/amd/amdgpu/vi.c b/drivers/gpu/drm/amd/amdgpu/vi.c
+index aeef3c9..8c784b4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vi.c
++++ b/drivers/gpu/drm/amd/amdgpu/vi.c
+@@ -722,6 +722,7 @@ static int vi_gpu_pci_config_reset(struct amdgpu_device *adev)
+ 		if (RREG32(mmCONFIG_MEMSIZE) != 0xffffffff) {
+ 			/* enable BM */
+ 			pci_set_master(adev->pdev);
++			adev->has_hw_reset = true;
+ 			return 0;
+ 		}
+ 		udelay(1);
+-- 
+2.7.4
+

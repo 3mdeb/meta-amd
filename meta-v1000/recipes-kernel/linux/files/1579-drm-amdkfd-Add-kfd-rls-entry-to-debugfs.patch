@@ -1,0 +1,128 @@
+From eb32e8c195c0679c0b36ca971393b345df471540 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Mon, 6 Jun 2016 23:55:05 -0400
+Subject: [PATCH 1579/1722] drm/amdkfd: Add kfd/rls entry to debugfs
+
+This dumps runlist IBs of all GPUs.
+
+Change-Id: I27c876559f45cf8bc3d9742e1a2007431181e45f
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c         |  6 ++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c | 15 ++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h           |  3 +++
+ drivers/gpu/drm/amd/amdkfd/kfd_topology.c       | 26 +++++++++++++++++++++++++
+ 4 files changed, 50 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 58ed979..666853e 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -371,6 +371,12 @@ static void kfd_debugfs_init(struct kfd_dev *kfd)
+ 				  &kfd_debugfs_fops);
+ 	if (ent == NULL)
+ 		dev_warn(kfd_device, "Failed to create hqds in kfd debugfs\n");
++
++	ent = debugfs_create_file("rls", S_IFREG | S_IRUGO, kfd->debugfs_root,
++				  kfd_debugfs_rls_by_device,
++				  &kfd_debugfs_fops);
++	if (ent == NULL)
++		dev_warn(kfd_device, "Failed to create rls in kfd debugfs\n");
+ }
+ 
+ static void kfd_debugfs_fini(struct kfd_dev *kfd)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+index aa925c6..b9cba37 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+@@ -449,6 +449,7 @@ static int pm_create_runlist_ib(struct packet_manager *pm,
+ 		return retval;
+ 
+ 	*rl_size_bytes = alloc_size_bytes;
++	pm->ib_size_bytes = alloc_size_bytes;
+ 
+ 	pr_debug("kfd: In func %s\n", __func__);
+ 	pr_debug("kfd: building runlist ib process count: %d queues count %d\n",
+@@ -832,3 +833,17 @@ void pm_release_ib(struct packet_manager *pm)
+ 	mutex_unlock(&pm->lock);
+ }
+ 
++int pm_debugfs_runlist(struct seq_file *m, void *data)
++{
++	struct packet_manager *pm = data;
++
++	if (!pm->allocated) {
++		seq_puts(m, "  No active runlist\n");
++		return 0;
++	}
++
++	seq_hex_dump(m, "  ", DUMP_PREFIX_OFFSET, 32, 4,
++		     pm->ib_buffer_obj->cpu_ptr, pm->ib_size_bytes, false);
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 80128e9..a222efc 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -830,6 +830,7 @@ struct packet_manager {
+ 	struct mutex lock;
+ 	bool allocated;
+ 	struct kfd_mem_obj *ib_buffer_obj;
++	unsigned ib_size_bytes;
+ 
+ 	struct packet_manager_firmware *pmf;
+ };
+@@ -924,6 +925,8 @@ int kfd_debugfs_mqds_by_process(struct seq_file *m, void *data);
+ int pqm_debugfs_mqds(struct seq_file *m, void *data);
+ int kfd_debugfs_hqds_by_device(struct seq_file *m, void *data);
+ int device_queue_manager_debugfs_hqds(struct seq_file *m, void *data);
++int kfd_debugfs_rls_by_device(struct seq_file *m, void *data);
++int pm_debugfs_runlist(struct seq_file *m, void *data);
+ 
+ #endif
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+index 99ae625..b2f2a67 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+@@ -34,6 +34,7 @@
+ #include "kfd_priv.h"
+ #include "kfd_crat.h"
+ #include "kfd_topology.h"
++#include "kfd_device_queue_manager.h"
+ 
+ /* topology_device_list - Master list of all topology devices */
+ struct list_head topology_device_list;
+@@ -1267,3 +1268,28 @@ int kfd_debugfs_hqds_by_device(struct seq_file *m, void *data)
+ 
+ 	return r;
+ }
++
++int kfd_debugfs_rls_by_device(struct seq_file *m, void *data)
++{
++	struct kfd_topology_device *dev;
++	unsigned i = 0;
++	int r = 0;
++
++	down_read(&topology_lock);
++
++	list_for_each_entry(dev, &topology_device_list, list) {
++		if (!dev->gpu) {
++			i++;
++			continue;
++		}
++
++		seq_printf(m, "Node %u, gpu_id %x:\n", i++, dev->gpu->id);
++		r = pm_debugfs_runlist(m, &dev->gpu->dqm->packets);
++		if (r != 0)
++			break;
++	}
++
++	up_read(&topology_lock);
++
++	return r;
++}
+-- 
+2.7.4
+

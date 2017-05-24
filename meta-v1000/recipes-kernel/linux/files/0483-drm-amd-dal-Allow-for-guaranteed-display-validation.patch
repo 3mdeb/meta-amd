@@ -1,0 +1,349 @@
+From aea1e7dd3d5a0d395b1aad60e555fea304c87971 Mon Sep 17 00:00:00 2001
+From: Krunoslav Kovac <Krunoslav.Kovac@amd.com>
+Date: Mon, 9 May 2016 10:45:46 -0400
+Subject: [PATCH 0483/1722] drm/amd/dal: Allow for guaranteed display
+ validation
+
+Signed-off-by: Krunoslav Kovac <Krunoslav.Kovac@amd.com>
+Acked-by: Jordan Lazare <Jordan.Lazare@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 31 ++++++++++++++++++++
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      | 21 +++++++++++++
+ drivers/gpu/drm/amd/dal/dc/dc.h                    | 12 ++++++++
+ .../gpu/drm/amd/dal/dc/dce100/dce100_resource.c    | 34 ++++++++++++++++++++++
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    | 34 ++++++++++++++++++++++
+ .../gpu/drm/amd/dal/dc/dce112/dce112_resource.c    | 34 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c  | 34 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/dal/dc/inc/core_types.h        |  5 ++++
+ drivers/gpu/drm/amd/dal/dc/inc/resource.h          |  4 +++
+ 9 files changed, 209 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index b9af925..c26a4be 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -477,6 +477,37 @@ context_alloc_fail:
+ 
+ }
+ 
++bool dc_validate_guaranteed(
++		const struct dc *dc,
++		const struct dc_target *dc_target)
++{
++	struct core_dc *core_dc = DC_TO_CORE(dc);
++	enum dc_status result = DC_ERROR_UNEXPECTED;
++	struct validate_context *context;
++
++	context = dm_alloc(sizeof(struct validate_context));
++	if (context == NULL)
++		goto context_alloc_fail;
++
++	result = core_dc->res_pool.funcs->validate_guaranteed(
++					core_dc, dc_target, context);
++
++	resource_validate_ctx_destruct(context);
++	dm_free(context);
++
++context_alloc_fail:
++	if (result != DC_OK) {
++		dal_logger_write(core_dc->ctx->logger,
++			LOG_MAJOR_WARNING,
++			LOG_MINOR_COMPONENT_TOPOLOGY_MANAGER,
++			"%s:guaranteed validation failed, dc_status:%d\n",
++			__func__,
++			result);
++		}
++
++	return (result == DC_OK);
++}
++
+ static void program_timing_sync(
+ 		struct core_dc *core_dc,
+ 		struct validate_context *ctx)
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index a87a70f..cd17020 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -922,6 +922,27 @@ enum dc_status resource_map_pool_resources(
+ 	return DC_OK;
+ }
+ 
++/* first target in the context is used to populate the rest */
++void validate_guaranteed_copy_target(
++		struct validate_context *context,
++		uint8_t max_targets)
++{
++	uint8_t i;
++
++	for (i = 1; i < max_targets; i++) {
++		context->targets[i] = context->targets[0];
++
++		copy_pipe_ctx(&context->res_ctx.pipe_ctx[0],
++			      &context->res_ctx.pipe_ctx[i]);
++		context->res_ctx.pipe_ctx[i].stream =
++				context->res_ctx.pipe_ctx[0].stream;
++
++		dc_target_retain(&context->targets[i]->public);
++		context->target_count++;
++	}
++}
++
++
+ static void translate_info_frame(const struct hw_info_frame *hw_info_frame,
+ 	struct encoder_info_frame *encoder_info_frame)
+ {
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index ec1d4c4..4ed39f4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -288,6 +288,18 @@ bool dc_validate_resources(
+ 		uint8_t set_count);
+ 
+ /*
++ * This function takes a target and checks if it is guaranteed to be supported.
++ * Guaranteed means that MAX_COFUNC*target is supported.
++ *
++ * After this call:
++ *   No hardware is programmed for call.  Only validation is done.
++ */
++
++bool dc_validate_guaranteed(
++		const struct dc *dc,
++		const struct dc_target *dc_target);
++
++/*
+  * Set up streams and links associated to targets to drive sinks
+  * The targets parameter is an absolute set of all active targets.
+  *
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+index ed2fbaf..eb7ba39 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+@@ -682,10 +682,44 @@ enum dc_status dce100_validate_with_context(
+ 	return result;
+ }
+ 
++enum dc_status dce100_validate_guaranteed(
++		const struct core_dc *dc,
++		const struct dc_target *dc_target,
++		struct validate_context *context)
++{
++	enum dc_status result = DC_ERROR_UNEXPECTED;
++
++	context->res_ctx.pool = dc->res_pool;
++
++	context->targets[0] = DC_TARGET_TO_CORE(dc_target);
++	dc_target_retain(&context->targets[0]->public);
++	context->target_count++;
++
++	result = resource_map_pool_resources(dc, context);
++
++	if (result == DC_OK)
++		result = resource_map_clock_resources(dc, context);
++
++	if (result == DC_OK)
++		result = validate_mapped_resource(dc, context);
++
++	if (result == DC_OK) {
++		validate_guaranteed_copy_target(
++				context, dc->public.caps.max_targets);
++		resource_build_scaling_params_for_context(dc, context);
++	}
++
++	if (result == DC_OK)
++		result = dce100_validate_bandwidth(dc, context);
++
++	return result;
++}
++
+ static struct resource_funcs dce100_res_pool_funcs = {
+ 	.destruct = dce100_destruct_resource_pool,
+ 	.link_enc_create = dce100_link_encoder_create,
+ 	.validate_with_context = dce100_validate_with_context,
++	.validate_guaranteed = dce100_validate_guaranteed,
+ 	.validate_bandwidth = dce100_validate_bandwidth
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index a361d50..15bd9141 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -873,10 +873,44 @@ enum dc_status dce110_validate_with_context(
+ 	return result;
+ }
+ 
++enum dc_status dce110_validate_guaranteed(
++		const struct core_dc *dc,
++		const struct dc_target *dc_target,
++		struct validate_context *context)
++{
++	enum dc_status result = DC_ERROR_UNEXPECTED;
++
++	context->res_ctx.pool = dc->res_pool;
++
++	context->targets[0] = DC_TARGET_TO_CORE(dc_target);
++	dc_target_retain(&context->targets[0]->public);
++	context->target_count++;
++
++	result = resource_map_pool_resources(dc, context);
++
++	if (result == DC_OK)
++		result = resource_map_clock_resources(dc, context);
++
++	if (result == DC_OK)
++		result = validate_mapped_resource(dc, context);
++
++	if (result == DC_OK) {
++		validate_guaranteed_copy_target(
++				context, dc->public.caps.max_targets);
++		resource_build_scaling_params_for_context(dc, context);
++	}
++
++	if (result == DC_OK)
++		result = dce110_validate_bandwidth(dc, context);
++
++	return result;
++}
++
+ static struct resource_funcs dce110_res_pool_funcs = {
+ 	.destruct = dce110_destruct_resource_pool,
+ 	.link_enc_create = dce110_link_encoder_create,
+ 	.validate_with_context = dce110_validate_with_context,
++	.validate_guaranteed = dce110_validate_guaranteed,
+ 	.validate_bandwidth = dce110_validate_bandwidth
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
+index 7c808d6d..0ca073c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
+@@ -945,10 +945,44 @@ enum dc_status dce112_validate_with_context(
+ 	return result;
+ }
+ 
++enum dc_status dce112_validate_guaranteed(
++		const struct core_dc *dc,
++		const struct dc_target *dc_target,
++		struct validate_context *context)
++{
++	enum dc_status result = DC_ERROR_UNEXPECTED;
++
++	context->res_ctx.pool = dc->res_pool;
++
++	context->targets[0] = DC_TARGET_TO_CORE(dc_target);
++	dc_target_retain(&context->targets[0]->public);
++	context->target_count++;
++
++	result = resource_map_pool_resources(dc, context);
++
++	if (result == DC_OK)
++		result = resource_map_clock_resources(dc, context);
++
++	if (result == DC_OK)
++		result = validate_mapped_resource(dc, context);
++
++	if (result == DC_OK) {
++		validate_guaranteed_copy_target(
++				context, dc->public.caps.max_targets);
++		resource_build_scaling_params_for_context(dc, context);
++	}
++
++	if (result == DC_OK)
++		result = dce112_validate_bandwidth(dc, context);
++
++	return result;
++}
++
+ static struct resource_funcs dce112_res_pool_funcs = {
+ 	.destruct = dce112_destruct_resource_pool,
+ 	.link_enc_create = dce112_link_encoder_create,
+ 	.validate_with_context = dce112_validate_with_context,
++	.validate_guaranteed = dce112_validate_guaranteed,
+ 	.validate_bandwidth = dce112_validate_bandwidth
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+index a71aa14..7751fc6 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+@@ -637,10 +637,44 @@ enum dc_status dce80_validate_with_context(
+ 	return result;
+ }
+ 
++enum dc_status dce80_validate_guaranteed(
++		const struct core_dc *dc,
++		const struct dc_target *dc_target,
++		struct validate_context *context)
++{
++	enum dc_status result = DC_ERROR_UNEXPECTED;
++
++	context->res_ctx.pool = dc->res_pool;
++
++	context->targets[0] = DC_TARGET_TO_CORE(dc_target);
++	dc_target_retain(&context->targets[0]->public);
++	context->target_count++;
++
++	result = resource_map_pool_resources(dc, context);
++
++	if (result == DC_OK)
++		result = resource_map_clock_resources(dc, context);
++
++	if (result == DC_OK)
++		result = validate_mapped_resource(dc, context);
++
++	if (result == DC_OK) {
++		validate_guaranteed_copy_target(
++				context, dc->public.caps.max_targets);
++		resource_build_scaling_params_for_context(dc, context);
++	}
++
++	if (result == DC_OK)
++		result = dce80_validate_bandwidth(dc, context);
++
++	return result;
++}
++
+ static struct resource_funcs dce80_res_pool_funcs = {
+ 	.destruct = dce80_destruct_resource_pool,
+ 	.link_enc_create = dce80_link_encoder_create,
+ 	.validate_with_context = dce80_validate_with_context,
++	.validate_guaranteed = dce80_validate_guaranteed,
+ 	.validate_bandwidth = dce80_validate_bandwidth
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+index 5c41f12..0edd902 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+@@ -224,6 +224,11 @@ struct resource_funcs {
+ 					uint8_t set_count,
+ 					struct validate_context *context);
+ 
++	enum dc_status (*validate_guaranteed)(
++					const struct core_dc *dc,
++					const struct dc_target *dc_target,
++					struct validate_context *context);
++
+ 	enum dc_status (*validate_bandwidth)(
+ 					const struct core_dc *dc,
+ 					struct validate_context *context);
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/resource.h b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+index 480df80..09d27b7 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+@@ -91,6 +91,10 @@ bool resource_validate_attach_surfaces(
+ 		const struct validate_context *old_context,
+ 		struct validate_context *context);
+ 
++void validate_guaranteed_copy_target(
++		struct validate_context *context,
++		uint8_t max_targets);
++
+ void resource_validate_ctx_copy_construct(
+ 		const struct validate_context *src_ctx,
+ 		struct validate_context *dst_ctx);
+-- 
+2.7.4
+

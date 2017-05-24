@@ -1,0 +1,273 @@
+From 76ac556b91fe3d8b49b7a96db5fb0455b0b0e183 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Wed, 27 Apr 2016 18:02:47 -0400
+Subject: [PATCH 0460/1722] drm/amd/dal: Add function to calculate recout for
+ scaler
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/basics/fixpt31_32.c     |  3 +-
+ drivers/gpu/drm/amd/dal/dc/calcs/scaler_filter.c   | 34 ++++++++++++++++++++
+ drivers/gpu/drm/amd/dal/dc/calcs/scaler_filter.h   |  3 ++
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      | 37 ++++++++++++++++++++++
+ .../gpu/drm/amd/dal/dc/dce110/dce110_transform.h   |  2 +-
+ .../drm/amd/dal/dc/dce110/dce110_transform_scl.c   |  2 +-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_transform_v.c |  2 +-
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform.h |  2 +-
+ .../gpu/drm/amd/dal/dc/dce80/dce80_transform_scl.c |  2 +-
+ drivers/gpu/drm/amd/dal/dc/inc/hw/transform.h      | 28 ++++++++--------
+ 10 files changed, 94 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/basics/fixpt31_32.c b/drivers/gpu/drm/amd/dal/dc/basics/fixpt31_32.c
+index 9f93b3b..5a6e4684 100644
+--- a/drivers/gpu/drm/amd/dal/dc/basics/fixpt31_32.c
++++ b/drivers/gpu/drm/amd/dal/dc/basics/fixpt31_32.c
+@@ -665,8 +665,7 @@ static inline uint32_t ux_dy(
+ 	uint32_t fractional_bits)
+ {
+ 	/* 1. create mask of integer part */
+-	uint32_t result =
+-		(1 << integer_bits) - 1;
++	uint32_t result = (1 << integer_bits) - 1;
+ 	/* 2. mask out fractional part */
+ 	uint32_t fractional_part = FRACTIONAL_PART_MASK & value;
+ 	/* 3. shrink fixed point integer part to be of integer_bits width*/
+diff --git a/drivers/gpu/drm/amd/dal/dc/calcs/scaler_filter.c b/drivers/gpu/drm/amd/dal/dc/calcs/scaler_filter.c
+index 706bf0a..d40ab63 100644
+--- a/drivers/gpu/drm/amd/dal/dc/calcs/scaler_filter.c
++++ b/drivers/gpu/drm/amd/dal/dc/calcs/scaler_filter.c
+@@ -1961,6 +1961,40 @@ const struct fixed31_32 *dal_scaler_filter_get(
+ 	return filter->filter;
+ }
+ 
++const uint32_t *dal_scaler_filter_get_1s12(
++			const struct scaler_filter *filter, uint32_t *size)
++{
++	int i;
++
++	if (!filter) {
++		BREAK_TO_DEBUGGER();
++		return NULL;
++	}
++
++	for (i = 0; i < filter->filter_size_effective; i++) {
++		/* req. format sign fixed 1.1.12, the values are always between
++		 * [-1; 1]
++		 *
++		 * Each phase is mirrored as follows :
++		 * 0 : Phase 0
++		 * 1 : Phase 1 or Phase 64 - 1 / 128 - 1
++		 * N : Phase N or Phase 64 - N / 128 - N
++		 *
++		 * Convert from Fixed31_32 to 1.1.12 by using floor on value
++		 * shifted by number of required fractional bits(12)
++		 */
++		struct fixed31_32 coef = filter->filter[i];
++
++		filter->integer_filter[i] = 0x3FFC & dal_fixed31_32_floor(
++						dal_fixed31_32_shl(coef, 12));
++	}
++
++	if (size)
++		*size = filter->filter_size_effective;
++
++	return filter->integer_filter;
++}
++
+ void dal_scaler_filter_destroy(
+ 	struct scaler_filter **filter)
+ {
+diff --git a/drivers/gpu/drm/amd/dal/dc/calcs/scaler_filter.h b/drivers/gpu/drm/amd/dal/dc/calcs/scaler_filter.h
+index 220b736..8d1381c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/calcs/scaler_filter.h
++++ b/drivers/gpu/drm/amd/dal/dc/calcs/scaler_filter.h
+@@ -69,4 +69,7 @@ const struct fixed31_32 *dal_scaler_filter_get(
+ 	uint32_t **data,
+ 	uint32_t *number);
+ 
++const uint32_t *dal_scaler_filter_get_1s12(
++			const struct scaler_filter *filter, uint32_t *size);
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index 928141a..c07bece7 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -328,6 +328,41 @@ static void calculate_overscan(
+ 	/* TODO: Add timing overscan to finalize overscan calculation*/
+ }
+ 
++static void calculate_recout(
++		const struct dc_surface *surface,
++		struct pipe_ctx *pipe_ctx)
++{
++	struct core_stream *stream = pipe_ctx->stream;
++
++	pipe_ctx->scl_data.recout.x = 0;
++	if (stream->public.src.x < surface->clip_rect.x)
++		pipe_ctx->scl_data.recout.x = (surface->clip_rect.x
++			- stream->public.src.x) * stream->public.dst.width
++						/ stream->public.src.width;
++
++	pipe_ctx->scl_data.recout.width = surface->clip_rect.width *
++			stream->public.dst.width / stream->public.src.width;
++	if (pipe_ctx->scl_data.recout.width + pipe_ctx->scl_data.recout.x >
++			stream->public.dst.x + stream->public.dst.width)
++		pipe_ctx->scl_data.recout.width =
++			stream->public.dst.x + stream->public.dst.width
++						- pipe_ctx->scl_data.recout.x;
++
++	pipe_ctx->scl_data.recout.y = 0;
++	if (stream->public.src.y < surface->clip_rect.y)
++		pipe_ctx->scl_data.recout.y = (surface->clip_rect.y
++			- stream->public.src.y) * stream->public.dst.height
++						/ stream->public.src.height;
++
++	pipe_ctx->scl_data.recout.height = surface->clip_rect.height *
++			stream->public.dst.height / stream->public.src.height;
++	if (pipe_ctx->scl_data.recout.height + pipe_ctx->scl_data.recout.y >
++			stream->public.dst.y + stream->public.dst.height)
++		pipe_ctx->scl_data.recout.height =
++			stream->public.dst.y + stream->public.dst.height
++						- pipe_ctx->scl_data.recout.y;
++}
++
+ static void calculate_scaling_ratios(
+ 		const struct dc_surface *surface,
+ 		struct pipe_ctx *pipe_ctx)
+@@ -380,6 +415,8 @@ void resource_build_scaling_params(
+ 
+ 	calculate_overscan(surface, pipe_ctx);
+ 
++	calculate_recout(surface, pipe_ctx);
++
+ 	/* Check if scaling is required update taps if not */
+ 	if (dal_fixed31_32_u2d19(pipe_ctx->scl_data.ratios.horz) == 1 << 19)
+ 		pipe_ctx->scl_data.taps.h_taps = 1;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h
+index a5b3f8f..c9740f5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform.h
+@@ -58,7 +58,7 @@ bool dce110_transform_set_scaler(
+ 
+ void dce110_transform_set_scaler_bypass(
+ 		struct transform *xfm,
+-		const struct output_size_params *output_size);
++		const struct scaler_data *scl_data);
+ 
+ void dce110_transform_set_scaler_filter(
+ 	struct transform *xfm,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_scl.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_scl.c
+index 3353e91..0f7336a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_scl.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_scl.c
+@@ -686,7 +686,7 @@ bool dce110_transform_set_scaler(
+ 
+ void dce110_transform_set_scaler_bypass(
+ 		struct transform *xfm,
+-		const struct output_size_params *output_size)
++		const struct scaler_data *scl_data)
+ {
+ 	struct dce110_transform *xfm110 = TO_DCE110_TRANSFORM(xfm);
+ 	uint32_t sclv_mode;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_v.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_v.c
+index 1ec5a01..dbca59c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_v.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_v.c
+@@ -455,7 +455,7 @@ static void program_scl_ratios_inits(
+ 
+ static void dce110_transform_v_set_scalerv_bypass(
+ 		struct transform *xfm,
+-		const struct output_size_params *output_size)
++		const struct scaler_data *scl_data)
+ {
+ 	uint32_t addr = mmSCLV_MODE;
+ 	uint32_t value = dm_read_reg(xfm->ctx, addr);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform.h b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform.h
+index 45e64e6..f7b7cc5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform.h
+@@ -58,7 +58,7 @@ bool dce80_transform_set_scaler(
+ 
+ void dce80_transform_set_scaler_bypass(
+ 		struct transform *xfm,
+-		const struct output_size_params *output_size);
++		const struct scaler_data *scl_data);
+ 
+ void dce80_transform_set_scaler_filter(
+ 	struct transform *xfm,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_scl.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_scl.c
+index a0b8e9d..3cc955d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_scl.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_scl.c
+@@ -687,7 +687,7 @@ bool dce80_transform_set_scaler(
+ 
+ void dce80_transform_set_scaler_bypass(
+ 		struct transform *xfm,
+-		const struct output_size_params *output_size)
++		const struct scaler_data *scl_data)
+ {
+ 	struct dce80_transform *xfm80 = TO_DCE80_TRANSFORM(xfm);
+ 	uint32_t sclv_mode;
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw/transform.h b/drivers/gpu/drm/amd/dal/dc/inc/hw/transform.h
+index 405c98a..0e1ebde 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw/transform.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw/transform.h
+@@ -135,28 +135,29 @@ struct scaling_ratios {
+ 	struct fixed31_32 vert_c;
+ };
+ 
++struct sharpness_adj {
++	uint32_t horz;
++	uint32_t vert;
++};
++
+ struct scaler_data {
+ 	struct overscan_info overscan;
+ 	struct scaling_taps taps;
+ 	struct rect viewport;
++	struct rect recout;
+ 	struct scaling_ratios ratios;
+-
++	struct sharpness_adj sharpness;
+ 	enum pixel_format format;
+ };
+ 
+-
+-
+-struct output_size_params {
+-	uint32_t recout_width;
+-	uint32_t recout_height;
+-	uint32_t recout_start_x;
+-	uint32_t recout_start_y;
+-	uint32_t otg_active_width; // MPC width:  OTG non-blank, includes overscan
+-	uint32_t otg_active_height; // MPC height: OTG non-blank, includes overscan
++struct line_buffer_params {
++	bool alpha_en;
++	bool pixel_expan_mode;
++	bool interleave_en;
++	uint32_t dynamic_pixel_depth;
++	enum lb_pixel_depth depth;
+ };
+ 
+-
+-
+ struct transform_funcs {
+ 	bool (*transform_power_up)(
+ 		struct transform *xfm);
+@@ -166,8 +167,7 @@ struct transform_funcs {
+ 		const struct scaler_data *data);
+ 
+ 	void (*transform_set_scaler_bypass)(
+-		struct transform *xfm,
+-		const struct output_size_params *output_size);
++		struct transform *xfm, const struct scaler_data *scl_data);
+ 
+ 	void (*transform_set_scaler_filter)(
+ 		struct transform *xfm,
+-- 
+2.7.4
+

@@ -1,0 +1,389 @@
+From 067488799dd34689fb8013769cec37695e01d393 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Fri, 3 Jun 2016 20:32:53 -0400
+Subject: [PATCH 1575/1722] drm/amdkfd: Add debugfs entry for hexdump of MQDs
+
+This commit adds initial Debugfs support to KFD and implements a list
+of all queues by process with hexdumps of the MQDs. This can be
+useful for debugging CP scheduler problems.
+
+Change-Id: Ia63a65af8927e40d24a747d4c35b5907fe59c4b4
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c            | 56 +++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h       |  4 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c   | 27 ++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c    | 25 +++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h              | 13 +++++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c           | 28 ++++++++++
+ .../gpu/drm/amd/amdkfd/kfd_process_queue_manager.c | 63 ++++++++++++++++++++++
+ 7 files changed, 216 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index aae4e5a..64f41d6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -25,6 +25,7 @@
+ #include <linux/pci.h>
+ #include <linux/slab.h>
+ #include <linux/highmem.h>
++#include <linux/debugfs.h>
+ #include "kfd_priv.h"
+ #include "kfd_device_queue_manager.h"
+ #include "kfd_pm4_headers.h"
+@@ -331,6 +332,58 @@ static void kfd_cwsr_fini(struct kfd_dev *kfd)
+ 		__free_pages(kfd->cwsr_pages, get_order(kfd->cwsr_size));
+ }
+ 
++#if defined(CONFIG_DEBUG_FS)
++
++static int kfd_debugfs_open(struct inode *inode, struct file *file)
++{
++	int (*show)(struct seq_file *, void *) = inode->i_private;
++
++	return single_open(file, show, NULL);
++}
++
++static const struct file_operations kfd_debugfs_fops = {
++	.owner = THIS_MODULE,
++	.open = kfd_debugfs_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static void kfd_debugfs_init(struct kfd_dev *kfd)
++{
++	struct dentry *ent;
++
++	kfd->debugfs_root = debugfs_create_dir("kfd", NULL);
++	if (kfd->debugfs_root == NULL ||
++	    kfd->debugfs_root == ERR_PTR(-ENODEV)) {
++		dev_warn(kfd_device, "Failed to create kfd debugfs dir\n");
++		return;
++	}
++
++	ent = debugfs_create_file("mqds", S_IFREG | S_IRUGO, kfd->debugfs_root,
++				  kfd_debugfs_mqds_by_process,
++				  &kfd_debugfs_fops);
++	if (ent == NULL)
++		dev_warn(kfd_device, "Failed to create mqds in kfd debugfs\n");
++}
++
++static void kfd_debugfs_fini(struct kfd_dev *kfd)
++{
++	debugfs_remove_recursive(kfd->debugfs_root);
++}
++
++#else
++
++static void kfd_debugfs_init(struct kfd_dev *kfd)
++{
++}
++
++static void kfd_debugfs_fini(struct kfd_dev *kfd)
++{
++}
++
++#endif
++
+ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+ 			 const struct kgd2kfd_shared_resources *gpu_resources)
+ {
+@@ -439,6 +492,8 @@ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+ 	if (kfd_resume(kfd))
+ 		goto kfd_resume_error;
+ 
++	kfd_debugfs_init(kfd);
++
+ 	kfd->dbgmgr = NULL;
+ 
+ 	kfd->init_complete = true;
+@@ -472,6 +527,7 @@ out:
+ void kgd2kfd_device_exit(struct kfd_dev *kfd)
+ {
+ 	if (kfd->init_complete) {
++		kfd_debugfs_fini(kfd);
+ 		kgd2kfd_suspend(kfd);
+ 		kfd_cwsr_fini(kfd);
+ 		device_queue_manager_uninit(kfd->dqm);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+index eb60192..574684f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+@@ -85,6 +85,10 @@ struct mqd_manager {
+ 				uint64_t queue_address,	uint32_t pipe_id,
+ 				uint32_t queue_id);
+ 
++#if defined(CONFIG_DEBUG_FS)
++	int	(*debugfs_show_mqd)(struct seq_file *m, void *data);
++#endif
++
+ 	struct mutex	mqd_mutex;
+ 	struct kfd_dev	*dev;
+ };
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+index bf31b18..d6f856a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -473,6 +473,24 @@ static int update_mqd_hiq(struct mqd_manager *mm, void *mqd,
+ 	return 0;
+ }
+ 
++#if defined(CONFIG_DEBUG_FS)
++
++static int debugfs_show_mqd(struct seq_file *m, void *data)
++{
++	seq_hex_dump(m, "    ", DUMP_PREFIX_OFFSET, 32, 4,
++		     data, sizeof(struct cik_mqd), false);
++	return 0;
++}
++
++static int debugfs_show_mqd_sdma(struct seq_file *m, void *data)
++{
++	seq_hex_dump(m, "    ", DUMP_PREFIX_OFFSET, 32, 4,
++		     data, sizeof(struct cik_sdma_rlc_registers), false);
++	return 0;
++}
++
++#endif
++
+ 
+ struct mqd_manager *mqd_manager_init_cik(enum KFD_MQD_TYPE type,
+ 		struct kfd_dev *dev)
+@@ -499,6 +517,9 @@ struct mqd_manager *mqd_manager_init_cik(enum KFD_MQD_TYPE type,
+ 		mqd->update_mqd = update_mqd;
+ 		mqd->destroy_mqd = destroy_mqd;
+ 		mqd->is_occupied = is_occupied;
++#if defined(CONFIG_DEBUG_FS)
++		mqd->debugfs_show_mqd = debugfs_show_mqd;
++#endif
+ 		break;
+ 	case KFD_MQD_TYPE_HIQ:
+ 		mqd->init_mqd = init_mqd_hiq;
+@@ -507,6 +528,9 @@ struct mqd_manager *mqd_manager_init_cik(enum KFD_MQD_TYPE type,
+ 		mqd->update_mqd = update_mqd_hiq;
+ 		mqd->destroy_mqd = destroy_mqd;
+ 		mqd->is_occupied = is_occupied;
++#if defined(CONFIG_DEBUG_FS)
++		mqd->debugfs_show_mqd = debugfs_show_mqd;
++#endif
+ 		break;
+ 	case KFD_MQD_TYPE_SDMA:
+ 		mqd->init_mqd = init_mqd_sdma;
+@@ -515,6 +539,9 @@ struct mqd_manager *mqd_manager_init_cik(enum KFD_MQD_TYPE type,
+ 		mqd->update_mqd = update_mqd_sdma;
+ 		mqd->destroy_mqd = destroy_mqd_sdma;
+ 		mqd->is_occupied = is_occupied_sdma;
++#if defined(CONFIG_DEBUG_FS)
++		mqd->debugfs_show_mqd = debugfs_show_mqd_sdma;
++#endif
+ 		break;
+ 	default:
+ 		kfree(mqd);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+index b5fb783..62dbb40 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -424,7 +424,23 @@ static bool is_occupied_sdma(struct mqd_manager *mm, void *mqd,
+ 	return mm->dev->kfd2kgd->hqd_sdma_is_occupied(mm->dev->kgd, mqd);
+ }
+ 
++#if defined(CONFIG_DEBUG_FS)
+ 
++static int debugfs_show_mqd(struct seq_file *m, void *data)
++{
++	seq_hex_dump(m, "    ", DUMP_PREFIX_OFFSET, 32, 4,
++		     data, sizeof(struct vi_mqd), false);
++	return 0;
++}
++
++static int debugfs_show_mqd_sdma(struct seq_file *m, void *data)
++{
++	seq_hex_dump(m, "    ", DUMP_PREFIX_OFFSET, 32, 4,
++		     data, sizeof(struct vi_sdma_mqd), false);
++	return 0;
++}
++
++#endif
+ 
+ struct mqd_manager *mqd_manager_init_vi(enum KFD_MQD_TYPE type,
+ 		struct kfd_dev *dev)
+@@ -451,6 +467,9 @@ struct mqd_manager *mqd_manager_init_vi(enum KFD_MQD_TYPE type,
+ 		mqd->update_mqd = update_mqd;
+ 		mqd->destroy_mqd = destroy_mqd;
+ 		mqd->is_occupied = is_occupied;
++#if defined(CONFIG_DEBUG_FS)
++		mqd->debugfs_show_mqd = debugfs_show_mqd;
++#endif
+ 		break;
+ 	case KFD_MQD_TYPE_HIQ:
+ 		mqd->init_mqd = init_mqd_hiq;
+@@ -459,6 +478,9 @@ struct mqd_manager *mqd_manager_init_vi(enum KFD_MQD_TYPE type,
+ 		mqd->update_mqd = update_mqd_hiq;
+ 		mqd->destroy_mqd = destroy_mqd;
+ 		mqd->is_occupied = is_occupied;
++#if defined(CONFIG_DEBUG_FS)
++		mqd->debugfs_show_mqd = debugfs_show_mqd;
++#endif
+ 		break;
+ 	case KFD_MQD_TYPE_SDMA:
+ 		mqd->init_mqd = init_mqd_sdma;
+@@ -467,6 +489,9 @@ struct mqd_manager *mqd_manager_init_vi(enum KFD_MQD_TYPE type,
+ 		mqd->update_mqd = update_mqd_sdma;
+ 		mqd->destroy_mqd = destroy_mqd_sdma;
+ 		mqd->is_occupied = is_occupied_sdma;
++#if defined(CONFIG_DEBUG_FS)
++		mqd->debugfs_show_mqd = debugfs_show_mqd_sdma;
++#endif
+ 		break;
+ 	default:
+ 		kfree(mqd);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index bfce9a9..ee91cf7 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -34,6 +34,7 @@
+ #include <linux/kfd_ioctl.h>
+ #include <linux/pid.h>
+ #include <linux/interval_tree.h>
++#include <linux/seq_file.h>
+ #include <kgd_kfd_interface.h>
+ 
+ #include "amd_rdma.h"
+@@ -269,6 +270,11 @@ struct kfd_dev {
+ 	struct page *cwsr_pages;
+ 	uint32_t cwsr_size;
+ 	uint32_t tma_offset;  /*Offset for TMA from the  start of cwsr_mem*/
++
++	/* Debugfs */
++#if defined(CONFIG_DEBUG_FS)
++	struct dentry *debugfs_root;
++#endif
+ };
+ 
+ struct kfd_bo {
+@@ -911,5 +917,12 @@ int restore(struct kfd_dev *kfd);
+ int kfd_init_peer_direct(void);
+ void kfd_close_peer_direct(void);
+ 
++/* Debugfs */
++#if defined(CONFIG_DEBUG_FS)
++
++int kfd_debugfs_mqds_by_process(struct seq_file *m, void *data);
++int pqm_debugfs_mqds(struct seq_file *m, void *data);
++
++#endif
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 9a7a970..2900210 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -984,3 +984,31 @@ int kfd_reserved_mem_mmap(struct kfd_process *process, struct vm_area_struct *vm
+ 	return ret;
+ }
+ 
++#if defined(CONFIG_DEBUG_FS)
++
++int kfd_debugfs_mqds_by_process(struct seq_file *m, void *data)
++{
++	struct kfd_process *p;
++	unsigned int temp;
++	int r = 0;
++
++	int idx = srcu_read_lock(&kfd_processes_srcu);
++
++	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
++		seq_printf(m, "Process %d PASID %d:\n",
++			   p->lead_thread->tgid, p->pasid);
++
++		down_read(&p->lock);
++		r = pqm_debugfs_mqds(m, &p->pqm);
++		up_read(&p->lock);
++
++		if (r != 0)
++			break;
++	}
++
++	srcu_read_unlock(&kfd_processes_srcu, idx);
++
++	return r;
++}
++
++#endif
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+index 75c6f18..a6c3cbd 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -425,4 +425,67 @@ struct kernel_queue *pqm_get_kernel_queue(
+ 	return NULL;
+ }
+ 
++#if defined(CONFIG_DEBUG_FS)
+ 
++int pqm_debugfs_mqds(struct seq_file *m, void *data)
++{
++	struct process_queue_manager *pqm = data;
++	struct process_queue_node *pqn;
++	struct queue *q;
++	enum KFD_MQD_TYPE mqd_type;
++	struct mqd_manager *mqd_manager;
++	int r = 0;
++
++	list_for_each_entry(pqn, &pqm->queues, process_queue_list) {
++		if (pqn->q) {
++			q = pqn->q;
++			switch (q->properties.type) {
++			case KFD_QUEUE_TYPE_SDMA:
++				seq_printf(m, "  SDMA queue on device %x\n",
++					   q->device->id);
++				mqd_type = KFD_MQD_TYPE_SDMA;
++				break;
++			case KFD_QUEUE_TYPE_COMPUTE:
++				seq_printf(m, "  Compute queue on device %x\n",
++					   q->device->id);
++				mqd_type = KFD_MQD_TYPE_CP;
++				break;
++			default:
++				seq_printf(m,
++				"  Bad user queue type %d on device %x\n",
++					   q->properties.type, q->device->id);
++				continue;
++			}
++			mqd_manager = q->device->dqm->ops.get_mqd_manager(
++				q->device->dqm, mqd_type);
++		} else if (pqn->kq) {
++			q = pqn->kq->queue;
++			mqd_manager = pqn->kq->mqd;
++			switch (q->properties.type) {
++			case KFD_QUEUE_TYPE_DIQ:
++				seq_printf(m, "  DIQ on device %x\n",
++					   pqn->kq->dev->id);
++				mqd_type = KFD_MQD_TYPE_HIQ;
++				break;
++			default:
++				seq_printf(m,
++				"  Bad kernel queue type %d on device %x\n",
++					   q->properties.type,
++					   pqn->kq->dev->id);
++				continue;
++			}
++		} else {
++			seq_printf(m,
++		"  Weird: Queue node with neither kernel nor user queue\n");
++			continue;
++		}
++
++		r = mqd_manager->debugfs_show_mqd(m, q->mqd);
++		if (r != 0)
++			break;
++	}
++
++	return r;
++}
++
++#endif
+-- 
+2.7.4
+

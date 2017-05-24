@@ -1,0 +1,137 @@
+From e47444b0143b54c8180330b042193dcf24114e6a Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Wed, 15 Jun 2016 16:33:15 -0400
+Subject: [PATCH 1584/1722] drm/amdgpu: Fix SDMA RLC queues on Hawaii
+
+Enable SDMA context switching on CIK (copied from sdma_v3_0.c).
+Fix programming sequence for queueing and dequeueing RLC queues
+(copied from gfx_v8).
+
+Change-Id: I97d0298ad91144ad7a683cd1c57470d359893dac
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c | 36 ++++++++++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c             | 30 +++++++++++++++++++
+ 2 files changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+index 14903fb7..caf2615 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+@@ -463,16 +463,44 @@ static int kgd_hqd_sdma_load(struct kgd_dev *kgd, void *mqd)
+ 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
+ 	struct cik_sdma_rlc_registers *m;
+ 	uint32_t sdma_base_addr;
++	uint32_t temp, timeout = 2000;
++	uint32_t data;
+ 
+ 	m = get_sdma_mqd(mqd);
+ 	sdma_base_addr = get_sdma_base_addr(m);
+ 
++	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_CNTL,
++		m->sdma_rlc_rb_cntl & (~SDMA0_RLC0_RB_CNTL__RB_ENABLE_MASK));
++
++	while (true) {
++		temp = RREG32(sdma_base_addr + mmSDMA0_RLC0_CONTEXT_STATUS);
++		if (temp & SDMA0_RLC0_CONTEXT_STATUS__IDLE_MASK)
++			break;
++		if (timeout == 0)
++			return -ETIME;
++		msleep(10);
++		timeout -= 10;
++	}
++	if (m->sdma_engine_id) {
++		data = RREG32(mmSDMA1_GFX_CONTEXT_CNTL);
++		data = REG_SET_FIELD(data, SDMA1_GFX_CONTEXT_CNTL,
++				RESUME_CTX, 0);
++		WREG32(mmSDMA1_GFX_CONTEXT_CNTL, data);
++	} else {
++		data = RREG32(mmSDMA0_GFX_CONTEXT_CNTL);
++		data = REG_SET_FIELD(data, SDMA0_GFX_CONTEXT_CNTL,
++				RESUME_CTX, 0);
++		WREG32(mmSDMA0_GFX_CONTEXT_CNTL, data);
++	}
++
++	WREG32(sdma_base_addr + mmSDMA0_RLC0_DOORBELL, m->sdma_rlc_doorbell);
++	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_RPTR, 0);
++	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_WPTR, 0);
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_VIRTUAL_ADDR, m->sdma_rlc_virtual_addr);
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_BASE, m->sdma_rlc_rb_base);
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_BASE_HI, m->sdma_rlc_rb_base_hi);
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_RPTR_ADDR_LO, m->sdma_rlc_rb_rptr_addr_lo);
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_RPTR_ADDR_HI, m->sdma_rlc_rb_rptr_addr_hi);
+-	WREG32(sdma_base_addr + mmSDMA0_RLC0_DOORBELL, m->sdma_rlc_doorbell);
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_CNTL, m->sdma_rlc_rb_cntl);
+ 
+ 	return 0;
+@@ -615,9 +643,9 @@ static int kgd_hqd_sdma_destroy(struct kgd_dev *kgd, void *mqd,
+ 	}
+ 
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_DOORBELL, 0);
+-	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_RPTR, 0);
+-	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_WPTR, 0);
+-	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_BASE, 0);
++	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_CNTL,
++		RREG32(sdma_base_addr + mmSDMA0_RLC0_RB_CNTL) |
++		SDMA0_RLC0_RB_CNTL__RB_ENABLE_MASK);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 914058f..022694e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -342,6 +342,33 @@ static void cik_sdma_rlc_stop(struct amdgpu_device *adev)
+ }
+ 
+ /**
++ * cik_ctx_switch_enable - stop the async dma engines context switch
++ *
++ * @adev: amdgpu_device pointer
++ * @enable: enable/disable the DMA MEs context switch.
++ *
++ * Halt or unhalt the async dma engines context switch (VI).
++ */
++static void cik_ctx_switch_enable(struct amdgpu_device *adev, bool enable)
++{
++	u32 f32_cntl;
++	int i;
++
++	for (i = 0; i < adev->sdma.num_instances; i++) {
++		f32_cntl = RREG32(mmSDMA0_CNTL + sdma_offsets[i]);
++		if (enable) {
++			f32_cntl = REG_SET_FIELD(f32_cntl, SDMA0_CNTL,
++					AUTO_CTXSW_ENABLE, 1);
++		} else {
++			f32_cntl = REG_SET_FIELD(f32_cntl, SDMA0_CNTL,
++					AUTO_CTXSW_ENABLE, 0);
++		}
++
++		WREG32(mmSDMA0_CNTL + sdma_offsets[i], f32_cntl);
++	}
++}
++
++/**
+  * cik_sdma_enable - stop the async dma engines
+  *
+  * @adev: amdgpu_device pointer
+@@ -537,6 +564,8 @@ static int cik_sdma_start(struct amdgpu_device *adev)
+ 
+ 	/* halt the engine before programing */
+ 	cik_sdma_enable(adev, false);
++	/* enable sdma ring preemption */
++	cik_ctx_switch_enable(adev, true);
+ 
+ 	/* start the gfx rings and rlc compute queues */
+ 	r = cik_sdma_gfx_resume(adev);
+@@ -981,6 +1010,7 @@ static int cik_sdma_hw_fini(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
++	cik_ctx_switch_enable(adev, false);
+ 	cik_sdma_enable(adev, false);
+ 
+ 	return 0;
+-- 
+2.7.4
+

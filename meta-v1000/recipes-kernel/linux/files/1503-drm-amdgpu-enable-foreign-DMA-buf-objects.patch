@@ -1,0 +1,113 @@
+From 81aede1c7484af0c66acd0e19c18780ead61ac48 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 2 Dec 2015 15:40:55 +0100
+Subject: [PATCH 1503/1722] drm/amdgpu: enable foreign DMA-buf objects
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We should be able to handle BOs from other instances as well.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c | 59 +++++++++++++++++++++++++++++++
+ 3 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index d63ea76..7e654df 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -442,6 +442,8 @@ struct drm_gem_object *amdgpu_gem_prime_import_sg_table(struct drm_device *dev,
+ struct dma_buf *amdgpu_gem_prime_export(struct drm_device *dev,
+ 					struct drm_gem_object *gobj,
+ 					int flags);
++struct drm_gem_object *amdgpu_gem_prime_import(struct drm_device *dev,
++					       struct dma_buf *dma_buf);
+ int amdgpu_gem_prime_pin(struct drm_gem_object *obj);
+ void amdgpu_gem_prime_unpin(struct drm_gem_object *obj);
+ struct reservation_object *amdgpu_gem_prime_res_obj(struct drm_gem_object *);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 3f1bf2d..d6e041b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -705,7 +705,7 @@ static struct drm_driver kms_driver = {
+ 	.prime_handle_to_fd = drm_gem_prime_handle_to_fd,
+ 	.prime_fd_to_handle = drm_gem_prime_fd_to_handle,
+ 	.gem_prime_export = amdgpu_gem_prime_export,
+-	.gem_prime_import = drm_gem_prime_import,
++	.gem_prime_import = amdgpu_gem_prime_import,
+ 	.gem_prime_pin = amdgpu_gem_prime_pin,
+ 	.gem_prime_unpin = amdgpu_gem_prime_unpin,
+ 	.gem_prime_res_obj = amdgpu_gem_prime_res_obj,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+index e70fd3c..72c9d69 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+@@ -140,3 +140,62 @@ struct dma_buf *amdgpu_gem_prime_export(struct drm_device *dev,
+ 
+ 	return drm_gem_prime_export(dev, gobj, flags);
+ }
++
++static struct drm_gem_object *
++amdgpu_gem_prime_foreign_bo(struct amdgpu_device *adev, struct amdgpu_bo *bo)
++{
++	struct amdgpu_gem_object *gobj;
++	int r;
++
++	ww_mutex_lock(&bo->tbo.resv->lock, NULL);
++
++	list_for_each_entry(gobj, &bo->gem_objects, list) {
++		if (gobj->base.dev != adev->ddev)
++			continue;
++
++		ww_mutex_unlock(&bo->tbo.resv->lock);
++		drm_gem_object_reference(&gobj->base);
++		return &gobj->base;
++	}
++
++
++	gobj = kzalloc(sizeof(struct amdgpu_gem_object), GFP_KERNEL);
++	if (unlikely(!gobj)) {
++		ww_mutex_unlock(&bo->tbo.resv->lock);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	r = drm_gem_object_init(adev->ddev, &gobj->base, amdgpu_bo_size(bo));
++	if (unlikely(r)) {
++		kfree(gobj);
++		ww_mutex_unlock(&bo->tbo.resv->lock);
++		return ERR_PTR(r);
++	}
++
++	list_add(&gobj->list, &bo->gem_objects);
++	gobj->bo = amdgpu_bo_ref(bo);
++	bo->flags |= AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
++
++	ww_mutex_unlock(&bo->tbo.resv->lock);
++
++	return &gobj->base;
++}
++
++struct drm_gem_object *amdgpu_gem_prime_import(struct drm_device *dev,
++					       struct dma_buf *dma_buf)
++{
++	struct amdgpu_device *adev = dev->dev_private;
++
++	if (dma_buf->ops == &drm_gem_prime_dmabuf_ops) {
++		struct drm_gem_object *obj = dma_buf->priv;
++
++		if (obj->dev != dev && obj->dev->driver == dev->driver) {
++			/* It's a amdgpu_bo from a different driver instance */
++			struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
++
++			return amdgpu_gem_prime_foreign_bo(adev, bo);
++		}
++	}
++
++	return drm_gem_prime_import(dev, dma_buf);
++}
+-- 
+2.7.4
+

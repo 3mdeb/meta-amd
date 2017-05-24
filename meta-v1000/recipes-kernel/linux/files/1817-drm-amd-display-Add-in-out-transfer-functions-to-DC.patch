@@ -1,0 +1,400 @@
+From 77ceb812083e9e84a1c2f69a653784d45da41871 Mon Sep 17 00:00:00 2001
+From: Anthony Koo <Anthony.Koo@amd.com>
+Date: Tue, 13 Dec 2016 13:59:41 -0500
+Subject: [PATCH 1817/3082] drm/amd/display: Add in/out transfer functions to
+ DC
+
+Refactor part 1 of degamma/regamma programming.
+
+End goal is to have source and output transfer function in
+which dc can use to decide how to program the degamma
+and regamma HW.
+
+Gamma will be explicitly applied through
+dc_update_surfaces_for_target.
+
+Color module should build the logical curve with all
+adjustments applied and pass enough information
+for dc to program HW PWL.
+
+Change-Id: If6cfcdd0df0425e3b01d909edf21f196cdd8b8d1
+Signed-off-by: Anthony Koo <anthony.koo@amd.com>
+Reviewed-by: Aric Cyr <Aric.Cyr@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           | 38 +++++++++++--
+ drivers/gpu/drm/amd/display/dc/core/dc_surface.c   | 64 ++++++++++++++++------
+ drivers/gpu/drm/amd/display/dc/dc.h                | 40 +++++++++++++-
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    | 36 ++++--------
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h    |  5 ++
+ drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h  |  4 +-
+ 6 files changed, 135 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 9a35e3b..f20701a 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1455,6 +1455,34 @@ void dc_update_surfaces_for_target(struct dc *dc, struct dc_surface_update *upda
+ 				surface->public.gamma_correction =
+ 							updates[i].gamma;
+ 			}
++
++			if (updates[i].in_transfer_func &&
++					updates[i].in_transfer_func !=
++					surface->public.in_transfer_func) {
++				if (surface->public.in_transfer_func != NULL)
++					dc_transfer_func_release(
++							surface->public.
++							in_transfer_func);
++
++				dc_transfer_func_retain(
++						updates[i].in_transfer_func);
++				surface->public.in_transfer_func =
++						updates[i].in_transfer_func;
++			}
++
++			if (updates[i].out_transfer_func &&
++					updates[i].out_transfer_func !=
++					surface->public.out_transfer_func) {
++				if (surface->public.out_transfer_func != NULL)
++					dc_transfer_func_release(
++							surface->public.
++							out_transfer_func);
++
++				dc_transfer_func_retain(
++						updates[i].out_transfer_func);
++				surface->public.out_transfer_func =
++						updates[i].out_transfer_func;
++			}
+ 		}
+ 	}
+ 
+@@ -1474,7 +1502,6 @@ void dc_update_surfaces_for_target(struct dc *dc, struct dc_surface_update *upda
+ 
+ 			if (updates[i].plane_info || updates[i].scaling_info
+ 					|| is_new_pipe_surface[j]) {
+-
+ 				apply_ctx = true;
+ 
+ 				if (!pipe_ctx->tg->funcs->is_blanked(pipe_ctx->tg)) {
+@@ -1489,9 +1516,12 @@ void dc_update_surfaces_for_target(struct dc *dc, struct dc_surface_update *upda
+ 				}
+ 			}
+ 
+-			if (updates[i].gamma)
+-				core_dc->hwss.prepare_pipe_for_context(
+-						core_dc, pipe_ctx, context);
++			if (is_new_pipe_surface[j] ||
++					updates[i].gamma ||
++					updates[i].in_transfer_func ||
++					updates[i].out_transfer_func)
++				core_dc->hwss.set_gamma_correction(
++						pipe_ctx, pipe_ctx->surface);
+ 		}
+ 		if (apply_ctx) {
+ 			core_dc->hwss.apply_ctx_for_surface(core_dc, surface, context);
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_surface.c b/drivers/gpu/drm/amd/display/dc/core/dc_surface.c
+index 813c37e..26f2f76 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_surface.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_surface.c
+@@ -45,11 +45,18 @@ struct gamma {
+ 	int ref_count;
+ };
+ 
++struct transfer_func {
++	struct core_transfer_func protected;
++	int ref_count;
++};
++
+ #define DC_SURFACE_TO_SURFACE(dc_surface) container_of(dc_surface, struct surface, protected.public)
+ #define CORE_SURFACE_TO_SURFACE(core_surface) container_of(core_surface, struct surface, protected)
+ 
+ #define DC_GAMMA_TO_GAMMA(dc_gamma) \
+ 	container_of(dc_gamma, struct gamma, protected.public)
++#define DC_TRANSFER_FUNC_TO_TRANSFER_FUNC(dc_tf) \
++	container_of(dc_tf, struct transfer_func, protected.public)
+ #define CORE_GAMMA_TO_GAMMA(core_gamma) \
+ 	container_of(core_gamma, struct gamma, protected)
+ 
+@@ -66,6 +73,12 @@ static void destruct(struct surface *surface)
+ {
+ 	if (surface->protected.public.gamma_correction != NULL)
+ 		dc_gamma_release(surface->protected.public.gamma_correction);
++	if (surface->protected.public.in_transfer_func != NULL)
++		dc_transfer_func_release(
++				surface->protected.public.in_transfer_func);
++	if (surface->protected.public.out_transfer_func != NULL)
++		dc_transfer_func_release(
++				surface->protected.public.out_transfer_func);
+ }
+ 
+ /*******************************************************************************
+@@ -163,16 +176,6 @@ void dc_surface_release(const struct dc_surface *dc_surface)
+ 	}
+ }
+ 
+-static bool construct_gamma(struct dc_context *ctx, struct gamma *gamma)
+-{
+-	return true;
+-}
+-
+-static void destruct_gamma(struct gamma *gamma)
+-{
+-
+-}
+-
+ void dc_gamma_retain(const struct dc_gamma *dc_gamma)
+ {
+ 	struct gamma *gamma = DC_GAMMA_TO_GAMMA(dc_gamma);
+@@ -185,10 +188,8 @@ void dc_gamma_release(const struct dc_gamma *dc_gamma)
+ 	struct gamma *gamma = DC_GAMMA_TO_GAMMA(dc_gamma);
+ 	--gamma->ref_count;
+ 
+-	if (gamma->ref_count == 0) {
+-		destruct_gamma(gamma);
++	if (gamma->ref_count == 0)
+ 		dm_free(gamma);
+-	}
+ }
+ 
+ struct dc_gamma *dc_create_gamma(const struct dc *dc)
+@@ -199,17 +200,44 @@ struct dc_gamma *dc_create_gamma(const struct dc *dc)
+ 	if (gamma == NULL)
+ 		goto alloc_fail;
+ 
+-	if (false == construct_gamma(core_dc->ctx, gamma))
+-		goto construct_fail;
+-
+ 	dc_gamma_retain(&gamma->protected.public);
+ 
+ 	return &gamma->protected.public;
+ 
+-construct_fail:
+-	dm_free(gamma);
++alloc_fail:
++	return NULL;
++}
++
++void dc_transfer_func_retain(const struct dc_transfer_func *dc_tf)
++{
++	struct transfer_func *tf = DC_TRANSFER_FUNC_TO_TRANSFER_FUNC(dc_tf);
++
++	++tf->ref_count;
++}
++
++void dc_transfer_func_release(const struct dc_transfer_func *dc_tf)
++{
++	struct transfer_func *tf = DC_TRANSFER_FUNC_TO_TRANSFER_FUNC(dc_tf);
++	--tf->ref_count;
++
++	if (tf->ref_count == 0)
++		dm_free(tf);
++}
++
++struct dc_transfer_func *dc_create_transfer_func(const struct dc *dc)
++{
++	struct core_dc *core_dc = DC_TO_CORE(dc);
++	struct transfer_func *tf = dm_alloc(sizeof(*tf));
++
++	if (tf == NULL)
++		goto alloc_fail;
++
++	dc_transfer_func_retain(&tf->protected.public);
++
++	return &tf->protected.public;
+ 
+ alloc_fail:
+ 	return NULL;
+ }
+ 
++
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index d9e2ed1..4cb1948 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -201,7 +201,8 @@ bool dc_init_dchub(struct dc *dc, struct dchub_init_data *dh_data);
+ 
+ enum {
+ 	RGB_256X3X16 = 256,
+-	FLOAT_GAMMA_RAMP_MAX = 1025
++	FLOAT_GAMMA_RAMP_MAX = 1025,
++	TRANSFER_FUNC_POINTS = 1025
+ };
+ 
+ enum dc_gamma_ramp_type {
+@@ -236,6 +237,31 @@ struct dc_gamma {
+ 	uint32_t size;
+ };
+ 
++enum dc_transfer_func_type {
++	TF_TYPE_PREDEFINED,
++	TF_TYPE_DISTRIBUTED_POINTS,
++};
++
++struct dc_transfer_func_distributed_points {
++	uint16_t red[TRANSFER_FUNC_POINTS];
++	uint16_t green[TRANSFER_FUNC_POINTS];
++	uint16_t blue[TRANSFER_FUNC_POINTS];
++	uint16_t end_exponent;
++	uint16_t x_point_at_y1;
++};
++
++enum dc_transfer_func_predefined {
++	TRANSFER_FUNCTION_SRGB,
++	TRANSFER_FUNCTION_BT709,
++	TRANSFER_FUNCTION_LINEAR,
++};
++
++struct dc_transfer_func {
++	enum dc_transfer_func_type type;
++	enum dc_transfer_func_predefined tf;
++	struct dc_transfer_func_distributed_points tf_pts;
++};
++
+ struct dc_surface {
+ 	bool visible;
+ 	bool flip_immediate;
+@@ -256,7 +282,11 @@ struct dc_surface {
+ 	bool horizontal_mirror;
+ 	enum plane_stereo_format stereo_format;
+ 
++	/* TO BE REMOVED AFTER BELOW TRANSFER FUNCTIONS IMPLEMENTED */
+ 	const struct dc_gamma *gamma_correction;
++
++	const struct dc_transfer_func *in_transfer_func;
++	const struct dc_transfer_func *out_transfer_func;
+ };
+ 
+ struct dc_plane_info {
+@@ -287,8 +317,12 @@ struct dc_surface_update {
+ 	/* following updates require alloc/sleep/spin that is not isr safe,
+ 	 * null means no updates
+ 	 */
++	/* gamma TO BE REMOVED */
+ 	struct dc_gamma *gamma;
+ 
++	struct dc_transfer_func *in_transfer_func;
++	struct dc_transfer_func *out_transfer_func;
++
+ 
+ };
+ /*
+@@ -316,6 +350,10 @@ void dc_gamma_retain(const struct dc_gamma *dc_gamma);
+ void dc_gamma_release(const struct dc_gamma *dc_gamma);
+ struct dc_gamma *dc_create_gamma(const struct dc *dc);
+ 
++void dc_transfer_func_retain(const struct dc_transfer_func *dc_tf);
++void dc_transfer_func_release(const struct dc_transfer_func *dc_tf);
++struct dc_transfer_func *dc_create_transfer_func(const struct dc *dc);
++
+ /*
+  * This structure holds a surface address.  There could be multiple addresses
+  * in cases such as Stereo 3D, Planar YUV, etc.  Other per-flip attributes such
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 99937fa..f6984e9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -231,16 +231,20 @@ static void build_prescale_params(struct ipp_prescale_params *prescale_params,
+ 	}
+ }
+ 
+-static bool set_gamma_ramp(
+-	struct input_pixel_processor *ipp,
+-	struct output_pixel_processor *opp,
+-	const struct core_gamma *ramp,
++static bool dce110_set_gamma_correction(
++	struct pipe_ctx *pipe_ctx,
+ 	const struct core_surface *surface)
+ {
++	struct input_pixel_processor *ipp = pipe_ctx->ipp;
++	struct output_pixel_processor *opp = pipe_ctx->opp;
++	const struct core_gamma *ramp = NULL;
+ 	struct ipp_prescale_params prescale_params = { 0 };
+ 	struct pwl_params *regamma_params;
+ 	bool result = false;
+ 
++	if (surface->public.gamma_correction)
++		ramp = DC_GAMMA_TO_CORE(surface->public.gamma_correction);
++
+ 	regamma_params = dm_alloc(sizeof(struct pwl_params));
+ 	if (regamma_params == NULL)
+ 		goto regamma_alloc_fail;
+@@ -1842,33 +1846,13 @@ static void dce110_program_front_end_for_pipe(
+ 			pipe_ctx->scl_data.recout.y);
+ }
+ 
+-
+-
+-static void dce110_prepare_pipe_for_surface_commit(
+-		struct core_dc *dc,
+-		struct pipe_ctx *pipe_ctx,
+-		struct validate_context *context) {
+-	struct core_gamma *gamma = NULL;
+-
+-	dc->hwss.increase_watermarks_for_pipe(dc, pipe_ctx, context);
+-
+-	if (pipe_ctx->surface->public.gamma_correction)
+-		gamma = DC_GAMMA_TO_CORE(
+-			pipe_ctx->surface->public.gamma_correction);
+-
+-	dc->hwss.set_gamma_correction(
+-			pipe_ctx->ipp,
+-			pipe_ctx->opp,
+-			gamma, pipe_ctx->surface);
+-}
+-
+ static void dce110_prepare_pipe_for_context(
+ 		struct core_dc *dc,
+ 		struct pipe_ctx *pipe_ctx,
+ 		struct validate_context *context)
+ {
+ 	dce110_power_on_pipe_if_needed(dc, pipe_ctx, context);
+-	dce110_prepare_pipe_for_surface_commit(dc, pipe_ctx, context);
++	dc->hwss.increase_watermarks_for_pipe(dc, pipe_ctx, context);
+ }
+ 
+ static void dce110_apply_ctx_for_surface(
+@@ -1920,7 +1904,7 @@ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.set_plane_config = set_plane_config,
+ 	.update_plane_addr = update_plane_addr,
+ 	.update_pending_status = dce110_update_pending_status,
+-	.set_gamma_correction = set_gamma_ramp,
++	.set_gamma_correction = dce110_set_gamma_correction,
+ 	.power_down = dce110_power_down,
+ 	.enable_accelerated_mode = dce110_enable_accelerated_mode,
+ 	.enable_timing_synchronization = dce110_enable_timing_synchronization,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index 3cf9bfb..a67d675 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -66,6 +66,11 @@ struct core_gamma {
+ 	struct dc_context *ctx;
+ };
+ 
++struct core_transfer_func {
++	struct dc_transfer_func public;
++	struct dc_context *ctx;
++};
++
+ void enable_surface_flip_reporting(struct dc_surface *dc_surface,
+ 		uint32_t controller_id);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index fcaf2c7..89a0834 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -78,9 +78,7 @@ struct hw_sequencer_funcs {
+ 			struct pipe_ctx *pipe_ctx);
+ 
+ 	bool (*set_gamma_correction)(
+-				struct input_pixel_processor *ipp,
+-				struct output_pixel_processor *opp,
+-				const struct core_gamma *ramp,
++				struct pipe_ctx *pipe_ctx,
+ 				const struct core_surface *surface);
+ 
+ 	void (*power_down)(struct core_dc *dc);
+-- 
+2.7.4
+

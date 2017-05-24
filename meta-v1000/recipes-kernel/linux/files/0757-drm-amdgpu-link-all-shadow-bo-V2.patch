@@ -1,0 +1,101 @@
+From eba0ac6066699bb19c130204c1234f42087e7038 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <David1.Zhou@amd.com>
+Date: Wed, 17 Aug 2016 11:41:30 +0800
+Subject: [PATCH 0757/1722] drm/amdgpu: link all shadow bo V2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+V2:
+1. use mutex instead of spinlock for shadow list, since its process could
+sleep.
+2. move list_del to bo destroy phase.
+
+Signed-off-by: Chunming Zhou <David1.Zhou@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  5 +++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  3 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 12 +++++++++++-
+ 3 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 9961d18..be872c8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -480,6 +480,7 @@ struct amdgpu_bo {
+ 	struct ttm_bo_kmap_obj		dma_buf_vmap;
+ 	struct amdgpu_mn		*mn;
+ 	struct list_head		mn_list;
++	struct list_head		shadow_list;
+ };
+ #define gem_to_amdgpu_bo(gobj) container_of((gobj), struct amdgpu_bo, gem_base)
+ 
+@@ -2112,6 +2113,10 @@ struct amdgpu_device {
+ 	struct kfd_dev		*kfd;
+ 
+ 	struct amdgpu_virtualization virtualization;
++ 
++        /* link all shadow bo */
++        struct list_head                shadow_list;
++        struct mutex                    shadow_list_lock;
+ };
+ 
+ bool amdgpu_device_is_px(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index e582ca9..913298f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1594,6 +1594,9 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	spin_lock_init(&adev->gc_cac_idx_lock);
+ 	spin_lock_init(&adev->audio_endpt_idx_lock);
+ 
++	INIT_LIST_HEAD(&adev->shadow_list);
++	mutex_init(&adev->shadow_list_lock);
++
+ 	adev->rmmio_base = pci_resource_start(adev->pdev, 5);
+ 	adev->rmmio_size = pci_resource_len(adev->pdev, 5);
+ 	adev->rmmio = ioremap(adev->rmmio_base, adev->rmmio_size);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 8499041..9113fff 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -98,6 +98,11 @@ static void amdgpu_ttm_bo_destroy(struct ttm_buffer_object *tbo)
+ 
+ 	drm_gem_object_release(&bo->gem_base);
+ 	amdgpu_bo_unref(&bo->parent);
++	if (!list_empty(&bo->shadow_list)) {
++		mutex_lock(&bo->adev->shadow_list_lock);
++		list_del_init(&bo->shadow_list);
++		mutex_unlock(&bo->adev->shadow_list_lock);
++	}
+ 	kfree(bo->metadata);
+ 	kfree(bo);
+ }
+@@ -315,6 +320,7 @@ int amdgpu_bo_create_restricted(struct amdgpu_device *adev,
+ 	}
+ 	bo->adev = adev;
+ 	INIT_LIST_HEAD(&bo->list);
++	INIT_LIST_HEAD(&bo->shadow_list);
+ 	INIT_LIST_HEAD(&bo->va);
+ 	bo->prefered_domains = domain & (AMDGPU_GEM_DOMAIN_VRAM |
+ 					 AMDGPU_GEM_DOMAIN_GTT |
+@@ -407,8 +413,12 @@ static int amdgpu_bo_create_shadow(struct amdgpu_device *adev,
+ 					NULL, &placement,
+ 					bo->tbo.resv,
+ 					&bo->shadow);
+-	if (!r)
++	if (!r) {
+ 		bo->shadow->parent = amdgpu_bo_ref(bo);
++		mutex_lock(&adev->shadow_list_lock);
++		list_add_tail(&bo->shadow_list, &adev->shadow_list);
++		mutex_unlock(&adev->shadow_list_lock);
++	}
+ 
+ 	return r;
+ }
+-- 
+2.7.4
+

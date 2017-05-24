@@ -1,0 +1,115 @@
+From 2fe235d55b5373c6d3d76edd20da7475bf95da7e Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Fri, 19 Aug 2016 17:38:51 -0400
+Subject: [PATCH 0837/1722] drm/amd/dal: move optimization for skipping surface
+ programming to dc
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c | 54 ++++++++++++++++++++++++++++++------
+ 1 file changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 018cc77..e79add5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -1008,7 +1008,9 @@ bool dc_pre_commit_surfaces_to_target(
+         for (i = 0; i < core_dc->current_context->target_count; i++)
+                 if (target == core_dc->current_context->targets[i])
+                         break;
+- 
++        if (i == core_dc->current_context->target_count)
++                return false;
++  
+         target_status = &core_dc->current_context->target_status[i];
+  
+         if (new_surface_count == target_status->surface_count) {
+@@ -1125,10 +1127,10 @@ bool dc_pre_commit_surfaces_to_target(
+ 				&core_dc->current_context->res_ctx);
+  
+ unexpected_fail:
+-val_ctx_fail:
+         resource_validate_ctx_destruct(context);
+         dm_free(context);
+-	
++val_ctx_fail:	
++
+ 	return true;
+ }
+ 
+@@ -1141,9 +1143,38 @@ val_ctx_fail:
+         int i, j;
+         struct core_dc *core_dc = DC_TO_CORE(dc);
+         struct validate_context *context = core_dc->temp_flip_context;
++        struct core_target *target = DC_TARGET_TO_CORE(dc_target);
++        struct dc_target_status *target_status = NULL;
++        bool surface_needs_programming = false;
+ 
+-        *context = *core_dc->current_context;
++        if (core_dc->current_context->target_count == 0)
++                return false;
++ 
++        /* Cannot commit surface to a target that is not commited */
++        for (i = 0; i < core_dc->current_context->target_count; i++)
++                if (target == core_dc->current_context->targets[i])
++                        break;
++        if (i == core_dc->current_context->target_count)
++                return false;
+ 
++        target_status = &core_dc->current_context->target_status[i];
++ 
++        if (new_surface_count != target_status->surface_count)
++                surface_needs_programming = true;
++        else
++                for (i = 0; i < target_status->surface_count; i++) {
++                        struct dc_surface temp_surf = { 0 };
++ 
++                        temp_surf = *target_status->surfaces[i];
++                        temp_surf.address = new_surfaces[i]->address;
++ 
++                        if (memcmp(&temp_surf, new_surfaces[i], sizeof(temp_surf)) != 0) {
++                                surface_needs_programming = true;
++                                break;
++                        }
++                }
++ 
++        *context = *core_dc->current_context; 
+         for (i = 0; i < context->res_ctx.pool->pipe_count; i++) {
+                 struct pipe_ctx *cur_pipe = &context->res_ctx.pipe_ctx[i];
+ 
+@@ -1170,11 +1201,14 @@ val_ctx_fail:
+                                         DC_SURFACE_TO_CORE(new_surfaces[i]))
+                                 continue;
+  
+-                        resource_build_scaling_params(new_surfaces[i], pipe_ctx);
++                        if (surface_needs_programming) {
++                                resource_build_scaling_params(new_surfaces[i], pipe_ctx);
++ 
++                                if (dc->debug.surface_visual_confirm) {
++                                        pipe_ctx->scl_data.recout.height -= 2;
++                                        pipe_ctx->scl_data.recout.width -= 2;
++                                }
+  
+-                        if (dc->debug.surface_visual_confirm) {
+-                                pipe_ctx->scl_data.recout.height -= 2;
+-                                pipe_ctx->scl_data.recout.width -= 2;
+                         }
+ 
+                         core_dc->hwss.pipe_control_lock(
+@@ -1186,7 +1220,9 @@ val_ctx_fail:
+                         core_dc->hwss.update_plane_addr(core_dc, pipe_ctx);
+                 }
+ 
+-        core_dc->hwss.apply_ctx_to_surface(core_dc, context);
++        if (surface_needs_programming)
++                core_dc->hwss.apply_ctx_to_surface(core_dc, context);
++
+         /* Go in reverse order so that all pipes are unlocked simultaneously
+          * when pipe 0 is unlocked
+          * Need PIPE_LOCK_CONTROL_MODE to be 1 for this
+-- 
+2.7.4
+

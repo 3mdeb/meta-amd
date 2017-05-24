@@ -1,0 +1,612 @@
+From 975897b564066b3667ad74cc903e81472492c7e3 Mon Sep 17 00:00:00 2001
+From: Amy Zhang <Amy.Zhang@amd.com>
+Date: Thu, 30 Jun 2016 17:26:10 -0400
+Subject: [PATCH 0610/1722] drm/amd/dal: Color Temperature Adjustment
+
+- Adding DC interface for color temperature adjustment
+- Updating color temperature register programming
+- Introducing color adjustment module
+
+Change-Id: Id789b794efa858dfae42359abf47d501bd6819b3
+Signed-off-by: Amy Zhang <Amy.Zhang@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |  40 +++-
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |   3 +
+ drivers/gpu/drm/amd/dal/dc/dc_types.h              |   5 +
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |  25 +++
+ .../drm/amd/dal/dc/dce110/dce110_transform_gamut.c |  48 +----
+ .../drm/amd/dal/dc/dce80/dce80_transform_gamut.c   |  48 +----
+ drivers/gpu/drm/amd/dal/dc/inc/hw/transform.h      |   3 +-
+ drivers/gpu/drm/amd/dal/modules/color/color.c      | 217 +++++++++++++++++++++
+ .../gpu/drm/amd/dal/modules/freesync/freesync.c    |   1 +
+ drivers/gpu/drm/amd/dal/modules/inc/mod_color.h    |  47 +++++
+ 10 files changed, 354 insertions(+), 83 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/dal/modules/color/color.c
+ create mode 100644 drivers/gpu/drm/amd/dal/modules/inc/mod_color.h
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 072a685..a34a193d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -230,7 +230,31 @@ static bool stream_adjust_vmin_vmax(struct dc *dc,
+ 	return ret;
+ }
+ 
+-static void stream_send_null_packet(const struct dc_stream *dc_stream, bool enable)
++static bool adjust_color_temperature(struct dc *dc,
++			const struct dc_stream **stream, int num_streams)
++{
++	struct core_dc *core_dc = DC_TO_CORE(dc);
++	struct core_stream *core_stream = DC_STREAM_TO_CORE(stream[0]);
++	int i = 0;
++	bool ret = false;
++	struct pipe_ctx *pipes;
++
++	for (i = 0; i < MAX_PIPES; i++) {
++		if (core_dc->current_context->res_ctx.pipe_ctx[i].stream
++				== core_stream) {
++
++			pipes = &core_dc->current_context->res_ctx.pipe_ctx[i];
++			core_dc->hwss.set_plane_config(core_dc, pipes,
++					&core_dc->current_context->res_ctx);
++			ret = true;
++		}
++	}
++
++	return ret;
++}
++
++static void stream_send_null_packet(const struct dc_stream *dc_stream,
++		bool enable)
+ {
+ 	struct core_stream *stream = DC_STREAM_TO_CORE(dc_stream);
+ 	struct core_dc *core_dc = DC_TO_CORE(stream->ctx->dc);
+@@ -243,19 +267,25 @@ static void stream_send_null_packet(const struct dc_stream *dc_stream, bool enab
+ 		if (res_ctx->pipe_ctx[i].stream != stream)
+ 			continue;
+ 
+-		res_ctx->pipe_ctx[i].stream_enc->funcs->send_null_packet(res_ctx->pipe_ctx[i].stream_enc, enable);
++		res_ctx->pipe_ctx[i].stream_enc->funcs->
++		send_null_packet(res_ctx->pipe_ctx[i].stream_enc, enable);
+ 	}
+ }
+ 
+ static void allocate_dc_stream_funcs(struct core_dc *core_dc)
+ {
+ 	if (core_dc->hwss.set_drr != NULL) {
+-		core_dc->public.stream_funcs.adjust_vmin_vmax = stream_adjust_vmin_vmax;
+-		core_dc->public.stream_funcs.send_null_packet = stream_send_null_packet;
++		core_dc->public.stream_funcs.adjust_vmin_vmax =
++				stream_adjust_vmin_vmax;
++		core_dc->public.stream_funcs.send_null_packet =
++				stream_send_null_packet;
+ 	}
++	core_dc->public.stream_funcs.adjust_color_temperature =
++			adjust_color_temperature;
+ }
+ 
+-static bool construct(struct core_dc *dc, const struct dc_init_data *init_params)
++static bool construct(struct core_dc *dc,
++		const struct dc_init_data *init_params)
+ {
+ 	struct dal_logger *logger;
+ 	struct adapter_service *as;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index b152aa9..a5af816 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -56,6 +56,8 @@ struct dc_stream_funcs {
+ 	bool (*adjust_vmin_vmax)(struct dc *dc,
+ 			const struct dc_stream **stream, int num_streams, int vmin, int vmax);
+ 	void (*send_null_packet)(const struct dc_stream *dc_stream, bool enable);
++	bool (*adjust_color_temperature)(struct dc *dc,
++			const struct dc_stream **stream, int num_streams);
+ };
+ 
+ /* Structure to hold configuration flags set by dm at dc creation. */
+@@ -352,6 +354,7 @@ struct dc_stream {
+ 
+ 	/* TODO: dithering */
+ 	/* TODO: transfer function (CSC/regamma/gamut remap) */
++	struct colorspace_transform csc_matrix;
+ 	/* TODO: custom INFO packets */
+ 	/* TODO: ABM info (DMCU) */
+ 	/* TODO: PSR info */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_types.h b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+index 472b5d0..c7f36c7 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+@@ -527,4 +527,9 @@ struct freesync_context {
+ 	unsigned int nominal_refresh_in_micro_hz;
+ };
+ 
++struct colorspace_transform {
++	struct fixed31_32 matrix[12];
++	bool bypass;
++};
++
+ #endif /* DC_TYPES_H_ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 0e8ebd0..d4d4308 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -1492,11 +1492,36 @@ static void set_plane_config(
+ 	struct dc_context *ctx = pipe_ctx->stream->ctx;
+ 	struct core_surface *surface = pipe_ctx->surface;
+ 	enum blender_mode blender_mode = BLENDER_MODE_CURRENT_PIPE;
++	struct xfm_grph_csc_adjustment adjust;
+ 
+ 	dc->hwss.enable_fe_clock(ctx, pipe_ctx->pipe_idx, true);
+ 
+ 	set_default_colors(pipe_ctx);
+ 
++	if (pipe_ctx->stream->public.csc_matrix.bypass == false) {
++		adjust.gamut_adjust_type = GRAPHICS_GAMUT_ADJUST_TYPE_SW;
++		adjust.temperature_matrix[0] =
++				pipe_ctx->stream->public.csc_matrix.matrix[0];
++		adjust.temperature_matrix[1] =
++				pipe_ctx->stream->public.csc_matrix.matrix[1];
++		adjust.temperature_matrix[2] =
++				pipe_ctx->stream->public.csc_matrix.matrix[2];
++		adjust.temperature_matrix[3] =
++				pipe_ctx->stream->public.csc_matrix.matrix[4];
++		adjust.temperature_matrix[4] =
++				pipe_ctx->stream->public.csc_matrix.matrix[5];
++		adjust.temperature_matrix[5] =
++				pipe_ctx->stream->public.csc_matrix.matrix[6];
++		adjust.temperature_matrix[6] =
++				pipe_ctx->stream->public.csc_matrix.matrix[8];
++		adjust.temperature_matrix[7] =
++				pipe_ctx->stream->public.csc_matrix.matrix[9];
++		adjust.temperature_matrix[8] =
++				pipe_ctx->stream->public.csc_matrix.matrix[10];
++	}
++
++	pipe_ctx->xfm->funcs->transform_set_gamut_remap(pipe_ctx->xfm, &adjust);
++
+ 	program_scaler(dc, pipe_ctx);
+ 
+ 	for (i = pipe_ctx->pipe_idx + 1; i < MAX_PIPES; i++)
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_gamut.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_gamut.c
+index fe5be62..3c9eb56a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_gamut.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_transform_gamut.c
+@@ -238,53 +238,25 @@ void dce110_transform_set_gamut_remap(
+ {
+ 	struct dce110_transform *xfm110 = TO_DCE110_TRANSFORM(xfm);
+ 
+-	if (adjust->gamut_adjust_type != GRAPHICS_GAMUT_ADJUST_TYPE_SW ||
+-		adjust->temperature_divider == 0)
++	if (adjust->gamut_adjust_type != GRAPHICS_GAMUT_ADJUST_TYPE_SW)
+ 		program_gamut_remap(xfm110, NULL);
+ 	else {
+ 		struct fixed31_32 arr_matrix[GAMUT_MATRIX_SIZE];
+ 		uint16_t arr_reg_val[GAMUT_MATRIX_SIZE];
+ 
+-		arr_matrix[0] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[0],
+-				adjust->temperature_divider);
+-		arr_matrix[1] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[1],
+-				adjust->temperature_divider);
+-		arr_matrix[2] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[2],
+-				adjust->temperature_divider);
++		arr_matrix[0] = adjust->temperature_matrix[0];
++		arr_matrix[1] = adjust->temperature_matrix[1];
++		arr_matrix[2] = adjust->temperature_matrix[2];
+ 		arr_matrix[3] = dal_fixed31_32_zero;
+ 
+-		arr_matrix[4] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[3],
+-				adjust->temperature_divider);
+-		arr_matrix[5] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[4],
+-				adjust->temperature_divider);
+-		arr_matrix[6] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[5],
+-				adjust->temperature_divider);
++		arr_matrix[4] = adjust->temperature_matrix[3];
++		arr_matrix[5] = adjust->temperature_matrix[4];
++		arr_matrix[6] = adjust->temperature_matrix[5];
+ 		arr_matrix[7] = dal_fixed31_32_zero;
+ 
+-		arr_matrix[8] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[6],
+-				adjust->temperature_divider);
+-		arr_matrix[9] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[7],
+-				adjust->temperature_divider);
+-		arr_matrix[10] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[8],
+-				adjust->temperature_divider);
++		arr_matrix[8] = adjust->temperature_matrix[6];
++		arr_matrix[9] = adjust->temperature_matrix[7];
++		arr_matrix[10] = adjust->temperature_matrix[8];
+ 		arr_matrix[11] = dal_fixed31_32_zero;
+ 
+ 		convert_float_matrix(
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_gamut.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_gamut.c
+index 4c54f3d..45f15d4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_gamut.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_transform_gamut.c
+@@ -239,53 +239,25 @@ void dce80_transform_set_gamut_remap(
+ {
+ 	struct dce80_transform *xfm80 = TO_DCE80_TRANSFORM(xfm);
+ 
+-	if (adjust->gamut_adjust_type != GRAPHICS_GAMUT_ADJUST_TYPE_SW ||
+-		adjust->temperature_divider == 0)
++	if (adjust->gamut_adjust_type != GRAPHICS_GAMUT_ADJUST_TYPE_SW)
+ 		program_gamut_remap(xfm80, NULL);
+ 	else {
+ 		struct fixed31_32 arr_matrix[GAMUT_MATRIX_SIZE];
+ 		uint16_t arr_reg_val[GAMUT_MATRIX_SIZE];
+ 
+-		arr_matrix[0] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[0],
+-				adjust->temperature_divider);
+-		arr_matrix[1] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[1],
+-				adjust->temperature_divider);
+-		arr_matrix[2] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[2],
+-				adjust->temperature_divider);
++		arr_matrix[0] = adjust->temperature_matrix[0];
++		arr_matrix[1] = adjust->temperature_matrix[1];
++		arr_matrix[2] = adjust->temperature_matrix[2];
+ 		arr_matrix[3] = dal_fixed31_32_zero;
+ 
+-		arr_matrix[4] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[3],
+-				adjust->temperature_divider);
+-		arr_matrix[5] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[4],
+-				adjust->temperature_divider);
+-		arr_matrix[6] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[5],
+-				adjust->temperature_divider);
++		arr_matrix[4] = adjust->temperature_matrix[3];
++		arr_matrix[5] = adjust->temperature_matrix[4];
++		arr_matrix[6] = adjust->temperature_matrix[5];
+ 		arr_matrix[7] = dal_fixed31_32_zero;
+ 
+-		arr_matrix[8] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[6],
+-				adjust->temperature_divider);
+-		arr_matrix[9] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[7],
+-				adjust->temperature_divider);
+-		arr_matrix[10] =
+-			dal_fixed31_32_from_fraction(
+-				adjust->temperature_matrix[8],
+-				adjust->temperature_divider);
++		arr_matrix[8] = adjust->temperature_matrix[6];
++		arr_matrix[9] = adjust->temperature_matrix[7];
++		arr_matrix[10] = adjust->temperature_matrix[8];
+ 		arr_matrix[11] = dal_fixed31_32_zero;
+ 
+ 		convert_float_matrix(
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw/transform.h b/drivers/gpu/drm/amd/dal/dc/inc/hw/transform.h
+index bf0f25c..c6e5d17 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw/transform.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw/transform.h
+@@ -115,8 +115,7 @@ enum graphics_gamut_adjust_type {
+ #define CSC_TEMPERATURE_MATRIX_SIZE 9
+ 
+ struct xfm_grph_csc_adjustment {
+-	int32_t temperature_matrix[CSC_TEMPERATURE_MATRIX_SIZE];
+-	int32_t temperature_divider;
++	struct fixed31_32 temperature_matrix[CSC_TEMPERATURE_MATRIX_SIZE];
+ 	enum graphics_gamut_adjust_type gamut_adjust_type;
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/dal/modules/color/color.c b/drivers/gpu/drm/amd/dal/modules/color/color.c
+new file mode 100644
+index 0000000..fa2f9cc
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/modules/color/color.c
+@@ -0,0 +1,217 @@
++/*
++ * Copyright 2016 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#include "dm_services.h"
++#include "dc.h"
++#include "mod_color.h"
++#include "core_types.h"
++#include "fixed32_32.h"
++
++#define MOD_COLOR_MAX_CONCURRENT_SINKS 32
++
++struct sink_caps {
++	const struct dc_sink *sink;
++};
++
++struct core_color {
++	struct mod_color public;
++	struct dc *dc;
++	struct sink_caps *caps;
++	int num_sinks;
++	bool *user_enable_color_temperature;
++	int color_temperature;
++};
++
++#define MOD_COLOR_TO_CORE(mod_color)\
++		container_of(mod_color, struct core_color, public)
++
++static bool check_dc_support(const struct dc *dc)
++{
++	if (dc->stream_funcs.adjust_color_temperature == NULL)
++		return false;
++
++	return true;
++}
++
++struct mod_color *mod_color_create(struct dc *dc)
++{
++	int i = 0;
++	struct core_color *core_color =
++				dm_alloc(sizeof(struct core_color));
++	if (core_color == NULL)
++		goto fail_alloc_context;
++
++	core_color->caps = dm_alloc(sizeof(struct sink_caps) *
++			MOD_COLOR_MAX_CONCURRENT_SINKS);
++
++	if (core_color->caps == NULL)
++		goto fail_alloc_caps;
++
++	for (i = 0; i < MOD_COLOR_MAX_CONCURRENT_SINKS; i++)
++		core_color->caps[i].sink = NULL;
++
++	core_color->user_enable_color_temperature =
++			dm_alloc(sizeof(bool) *
++					MOD_COLOR_MAX_CONCURRENT_SINKS);
++
++	if (core_color->user_enable_color_temperature == NULL)
++		goto fail_alloc_user_enable;
++
++	core_color->num_sinks = 0;
++	core_color->color_temperature = 6500;
++
++	if (dc == NULL)
++		goto fail_construct;
++
++	core_color->dc = dc;
++
++	if (!check_dc_support(dc))
++		goto fail_construct;
++
++	return &core_color->public;
++
++fail_construct:
++		dm_free(core_color->user_enable_color_temperature);
++
++fail_alloc_user_enable:
++		dm_free(core_color->caps);
++
++fail_alloc_caps:
++		dm_free(core_color);
++
++fail_alloc_context:
++		return NULL;
++
++}
++
++void mod_color_destroy(struct mod_color *mod_color)
++{
++	if (mod_color != NULL) {
++		int i;
++		struct core_color *core_color =
++				MOD_COLOR_TO_CORE(mod_color);
++
++		dm_free(core_color->user_enable_color_temperature);
++
++		for (i = 0; i < core_color->num_sinks; i++)
++			dc_sink_release(core_color->caps[i].sink);
++
++		dm_free(core_color->caps);
++
++		dm_free(core_color);
++	}
++}
++
++/* Given a specific dc_sink* this function finds its equivalent
++ * on the dc_sink array and returns the corresponding index
++ */
++static unsigned int sink_index_from_sink(struct core_color *core_color,
++		const struct dc_sink *sink)
++{
++	unsigned int index = 0;
++
++	for (index = 0; index < core_color->num_sinks; index++)
++		if (core_color->caps[index].sink == sink)
++			return index;
++
++	/* Could not find sink requested */
++	ASSERT(false);
++	return index;
++}
++
++bool mod_color_adjust_temperature(struct mod_color *mod_color,
++		const struct dc_stream **streams, int num_streams,
++		int temperature)
++{
++	struct core_color *core_color = MOD_COLOR_TO_CORE(mod_color);
++
++	/*TODO: calculations for the matrix and add to the streams*/
++	struct fixed31_32 identity_matrix[12];
++
++	identity_matrix[0] = dal_fixed31_32_from_fraction(temperature, 6500);
++	identity_matrix[1] = dal_fixed31_32_zero;
++	identity_matrix[2] = dal_fixed31_32_zero;
++	identity_matrix[3] = dal_fixed31_32_zero;
++	identity_matrix[4] = dal_fixed31_32_zero;
++	identity_matrix[5] = dal_fixed31_32_from_fraction(temperature, 6500);
++	identity_matrix[6] = dal_fixed31_32_zero;
++	identity_matrix[7] = dal_fixed31_32_zero;
++	identity_matrix[8] = dal_fixed31_32_zero;
++	identity_matrix[9] = dal_fixed31_32_zero;
++	identity_matrix[10] = dal_fixed31_32_from_fraction(temperature, 6500);
++	identity_matrix[11] = dal_fixed31_32_zero;
++
++	int i;
++	int j;
++
++	for (i = 0; i < num_streams; i++) {
++		struct core_stream *core_stream = DC_STREAM_TO_CORE(streams[i]);
++
++		core_stream->public.csc_matrix.bypass = false;
++
++		for (j = 0; j < 12; j++)
++			core_stream->public.csc_matrix.matrix[j] =
++					identity_matrix[j];
++	}
++
++	core_color->dc->stream_funcs.adjust_color_temperature(
++						core_color->dc, streams,
++						num_streams);
++
++	return true;
++}
++
++/*TODO: user enable for color temperature button*/
++
++bool mod_color_set_user_enable(struct mod_color *mod_color,
++		const struct dc_stream **streams, int num_streams,
++		bool user_enable)
++{
++	struct core_color *core_color = MOD_COLOR_TO_CORE(mod_color);
++
++	unsigned int stream_index, sink_index;
++
++	for (stream_index = 0; stream_index < num_streams; stream_index++) {
++
++		sink_index = sink_index_from_sink(core_color,
++				streams[stream_index]->sink);
++
++		core_color->user_enable_color_temperature[sink_index] =
++				user_enable;
++	}
++
++	/*set_color_on_streams(core_color, streams, num_streams);*/
++
++	return true;
++}
++
++
++
++
++
++
++
++
++
+diff --git a/drivers/gpu/drm/amd/dal/modules/freesync/freesync.c b/drivers/gpu/drm/amd/dal/modules/freesync/freesync.c
+index afcf358..9d50826 100644
+--- a/drivers/gpu/drm/amd/dal/modules/freesync/freesync.c
++++ b/drivers/gpu/drm/amd/dal/modules/freesync/freesync.c
+@@ -443,6 +443,7 @@ void mod_freesync_handle_v_update(struct mod_freesync *mod_freesync,
+ 					v_total);
+ 	}
+ }
++
+ /*
+  * Sets freesync mode on a stream depending on current freesync state.
+  */
+diff --git a/drivers/gpu/drm/amd/dal/modules/inc/mod_color.h b/drivers/gpu/drm/amd/dal/modules/inc/mod_color.h
+new file mode 100644
+index 0000000..dd548e9
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/modules/inc/mod_color.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright 2016 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++
++#ifndef MOD_COLOR_H_
++#define MOD_COLOR_H_
++
++#include "dm_services.h"
++
++struct mod_color {
++	int dummy;
++};
++
++struct mod_color *mod_color_create(struct dc *dc);
++void mod_color_destroy(struct mod_color *mod_color);
++
++bool mod_color_adjust_temperature(struct mod_color *mod_color,
++		const struct dc_stream **streams, int num_streams,
++		int temperature);
++
++bool mod_color_set_user_enable(struct mod_color *mod_color,
++		const struct dc_stream **streams, int num_streams,
++		bool user_enable);
++
++#endif /* MOD_COLOR_H_ */
+-- 
+2.7.4
+
