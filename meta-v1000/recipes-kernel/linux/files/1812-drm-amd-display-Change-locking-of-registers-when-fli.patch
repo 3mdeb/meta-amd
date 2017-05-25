@@ -1,0 +1,215 @@
+From 0a67621df3398ecf2f6aded2d2d1026d4500e4ae Mon Sep 17 00:00:00 2001
+From: Andrew Wong <andrew.wong1@amd.com>
+Date: Mon, 12 Dec 2016 11:17:06 -0500
+Subject: [PATCH 1812/3082] drm/amd/display: Change locking of registers when
+ flipping frames.
+
+- Introduce GRPH_UPDATE_LOCK around programming surface flip.
+- Remove the now unused graphic surface lock.
+- Add macros to get and set four registers
+- both immediate and H Retrace should not be enabled at the same time
+
+Change-Id: Id5e54253f3e104730386e1aea551c2835282fbeb
+Signed-off-by: Andrew Wong <andrew.wong1@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c                |  9 +--------
+ drivers/gpu/drm/amd/display/dc/dc_helper.c              | 14 ++++++++++++++
+ drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.c          | 11 +++--------
+ .../gpu/drm/amd/display/dc/dce110/dce110_mem_input.c    | 17 +++++++++++++++--
+ drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h       |  3 +--
+ drivers/gpu/drm/amd/display/dc/inc/reg_helper.h         | 13 +++++++++++++
+ 6 files changed, 47 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 41df500..75b6e40 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1468,11 +1468,6 @@ void dc_update_surfaces_for_target(struct dc *dc, struct dc_surface_update *upda
+ 				continue;
+ 
+ 			if (updates[i].flip_addr) {
+-				core_dc->hwss.pipe_control_lock(
+-							core_dc->hwseq,
+-							pipe_ctx->pipe_idx,
+-							PIPE_LOCK_CONTROL_SURFACE,
+-							true);
+ 				core_dc->hwss.update_plane_addr(core_dc, pipe_ctx);
+ 			}
+ 
+@@ -1485,7 +1480,6 @@ void dc_update_surfaces_for_target(struct dc *dc, struct dc_surface_update *upda
+ 					core_dc->hwss.pipe_control_lock(
+ 							core_dc->hwseq,
+ 							pipe_ctx->pipe_idx,
+-							PIPE_LOCK_CONTROL_SURFACE |
+ 							PIPE_LOCK_CONTROL_GRAPHICS |
+ 							PIPE_LOCK_CONTROL_SCL |
+ 							PIPE_LOCK_CONTROL_BLENDER |
+@@ -1515,8 +1509,7 @@ void dc_update_surfaces_for_target(struct dc *dc, struct dc_surface_update *upda
+ 							pipe_ctx->pipe_idx,
+ 							PIPE_LOCK_CONTROL_GRAPHICS |
+ 							PIPE_LOCK_CONTROL_SCL |
+-							PIPE_LOCK_CONTROL_BLENDER |
+-							PIPE_LOCK_CONTROL_SURFACE,
++							PIPE_LOCK_CONTROL_BLENDER,
+ 							false);
+ 				}
+ 				break;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_helper.c b/drivers/gpu/drm/amd/display/dc/dc_helper.c
+index c5ff7b6..a950dd5 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_helper.c
++++ b/drivers/gpu/drm/amd/display/dc/dc_helper.c
+@@ -65,6 +65,20 @@ uint32_t generic_reg_get3(const struct dc_context *ctx, uint32_t addr,
+ 	return reg_val;
+ }
+ 
++uint32_t generic_reg_get4(const struct dc_context *ctx, uint32_t addr,
++		uint8_t shift1, uint32_t mask1, uint32_t *field_value1,
++		uint8_t shift2, uint32_t mask2, uint32_t *field_value2,
++		uint8_t shift3, uint32_t mask3, uint32_t *field_value3,
++		uint8_t shift4, uint32_t mask4, uint32_t *field_value4)
++{
++	uint32_t reg_val = dm_read_reg(ctx, addr);
++	*field_value1 = get_reg_field_value_ex(reg_val, mask1, shift1);
++	*field_value2 = get_reg_field_value_ex(reg_val, mask2, shift2);
++	*field_value3 = get_reg_field_value_ex(reg_val, mask3, shift3);
++	*field_value4 = get_reg_field_value_ex(reg_val, mask4, shift4);
++	return reg_val;
++}
++
+ uint32_t generic_reg_get5(const struct dc_context *ctx, uint32_t addr,
+ 		uint8_t shift1, uint32_t mask1, uint32_t *field_value1,
+ 		uint8_t shift2, uint32_t mask2, uint32_t *field_value2,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.c b/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.c
+index dd1cf5e..cd9a371 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.c
+@@ -49,12 +49,11 @@ void dce_pipe_control_lock(struct dce_hwseq *hws,
+ 		bool lock)
+ {
+ 	uint32_t lock_val = lock ? 1 : 0;
+-	uint32_t dcp_grph, scl, dcp_grph_surf, blnd, update_lock_mode;
++	uint32_t dcp_grph, scl, blnd, update_lock_mode;
+ 
+-	uint32_t val = REG_GET_5(BLND_V_UPDATE_LOCK[blnd_inst],
++	uint32_t val = REG_GET_4(BLND_V_UPDATE_LOCK[blnd_inst],
+ 			BLND_DCP_GRPH_V_UPDATE_LOCK, &dcp_grph,
+ 			BLND_SCL_V_UPDATE_LOCK, &scl,
+-			BLND_DCP_GRPH_SURF_V_UPDATE_LOCK, &dcp_grph_surf,
+ 			BLND_BLND_V_UPDATE_LOCK, &blnd,
+ 			BLND_V_UPDATE_LOCK_MODE, &update_lock_mode);
+ 
+@@ -64,19 +63,15 @@ void dce_pipe_control_lock(struct dce_hwseq *hws,
+ 	if (control_mask & PIPE_LOCK_CONTROL_SCL)
+ 		scl = lock_val;
+ 
+-	if (control_mask & PIPE_LOCK_CONTROL_SURFACE)
+-		dcp_grph_surf = lock_val;
+-
+ 	if (control_mask & PIPE_LOCK_CONTROL_BLENDER)
+ 		blnd = lock_val;
+ 
+ 	if (control_mask & PIPE_LOCK_CONTROL_MODE)
+ 		update_lock_mode = lock_val;
+ 
+-	REG_SET_5(BLND_V_UPDATE_LOCK[blnd_inst], val,
++	REG_SET_4(BLND_V_UPDATE_LOCK[blnd_inst], val,
+ 			BLND_DCP_GRPH_V_UPDATE_LOCK, dcp_grph,
+ 			BLND_SCL_V_UPDATE_LOCK, scl,
+-			BLND_DCP_GRPH_SURF_V_UPDATE_LOCK, dcp_grph_surf,
+ 			BLND_BLND_V_UPDATE_LOCK, blnd,
+ 			BLND_V_UPDATE_LOCK_MODE, update_lock_mode);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.c
+index af9d682..a20feae 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.c
+@@ -113,16 +113,25 @@ bool dce110_mem_input_program_surface_flip_and_addr(
+ 	struct dce110_mem_input *mem_input110 = TO_DCE110_MEM_INPUT(mem_input);
+ 
+ 	uint32_t value = 0;
++	uint32_t value_old = 0;
++	uint32_t lock_value = 0;
++
++	lock_value = dm_read_reg(mem_input110->base.ctx, DCP_REG(mmGRPH_UPDATE));
++	set_reg_field_value(lock_value, 1, GRPH_UPDATE, GRPH_UPDATE_LOCK);
++	dm_write_reg(mem_input110->base.ctx, DCP_REG(mmGRPH_UPDATE), lock_value);
+ 
+ 	value = dm_read_reg(mem_input110->base.ctx, DCP_REG(mmGRPH_FLIP_CONTROL));
++	value_old = value;
+ 	if (flip_immediate) {
+-		set_reg_field_value(value, 1, GRPH_FLIP_CONTROL, GRPH_SURFACE_UPDATE_IMMEDIATE_EN);
++		set_reg_field_value(value, 0, GRPH_FLIP_CONTROL, GRPH_SURFACE_UPDATE_IMMEDIATE_EN);
+ 		set_reg_field_value(value, 1, GRPH_FLIP_CONTROL, GRPH_SURFACE_UPDATE_H_RETRACE_EN);
+ 	} else {
+ 		set_reg_field_value(value, 0, GRPH_FLIP_CONTROL, GRPH_SURFACE_UPDATE_IMMEDIATE_EN);
+ 		set_reg_field_value(value, 0, GRPH_FLIP_CONTROL, GRPH_SURFACE_UPDATE_H_RETRACE_EN);
+ 	}
+-	dm_write_reg(mem_input110->base.ctx, DCP_REG(mmGRPH_FLIP_CONTROL), value);
++	if (value != value_old) {
++		dm_write_reg(mem_input110->base.ctx, DCP_REG(mmGRPH_FLIP_CONTROL), value);
++	}
+ 
+ 	switch (address->type) {
+ 	case PLN_ADDR_TYPE_GRAPHICS:
+@@ -147,6 +156,10 @@ bool dce110_mem_input_program_surface_flip_and_addr(
+ 	if (flip_immediate)
+ 		mem_input->current_address = *address;
+ 
++	lock_value = dm_read_reg(mem_input110->base.ctx, DCP_REG(mmGRPH_UPDATE));
++	set_reg_field_value(lock_value, 0, GRPH_UPDATE, GRPH_UPDATE_LOCK);
++	dm_write_reg(mem_input110->base.ctx, DCP_REG(mmGRPH_UPDATE), lock_value);
++
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index 50d499c..fcaf2c7 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -40,8 +40,7 @@ enum pipe_lock_control {
+ 	PIPE_LOCK_CONTROL_GRAPHICS = 1 << 0,
+ 	PIPE_LOCK_CONTROL_BLENDER = 1 << 1,
+ 	PIPE_LOCK_CONTROL_SCL = 1 << 2,
+-	PIPE_LOCK_CONTROL_SURFACE = 1 << 3,
+-	PIPE_LOCK_CONTROL_MODE = 1 << 4
++	PIPE_LOCK_CONTROL_MODE = 1 << 3
+ };
+ 
+ struct dce_hwseq;
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/reg_helper.h b/drivers/gpu/drm/amd/display/dc/inc/reg_helper.h
+index dbc8424..a078174 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/reg_helper.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/reg_helper.h
+@@ -143,6 +143,13 @@
+ 				FN(reg_name, f2), v2, \
+ 				FN(reg_name, f3), v3)
+ 
++#define REG_GET_4(reg_name, f1, v1, f2, v2, f3, v3, f4, v4)	\
++		generic_reg_get4(CTX, REG(reg_name), \
++				FN(reg_name, f1), v1, \
++				FN(reg_name, f2), v2, \
++				FN(reg_name, f3), v3, \
++				FN(reg_name, f4), v4)
++
+ #define REG_GET_5(reg_name, f1, v1, f2, v2, f3, v3, f4, v4, f5, v5)	\
+ 		generic_reg_get5(CTX, REG(reg_name), \
+ 				FN(reg_name, f1), v1, \
+@@ -280,6 +287,12 @@ uint32_t generic_reg_get3(const struct dc_context *ctx, uint32_t addr,
+ 		uint8_t shift2, uint32_t mask2, uint32_t *field_value2,
+ 		uint8_t shift3, uint32_t mask3, uint32_t *field_value3);
+ 
++uint32_t generic_reg_get4(const struct dc_context *ctx, uint32_t addr,
++		uint8_t shift1, uint32_t mask1, uint32_t *field_value1,
++		uint8_t shift2, uint32_t mask2, uint32_t *field_value2,
++		uint8_t shift3, uint32_t mask3, uint32_t *field_value3,
++		uint8_t shift4, uint32_t mask4, uint32_t *field_value4);
++
+ uint32_t generic_reg_get5(const struct dc_context *ctx, uint32_t addr,
+ 		uint8_t shift1, uint32_t mask1, uint32_t *field_value1,
+ 		uint8_t shift2, uint32_t mask2, uint32_t *field_value2,
+-- 
+2.7.4
+

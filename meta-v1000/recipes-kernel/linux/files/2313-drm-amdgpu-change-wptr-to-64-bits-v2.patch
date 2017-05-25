@@ -1,0 +1,856 @@
+From 1934899858f99086839b3c444b2d87a946132a93 Mon Sep 17 00:00:00 2001
+From: Ken Wang <Qingqing.Wang@amd.com>
+Date: Sat, 12 Mar 2016 09:32:30 +0800
+Subject: [PATCH 2313/3082] drm/amdgpu: change wptr to 64 bits (v2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Newer asics need 64 bit wptrs.  If the wptr is now
+smaller than the rptr that doesn't indicate a wrap-around
+anymore.
+
+v2: integrate Christian's comments.
+
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Ken Wang <Qingqing.Wang@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h      |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c |  5 ++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h | 12 +++++++-----
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c    | 12 +++++++-----
+ drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c    | 11 ++++++-----
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c    | 18 ++++++++++--------
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c    | 23 +++++++++++++----------
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c   | 11 ++++++-----
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c   | 15 ++++++++-------
+ drivers/gpu/drm/amd/amdgpu/si_dma.c      | 12 +++++++-----
+ drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c    |  9 +++++----
+ drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c    |  9 +++++----
+ drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c    | 10 ++++++----
+ drivers/gpu/drm/amd/amdgpu/vce_v2_0.c    | 17 +++++++++--------
+ drivers/gpu/drm/amd/amdgpu/vce_v3_0.c    | 24 +++++++++++++-----------
+ 15 files changed, 107 insertions(+), 83 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index c810df0..15fb938 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1612,7 +1612,7 @@ static inline void amdgpu_ring_write(struct amdgpu_ring *ring, uint32_t v)
+ {
+ 	if (ring->count_dw <= 0)
+ 		DRM_ERROR("amdgpu: writing more dwords to the ring than expected!\n");
+-	ring->ring[ring->wptr++] = v;
++	ring->ring[ring->wptr++ & ring->buf_mask] = v;
+ 	ring->wptr &= ring->ptr_mask;
+ 	ring->count_dw--;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index 37d8422..cb453d0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -232,7 +232,10 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 		}
+ 		amdgpu_ring_clear_ring(ring);
+ 	}
+-	ring->ptr_mask = (ring->ring_size / 4) - 1;
++	ring->buf_mask = (ring->ring_size / 4) - 1;
++	ring->ptr_mask = ring->funcs->support_64bit_ptrs ?
++		0xffffffffffffffff : ring->buf_mask;
++
+ 	ring->max_dw = max_dw;
+ 
+ 	if (amdgpu_debugfs_ring_init(adev, ring)) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+index a1bfc4e..6d29af4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -96,10 +96,11 @@ struct amdgpu_ring_funcs {
+ 	enum amdgpu_ring_type	type;
+ 	uint32_t		align_mask;
+ 	u32			nop;
++	bool			support_64bit_ptrs;
+ 
+ 	/* ring read/write ptr handling */
+-	u32 (*get_rptr)(struct amdgpu_ring *ring);
+-	u32 (*get_wptr)(struct amdgpu_ring *ring);
++	u64 (*get_rptr)(struct amdgpu_ring *ring);
++	u64 (*get_wptr)(struct amdgpu_ring *ring);
+ 	void (*set_wptr)(struct amdgpu_ring *ring);
+ 	/* validating and patching of IBs */
+ 	int (*parse_cs)(struct amdgpu_cs_parser *p, uint32_t ib_idx);
+@@ -148,13 +149,14 @@ struct amdgpu_ring {
+ 	struct amdgpu_bo	*ring_obj;
+ 	volatile uint32_t	*ring;
+ 	unsigned		rptr_offs;
+-	unsigned		wptr;
+-	unsigned		wptr_old;
++	u64			wptr;
++	u64			wptr_old;
+ 	unsigned		ring_size;
+ 	unsigned		max_dw;
+ 	int			count_dw;
+ 	uint64_t		gpu_addr;
+-	uint32_t		ptr_mask;
++	uint64_t		ptr_mask;
++	uint32_t		buf_mask;
+ 	bool			ready;
+ 	u32			idx;
+ 	u32			me;
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index bfd512d..c853461 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -158,7 +158,7 @@ out:
+  *
+  * Get the current rptr from the hardware (CIK+).
+  */
+-static uint32_t cik_sdma_ring_get_rptr(struct amdgpu_ring *ring)
++static uint64_t cik_sdma_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	u32 rptr;
+ 
+@@ -174,7 +174,7 @@ static uint32_t cik_sdma_ring_get_rptr(struct amdgpu_ring *ring)
+  *
+  * Get the current wptr from the hardware (CIK+).
+  */
+-static uint32_t cik_sdma_ring_get_wptr(struct amdgpu_ring *ring)
++static uint64_t cik_sdma_ring_get_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	u32 me = (ring == &adev->sdma.instance[0].ring) ? 0 : 1;
+@@ -194,7 +194,8 @@ static void cik_sdma_ring_set_wptr(struct amdgpu_ring *ring)
+ 	struct amdgpu_device *adev = ring->adev;
+ 	u32 me = (ring == &adev->sdma.instance[0].ring) ? 0 : 1;
+ 
+-	WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[me], (ring->wptr << 2) & 0x3fffc);
++	WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[me],
++		       	(lower_32_bits(ring->wptr) << 2) & 0x3fffc);
+ }
+ 
+ static void cik_sdma_ring_insert_nop(struct amdgpu_ring *ring, uint32_t count)
+@@ -225,7 +226,7 @@ static void cik_sdma_ring_emit_ib(struct amdgpu_ring *ring,
+ 	u32 extra_bits = vm_id & 0xf;
+ 
+ 	/* IB packet must end on a 8 DW boundary */
+-	cik_sdma_ring_insert_nop(ring, (12 - (ring->wptr & 7)) % 8);
++	cik_sdma_ring_insert_nop(ring, (12 - (lower_32_bits(ring->wptr) & 7)) % 8);
+ 
+ 	amdgpu_ring_write(ring, SDMA_PACKET(SDMA_OPCODE_INDIRECT_BUFFER, 0, extra_bits));
+ 	amdgpu_ring_write(ring, ib->gpu_addr & 0xffffffe0); /* base must be 32 byte aligned */
+@@ -432,7 +433,7 @@ static int cik_sdma_gfx_resume(struct amdgpu_device *adev)
+ 		WREG32(mmSDMA0_GFX_RB_BASE_HI + sdma_offsets[i], ring->gpu_addr >> 40);
+ 
+ 		ring->wptr = 0;
+-		WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[i], ring->wptr << 2);
++		WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[i], lower_32_bits(ring->wptr) << 2);
+ 
+ 		/* enable DMA RB */
+ 		WREG32(mmSDMA0_GFX_RB_CNTL + sdma_offsets[i],
+@@ -1209,6 +1210,7 @@ static const struct amdgpu_ring_funcs cik_sdma_ring_funcs = {
+ 	.type = AMDGPU_RING_TYPE_SDMA,
+ 	.align_mask = 0xf,
+ 	.nop = SDMA_PACKET(SDMA_OPCODE_NOP, 0, 0),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = cik_sdma_ring_get_rptr,
+ 	.get_wptr = cik_sdma_ring_get_wptr,
+ 	.set_wptr = cik_sdma_ring_set_wptr,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
+index 88b63ed..51731a6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
+@@ -2192,12 +2192,12 @@ static int gfx_v6_0_cp_gfx_resume(struct amdgpu_device *adev)
+ 	return 0;
+ }
+ 
+-static u32 gfx_v6_0_ring_get_rptr(struct amdgpu_ring *ring)
++static u64 gfx_v6_0_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	return ring->adev->wb.wb[ring->rptr_offs];
+ }
+ 
+-static u32 gfx_v6_0_ring_get_wptr(struct amdgpu_ring *ring)
++static u64 gfx_v6_0_ring_get_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -2215,7 +2215,7 @@ static void gfx_v6_0_ring_set_wptr_gfx(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+-	WREG32(mmCP_RB0_WPTR, ring->wptr);
++	WREG32(mmCP_RB0_WPTR, lower_32_bits(ring->wptr));
+ 	(void)RREG32(mmCP_RB0_WPTR);
+ }
+ 
+@@ -2224,10 +2224,10 @@ static void gfx_v6_0_ring_set_wptr_compute(struct amdgpu_ring *ring)
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+ 	if (ring == &adev->gfx.compute_ring[0]) {
+-		WREG32(mmCP_RB1_WPTR, ring->wptr);
++		WREG32(mmCP_RB1_WPTR, lower_32_bits(ring->wptr));
+ 		(void)RREG32(mmCP_RB1_WPTR);
+ 	} else if (ring == &adev->gfx.compute_ring[1]) {
+-		WREG32(mmCP_RB2_WPTR, ring->wptr);
++		WREG32(mmCP_RB2_WPTR, lower_32_bits(ring->wptr));
+ 		(void)RREG32(mmCP_RB2_WPTR);
+ 	} else {
+ 		BUG();
+@@ -3631,6 +3631,7 @@ static const struct amdgpu_ring_funcs gfx_v6_0_ring_funcs_gfx = {
+ 	.type = AMDGPU_RING_TYPE_GFX,
+ 	.align_mask = 0xff,
+ 	.nop = 0x80000000,
++	.support_64bit_ptrs = false,
+ 	.get_rptr = gfx_v6_0_ring_get_rptr,
+ 	.get_wptr = gfx_v6_0_ring_get_wptr,
+ 	.set_wptr = gfx_v6_0_ring_set_wptr_gfx,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 3d8442c..bbd62dc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2629,7 +2629,7 @@ static int gfx_v7_0_cp_gfx_resume(struct amdgpu_device *adev)
+ 	/* Initialize the ring buffer's read and write pointers */
+ 	WREG32(mmCP_RB0_CNTL, tmp | CP_RB0_CNTL__RB_RPTR_WR_ENA_MASK);
+ 	ring->wptr = 0;
+-	WREG32(mmCP_RB0_WPTR, ring->wptr);
++	WREG32(mmCP_RB0_WPTR, lower_32_bits(ring->wptr));
+ 
+ 	/* set the wb address wether it's enabled or not */
+ 	rptr_addr = adev->wb.gpu_addr + (ring->rptr_offs * 4);
+@@ -2658,12 +2658,12 @@ static int gfx_v7_0_cp_gfx_resume(struct amdgpu_device *adev)
+ 	return 0;
+ }
+ 
+-static u32 gfx_v7_0_ring_get_rptr(struct amdgpu_ring *ring)
++static u64 gfx_v7_0_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	return ring->adev->wb.wb[ring->rptr_offs];
+ }
+ 
+-static u32 gfx_v7_0_ring_get_wptr_gfx(struct amdgpu_ring *ring)
++static u64 gfx_v7_0_ring_get_wptr_gfx(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -2674,11 +2674,11 @@ static void gfx_v7_0_ring_set_wptr_gfx(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+-	WREG32(mmCP_RB0_WPTR, ring->wptr);
++	WREG32(mmCP_RB0_WPTR, lower_32_bits(ring->wptr));
+ 	(void)RREG32(mmCP_RB0_WPTR);
+ }
+ 
+-static u32 gfx_v7_0_ring_get_wptr_compute(struct amdgpu_ring *ring)
++static u64 gfx_v7_0_ring_get_wptr_compute(struct amdgpu_ring *ring)
+ {
+ 	/* XXX check if swapping is necessary on BE */
+ 	return ring->adev->wb.wb[ring->wptr_offs];
+@@ -2689,8 +2689,8 @@ static void gfx_v7_0_ring_set_wptr_compute(struct amdgpu_ring *ring)
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+ 	/* XXX check if swapping is necessary on BE */
+-	adev->wb.wb[ring->wptr_offs] = ring->wptr;
+-	WDOORBELL32(ring->doorbell_index, ring->wptr);
++	adev->wb.wb[ring->wptr_offs] = lower_32_bits(ring->wptr);
++	WDOORBELL32(ring->doorbell_index, lower_32_bits(ring->wptr));
+ }
+ 
+ /**
+@@ -3160,7 +3160,7 @@ static int gfx_v7_0_cp_compute_resume(struct amdgpu_device *adev)
+ 
+ 		/* read and write pointers, similar to CP_RB0_WPTR/_RPTR */
+ 		ring->wptr = 0;
+-		mqd->queue_state.cp_hqd_pq_wptr = ring->wptr;
++		mqd->queue_state.cp_hqd_pq_wptr = lower_32_bits(ring->wptr);
+ 		WREG32(mmCP_HQD_PQ_WPTR, mqd->queue_state.cp_hqd_pq_wptr);
+ 		mqd->queue_state.cp_hqd_pq_rptr = RREG32(mmCP_HQD_PQ_RPTR);
+ 
+@@ -5206,6 +5206,7 @@ static const struct amdgpu_ring_funcs gfx_v7_0_ring_funcs_gfx = {
+ 	.type = AMDGPU_RING_TYPE_GFX,
+ 	.align_mask = 0xff,
+ 	.nop = PACKET3(PACKET3_NOP, 0x3FFF),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = gfx_v7_0_ring_get_rptr,
+ 	.get_wptr = gfx_v7_0_ring_get_wptr_gfx,
+ 	.set_wptr = gfx_v7_0_ring_set_wptr_gfx,
+@@ -5236,6 +5237,7 @@ static const struct amdgpu_ring_funcs gfx_v7_0_ring_funcs_compute = {
+ 	.type = AMDGPU_RING_TYPE_COMPUTE,
+ 	.align_mask = 0xff,
+ 	.nop = PACKET3(PACKET3_NOP, 0x3FFF),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = gfx_v7_0_ring_get_rptr,
+ 	.get_wptr = gfx_v7_0_ring_get_wptr_compute,
+ 	.set_wptr = gfx_v7_0_ring_set_wptr_compute,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 91daf07e..5469751 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -4490,7 +4490,7 @@ static int gfx_v8_0_cp_gfx_resume(struct amdgpu_device *adev)
+ 	/* Initialize the ring buffer's read and write pointers */
+ 	WREG32(mmCP_RB0_CNTL, tmp | CP_RB0_CNTL__RB_RPTR_WR_ENA_MASK);
+ 	ring->wptr = 0;
+-	WREG32(mmCP_RB0_WPTR, ring->wptr);
++	WREG32(mmCP_RB0_WPTR, lower_32_bits(ring->wptr));
+ 
+ 	/* set the wb address wether it's enabled or not */
+ 	rptr_addr = adev->wb.gpu_addr + (ring->rptr_offs * 4);
+@@ -5204,7 +5204,7 @@ static int gfx_v8_0_cp_compute_resume(struct amdgpu_device *adev)
+ 
+ 		/* reset read and write pointers, similar to CP_RB0_WPTR/_RPTR */
+ 		ring->wptr = 0;
+-		mqd->cp_hqd_pq_wptr = ring->wptr;
++		mqd->cp_hqd_pq_wptr = lower_32_bits(ring->wptr);
+ 		WREG32(mmCP_HQD_PQ_WPTR, mqd->cp_hqd_pq_wptr);
+ 		mqd->cp_hqd_pq_rptr = RREG32(mmCP_HQD_PQ_RPTR);
+ 
+@@ -6458,12 +6458,12 @@ static int gfx_v8_0_set_clockgating_state(void *handle,
+ 	return 0;
+ }
+ 
+-static u32 gfx_v8_0_ring_get_rptr(struct amdgpu_ring *ring)
++static u64 gfx_v8_0_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	return ring->adev->wb.wb[ring->rptr_offs];
+ }
+ 
+-static u32 gfx_v8_0_ring_get_wptr_gfx(struct amdgpu_ring *ring)
++static u64 gfx_v8_0_ring_get_wptr_gfx(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -6480,10 +6480,10 @@ static void gfx_v8_0_ring_set_wptr_gfx(struct amdgpu_ring *ring)
+ 
+ 	if (ring->use_doorbell) {
+ 		/* XXX check if swapping is necessary on BE */
+-		adev->wb.wb[ring->wptr_offs] = ring->wptr;
+-		WDOORBELL32(ring->doorbell_index, ring->wptr);
++		adev->wb.wb[ring->wptr_offs] = lower_32_bits(ring->wptr);
++		WDOORBELL32(ring->doorbell_index, lower_32_bits(ring->wptr));
+ 	} else {
+-		WREG32(mmCP_RB0_WPTR, ring->wptr);
++		WREG32(mmCP_RB0_WPTR, lower_32_bits(ring->wptr));
+ 		(void)RREG32(mmCP_RB0_WPTR);
+ 	}
+ }
+@@ -6671,7 +6671,7 @@ static void gfx_v8_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ 	}
+ }
+ 
+-static u32 gfx_v8_0_ring_get_wptr_compute(struct amdgpu_ring *ring)
++static u64 gfx_v8_0_ring_get_wptr_compute(struct amdgpu_ring *ring)
+ {
+ 	return ring->adev->wb.wb[ring->wptr_offs];
+ }
+@@ -6681,8 +6681,8 @@ static void gfx_v8_0_ring_set_wptr_compute(struct amdgpu_ring *ring)
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+ 	/* XXX check if swapping is necessary on BE */
+-	adev->wb.wb[ring->wptr_offs] = ring->wptr;
+-	WDOORBELL32(ring->doorbell_index, ring->wptr);
++	adev->wb.wb[ring->wptr_offs] = lower_32_bits(ring->wptr);
++	WDOORBELL32(ring->doorbell_index, lower_32_bits(ring->wptr));
+ }
+ 
+ static void gfx_v8_0_ring_emit_fence_compute(struct amdgpu_ring *ring,
+@@ -7037,6 +7037,7 @@ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_gfx = {
+ 	.type = AMDGPU_RING_TYPE_GFX,
+ 	.align_mask = 0xff,
+ 	.nop = PACKET3(PACKET3_NOP, 0x3FFF),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = gfx_v8_0_ring_get_rptr,
+ 	.get_wptr = gfx_v8_0_ring_get_wptr_gfx,
+ 	.set_wptr = gfx_v8_0_ring_set_wptr_gfx,
+@@ -7069,6 +7070,7 @@ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_compute = {
+ 	.type = AMDGPU_RING_TYPE_COMPUTE,
+ 	.align_mask = 0xff,
+ 	.nop = PACKET3(PACKET3_NOP, 0x3FFF),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = gfx_v8_0_ring_get_rptr,
+ 	.get_wptr = gfx_v8_0_ring_get_wptr_compute,
+ 	.set_wptr = gfx_v8_0_ring_set_wptr_compute,
+@@ -7097,6 +7099,7 @@ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_kiq = {
+ 	.type = AMDGPU_RING_TYPE_KIQ,
+ 	.align_mask = 0xff,
+ 	.nop = PACKET3(PACKET3_NOP, 0x3FFF),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = gfx_v8_0_ring_get_rptr,
+ 	.get_wptr = gfx_v8_0_ring_get_wptr_compute,
+ 	.set_wptr = gfx_v8_0_ring_set_wptr_compute,
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index 0af70eb..4b8efad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -186,7 +186,7 @@ out:
+  *
+  * Get the current rptr from the hardware (VI+).
+  */
+-static uint32_t sdma_v2_4_ring_get_rptr(struct amdgpu_ring *ring)
++static uint64_t sdma_v2_4_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	/* XXX check if swapping is necessary on BE */
+ 	return ring->adev->wb.wb[ring->rptr_offs] >> 2;
+@@ -199,7 +199,7 @@ static uint32_t sdma_v2_4_ring_get_rptr(struct amdgpu_ring *ring)
+  *
+  * Get the current wptr from the hardware (VI+).
+  */
+-static uint32_t sdma_v2_4_ring_get_wptr(struct amdgpu_ring *ring)
++static uint64_t sdma_v2_4_ring_get_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	int me = (ring == &ring->adev->sdma.instance[0].ring) ? 0 : 1;
+@@ -220,7 +220,7 @@ static void sdma_v2_4_ring_set_wptr(struct amdgpu_ring *ring)
+ 	struct amdgpu_device *adev = ring->adev;
+ 	int me = (ring == &ring->adev->sdma.instance[0].ring) ? 0 : 1;
+ 
+-	WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[me], ring->wptr << 2);
++	WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[me], lower_32_bits(ring->wptr) << 2);
+ }
+ 
+ static void sdma_v2_4_ring_insert_nop(struct amdgpu_ring *ring, uint32_t count)
+@@ -251,7 +251,7 @@ static void sdma_v2_4_ring_emit_ib(struct amdgpu_ring *ring,
+ 	u32 vmid = vm_id & 0xf;
+ 
+ 	/* IB packet must end on a 8 DW boundary */
+-	sdma_v2_4_ring_insert_nop(ring, (10 - (ring->wptr & 7)) % 8);
++	sdma_v2_4_ring_insert_nop(ring, (10 - (lower_32_bits(ring->wptr) & 7)) % 8);
+ 
+ 	amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_INDIRECT) |
+ 			  SDMA_PKT_INDIRECT_HEADER_VMID(vmid));
+@@ -466,7 +466,7 @@ static int sdma_v2_4_gfx_resume(struct amdgpu_device *adev)
+ 		WREG32(mmSDMA0_GFX_RB_BASE_HI + sdma_offsets[i], ring->gpu_addr >> 40);
+ 
+ 		ring->wptr = 0;
+-		WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[i], ring->wptr << 2);
++		WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[i], lower_32_bits(ring->wptr) << 2);
+ 
+ 		/* enable DMA RB */
+ 		rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_GFX_RB_CNTL, RB_ENABLE, 1);
+@@ -1206,6 +1206,7 @@ static const struct amdgpu_ring_funcs sdma_v2_4_ring_funcs = {
+ 	.type = AMDGPU_RING_TYPE_SDMA,
+ 	.align_mask = 0xf,
+ 	.nop = SDMA_PKT_NOP_HEADER_OP(SDMA_OP_NOP),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = sdma_v2_4_ring_get_rptr,
+ 	.get_wptr = sdma_v2_4_ring_get_wptr,
+ 	.set_wptr = sdma_v2_4_ring_set_wptr,
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index 76e33f0..740ec8c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -337,7 +337,7 @@ out:
+  *
+  * Get the current rptr from the hardware (VI+).
+  */
+-static uint32_t sdma_v3_0_ring_get_rptr(struct amdgpu_ring *ring)
++static uint64_t sdma_v3_0_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	/* XXX check if swapping is necessary on BE */
+ 	return ring->adev->wb.wb[ring->rptr_offs] >> 2;
+@@ -350,7 +350,7 @@ static uint32_t sdma_v3_0_ring_get_rptr(struct amdgpu_ring *ring)
+  *
+  * Get the current wptr from the hardware (VI+).
+  */
+-static uint32_t sdma_v3_0_ring_get_wptr(struct amdgpu_ring *ring)
++static uint64_t sdma_v3_0_ring_get_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	u32 wptr;
+@@ -380,12 +380,12 @@ static void sdma_v3_0_ring_set_wptr(struct amdgpu_ring *ring)
+ 
+ 	if (ring->use_doorbell) {
+ 		/* XXX check if swapping is necessary on BE */
+-		adev->wb.wb[ring->wptr_offs] = ring->wptr << 2;
+-		WDOORBELL32(ring->doorbell_index, ring->wptr << 2);
++		adev->wb.wb[ring->wptr_offs] = lower_32_bits(ring->wptr) << 2;
++		WDOORBELL32(ring->doorbell_index, lower_32_bits(ring->wptr) << 2);
+ 	} else {
+ 		int me = (ring == &ring->adev->sdma.instance[0].ring) ? 0 : 1;
+ 
+-		WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[me], ring->wptr << 2);
++		WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[me], lower_32_bits(ring->wptr) << 2);
+ 	}
+ }
+ 
+@@ -417,7 +417,7 @@ static void sdma_v3_0_ring_emit_ib(struct amdgpu_ring *ring,
+ 	u32 vmid = vm_id & 0xf;
+ 
+ 	/* IB packet must end on a 8 DW boundary */
+-	sdma_v3_0_ring_insert_nop(ring, (10 - (ring->wptr & 7)) % 8);
++	sdma_v3_0_ring_insert_nop(ring, (10 - (lower_32_bits(ring->wptr) & 7)) % 8);
+ 
+ 	amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_INDIRECT) |
+ 			  SDMA_PKT_INDIRECT_HEADER_VMID(vmid));
+@@ -660,7 +660,7 @@ static int sdma_v3_0_gfx_resume(struct amdgpu_device *adev)
+ 		WREG32(mmSDMA0_GFX_RB_BASE_HI + sdma_offsets[i], ring->gpu_addr >> 40);
+ 
+ 		ring->wptr = 0;
+-		WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[i], ring->wptr << 2);
++		WREG32(mmSDMA0_GFX_RB_WPTR + sdma_offsets[i], lower_32_bits(ring->wptr) << 2);
+ 
+ 		doorbell = RREG32(mmSDMA0_GFX_DOORBELL + sdma_offsets[i]);
+ 
+@@ -1579,6 +1579,7 @@ static const struct amdgpu_ring_funcs sdma_v3_0_ring_funcs = {
+ 	.type = AMDGPU_RING_TYPE_SDMA,
+ 	.align_mask = 0xf,
+ 	.nop = SDMA_PKT_NOP_HEADER_OP(SDMA_OP_NOP),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = sdma_v3_0_ring_get_rptr,
+ 	.get_wptr = sdma_v3_0_ring_get_wptr,
+ 	.set_wptr = sdma_v3_0_ring_set_wptr,
+diff --git a/drivers/gpu/drm/amd/amdgpu/si_dma.c b/drivers/gpu/drm/amd/amdgpu/si_dma.c
+index d2ba787..a6631f5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/si_dma.c
++++ b/drivers/gpu/drm/amd/amdgpu/si_dma.c
+@@ -37,12 +37,12 @@ static void si_dma_set_buffer_funcs(struct amdgpu_device *adev);
+ static void si_dma_set_vm_pte_funcs(struct amdgpu_device *adev);
+ static void si_dma_set_irq_funcs(struct amdgpu_device *adev);
+ 
+-static uint32_t si_dma_ring_get_rptr(struct amdgpu_ring *ring)
++static uint64_t si_dma_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	return ring->adev->wb.wb[ring->rptr_offs>>2];
+ }
+ 
+-static uint32_t si_dma_ring_get_wptr(struct amdgpu_ring *ring)
++static uint64_t si_dma_ring_get_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	u32 me = (ring == &adev->sdma.instance[0].ring) ? 0 : 1;
+@@ -55,7 +55,8 @@ static void si_dma_ring_set_wptr(struct amdgpu_ring *ring)
+ 	struct amdgpu_device *adev = ring->adev;
+ 	u32 me = (ring == &adev->sdma.instance[0].ring) ? 0 : 1;
+ 
+-	WREG32(DMA_RB_WPTR + sdma_offsets[me], (ring->wptr << 2) & 0x3fffc);
++	WREG32(DMA_RB_WPTR + sdma_offsets[me],
++	       (lower_32_bits(ring->wptr) << 2) & 0x3fffc);
+ }
+ 
+ static void si_dma_ring_emit_ib(struct amdgpu_ring *ring,
+@@ -65,7 +66,7 @@ static void si_dma_ring_emit_ib(struct amdgpu_ring *ring,
+ 	/* The indirect buffer packet must end on an 8 DW boundary in the DMA ring.
+ 	 * Pad as necessary with NOPs.
+ 	 */
+-	while ((ring->wptr & 7) != 5)
++	while ((lower_32_bits(ring->wptr) & 7) != 5)
+ 		amdgpu_ring_write(ring, DMA_PACKET(DMA_PACKET_NOP, 0, 0, 0, 0));
+ 	amdgpu_ring_write(ring, DMA_IB_PACKET(DMA_PACKET_INDIRECT_BUFFER, vm_id, 0));
+ 	amdgpu_ring_write(ring, (ib->gpu_addr & 0xFFFFFFE0));
+@@ -184,7 +185,7 @@ static int si_dma_start(struct amdgpu_device *adev)
+ 		WREG32(DMA_CNTL + sdma_offsets[i], dma_cntl);
+ 
+ 		ring->wptr = 0;
+-		WREG32(DMA_RB_WPTR + sdma_offsets[i], ring->wptr << 2);
++		WREG32(DMA_RB_WPTR + sdma_offsets[i], lower_32_bits(ring->wptr) << 2);
+ 		WREG32(DMA_RB_CNTL + sdma_offsets[i], rb_cntl | DMA_RB_ENABLE);
+ 
+ 		ring->ready = true;
+@@ -766,6 +767,7 @@ static const struct amdgpu_ring_funcs si_dma_ring_funcs = {
+ 	.type = AMDGPU_RING_TYPE_SDMA,
+ 	.align_mask = 0xf,
+ 	.nop = DMA_PACKET(DMA_PACKET_NOP, 0, 0, 0, 0),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = si_dma_ring_get_rptr,
+ 	.get_wptr = si_dma_ring_get_wptr,
+ 	.set_wptr = si_dma_ring_set_wptr,
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+index b34cefc..4bcb2f3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+@@ -55,7 +55,7 @@ static void uvd_v4_2_set_dcm(struct amdgpu_device *adev,
+  *
+  * Returns the current hardware read pointer
+  */
+-static uint32_t uvd_v4_2_ring_get_rptr(struct amdgpu_ring *ring)
++static uint64_t uvd_v4_2_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -69,7 +69,7 @@ static uint32_t uvd_v4_2_ring_get_rptr(struct amdgpu_ring *ring)
+  *
+  * Returns the current hardware write pointer
+  */
+-static uint32_t uvd_v4_2_ring_get_wptr(struct amdgpu_ring *ring)
++static uint64_t uvd_v4_2_ring_get_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -87,7 +87,7 @@ static void uvd_v4_2_ring_set_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+-	WREG32(mmUVD_RBC_RB_WPTR, ring->wptr);
++	WREG32(mmUVD_RBC_RB_WPTR, lower_32_bits(ring->wptr));
+ }
+ 
+ static int uvd_v4_2_early_init(void *handle)
+@@ -367,7 +367,7 @@ static int uvd_v4_2_start(struct amdgpu_device *adev)
+ 	WREG32(mmUVD_RBC_RB_RPTR, 0x0);
+ 
+ 	ring->wptr = RREG32(mmUVD_RBC_RB_RPTR);
+-	WREG32(mmUVD_RBC_RB_WPTR, ring->wptr);
++	WREG32(mmUVD_RBC_RB_WPTR, lower_32_bits(ring->wptr));
+ 
+ 	/* set the ring address */
+ 	WREG32(mmUVD_RBC_RB_BASE, ring->gpu_addr);
+@@ -770,6 +770,7 @@ static const struct amdgpu_ring_funcs uvd_v4_2_ring_funcs = {
+ 	.type = AMDGPU_RING_TYPE_UVD,
+ 	.align_mask = 0xf,
+ 	.nop = PACKET0(mmUVD_NO_OP, 0),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = uvd_v4_2_ring_get_rptr,
+ 	.get_wptr = uvd_v4_2_ring_get_wptr,
+ 	.set_wptr = uvd_v4_2_ring_set_wptr,
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+index ad8c02e..35008c1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+@@ -51,7 +51,7 @@ static void uvd_v5_0_enable_mgcg(struct amdgpu_device *adev,
+  *
+  * Returns the current hardware read pointer
+  */
+-static uint32_t uvd_v5_0_ring_get_rptr(struct amdgpu_ring *ring)
++static uint64_t uvd_v5_0_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -65,7 +65,7 @@ static uint32_t uvd_v5_0_ring_get_rptr(struct amdgpu_ring *ring)
+  *
+  * Returns the current hardware write pointer
+  */
+-static uint32_t uvd_v5_0_ring_get_wptr(struct amdgpu_ring *ring)
++static uint64_t uvd_v5_0_ring_get_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -83,7 +83,7 @@ static void uvd_v5_0_ring_set_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+-	WREG32(mmUVD_RBC_RB_WPTR, ring->wptr);
++	WREG32(mmUVD_RBC_RB_WPTR, lower_32_bits(ring->wptr));
+ }
+ 
+ static int uvd_v5_0_early_init(void *handle)
+@@ -424,7 +424,7 @@ static int uvd_v5_0_start(struct amdgpu_device *adev)
+ 	WREG32(mmUVD_RBC_RB_RPTR, 0);
+ 
+ 	ring->wptr = RREG32(mmUVD_RBC_RB_RPTR);
+-	WREG32(mmUVD_RBC_RB_WPTR, ring->wptr);
++	WREG32(mmUVD_RBC_RB_WPTR, lower_32_bits(ring->wptr));
+ 
+ 	WREG32_P(mmUVD_RBC_RB_CNTL, 0, ~UVD_RBC_RB_CNTL__RB_NO_FETCH_MASK);
+ 
+@@ -879,6 +879,7 @@ static const struct amdgpu_ring_funcs uvd_v5_0_ring_funcs = {
+ 	.type = AMDGPU_RING_TYPE_UVD,
+ 	.align_mask = 0xf,
+ 	.nop = PACKET0(mmUVD_NO_OP, 0),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = uvd_v5_0_ring_get_rptr,
+ 	.get_wptr = uvd_v5_0_ring_get_wptr,
+ 	.set_wptr = uvd_v5_0_ring_set_wptr,
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+index 18a6de4..46fe498 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+@@ -54,7 +54,7 @@ static void uvd_v6_0_enable_mgcg(struct amdgpu_device *adev,
+  *
+  * Returns the current hardware read pointer
+  */
+-static uint32_t uvd_v6_0_ring_get_rptr(struct amdgpu_ring *ring)
++static uint64_t uvd_v6_0_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -68,7 +68,7 @@ static uint32_t uvd_v6_0_ring_get_rptr(struct amdgpu_ring *ring)
+  *
+  * Returns the current hardware write pointer
+  */
+-static uint32_t uvd_v6_0_ring_get_wptr(struct amdgpu_ring *ring)
++static uint64_t uvd_v6_0_ring_get_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -86,7 +86,7 @@ static void uvd_v6_0_ring_set_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+-	WREG32(mmUVD_RBC_RB_WPTR, ring->wptr);
++	WREG32(mmUVD_RBC_RB_WPTR, lower_32_bits(ring->wptr));
+ }
+ 
+ static int uvd_v6_0_early_init(void *handle)
+@@ -521,7 +521,7 @@ static int uvd_v6_0_start(struct amdgpu_device *adev)
+ 	WREG32(mmUVD_RBC_RB_RPTR, 0);
+ 
+ 	ring->wptr = RREG32(mmUVD_RBC_RB_RPTR);
+-	WREG32(mmUVD_RBC_RB_WPTR, ring->wptr);
++	WREG32(mmUVD_RBC_RB_WPTR, lower_32_bits(ring->wptr));
+ 
+ 	WREG32_FIELD(UVD_RBC_RB_CNTL, RB_NO_FETCH, 0);
+ 
+@@ -1108,6 +1108,7 @@ static const struct amdgpu_ring_funcs uvd_v6_0_ring_phys_funcs = {
+ 	.type = AMDGPU_RING_TYPE_UVD,
+ 	.align_mask = 0xf,
+ 	.nop = PACKET0(mmUVD_NO_OP, 0),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = uvd_v6_0_ring_get_rptr,
+ 	.get_wptr = uvd_v6_0_ring_get_wptr,
+ 	.set_wptr = uvd_v6_0_ring_set_wptr,
+@@ -1134,6 +1135,7 @@ static const struct amdgpu_ring_funcs uvd_v6_0_ring_vm_funcs = {
+ 	.type = AMDGPU_RING_TYPE_UVD,
+ 	.align_mask = 0xf,
+ 	.nop = PACKET0(mmUVD_NO_OP, 0),
++	.support_64bit_ptrs = false,
+ 	.get_rptr = uvd_v6_0_ring_get_rptr,
+ 	.get_wptr = uvd_v6_0_ring_get_wptr,
+ 	.set_wptr = uvd_v6_0_ring_set_wptr,
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c
+index cb0b730f..3433a73 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c
+@@ -52,7 +52,7 @@ static void vce_v2_0_set_irq_funcs(struct amdgpu_device *adev);
+  *
+  * Returns the current hardware read pointer
+  */
+-static uint32_t vce_v2_0_ring_get_rptr(struct amdgpu_ring *ring)
++static uint64_t vce_v2_0_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -69,7 +69,7 @@ static uint32_t vce_v2_0_ring_get_rptr(struct amdgpu_ring *ring)
+  *
+  * Returns the current hardware write pointer
+  */
+-static uint32_t vce_v2_0_ring_get_wptr(struct amdgpu_ring *ring)
++static uint64_t vce_v2_0_ring_get_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -91,9 +91,9 @@ static void vce_v2_0_ring_set_wptr(struct amdgpu_ring *ring)
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+ 	if (ring == &adev->vce.ring[0])
+-		WREG32(mmVCE_RB_WPTR, ring->wptr);
++		WREG32(mmVCE_RB_WPTR, lower_32_bits(ring->wptr));
+ 	else
+-		WREG32(mmVCE_RB_WPTR2, ring->wptr);
++		WREG32(mmVCE_RB_WPTR2, lower_32_bits(ring->wptr));
+ }
+ 
+ static int vce_v2_0_lmi_clean(struct amdgpu_device *adev)
+@@ -241,15 +241,15 @@ static int vce_v2_0_start(struct amdgpu_device *adev)
+ 	vce_v2_0_mc_resume(adev);
+ 
+ 	ring = &adev->vce.ring[0];
+-	WREG32(mmVCE_RB_RPTR, ring->wptr);
+-	WREG32(mmVCE_RB_WPTR, ring->wptr);
++	WREG32(mmVCE_RB_RPTR, lower_32_bits(ring->wptr));
++	WREG32(mmVCE_RB_WPTR, lower_32_bits(ring->wptr));
+ 	WREG32(mmVCE_RB_BASE_LO, ring->gpu_addr);
+ 	WREG32(mmVCE_RB_BASE_HI, upper_32_bits(ring->gpu_addr));
+ 	WREG32(mmVCE_RB_SIZE, ring->ring_size / 4);
+ 
+ 	ring = &adev->vce.ring[1];
+-	WREG32(mmVCE_RB_RPTR2, ring->wptr);
+-	WREG32(mmVCE_RB_WPTR2, ring->wptr);
++	WREG32(mmVCE_RB_RPTR2, lower_32_bits(ring->wptr));
++	WREG32(mmVCE_RB_WPTR2, lower_32_bits(ring->wptr));
+ 	WREG32(mmVCE_RB_BASE_LO2, ring->gpu_addr);
+ 	WREG32(mmVCE_RB_BASE_HI2, upper_32_bits(ring->gpu_addr));
+ 	WREG32(mmVCE_RB_SIZE2, ring->ring_size / 4);
+@@ -631,6 +631,7 @@ static const struct amdgpu_ring_funcs vce_v2_0_ring_funcs = {
+ 	.type = AMDGPU_RING_TYPE_VCE,
+ 	.align_mask = 0xf,
+ 	.nop = VCE_CMD_NO_OP,
++	.support_64bit_ptrs = false,
+ 	.get_rptr = vce_v2_0_ring_get_rptr,
+ 	.get_wptr = vce_v2_0_ring_get_wptr,
+ 	.set_wptr = vce_v2_0_ring_set_wptr,
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+index 93ec881..2c5f88c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+@@ -73,7 +73,7 @@ static int vce_v3_0_wait_for_idle(void *handle);
+  *
+  * Returns the current hardware read pointer
+  */
+-static uint32_t vce_v3_0_ring_get_rptr(struct amdgpu_ring *ring)
++static uint64_t vce_v3_0_ring_get_rptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -92,7 +92,7 @@ static uint32_t vce_v3_0_ring_get_rptr(struct amdgpu_ring *ring)
+  *
+  * Returns the current hardware write pointer
+  */
+-static uint32_t vce_v3_0_ring_get_wptr(struct amdgpu_ring *ring)
++static uint64_t vce_v3_0_ring_get_wptr(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+@@ -116,11 +116,11 @@ static void vce_v3_0_ring_set_wptr(struct amdgpu_ring *ring)
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+ 	if (ring == &adev->vce.ring[0])
+-		WREG32(mmVCE_RB_WPTR, ring->wptr);
++		WREG32(mmVCE_RB_WPTR, lower_32_bits(ring->wptr));
+ 	else if (ring == &adev->vce.ring[1])
+-		WREG32(mmVCE_RB_WPTR2, ring->wptr);
++		WREG32(mmVCE_RB_WPTR2, lower_32_bits(ring->wptr));
+ 	else
+-		WREG32(mmVCE_RB_WPTR3, ring->wptr);
++		WREG32(mmVCE_RB_WPTR3, lower_32_bits(ring->wptr));
+ }
+ 
+ static void vce_v3_0_override_vce_clock_gating(struct amdgpu_device *adev, bool override)
+@@ -231,22 +231,22 @@ static int vce_v3_0_start(struct amdgpu_device *adev)
+ 	int idx, r;
+ 
+ 	ring = &adev->vce.ring[0];
+-	WREG32(mmVCE_RB_RPTR, ring->wptr);
+-	WREG32(mmVCE_RB_WPTR, ring->wptr);
++	WREG32(mmVCE_RB_RPTR, lower_32_bits(ring->wptr));
++	WREG32(mmVCE_RB_WPTR, lower_32_bits(ring->wptr));
+ 	WREG32(mmVCE_RB_BASE_LO, ring->gpu_addr);
+ 	WREG32(mmVCE_RB_BASE_HI, upper_32_bits(ring->gpu_addr));
+ 	WREG32(mmVCE_RB_SIZE, ring->ring_size / 4);
+ 
+ 	ring = &adev->vce.ring[1];
+-	WREG32(mmVCE_RB_RPTR2, ring->wptr);
+-	WREG32(mmVCE_RB_WPTR2, ring->wptr);
++	WREG32(mmVCE_RB_RPTR2, lower_32_bits(ring->wptr));
++	WREG32(mmVCE_RB_WPTR2, lower_32_bits(ring->wptr));
+ 	WREG32(mmVCE_RB_BASE_LO2, ring->gpu_addr);
+ 	WREG32(mmVCE_RB_BASE_HI2, upper_32_bits(ring->gpu_addr));
+ 	WREG32(mmVCE_RB_SIZE2, ring->ring_size / 4);
+ 
+ 	ring = &adev->vce.ring[2];
+-	WREG32(mmVCE_RB_RPTR3, ring->wptr);
+-	WREG32(mmVCE_RB_WPTR3, ring->wptr);
++	WREG32(mmVCE_RB_RPTR3, lower_32_bits(ring->wptr));
++	WREG32(mmVCE_RB_WPTR3, lower_32_bits(ring->wptr));
+ 	WREG32(mmVCE_RB_BASE_LO3, ring->gpu_addr);
+ 	WREG32(mmVCE_RB_BASE_HI3, upper_32_bits(ring->gpu_addr));
+ 	WREG32(mmVCE_RB_SIZE3, ring->ring_size / 4);
+@@ -860,6 +860,7 @@ static const struct amdgpu_ring_funcs vce_v3_0_ring_phys_funcs = {
+ 	.type = AMDGPU_RING_TYPE_VCE,
+ 	.align_mask = 0xf,
+ 	.nop = VCE_CMD_NO_OP,
++	.support_64bit_ptrs = false,
+ 	.get_rptr = vce_v3_0_ring_get_rptr,
+ 	.get_wptr = vce_v3_0_ring_get_wptr,
+ 	.set_wptr = vce_v3_0_ring_set_wptr,
+@@ -882,6 +883,7 @@ static const struct amdgpu_ring_funcs vce_v3_0_ring_vm_funcs = {
+ 	.type = AMDGPU_RING_TYPE_VCE,
+ 	.align_mask = 0xf,
+ 	.nop = VCE_CMD_NO_OP,
++	.support_64bit_ptrs = false,
+ 	.get_rptr = vce_v3_0_ring_get_rptr,
+ 	.get_wptr = vce_v3_0_ring_get_wptr,
+ 	.set_wptr = vce_v3_0_ring_set_wptr,
+-- 
+2.7.4
+

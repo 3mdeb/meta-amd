@@ -1,0 +1,139 @@
+From d8561cfa719a5e32d8e9ffdf56eafd4a4eb9a2b0 Mon Sep 17 00:00:00 2001
+From: Leon Elazar <leon.elazar@amd.com>
+Date: Tue, 22 Nov 2016 15:36:28 -0500
+Subject: [PATCH 1287/1722] drm/amd/dal: Memory leak fixes
+
+[Problem]
+DC Hw sequencer wansn't released during the destructor.
+DC Context was set to NULL before was actually released.
+
+Change-Id: If2c0caf0cc49d2f023adcdb083ef869d8712326d
+Signed-off-by: Leon Elazar <leon.elazar@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 27 +++++++++++++++++-----
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      | 11 +++++++++
+ drivers/gpu/drm/amd/dal/dc/dc_types.h              |  2 ++
+ drivers/gpu/drm/amd/dal/dc/inc/core_dc.h           |  1 +
+ drivers/gpu/drm/amd/dal/dc/inc/resource.h          |  3 +--
+ drivers/gpu/drm/amd/dal/include/i2caux_interface.h |  1 +
+ 6 files changed, 37 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 7b3aa67..eacacb2 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -561,15 +561,30 @@ ctx_fail:
+ static void destruct(struct core_dc *dc)
+ {
+ 	resource_validate_ctx_destruct(dc->current_context);
+-	dm_free(dc->current_context);
++	
+ 	dm_free(dc->temp_flip_context);
+-        dc->temp_flip_context = NULL;
++        dc->current_context = NULL;
++	
+ 	destroy_links(dc);
+-	dc->res_pool->funcs->destroy(&dc->res_pool);
+-	dal_logger_destroy(&dc->ctx->logger);
+-	if (dc->ctx->created_bios)
+-		dal_bios_parser_destroy(&dc->ctx->dc_bios);
++	
++	if (dc->res_pool)
++                dc->res_pool->funcs->destroy(&dc->res_pool);
++
++        if (dc->ctx->gpio_service)
++                dal_gpio_service_destroy(&dc->ctx->gpio_service);
++
++        if (dc->ctx->i2caux)
++                dal_i2caux_destroy(&dc->ctx->i2caux);
++
++        if (dc->ctx->created_bios)
++                dal_bios_parser_destroy(&dc->ctx->dc_bios);
++
++        if (dc->ctx->logger)
++                dal_logger_destroy(&dc->ctx->logger);
++	
++	dm_free(dc->current_context);
+ 	dm_free(dc->ctx);
++
+ 	dc->ctx = NULL;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index 82cac0a..9d88540 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -121,6 +121,17 @@ struct resource_pool *dc_create_resource_pool(struct adapter_service *adapter_se
+ 	return false;
+ }
+ 
++void dc_destroy_resource_pool(struct core_dc *dc)
++{
++        if (dc) {
++                if (dc->res_pool)
++                        dc->res_pool->funcs->destroy(&dc->res_pool);
++ 
++                if (dc->hwseq)
++                        dm_free(dc->hwseq);
++        }
++}
++
+ void resource_unreference_clock_source(
+ 		struct resource_context *res_ctx,
+ 		struct clock_source *clock_source)
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_types.h b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+index c71f81f..31f9611 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc_types.h
+@@ -75,6 +75,8 @@ struct dc_context {
+ 
+ 	struct dc_bios *dc_bios;
+ 	bool created_bios;
++	struct gpio_service *gpio_service;
++        struct i2caux *i2caux;
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h b/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h
+index 6c4f9e1..640d578 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_dc.h
+@@ -39,6 +39,7 @@ struct core_dc {
+ 
+ 	/* HW functions */
+ 	struct hw_sequencer_funcs hwss;
++        struct dce_hwseq *hwseq;
+ };
+ 
+ #endif /* __CORE_DC_H__ */
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/resource.h b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+index 4254f32..5237347 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/resource.h
+@@ -42,8 +42,7 @@ struct resource_pool *dc_create_resource_pool(struct adapter_service *adapter_se
+ 				enum dce_version dc_version,
+ 				struct hw_asic_id asic_id);
+ 
+-void dc_destroy_resource_pool(struct resource_pool **pool,
+-				enum dce_version dc_version);
++void dc_destroy_resource_pool(struct core_dc *dc);
+ 
+ enum dc_status resource_map_pool_resources(
+ 		const struct core_dc *dc,
+diff --git a/drivers/gpu/drm/amd/dal/include/i2caux_interface.h b/drivers/gpu/drm/amd/dal/include/i2caux_interface.h
+index b23e6c0..4dc28ed 100644
+--- a/drivers/gpu/drm/amd/dal/include/i2caux_interface.h
++++ b/drivers/gpu/drm/amd/dal/include/i2caux_interface.h
+@@ -28,6 +28,7 @@
+ 
+ #include "ddc_interface.h"
+ #include "adapter_service_interface.h"
++#include "gpio_service_interface.h" 
+ 
+ #define DEFAULT_AUX_MAX_DATA_SIZE 16
+ #define AUX_MAX_DEFER_WRITE_RETRY 20
+-- 
+2.7.4
+

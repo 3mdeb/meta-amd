@@ -1,0 +1,203 @@
+From 88a7438fc1fad778971b9f01b0df53ad170f07bc Mon Sep 17 00:00:00 2001
+From: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Date: Tue, 17 May 2016 13:42:46 +0800
+Subject: [PATCH 0498/1722] drm/amd/dal: share add remote sink code
+
+As code is calling helper function, proper context
+pointer should be passed
+
+Signed-off-by: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Acked-by: Jordan Lazare <Jordan.Lazare@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ .../drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c    | 68 +++-------------------
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 54 +++++++++++++++++
+ drivers/gpu/drm/amd/dal/dc/dc.h                    |  8 +++
+ 3 files changed, 69 insertions(+), 61 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+index e2857a5..f4b2812 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -163,62 +163,6 @@ static const struct drm_connector_funcs dm_dp_mst_connector_funcs = {
+ 	.atomic_set_property = amdgpu_dm_connector_atomic_set_property
+ };
+ 
+-static struct dc_sink *dm_dp_mst_add_mst_sink(
+-		const struct dc_link *dc_link,
+-		uint8_t *edid,
+-		uint16_t len)
+-{
+-	struct dc_sink *dc_sink;
+-	struct dc_sink_init_data init_params = {
+-			.link = dc_link,
+-			.sink_signal = SIGNAL_TYPE_DISPLAY_PORT_MST};
+-	enum dc_edid_status edid_status;
+-
+-	if (len > MAX_EDID_BUFFER_SIZE) {
+-		DRM_ERROR("Max EDID buffer size breached!\n");
+-		return NULL;
+-	}
+-
+-	if (!dc_link) {
+-		BREAK_TO_DEBUGGER();
+-		return NULL;
+-	}
+-
+-	/*
+-	 * TODO make dynamic-ish?
+-	 * dc_link->connector_signal;
+-	 */
+-
+-	dc_sink = dc_sink_create(&init_params);
+-
+-	if (!dc_sink)
+-		return NULL;
+-
+-	memmove(dc_sink->dc_edid.raw_edid, edid, len);
+-	dc_sink->dc_edid.length = len;
+-
+-	if (!dc_link_add_remote_sink(
+-			dc_link,
+-			dc_sink))
+-		goto fail_add_sink;
+-
+-	edid_status = dm_helpers_parse_edid_caps(
+-			NULL,
+-			&dc_sink->dc_edid,
+-			&dc_sink->edid_caps);
+-	if (edid_status != EDID_OK)
+-		goto fail;
+-
+-	return dc_sink;
+-
+-fail:
+-	dc_link_remove_remote_sink(dc_link, dc_sink);
+-
+-fail_add_sink:
+-        dc_sink_release(dc_sink);
+-	return NULL;
+-}
+-
+ static int dm_dp_mst_get_modes(struct drm_connector *connector)
+ {
+ 	struct amdgpu_connector *aconnector = to_amdgpu_connector(connector);
+@@ -390,7 +334,6 @@ static void dm_dp_mst_hotplug(struct drm_dp_mst_topology_mgr *mgr)
+ 	struct drm_connector *connector;
+ 	struct amdgpu_connector *aconnector;
+ 	struct edid *edid;
+-	const struct dc_sink *sink;
+ 
+ 	drm_modeset_lock_all(dev);
+ 	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
+@@ -401,6 +344,9 @@ static void dm_dp_mst_hotplug(struct drm_dp_mst_topology_mgr *mgr)
+ 			 * sink hasn't been created yet
+ 			 */
+ 			if (!aconnector->edid) {
++				struct dc_sink_init_data init_params = {
++						.link = aconnector->dc_link,
++						.sink_signal = SIGNAL_TYPE_DISPLAY_PORT_MST};
+ 				edid = drm_dp_mst_get_edid(connector, &aconnector->mst_port->mst_mgr, aconnector->port);
+ 
+ 				if (!edid) {
+@@ -412,11 +358,11 @@ static void dm_dp_mst_hotplug(struct drm_dp_mst_topology_mgr *mgr)
+ 
+ 				aconnector->edid = edid;
+ 
+-				sink = dm_dp_mst_add_mst_sink(
+-					aconnector->dc_link,
++				aconnector->dc_sink = dc_add_remote_sink(
++					adev->dm.dc,
+ 					(uint8_t *)edid,
+-					(edid->extensions + 1) * EDID_LENGTH);
+-				aconnector->dc_sink = sink;
++					(edid->extensions + 1) * EDID_LENGTH,
++					&init_params);
+ 
+ 				dm_restore_drm_connector_state(connector->dev, connector);
+ 			} else
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index daaa705..b5ac4c9 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -1444,3 +1444,57 @@ const struct dc_stream_status *dc_stream_get_status(
+ 
+ 	return &stream->status;
+ }
++
++struct dc_sink *dc_add_remote_sink(
++		struct dc *dc,
++		const uint8_t *edid,
++		int len,
++		struct dc_sink_init_data *init_data)
++{
++	struct dc_sink *dc_sink;
++	enum dc_edid_status edid_status;
++	struct core_dc *core_dc = DC_TO_CORE(dc);
++
++	if (len > MAX_EDID_BUFFER_SIZE) {
++		dm_error("Max EDID buffer size breached!\n");
++		return NULL;
++	}
++
++	if (!init_data) {
++		BREAK_TO_DEBUGGER();
++		return NULL;
++	}
++
++	if (!init_data->link) {
++		BREAK_TO_DEBUGGER();
++		return NULL;
++	}
++
++	dc_sink = dc_sink_create(init_data);
++
++	if (!dc_sink)
++		return NULL;
++
++	memmove(dc_sink->dc_edid.raw_edid, edid, len);
++	dc_sink->dc_edid.length = len;
++
++	if (!dc_link_add_remote_sink(
++			init_data->link,
++			dc_sink))
++		goto fail_add_sink;
++
++	edid_status = dm_helpers_parse_edid_caps(
++			core_dc->ctx,
++			&dc_sink->dc_edid,
++			&dc_sink->edid_caps);
++
++	if (edid_status != EDID_OK)
++		goto fail;
++
++	return dc_sink;
++fail:
++	dc_link_remove_remote_sink(init_data->link, dc_sink);
++fail_add_sink:
++	dc_sink_release(dc_sink);
++	return NULL;
++}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index 09725fa..8e5c8e4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -318,6 +318,14 @@ bool dc_commit_targets(
+ 		struct dc_target *targets[],
+ 		uint8_t target_count);
+ 
++struct dc_sink_init_data;
++
++struct dc_sink *dc_add_remote_sink(
++		struct dc *dc,
++		const uint8_t *edid,
++		int len,
++		struct dc_sink_init_data *init_data);
++
+ /*******************************************************************************
+  * Stream Interfaces
+  ******************************************************************************/
+-- 
+2.7.4
+

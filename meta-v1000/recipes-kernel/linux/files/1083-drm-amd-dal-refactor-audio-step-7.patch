@@ -1,0 +1,253 @@
+From cf6b54418d96806cb51f03b346a11fb3011ebbb9 Mon Sep 17 00:00:00 2001
+From: Tony Cheng <tony.cheng@amd.com>
+Date: Thu, 15 Sep 2016 13:07:29 -0400
+Subject: [PATCH 1083/1722] drm/amd/dal: refactor audio step 7
+
+- hw_init path clean up
+- remove audio context
+
+Change-Id: I8046d9340afac3d0c5f1e65dd4a32fefb5938a52
+Signed-off-by: Tony Cheng <tony.cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/audio/audio.h           | 26 +++++++++-------------
+ drivers/gpu/drm/amd/dal/dc/audio/audio_base.c      | 23 -------------------
+ .../gpu/drm/amd/dal/dc/audio/dce110/audio_dce110.c | 26 +++++++++++++++++++++-
+ .../gpu/drm/amd/dal/dc/audio/dce110/audio_dce110.h | 17 ++++++++++----
+ .../gpu/drm/amd/dal/dc/audio/dce80/audio_dce80.c   |  2 +-
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |  3 +--
+ drivers/gpu/drm/amd/dal/include/audio_interface.h  |  6 -----
+ 7 files changed, 51 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/audio/audio.h b/drivers/gpu/drm/amd/dal/dc/audio/audio.h
+index 7d02a6c..a36b7ea 100644
+--- a/drivers/gpu/drm/amd/dal/dc/audio/audio.h
++++ b/drivers/gpu/drm/amd/dal/dc/audio/audio.h
+@@ -39,17 +39,22 @@
+ struct audio;
+ 
+ struct audio_funcs {
+-	void (*az_enable)(
+-			struct audio *audio);
+ 
+-	void (*az_disable)(
+-			struct audio *audio);
++	void (*hw_init)(struct audio *audio);
++
++	void (*az_enable)(struct audio *audio);
++
++	void (*az_disable)(struct audio *audio);
+ 
+ 	void (*az_configure)(struct audio *audio,
+ 		enum signal_type signal,
+ 		const struct audio_crtc_info *crtc_info,
+ 		const struct audio_info *audio_info);
+ 
++	void (*wall_dto_setup)(struct audio *audio,
++		enum signal_type signal,
++		const struct audio_crtc_info *crtc_info,
++		const struct audio_pll_info *pll_info);
+ 	/*
+ 	 *get_object_id
+ 	 *get_object_type
+@@ -71,19 +76,10 @@ struct audio_funcs {
+ 	 * disable_azalia_audio_jack_presence
+ 	 */
+ 
+-	/* SW initialization that cannot be done in constructor. This will
+-	 * be done is audio_power_up but is not in audio_interface. It is only
+-	 * called by power_up
+-	 */
+-	enum audio_result (*initialize)(
+-		struct audio *audio);
++
+ 
+ 	/* Update audio wall clock source */
+-	void (*wall_dto_setup)(
+-		struct audio *audio,
+-		enum signal_type signal,
+-		const struct audio_crtc_info *crtc_info,
+-		const struct audio_pll_info *pll_info);
++
+ 
+ 	/* options and features supported by Audio */
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/audio/audio_base.c b/drivers/gpu/drm/amd/dal/dc/audio/audio_base.c
+index 74a8ef3..707c824 100644
+--- a/drivers/gpu/drm/amd/dal/dc/audio/audio_base.c
++++ b/drivers/gpu/drm/amd/dal/dc/audio/audio_base.c
+@@ -51,19 +51,8 @@ static void destroy(
+ 	BREAK_TO_DEBUGGER();
+ }
+ 
+-static enum audio_result initialize(
+-	struct audio *audio)
+-{
+-	/*DCE specific, must be implemented in derived. Implemeentaion of
+-	 *initialize will create audio hw context. create_hw_ctx
+-	 */
+-	BREAK_TO_DEBUGGER();
+-	return AUDIO_RESULT_OK;
+-}
+-
+ static const struct audio_funcs audio_funcs = {
+ 	.destroy = destroy,
+-	.initialize = initialize,
+ };
+ 
+ /***** SCOPE : declare in audio.h. use within dal-audio. *****/
+@@ -110,15 +99,3 @@ void dal_audio_destroy(
+ 
+ 	*audio = NULL;
+ }
+-
+-/* DP Audio register write access. This function call hw_ctx directly
+- * not overwitten at audio level.
+- */
+-
+-/* perform power up sequence (boot up, resume, recovery) */
+-enum audio_result dal_audio_power_up(
+-	struct audio *audio)
+-{
+-	return audio->funcs->initialize(audio);
+-}
+-
+diff --git a/drivers/gpu/drm/amd/dal/dc/audio/dce110/audio_dce110.c b/drivers/gpu/drm/amd/dal/dc/audio/dce110/audio_dce110.c
+index 67f47bb..0612e21 100644
+--- a/drivers/gpu/drm/amd/dal/dc/audio/dce110/audio_dce110.c
++++ b/drivers/gpu/drm/amd/dal/dc/audio/dce110/audio_dce110.c
+@@ -931,9 +931,33 @@ void dce110_aud_wall_dto_setup(
+ 	}
+ }
+ 
++/* initialize HW state */
++void dce110_aud_hw_init(
++		struct audio *audio)
++{
++	struct audio_dce110 *aud110 = DCE110_AUD(audio);
++
++	/* we only need to program the following registers once, so we only do
++	it for the inst 0*/
++	if (audio->inst != 0)
++		return;
++
++	/* Suport R5 - 32khz
++	 * Suport R6 - 44.1khz
++	 * Suport R7 - 48khz
++	 */
++	REG_UPDATE(AZALIA_F0_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES,
++			AUDIO_RATE_CAPABILITIES, 0x70);
++
++	/*Keep alive bit to verify HW block in BU. */
++	REG_UPDATE_N(AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES, 2,
++			FD(AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES__CLKSTOP), 1,
++			FD(AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES__EPSS), 1);
++}
++
+ static const struct audio_funcs funcs = {
+ 	.destroy = destroy,
+-	.initialize = initialize,
++	.hw_init = dce110_aud_hw_init,
+ 	.wall_dto_setup = dce110_aud_wall_dto_setup,
+ 	.az_enable = dce110_aud_az_enable,
+ 	.az_disable = dce110_aud_az_disable,
+diff --git a/drivers/gpu/drm/amd/dal/dc/audio/dce110/audio_dce110.h b/drivers/gpu/drm/amd/dal/dc/audio/dce110/audio_dce110.h
+index fccfe08..545d2a0 100644
+--- a/drivers/gpu/drm/amd/dal/dc/audio/dce110/audio_dce110.h
++++ b/drivers/gpu/drm/amd/dal/dc/audio/dce110/audio_dce110.h
+@@ -30,20 +30,25 @@
+ #include "audio/dce110/hw_ctx_audio_dce110.h"
+ 
+ #define AUD_REG(reg_name, block_prefix, id)\
+-	.reg_name = block_prefix ## id ## _ ## reg_name\
++	.reg_name = block_prefix ## id ## _ ## reg_name
+ 
+ #define MM_REG(reg_name)\
+-	.reg_name = mm ## reg_name\
++	.reg_name = mm ## reg_name
+ 
+-#define AUD_COMMON_REG_LIST(id)\
++#define AUD_COMMON_REG_LIST_BASE(id)\
+ 	SE_REG(AZALIA_F0_CODEC_ENDPOINT_INDEX, mmAZF0ENDPOINT, id),\
+ 	SE_REG(AZALIA_F0_CODEC_ENDPOINT_DATA, mmAZF0ENDPOINT, id),\
+ 	MM_REG(AZALIA_F0_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS),\
++	MM_REG(AZALIA_F0_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES),\
++	MM_REG(AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES),\
+ 	MM_REG(DCCG_AUDIO_DTO_SOURCE),\
+ 	MM_REG(DCCG_AUDIO_DTO0_MODULE),\
+ 	MM_REG(DCCG_AUDIO_DTO0_PHASE),\
+ 	MM_REG(DCCG_AUDIO_DTO1_MODULE),\
+-	MM_REG(DCCG_AUDIO_DTO1_PHASE),\
++	MM_REG(DCCG_AUDIO_DTO1_PHASE)
++
++#define AUD_COMMON_REG_LIST(id)\
++	AUD_COMMON_REG_LIST_BASE(id)
+ 
+ 
+ struct dce110_audio_registers {
+@@ -51,6 +56,8 @@ struct dce110_audio_registers {
+ 	uint32_t AZALIA_F0_CODEC_ENDPOINT_DATA;
+ 
+ 	uint32_t AZALIA_F0_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS;
++	uint32_t AZALIA_F0_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES;
++	uint32_t AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES;
+ 
+ 	uint32_t DCCG_AUDIO_DTO_SOURCE;
+ 	uint32_t DCCG_AUDIO_DTO0_MODULE;
+@@ -68,6 +75,8 @@ struct audio_dce110 {
+ 
+ struct audio *dal_audio_create_dce110(const struct audio_init_data *init_data);
+ 
++void dce110_aud_hw_init(struct audio *audio);
++
+ void dce110_aud_az_enable(struct audio *audio);
+ void dce110_aud_az_disable(struct audio *audio);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/audio/dce80/audio_dce80.c b/drivers/gpu/drm/amd/dal/dc/audio/dce80/audio_dce80.c
+index 6bc68e5..bea346c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/audio/dce80/audio_dce80.c
++++ b/drivers/gpu/drm/amd/dal/dc/audio/dce80/audio_dce80.c
+@@ -94,7 +94,7 @@ static enum audio_result initialize(
+ 
+ static const struct audio_funcs funcs = {
+ 	.destroy = destroy,
+-	.initialize = initialize,
++	.hw_init = dce110_aud_hw_init,
+ 	.wall_dto_setup = dce110_aud_wall_dto_setup,
+ 	.az_enable = dce110_aud_az_enable,
+ 	.az_disable = dce110_aud_az_disable,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 7bd9c63..1e38cc4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -1817,8 +1817,7 @@ static void init_hw(struct core_dc *dc)
+ 	for (i = 0; i < dc->res_pool.audio_count; i++) {
+ 		struct audio *audio = dc->res_pool.audios[i];
+ 
+-		if (dal_audio_power_up(audio) != AUDIO_RESULT_OK)
+-			dm_error("Failed audio power up!\n");
++                audio->funcs->hw_init(audio);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/include/audio_interface.h b/drivers/gpu/drm/amd/dal/include/audio_interface.h
+index 5014a13..22d0d3c 100644
+--- a/drivers/gpu/drm/amd/dal/include/audio_interface.h
++++ b/drivers/gpu/drm/amd/dal/include/audio_interface.h
+@@ -60,12 +60,6 @@ enum audio_result {
+ void dal_audio_destroy(
+ 	struct audio **audio);
+ 
+-/***** programming interface *****/
+-
+-/* perform power up sequence (boot up, resume, recovery) */
+-enum audio_result dal_audio_power_up(
+-	struct audio *audio);
+-
+ /***** information interface *****/
+ 
+ /* Update audio wall clock source */
+-- 
+2.7.4
+

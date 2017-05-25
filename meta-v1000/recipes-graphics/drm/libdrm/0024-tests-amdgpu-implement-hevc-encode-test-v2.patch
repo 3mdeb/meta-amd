@@ -1,0 +1,375 @@
+From beb4834fa49d83d6974ce06355724af3a6b4f26a Mon Sep 17 00:00:00 2001
+From: Boyuan Zhang <boyuan.zhang@amd.com>
+Date: Mon, 13 Feb 2017 09:54:32 -0500
+Subject: [PATCH 24/38] tests/amdgpu: implement hevc encode test v2
+
+v2:
+2fc4b7adae824313a169fc33e80aa62c1105be99
+[Ken Wang]
+fix test failure on pre-vega10 card (part)
+
+Change-Id: I3d77e1e7f60b2b806a9134f94ba851cee699f4a9
+Signed-off-by: Boyuan Zhang <boyuan.zhang@amd.com>
+Reviewed-by: Leo Liu <leo.liu@amd.com>
+Signed-off-by: Ken Wang <Qingqing.Wang@amd.com>
+---
+ tests/amdgpu/frame.h         |   2 +-
+ tests/amdgpu/uvd_enc_tests.c | 261 ++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 233 insertions(+), 30 deletions(-)
+
+diff --git a/tests/amdgpu/frame.h b/tests/amdgpu/frame.h
+index 4c946c2..335401c 100644
+--- a/tests/amdgpu/frame.h
++++ b/tests/amdgpu/frame.h
+@@ -24,7 +24,7 @@
+ #ifndef _frame_h_
+ #define _frame_h_
+ 
+-const uint8_t frame[] = {
++static const uint8_t frame[] = {
+ 	0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb,
+ 	0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xeb, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2,
+ 	0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xd2, 0xaa, 0xaa, 0xaa,
+diff --git a/tests/amdgpu/uvd_enc_tests.c b/tests/amdgpu/uvd_enc_tests.c
+index 81318df..fee0112 100644
+--- a/tests/amdgpu/uvd_enc_tests.c
++++ b/tests/amdgpu/uvd_enc_tests.c
+@@ -35,6 +35,8 @@
+ #include "amdgpu_test.h"
+ #include "amdgpu_drm.h"
+ #include "amdgpu_internal.h"
++#include "frame.h"
++#include "uve_ib.h"
+ 
+ #define IB_SIZE		4096
+ #define MAX_RESOURCES	16
+@@ -47,6 +49,16 @@ struct amdgpu_uvd_enc_bo {
+ 	uint8_t *ptr;
+ };
+ 
++struct amdgpu_uvd_enc {
++	unsigned width;
++	unsigned height;
++	struct amdgpu_uvd_enc_bo session;
++	struct amdgpu_uvd_enc_bo vbuf;
++	struct amdgpu_uvd_enc_bo bs;
++	struct amdgpu_uvd_enc_bo fb;
++	struct amdgpu_uvd_enc_bo cpb;
++};
++
+ static amdgpu_device_handle device_handle;
+ static uint32_t major_version;
+ static uint32_t minor_version;
+@@ -58,15 +70,18 @@ static amdgpu_va_handle ib_va_handle;
+ static uint64_t ib_mc_address;
+ static uint32_t *ib_cpu;
+ 
++static struct amdgpu_uvd_enc enc;
+ static amdgpu_bo_handle resources[MAX_RESOURCES];
+ static unsigned num_resources;
+ 
+ static void amdgpu_cs_uvd_enc_create(void);
++static void amdgpu_cs_uvd_enc_session_init(void);
+ static void amdgpu_cs_uvd_enc_encode(void);
+ static void amdgpu_cs_uvd_enc_destroy(void);
+ 
+ CU_TestInfo uvd_enc_tests[] = {
+ 	{ "UVD ENC create",  amdgpu_cs_uvd_enc_create },
++	{ "UVD ENC session init",  amdgpu_cs_uvd_enc_session_init },
+ 	{ "UVD ENC encode",  amdgpu_cs_uvd_enc_encode },
+ 	{ "UVD ENC destroy",  amdgpu_cs_uvd_enc_destroy },
+ 	CU_TEST_INFO_NULL,
+@@ -227,43 +242,235 @@ static void free_resource(struct amdgpu_uvd_enc_bo *uvd_enc_bo)
+ 
+ static void amdgpu_cs_uvd_enc_create(void)
+ {
+-	struct amdgpu_uvd_enc_bo sw_ctx;
+ 	int len, r;
+ 
+ 	if (family_id < AMDGPU_FAMILY_AI)
+ 		return;
+ 
++	enc.width = 160;
++	enc.height = 128;
++
+ 	num_resources  = 0;
+-	alloc_resource(&sw_ctx, 128 * 1024, AMDGPU_GEM_DOMAIN_GTT);
+-	resources[num_resources++] = sw_ctx.handle;
++	alloc_resource(&enc.session, 128 * 1024, AMDGPU_GEM_DOMAIN_GTT);
++	resources[num_resources++] = enc.session.handle;
+ 	resources[num_resources++] = ib_handle;
+ 
+ 	len = 0;
+-	ib_cpu[len++] = 0x00000018;
+-	ib_cpu[len++] = 0x00000001; /* session info */
+-	ib_cpu[len++] = 0x00000001;
+-	ib_cpu[len++] = 0x00000000;
+-	ib_cpu[len++] = sw_ctx.addr >> 32;
+-	ib_cpu[len++] = sw_ctx.addr;
++	memcpy((ib_cpu + len), uve_session_info, sizeof(uve_session_info));
++	len += sizeof(uve_session_info) / 4;
++	ib_cpu[len++] = enc.session.addr >> 32;
++	ib_cpu[len++] = enc.session.addr;
+ 
+-	ib_cpu[len++] = 0x00000014;
+-	ib_cpu[len++] = 0x00000002; /* task info */
++	memcpy((ib_cpu + len), uve_task_info, sizeof(uve_task_info));
++	len += sizeof(uve_task_info) / 4;
+ 	ib_cpu[len++] = 0x0000001c;
+ 	ib_cpu[len++] = 0x00000000;
+ 	ib_cpu[len++] = 0x00000000;
+ 
+-	ib_cpu[len++] = 0x00000008;
+-	ib_cpu[len++] = 0x08000001; /* op initialize */
++	memcpy((ib_cpu + len), uve_op_init, sizeof(uve_op_init));
++	len += sizeof(uve_op_init) / 4;
++
++	r = submit(len, AMDGPU_HW_IP_UVD_ENC);
++	CU_ASSERT_EQUAL(r, 0);
++}
++
++static void check_result(struct amdgpu_uvd_enc *enc)
++{
++	uint64_t sum;
++	uint32_t s = 20626;
++	uint32_t *ptr, size;
++	int i, j, r;
++
++	r = amdgpu_bo_cpu_map(enc->fb.handle, (void **)&enc->fb.ptr);
++	CU_ASSERT_EQUAL(r, 0);
++	ptr = (uint32_t *)enc->fb.ptr;
++	size = ptr[6];
++	r = amdgpu_bo_cpu_unmap(enc->fb.handle);
++	CU_ASSERT_EQUAL(r, 0);
++	r = amdgpu_bo_cpu_map(enc->bs.handle, (void **)&enc->bs.ptr);
++	CU_ASSERT_EQUAL(r, 0);
++	for (j = 0, sum = 0; j < size; ++j)
++		sum += enc->bs.ptr[j];
++	CU_ASSERT_EQUAL(sum, s);
++	r = amdgpu_bo_cpu_unmap(enc->bs.handle);
++	CU_ASSERT_EQUAL(r, 0);
++
++}
++
++static void amdgpu_cs_uvd_enc_session_init(void)
++{
++	int len, r;
++
++	if (family_id < AMDGPU_FAMILY_AI)
++		return;
++
++	num_resources  = 0;
++	alloc_resource(&enc.fb, 4096, AMDGPU_GEM_DOMAIN_GTT);
++	resources[num_resources++] = enc.fb.handle;
++	resources[num_resources++] = ib_handle;
++
++	len = 0;
++	memcpy((ib_cpu + len), uve_session_info, sizeof(uve_session_info));
++	len += sizeof(uve_session_info) / 4;
++	ib_cpu[len++] = enc.session.addr >> 32;
++	ib_cpu[len++] = enc.session.addr;
++
++	memcpy((ib_cpu + len), uve_task_info, sizeof(uve_task_info));
++	len += sizeof(uve_task_info) / 4;
++	ib_cpu[len++] = 0x000001c0;
++	ib_cpu[len++] = 0x00000001;
++	ib_cpu[len++] = 0x00000001;
++
++	memcpy((ib_cpu + len), uve_session_init, sizeof(uve_session_init));
++	len += sizeof(uve_session_init) / 4;
++
++	memcpy((ib_cpu + len), uve_layer_ctrl, sizeof(uve_layer_ctrl));
++	len += sizeof(uve_layer_ctrl) / 4;
++
++	memcpy((ib_cpu + len), uve_layer_select, sizeof(uve_layer_select));
++	len += sizeof(uve_layer_select) / 4;
++
++	memcpy((ib_cpu + len), uve_slice_ctrl, sizeof(uve_slice_ctrl));
++	len += sizeof(uve_slice_ctrl) / 4;
++
++	memcpy((ib_cpu + len), uve_spec_misc, sizeof(uve_spec_misc));
++	len += sizeof(uve_spec_misc) / 4;
++
++	memcpy((ib_cpu + len), uve_rc_session_init, sizeof(uve_rc_session_init));
++	len += sizeof(uve_rc_session_init) / 4;
++
++	memcpy((ib_cpu + len), uve_rc_layer_init, sizeof(uve_rc_layer_init));
++	len += sizeof(uve_rc_layer_init) / 4;
++
++	memcpy((ib_cpu + len), uve_hw_spec, sizeof(uve_hw_spec));
++	len += sizeof(uve_hw_spec) / 4;
++
++	memcpy((ib_cpu + len), uve_deblocking_filter, sizeof(uve_deblocking_filter));
++	len += sizeof(uve_deblocking_filter) / 4;
++
++	memcpy((ib_cpu + len), uve_feedback_buffer, sizeof(uve_feedback_buffer));
++	len += sizeof(uve_feedback_buffer) / 4;
++	ib_cpu[len++] = enc.fb.addr >> 32;
++	ib_cpu[len++] = enc.fb.addr;
++	ib_cpu[len++] = 0x00000003;
++
++	memcpy((ib_cpu + len), uve_op_init_rc, sizeof(uve_op_init_rc));
++	len += sizeof(uve_op_init_rc) / 4;
+ 
+ 	r = submit(len, AMDGPU_HW_IP_UVD_ENC);
+ 	CU_ASSERT_EQUAL(r, 0);
+ 
+-	free_resource(&sw_ctx);
++	free_resource(&enc.fb);
+ }
+ 
+ static void amdgpu_cs_uvd_enc_encode(void)
+ {
+-	/* TODO */
++	int len, r, i;
++	uint64_t luma_offset, chroma_offset;
++	uint32_t vbuf_size, bs_size = 0x154000, cpb_size;
++	unsigned align = (family_id >= AMDGPU_FAMILY_AI) ? 256 : 16;
++	vbuf_size = ALIGN(enc.width, align) * ALIGN(enc.height, 16) * 1.5;
++	cpb_size = vbuf_size * 10;
++
++	if (family_id < AMDGPU_FAMILY_AI)
++		return;
++
++	num_resources  = 0;
++	alloc_resource(&enc.fb, 4096, AMDGPU_GEM_DOMAIN_VRAM);
++	resources[num_resources++] = enc.fb.handle;
++	alloc_resource(&enc.bs, bs_size, AMDGPU_GEM_DOMAIN_VRAM);
++	resources[num_resources++] = enc.bs.handle;
++	alloc_resource(&enc.vbuf, vbuf_size, AMDGPU_GEM_DOMAIN_VRAM);
++	resources[num_resources++] = enc.vbuf.handle;
++	alloc_resource(&enc.cpb, cpb_size, AMDGPU_GEM_DOMAIN_VRAM);
++	resources[num_resources++] = enc.cpb.handle;
++	resources[num_resources++] = ib_handle;
++
++	r = amdgpu_bo_cpu_map(enc.vbuf.handle, (void **)&enc.vbuf.ptr);
++	CU_ASSERT_EQUAL(r, 0);
++
++	memset(enc.vbuf.ptr, 0, vbuf_size);
++	for (i = 0; i < enc.height; ++i) {
++		memcpy(enc.vbuf.ptr, (frame + i * enc.width), enc.width);
++		enc.vbuf.ptr += ALIGN(enc.width, align);
++	}
++	for (i = 0; i < enc.height / 2; ++i) {
++		memcpy(enc.vbuf.ptr, ((frame + enc.height * enc.width) + i * enc.width), enc.width);
++		enc.vbuf.ptr += ALIGN(enc.width, align);
++	}
++
++	r = amdgpu_bo_cpu_unmap(enc.vbuf.handle);
++	CU_ASSERT_EQUAL(r, 0);
++
++	len = 0;
++	memcpy((ib_cpu + len), uve_session_info, sizeof(uve_session_info));
++	len += sizeof(uve_session_info) / 4;
++	ib_cpu[len++] = enc.session.addr >> 32;
++	ib_cpu[len++] = enc.session.addr;
++
++	memcpy((ib_cpu + len), uve_task_info, sizeof(uve_task_info));
++	len += sizeof(uve_task_info) / 4;
++	ib_cpu[len++] = 0x00000210;
++	ib_cpu[len++] = 0x00000002;
++	ib_cpu[len++] = 0x00000001;
++
++	memcpy((ib_cpu + len), uve_slice_header, sizeof(uve_slice_header));
++	len += sizeof(uve_slice_header) / 4;
++
++	unsigned luma_size = ALIGN(enc.width, align) * ALIGN(enc.height, 16);
++	luma_offset = enc.vbuf.addr;
++	chroma_offset = luma_offset + luma_size;
++	ib_cpu[len++] = 0x00000088;
++	ib_cpu[len++] = 0x0000000d;
++	ib_cpu[len++] = 0x00018000;
++	ib_cpu[len++] = luma_offset >> 32;
++	ib_cpu[len++] = luma_offset;
++	ib_cpu[len++] = chroma_offset >> 32;
++	ib_cpu[len++] = chroma_offset;
++	memcpy((ib_cpu + len), uve_encode_param, sizeof(uve_encode_param));
++	len += sizeof(uve_encode_param) / 4;
++
++	memcpy((ib_cpu + len), uve_quality_param, sizeof(uve_quality_param));
++	len += sizeof(uve_quality_param) / 4;
++
++	memcpy((ib_cpu + len), uve_intra_refresh, sizeof(uve_intra_refresh));
++	len += sizeof(uve_intra_refresh) / 4;
++
++	memcpy((ib_cpu + len), uve_reconstructed_pic_output, sizeof(uve_reconstructed_pic_output));
++	len += sizeof(uve_reconstructed_pic_output) / 4;
++
++	memcpy((ib_cpu + len), uve_ctx_buffer, sizeof(uve_ctx_buffer));
++	len += sizeof(uve_ctx_buffer) / 4;
++	ib_cpu[len++] = enc.cpb.addr >> 32;
++	ib_cpu[len++] = enc.cpb.addr;
++
++	memcpy((ib_cpu + len), uve_bitstream_buffer, sizeof(uve_bitstream_buffer));
++	len += sizeof(uve_bitstream_buffer) / 4;
++	ib_cpu[len++] = enc.bs.addr >> 32;
++	ib_cpu[len++] = enc.bs.addr;
++	ib_cpu[len++] = 0x00030000;
++
++	memcpy((ib_cpu + len), uve_feedback_buffer, sizeof(uve_feedback_buffer));
++	len += sizeof(uve_feedback_buffer) / 4;
++	ib_cpu[len++] = enc.fb.addr >> 32;
++	ib_cpu[len++] = enc.fb.addr;
++	ib_cpu[len++] = 0x00000003;
++
++	memcpy((ib_cpu + len), uve_rc_per_pic, sizeof(uve_rc_per_pic));
++	len += sizeof(uve_rc_per_pic) / 4;
++
++	memcpy((ib_cpu + len), uve_op_encode, sizeof(uve_op_encode));
++	len += sizeof(uve_op_encode) / 4;
++
++	r = submit(len, AMDGPU_HW_IP_UVD_ENC);
++	CU_ASSERT_EQUAL(r, 0);
++
++	check_result(&enc);
++
++	free_resource(&enc.fb);
++	free_resource(&enc.bs);
++	free_resource(&enc.vbuf);
++	free_resource(&enc.cpb);
+ }
+ 
+ static void amdgpu_cs_uvd_enc_destroy(void)
+@@ -275,29 +482,25 @@ static void amdgpu_cs_uvd_enc_destroy(void)
+ 		return;
+ 
+ 	num_resources  = 0;
+-	alloc_resource(&sw_ctx, 128 * 1024, AMDGPU_GEM_DOMAIN_GTT);
+-	resources[num_resources++] = sw_ctx.handle;
+ 	resources[num_resources++] = ib_handle;
+ 
+ 	len = 0;
+-	ib_cpu[len++] = 0x00000018;
+-	ib_cpu[len++] = 0x00000001; /* session info */
+-	ib_cpu[len++] = 0x00000001;
+-	ib_cpu[len++] = 0x00000000;
+-	ib_cpu[len++] = sw_ctx.addr >> 32;
+-	ib_cpu[len++] = sw_ctx.addr;
++	memcpy((ib_cpu + len), uve_session_info, sizeof(uve_session_info));
++	len += sizeof(uve_session_info) / 4;
++	ib_cpu[len++] = enc.session.addr >> 32;
++	ib_cpu[len++] = enc.session.addr;
+ 
+-	ib_cpu[len++] = 0x00000014;
+-	ib_cpu[len++] = 0x00000002; /* task info */
++	memcpy((ib_cpu + len), uve_task_info, sizeof(uve_task_info));
++	len += sizeof(uve_task_info) / 4;
+ 	ib_cpu[len++] = 0xffffffff;
+-	ib_cpu[len++] = 0x00000000;
++	ib_cpu[len++] = 0x00000004;
+ 	ib_cpu[len++] = 0x00000000;
+ 
+-	ib_cpu[len++] = 0x00000008;
+-	ib_cpu[len++] = 0x08000002; /* op close session */
++	memcpy((ib_cpu + len), uve_op_close, sizeof(uve_op_close));
++	len += sizeof(uve_op_close) / 4;
+ 
+ 	r = submit(len, AMDGPU_HW_IP_UVD_ENC);
+ 	CU_ASSERT_EQUAL(r, 0);
+ 
+-	free_resource(&sw_ctx);
++	free_resource(&enc.session);
+ }
+-- 
+2.7.4
+

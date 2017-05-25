@@ -1,0 +1,221 @@
+From a7b8bf312f070891448ea35560c7218795bb1e89 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Tue, 9 Aug 2016 17:08:05 -0400
+Subject: [PATCH 0732/1722] drm/amd/dal: refactor mpo bandwidth down sequence
+ step 2
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               | 43 +++++++++++-----------
+ .../drm/amd/dal/dc/dce100/dce100_hw_sequencer.c    |  5 +--
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 24 +++---------
+ .../gpu/drm/amd/dal/dc/dce80/dce80_hw_sequencer.c  |  5 +--
+ drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h      |  2 +-
+ 5 files changed, 32 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 167024a..fb0d51a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -928,8 +928,11 @@ bool dc_pre_commit_surfaces_to_target(
+ 	int current_enabled_surface_count = 0;
+ 	int new_enabled_surface_count = 0;
+ 
+-	if (core_dc->pending_context)
+-		dc_post_commit_surfaces_to_target(dc);
++        if (core_dc->retired_context) {
++                resource_validate_ctx_destruct(core_dc->retired_context);
++                dm_free(core_dc->retired_context);
++                core_dc->retired_context = NULL;
++        }
+ 
+ 	if (core_dc->current_context->target_count == 0)
+ 		return NULL;
+@@ -1017,6 +1020,8 @@ bool dc_pre_commit_surfaces_to_target(
+                                                 &context->pp_display_cfg);
+                 core_dc->hwss.set_display_clock(context);
+                 bw_increased = true;
++                core_dc->current_context->bw_results.dispclk_khz =
++                                context->bw_results.dispclk_khz;
+ 	}
+ 
+ 	if (current_enabled_surface_count > 0 && new_enabled_surface_count == 0)
+@@ -1026,12 +1031,9 @@ bool dc_pre_commit_surfaces_to_target(
+         core_dc->hwss.apply_ctx_to_surface_locked(core_dc, context);
+         context->locked = true;
+  
+-        if (bw_increased)
+-                core_dc->current_context->bw_results = context->bw_results;
+- 
+         core_dc->pending_context = context; 
+  
+-        return true;
++        return !bw_increased;
+  
+ unexpected_fail:
+         resource_validate_ctx_destruct(context);
+@@ -1125,29 +1127,28 @@ bool dc_post_commit_surfaces_to_target(struct dc *dc)
+         struct core_dc *core_dc = DC_TO_CORE(dc);
+ 	int i;
+         
+-        if (!core_dc->retired_context)
+-                return true;
+- 
+         for (i = 0; i < core_dc->current_context->res_ctx.pool->pipe_count; i++) {
+-                if (core_dc->retired_context->res_ctx.pipe_ctx[i].stream != NULL
+-                                && core_dc->current_context->res_ctx.pipe_ctx[i].stream == NULL) { 
++                if (core_dc->current_context->res_ctx.pipe_ctx[i].stream == NULL) {
+                         core_dc->hwss.enable_display_power_gating(
+                                 core_dc->ctx, i, core_dc->ctx->dc_bios,
+                                 PIPE_GATING_CONTROL_ENABLE);
+-                        core_dc->current_context->res_ctx.pipe_ctx[i].xfm->funcs->transform_reset(
+-                                        core_dc->current_context->res_ctx.pipe_ctx[i].xfm);
+-                        memset(&core_dc->current_context->res_ctx.pipe_ctx[i], 0, sizeof(struct pipe_ctx));
++                        if (core_dc->current_context->res_ctx.pipe_ctx[i].xfm)
++                                core_dc->current_context->res_ctx.pipe_ctx[i].xfm->funcs->transform_reset(
++                                                core_dc->current_context->res_ctx.pipe_ctx[i].xfm);
++                        memset(&core_dc->current_context->res_ctx.pipe_ctx[i].scl_data, 0, sizeof(struct scaler_data));
+                 }
+         }
+  
+-        if (core_dc->hwss.decrease_bandwidth(core_dc))
+-                pplib_apply_display_requirements(
+-                                core_dc, core_dc->current_context, &core_dc->current_context->pp_display_cfg);
++        core_dc->hwss.set_bandwidth(core_dc);
+  
+-        resource_validate_ctx_destruct(core_dc->retired_context);
+-        dm_free(core_dc->retired_context);
+-        core_dc->retired_context = NULL;
+-  
++        pplib_apply_display_requirements(
++                        core_dc, core_dc->current_context, &core_dc->current_context->pp_display_cfg); 
++ 
++        if (core_dc->retired_context) {
++                resource_validate_ctx_destruct(core_dc->retired_context);
++                dm_free(core_dc->retired_context);
++                core_dc->retired_context = NULL;
++        } 
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.c
+index 3d3ec47..58ca223 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_hw_sequencer.c
+@@ -242,10 +242,9 @@ static void set_displaymarks(
+ 	/* Do nothing until we have proper bandwitdth calcs */
+ }
+ 
+-static bool decrease_bandwidth(struct core_dc *dc)
++static void set_bandwidth(struct core_dc *dc)
+ {
+ 	/* Do nothing until we have proper bandwitdth calcs */
+-	return true;
+ }
+ 
+ static void enable_hw_base_light_sleep(void)
+@@ -288,7 +287,7 @@ bool dce100_hw_sequencer_construct(struct core_dc *dc)
+ 	dc->hwss.set_blender_mode = dce100_set_blender_mode;
+ 	dc->hwss.set_displaymarks = set_displaymarks;
+ 	dc->hwss.increase_watermarks_for_pipe = set_display_mark_for_pipe_if_needed;
+-	dc->hwss.decrease_bandwidth = decrease_bandwidth;
++	dc->hwss.set_bandwidth = set_bandwidth;
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index e949d11..25d1149e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -1881,34 +1881,20 @@ static void dce110_increase_watermarks_for_pipe(
+ 		program_wm_for_pipe(dc, pipe_ctx, context);
+ }
+ 
+-static bool dce110_decrease_bandwidth(struct core_dc *dc)
++static void dce110_set_bandwidth(struct core_dc *dc)
+ {
+ 	int i;
+-	bool ret = false;
+-
+-	ASSERT(dc->current_context && dc->retired_context);
+ 
+ 	for (i = 0; i < dc->current_context->res_ctx.pool->pipe_count; i++) {
+ 		struct pipe_ctx *pipe_ctx = &dc->current_context->res_ctx.pipe_ctx[i];
+ 
+-		if (!dc->retired_context->res_ctx.pipe_ctx[i].stream
+-				|| !pipe_ctx->stream)
++		if (!pipe_ctx->stream)
+ 			continue;
+ 
+-		/* Reverse context order to check for decrease */
+-		if (did_watermarks_increase(pipe_ctx, dc->retired_context, dc->current_context)) {
+-			program_wm_for_pipe(dc, pipe_ctx, dc->current_context);
+-			ret = true;
+-		}
+-	}
+-
+-	if (dc->retired_context->bw_results.dispclk_khz
+-			> dc->current_context->bw_results.dispclk_khz) {
+-		dc->hwss.set_display_clock(dc->current_context);
+-		ret = true;
++		program_wm_for_pipe(dc, pipe_ctx, dc->current_context);
+ 	}
+ 
+-	return ret;
++	dc->hwss.set_display_clock(dc->current_context);
+ }
+ 
+ static void dce110_program_blending(struct core_dc *dc,
+@@ -2185,7 +2171,7 @@ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.set_display_clock = set_display_clock,
+ 	.set_displaymarks = set_displaymarks,
+ 	.increase_watermarks_for_pipe = dce110_increase_watermarks_for_pipe,
+-	.decrease_bandwidth = dce110_decrease_bandwidth,
++	.set_bandwidth = dce110_set_bandwidth,
+ 	.set_drr = set_drr
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_hw_sequencer.c
+index 3f376cc..3a383f5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_hw_sequencer.c
+@@ -226,10 +226,9 @@ static void set_displaymarks(
+ 	/* Do nothing until we have proper bandwitdth calcs */
+ }
+ 
+-static bool decrease_bandwidth(struct core_dc *dc)
++static void set_bandwidth(struct core_dc *dc)
+ {
+ 	/* Do nothing until we have proper bandwitdth calcs */
+-	return true;
+ }
+ 
+ 
+@@ -244,7 +243,7 @@ bool dce80_hw_sequencer_construct(struct core_dc *dc)
+ 	dc->hwss.set_blender_mode = dce80_set_blender_mode;
+ 	dc->hwss.set_displaymarks = set_displaymarks;
+ 	dc->hwss.increase_watermarks_for_pipe = set_display_mark_for_pipe_if_needed;
+-	dc->hwss.decrease_bandwidth = decrease_bandwidth;
++	dc->hwss.set_bandwidth = set_bandwidth;
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+index 3ebe8c4..af12833 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+@@ -140,7 +140,7 @@ struct hw_sequencer_funcs {
+ 
+ 	void (*set_display_clock)(struct validate_context *context);
+ 
+-	bool (*decrease_bandwidth)(struct core_dc *dc);
++	void (*set_bandwidth)(struct core_dc *dc);
+ 
+ 	void (*set_drr)(struct pipe_ctx **pipe_ctx, int num_pipes,
+ 			int vmin, int vmax);
+-- 
+2.7.4
+

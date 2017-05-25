@@ -1,0 +1,71 @@
+From f4a10be9cc22364e345ac1378e608d78717b606b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 14 Feb 2017 15:47:03 +0100
+Subject: [PATCH 2210/3082] drm/amdgpu: add OOM fallback on PRT teardown
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Don't assume kmalloc will always succeed.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Nicolai Hähnle <nicolai.haehnle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 28 ++++++++++++++++++++++------
+ 1 file changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 447cda5..c11b6b6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1194,14 +1194,22 @@ static void amdgpu_vm_update_prt_state(struct amdgpu_device *adev)
+ }
+ 
+ /**
++ * amdgpu_vm_prt_put - drop a PRT user
++ */
++static void amdgpu_vm_prt_put(struct amdgpu_device *adev)
++{
++	if (atomic_dec_return(&adev->vm_manager.num_prt_mappings) == 0)
++		amdgpu_vm_update_prt_state(adev);
++}
++
++/**
+  * amdgpu_vm_prt - callback for updating the PRT status
+  */
+ static void amdgpu_vm_prt_cb(struct fence *fence, struct fence_cb *_cb)
+ {
+ 	struct amdgpu_prt_cb *cb = container_of(_cb, struct amdgpu_prt_cb, cb);
+ 
+-	if (atomic_dec_return(&cb->adev->vm_manager.num_prt_mappings) == 0)
+-		amdgpu_vm_update_prt_state(cb->adev);
++	amdgpu_vm_prt_put(cb->adev);
+ 	kfree(cb);
+ }
+ 
+@@ -1224,10 +1232,18 @@ static void amdgpu_vm_free_mapping(struct amdgpu_device *adev,
+ 		struct amdgpu_prt_cb *cb = kmalloc(sizeof(struct amdgpu_prt_cb),
+ 						   GFP_KERNEL);
+ 
+-		cb->adev = adev;
+-		if (!fence || fence_add_callback(fence, &cb->cb,
+-						 amdgpu_vm_prt_cb))
+-			amdgpu_vm_prt_cb(fence, &cb->cb);
++		if (!cb) {
++			/* Last resort when we are OOM */
++			if (fence)
++				fence_wait(fence, false);
++
++			amdgpu_vm_prt_put(cb->adev);
++		} else {
++			cb->adev = adev;
++			if (!fence || fence_add_callback(fence, &cb->cb,
++							 amdgpu_vm_prt_cb))
++				amdgpu_vm_prt_cb(fence, &cb->cb);
++		}
+ 	}
+ 	kfree(mapping);
+ }
+-- 
+2.7.4
+

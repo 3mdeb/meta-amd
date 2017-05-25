@@ -1,0 +1,357 @@
+From 1c3c8ca6c95b4c696d7761d7e83c6fe678083133 Mon Sep 17 00:00:00 2001
+From: Ayyappa Ch <ayyappa.chandolu@amd.com>
+Date: Fri, 27 Jan 2017 15:14:05 +0530
+Subject: [PATCH 1620/1722] drm/amdgpu: Support PT update via CPU
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+If amdgpu.vm_update_context param is set to use CPU, then Page Table
+entries will be updated by CPU.
+
+Change-Id: I80780baaddeba0aec2b784d7417df2b0d8010f82
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Ayyappa Ch <ayyappa.chandolu@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 241 +++++++++++++++++++++++----------
+ 1 file changed, 173 insertions(+), 68 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index f8376d3..1e40074 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -84,8 +84,7 @@ struct amdgpu_pte_update_params {
+  *
+  */
+ static void write_pte_using_cpu(struct amdgpu_device *adev,
+-				struct amdgpu_vm_update_params
+-					*vm_update_params,
++				struct amdgpu_pte_update_params *params,
+ 				uint64_t pe_start, uint64_t addr,
+ 				unsigned count, uint32_t incr,
+ 				uint32_t flags)
+@@ -96,8 +95,8 @@ static void write_pte_using_cpu(struct amdgpu_device *adev,
+ 	page_idx = pe_start / 8;
+ 
+ 	for (i = 0; i < count; i++) {
+-		value = amdgpu_vm_map_gart(vm_update_params->pages_addr, addr);
+-		amdgpu_gart_set_pte_pde(adev, vm_update_params->kptr,
++		value = amdgpu_vm_map_gart(params->pages_addr, addr);
++		amdgpu_gart_set_pte_pde(adev, params->kptr,
+ 			page_idx, value, flags);
+ 		addr += incr;
+ 		page_idx++;
+@@ -521,8 +520,9 @@ struct amdgpu_bo_va *amdgpu_vm_bo_find(struct amdgpu_vm *vm,
+  * @incr: increase next addr by incr bytes
+  * @flags: hw access flags
+  *
+- * Traces the parameters and calls the right asic functions
+- * to setup the page table using the DMA.
++ * If kptr is available, then update pde/pte directly using CPU. Otherwise,
++ * assume ib is valid and call the right asic functions to setup the page table
++ * using the DMA. Also traces the parameters.
+  */
+ static void amdgpu_vm_do_set_ptes(struct amdgpu_pte_update_params *params,
+ 				  uint64_t pe, uint64_t addr,
+@@ -531,7 +531,7 @@ static void amdgpu_vm_do_set_ptes(struct amdgpu_pte_update_params *params,
+ {
+ 	trace_amdgpu_vm_set_ptes(pe, addr, count, incr, flags);
+ 
+-	if (vm_update_params->kptr) {
++	if (params->kptr) {
+ 		write_pte_using_cpu(params->adev, params, pe, addr,
+ 			count, incr, flags);
+ 	} else if (count < 3) {
+@@ -638,7 +638,7 @@ int amdgpu_vm_update_page_directory(struct amdgpu_device *adev,
+ 		struct amdgpu_bo *pd = vm->page_directory;
+ 
+ 		r = amdgpu_bo_kmap(vm->page_directory,
+-			&vm_update_params.kptr);
++			&params.kptr);
+ 		if (r)
+ 			dev_warn(adev->dev, "PD table update using CPU failed. Fallback to SDMA\n");
+ 		else {
+@@ -729,7 +729,7 @@ int amdgpu_vm_update_page_directory(struct amdgpu_device *adev,
+ 	}
+ 
+ 	/* Submit IB if updating using SDMA */
+-	if (vm_update_params.ib) {	
++	if (params.ib) {	
+ 		if (params.ib->length_dw == 0) {
+ 			amdgpu_job_free(job);
+ 			return 0;
+@@ -761,8 +761,97 @@ error_free:
+ 	return r;
+ }
+ 
++/*
++ * amdgpu_vm_frag_ptes - add fragment information to PTEs
++ *
++ * @params: see amdgpu_pte_update_params definition
++ * @vm: requested vm
++ * @start: first PTE to handle
++ * @end: last PTE to handle
++ * @dst: addr those PTEs should point to
++ * @flags: hw mapping flags
++ */
++static void amdgpu_vm_frag_ptes(struct amdgpu_pte_update_params	*params,
++				struct amdgpu_vm *vm,
++				uint64_t start, uint64_t end,
++				uint64_t dst, uint32_t flags)
++{
++	/**
++	 * The MC L1 TLB supports variable sized pages, based on a fragment
++	 * field in the PTE. When this field is set to a non-zero value, page
++	 * granularity is increased from 4KB to (1 << (12 + frag)). The PTE
++	 * flags are considered valid for all PTEs within the fragment range
++	 * and corresponding mappings are assumed to be physically contiguous.
++	 *
++	 * The L1 TLB can store a single PTE for the whole fragment,
++	 * significantly increasing the space available for translation
++	 * caching. This leads to large improvements in throughput when the
++	 * TLB is under pressure.
++	 *
++	 * The L2 TLB distributes small and large fragments into two
++	 * asymmetric partitions. The large fragment cache is significantly
++	 * larger. Thus, we try to use large fragments wherever possible.
++	 * Userspace can support this by aligning virtual base address and
++	 * allocation size to the fragment size.
++	 */
++
++	/* SI and newer are optimized for 64KB */
++	uint64_t frag_flags = AMDGPU_PTE_FRAG(AMDGPU_LOG2_PAGES_PER_FRAG);
++	uint64_t frag_align = 1 << AMDGPU_LOG2_PAGES_PER_FRAG;
++
++	uint64_t frag_start = ALIGN(start, frag_align);
++	uint64_t frag_end = end & ~(frag_align - 1);
++
++	unsigned count;
++	uint32_t incr = AMDGPU_VM_PTE_COUNT * 8;
++	/* system pages are non continuously */
++	if (params->src || !(flags & AMDGPU_PTE_VALID) ||
++	    (frag_start >= frag_end)) {
++
++		count = end - start;
++				
++		if (params->kptr)
++			write_pte_using_cpu(params->adev, params, start, dst, count, incr, flags);
++		else
++			amdgpu_vm_update_ptes_sdma(params, vm, start, end, dst, flags);
++		return;
++	}
++
++	/* handle the 4K area at the beginning */
++	if (start != frag_start) {
++	
++		count = frag_start - start;
++				
++		if (params->kptr)
++			write_pte_using_cpu(params->adev, params, start, dst, count, incr, flags);
++		else
++			amdgpu_vm_update_ptes_sdma(params, vm, start, frag_start,
++				      	dst, flags);
++		dst += (frag_start - start) * AMDGPU_GPU_PAGE_SIZE;
++	}
++
++	/* handle the area in the middle */
++	count = frag_end - frag_start;
++				
++	if (params->kptr)
++		write_pte_using_cpu(params->adev, params, frag_start, dst, count, incr, flags);
++	else	
++		amdgpu_vm_update_ptes_sdma(params, vm, frag_start, frag_end, dst,
++		      flags | frag_flags);
++
++	/* handle the 4K area at the end */
++	if (frag_end != end) {
++		dst += (frag_end - frag_start) * AMDGPU_GPU_PAGE_SIZE;
++		count = end - frag_end;
++		if (params->kptr)
++			write_pte_using_cpu(params->adev, params, frag_end, dst, count, incr, flags);
++		else		
++			amdgpu_vm_update_ptes_sdma(params, vm, frag_end, end, dst, flags);
++	}
++}
++
+ /**
+- * amdgpu_vm_update_ptes - make sure that page tables are valid
++ * amdgpu_vm_update_ptes_sdma - make sure that page tables are valid
+  *
+  * @params: see amdgpu_pte_update_params definition
+  * @vm: requested vm
+@@ -771,9 +860,9 @@ error_free:
+  * @dst: destination address to map to, the next dst inside the function
+  * @flags: mapping flags
+  *
+- * Update the page tables in the range @start - @end.
++ * Update the page tables in the range @start - @end using SDMA
+  */
+-static void amdgpu_vm_update_ptes(struct amdgpu_pte_update_params *params,
++static void amdgpu_vm_update_ptes_sdma(struct amdgpu_pte_update_params *params,
+ 				  struct amdgpu_vm *vm,
+ 				  uint64_t start, uint64_t end,
+ 				  uint64_t dst, uint32_t flags)
+@@ -853,71 +942,59 @@ static void amdgpu_vm_update_ptes(struct amdgpu_pte_update_params *params,
+ 		     AMDGPU_GPU_PAGE_SIZE, flags);
+ }
+ 
+-/*
+- * amdgpu_vm_frag_ptes - add fragment information to PTEs
++
++/**
++ * amdgpu_vm_update_ptes_cpu - make sure that page tables are valid
+  *
+- * @params: see amdgpu_pte_update_params definition
++ * @adev: amdgpu_device pointer
++ * @pte_update_params: see amdgpu_vm_update_params definition
+  * @vm: requested vm
+- * @start: first PTE to handle
+- * @end: last PTE to handle
+- * @dst: addr those PTEs should point to
+- * @flags: hw mapping flags
++ * @start: start of GPU address range
++ * @end: end of GPU address range
++ * @dst: destination address to map to
++ * @flags: mapping flags
++ *
++ * Update the page tables in the range @start - @end using CPU
+  */
+-static void amdgpu_vm_frag_ptes(struct amdgpu_pte_update_params	*params,
+-				struct amdgpu_vm *vm,
+-				uint64_t start, uint64_t end,
+-				uint64_t dst, uint32_t flags)
++static int amdgpu_vm_update_ptes_cpu(struct amdgpu_device *adev,
++				     struct amdgpu_pte_update_params
++					*vm_update_params,
++				     struct amdgpu_vm *vm,
++				     uint64_t start, uint64_t end,
++				     uint64_t dst, uint32_t flags)
+ {
+-	/**
+-	 * The MC L1 TLB supports variable sized pages, based on a fragment
+-	 * field in the PTE. When this field is set to a non-zero value, page
+-	 * granularity is increased from 4KB to (1 << (12 + frag)). The PTE
+-	 * flags are considered valid for all PTEs within the fragment range
+-	 * and corresponding mappings are assumed to be physically contiguous.
+-	 *
+-	 * The L1 TLB can store a single PTE for the whole fragment,
+-	 * significantly increasing the space available for translation
+-	 * caching. This leads to large improvements in throughput when the
+-	 * TLB is under pressure.
+-	 *
+-	 * The L2 TLB distributes small and large fragments into two
+-	 * asymmetric partitions. The large fragment cache is significantly
+-	 * larger. Thus, we try to use large fragments wherever possible.
+-	 * Userspace can support this by aligning virtual base address and
+-	 * allocation size to the fragment size.
+-	 */
+-
+-	/* SI and newer are optimized for 64KB */
+-	uint64_t frag_flags = AMDGPU_PTE_FRAG(AMDGPU_LOG2_PAGES_PER_FRAG);
+-	uint64_t frag_align = 1 << AMDGPU_LOG2_PAGES_PER_FRAG;
++	const uint64_t mask = AMDGPU_VM_PTE_COUNT - 1;
++	int r;
++	uint64_t addr;
++	struct amdgpu_bo *pt = NULL;
++	uint32_t incr = AMDGPU_VM_PTE_COUNT * 8;
++	
++	/* walk over the address space and update the page tables */
++	for (addr = start; addr < end; ) {
++		uint64_t pt_idx = addr >> amdgpu_vm_block_size;
++		unsigned nptes;
++		uint64_t pe_start;
+ 
+-	uint64_t frag_start = ALIGN(start, frag_align);
+-	uint64_t frag_end = end & ~(frag_align - 1);
++		pt = vm->page_tables[pt_idx].bo;
++		r = amdgpu_bo_kmap(pt, &vm_update_params->kptr);
++		if (r)
++			return r;
+ 
+-	/* system pages are non continuously */
+-	if (params->src || !(flags & AMDGPU_PTE_VALID) ||
+-	    (frag_start >= frag_end)) {
++		if ((addr & ~mask) == (end & ~mask))
++			nptes = end - addr;
++		else
++			nptes = AMDGPU_VM_PTE_COUNT - (addr & mask);
+ 
+-		amdgpu_vm_update_ptes(params, vm, start, end, dst, flags);
+-		return;
+-	}
++		pe_start = (addr & mask) * 8;
+ 
+-	/* handle the 4K area at the beginning */
+-	if (start != frag_start) {
+-		amdgpu_vm_update_ptes(params, vm, start, frag_start,
+-				      dst, flags);
+-		dst += (frag_start - start) * AMDGPU_GPU_PAGE_SIZE;
+-	}
++		write_pte_using_cpu(adev, vm_update_params, pe_start, dst, 1 , incr , flags);		
+ 
+-	/* handle the area in the middle */
+-	amdgpu_vm_update_ptes(params, vm, frag_start, frag_end, dst,
+-			      flags | frag_flags);
++		addr += nptes;
++		dst += nptes * AMDGPU_GPU_PAGE_SIZE;
+ 
+-	/* handle the 4K area at the end */
+-	if (frag_end != end) {
+-		dst += (frag_end - frag_start) * AMDGPU_GPU_PAGE_SIZE;
+-		amdgpu_vm_update_ptes(params, vm, frag_end, end, dst, flags);
++		amdgpu_bo_kunmap(pt);
+ 	}
++	return 0;
+ }
+ 
+ /**
+@@ -968,6 +1045,34 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 	if (!(flags & AMDGPU_PTE_VALID))
+ 		owner = AMDGPU_FENCE_OWNER_UNDEFINED;
+ 
++	/* If update flag is set to CPU, then try to update PT entries directly
++	 * by CPU. If failed, fallback to SDMA update.
++	 */
++	if (vm->is_vm_update_mode_cpu) {
++		struct amdgpu_sync sync;
++
++		amdgpu_sync_create(&sync);
++		r = amdgpu_sync_resv(adev, &sync, vm->page_directory->tbo.resv,
++			owner);
++		if (r) {
++			dev_warn(adev->dev, "CPU pte update failed. Fallback to SDMA\n");
++			goto fallback_sdma_update;
++		}
++		amdgpu_sync_wait(&sync);
++		amdgpu_sync_free(&sync);
++
++		r = amdgpu_vm_update_ptes_cpu(adev, &vm_update_params,
++			vm, start, last + 1, addr, flags);
++		if (r) {
++			dev_info(adev->dev, "CPU pte update failed. Fallback to sdma\n");
++			goto fallback_sdma_update;
++		}
++		return r;
++	}
++
++fallback_sdma_update:
++	ring = container_of(vm->entity.sched, struct amdgpu_ring, sched);
++
+ 	nptes = last - start + 1;
+ 
+ 	/*
+@@ -1631,8 +1736,8 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 	r = amdgpu_bo_create(adev, pd_size, align, true,
+ 			     AMDGPU_GEM_DOMAIN_VRAM,
+ 			     (vm->is_vm_update_mode_cpu ?
+-				 AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED :
+-				 AMDGPU_GEM_CREATE_NO_CPU_ACCESS) |
++			     AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED :
++			     AMDGPU_GEM_CREATE_NO_CPU_ACCESS) |
+ 			     AMDGPU_GEM_CREATE_SHADOW |
+ 			     AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS |
+ 			     AMDGPU_GEM_CREATE_VRAM_CLEARED,
+-- 
+2.7.4
+

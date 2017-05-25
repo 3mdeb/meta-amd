@@ -1,0 +1,160 @@
+From 554436ebf1a5fa022d33139f81df4f833efa571b Mon Sep 17 00:00:00 2001
+From: Wenjing Liu <Wenjing.Liu@amd.com>
+Date: Wed, 30 Nov 2016 17:57:24 -0500
+Subject: [PATCH 1782/3082] drm/amd/display: use rgb full range as default
+ quantization for non HDMI
+
+[Description]
+Refactor the quantization decision to color module.
+Add the check if non HDMI, default quantization should be rgb full range.
+
+Change-Id: Icf2d690ed71e16f0af8128b8a405f530974d48ce
+Signed-off-by: Wenjing Liu <Wenjing.Liu@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Reviewed-by: Anthony Koo <Anthony.Koo@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/modules/color/color.c  | 88 ++++++++++++++++++++--
+ .../gpu/drm/amd/display/modules/inc/mod_color.h    | 12 ++-
+ 2 files changed, 94 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/modules/color/color.c b/drivers/gpu/drm/amd/display/modules/color/color.c
+index 30d09d3..0610b82 100644
+--- a/drivers/gpu/drm/amd/display/modules/color/color.c
++++ b/drivers/gpu/drm/amd/display/modules/color/color.c
+@@ -2184,7 +2184,8 @@ bool mod_color_set_saturation(struct mod_color *mod_color,
+ 	return true;
+ }
+ 
+-bool mod_color_set_preferred_quantization_range(struct mod_color *mod_color,
++bool mod_color_persist_user_preferred_quantization_range(
++		struct mod_color *mod_color,
+ 		const struct dc_sink *sink,
+ 		enum dc_quantization_range quantization_range)
+ {
+@@ -2214,13 +2215,90 @@ bool mod_color_set_preferred_quantization_range(struct mod_color *mod_color,
+ 
+ bool mod_color_get_preferred_quantization_range(struct mod_color *mod_color,
+ 		const struct dc_sink *sink,
++		const struct dc_crtc_timing *timing,
+ 		enum dc_quantization_range *quantization_range)
+ {
+ 	struct core_color *core_color = MOD_COLOR_TO_CORE(mod_color);
+-	unsigned int sink_index;
++	unsigned int sink_index = sink_index_from_sink(core_color, sink);
++	enum dc_quantization_range user_preferred_quantization_range =
++			core_color->state[sink_index].
++				preferred_quantization_range;
++	bool rgb_full_range_supported =
++			mod_color_is_rgb_full_range_supported_for_timing(
++				sink, timing);
++	bool rgb_limited_range_supported =
++			mod_color_is_rgb_limited_range_supported_for_timing(
++				sink, timing);
++
++	if (rgb_full_range_supported && rgb_limited_range_supported)
++		*quantization_range = user_preferred_quantization_range;
++	else if (rgb_full_range_supported && !rgb_limited_range_supported)
++		*quantization_range = QUANTIZATION_RANGE_FULL;
++	else if (!rgb_full_range_supported && rgb_limited_range_supported)
++		*quantization_range = QUANTIZATION_RANGE_LIMITED;
++	else
++		*quantization_range = QUANTIZATION_RANGE_UNKNOWN;
+ 
+-	sink_index = sink_index_from_sink(core_color, sink);
+-	*quantization_range = core_color->state[sink_index].
+-			preferred_quantization_range;
+ 	return true;
+ }
++
++bool mod_color_is_rgb_full_range_supported_for_timing(
++		const struct dc_sink *sink,
++		const struct dc_crtc_timing *timing)
++{
++	bool result = false;
++
++	if (!sink || !timing)
++		return result;
++
++	if (sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A)
++		if (timing->vic || timing->hdmi_vic)
++			if (timing->h_addressable == 640 &&
++				timing->v_addressable == 480 &&
++				(timing->pix_clk_khz == 25200 ||
++					timing->pix_clk_khz == 25170 ||
++					timing->pix_clk_khz == 25175))
++				result = true;
++			else
++				/* don't support full range rgb */
++				/* for HDMI CEA861 timings except VGA mode */
++				result = false;
++		else
++			result = true;
++	else
++		result = true;
++
++	return result;
++}
++
++bool mod_color_is_rgb_limited_range_supported_for_timing(
++		const struct dc_sink *sink,
++		const struct dc_crtc_timing *timing)
++{
++	bool result = false;
++
++	if (!sink || !timing)
++		return result;
++
++	if (sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A)
++		if (timing->vic || timing->hdmi_vic)
++			if (timing->h_addressable == 640 &&
++				timing->v_addressable == 480 &&
++				(timing->pix_clk_khz == 25200 ||
++						timing->pix_clk_khz == 25170 ||
++						timing->pix_clk_khz == 25175))
++				/* don't support rgb limited for */
++				/* HDMI CEA VGA mode */
++				result = false;
++			else
++				/* support rgb limited for non VGA CEA timing */
++				result = true;
++		else
++			/* support rgb limited for non CEA HDMI timing */
++			result = true;
++	else
++		/* don't support rgb limited for non HDMI signal */
++		result = false;
++
++	return result;
++}
+diff --git a/drivers/gpu/drm/amd/display/modules/inc/mod_color.h b/drivers/gpu/drm/amd/display/modules/inc/mod_color.h
+index e54fe2c..91abc17 100644
+--- a/drivers/gpu/drm/amd/display/modules/inc/mod_color.h
++++ b/drivers/gpu/drm/amd/display/modules/inc/mod_color.h
+@@ -168,12 +168,22 @@ bool mod_color_set_saturation(struct mod_color *mod_color,
+ 		const struct dc_stream **streams, int num_streams,
+ 		int saturation_value);
+ 
+-bool mod_color_set_preferred_quantization_range(struct mod_color *mod_color,
++bool mod_color_persist_user_preferred_quantization_range(
++		struct mod_color *mod_color,
+ 		const struct dc_sink *sink,
+ 		enum dc_quantization_range quantization_range);
+ 
+ bool mod_color_get_preferred_quantization_range(struct mod_color *mod_color,
+ 		const struct dc_sink *sink,
++		const struct dc_crtc_timing *timing,
+ 		enum dc_quantization_range *quantization_range);
+ 
++bool mod_color_is_rgb_full_range_supported_for_timing(
++		const struct dc_sink *sink,
++		const struct dc_crtc_timing *timing);
++
++bool mod_color_is_rgb_limited_range_supported_for_timing(
++		const struct dc_sink *sink,
++		const struct dc_crtc_timing *timing);
++
+ #endif /* MOD_COLOR_H_ */
+-- 
+2.7.4
+

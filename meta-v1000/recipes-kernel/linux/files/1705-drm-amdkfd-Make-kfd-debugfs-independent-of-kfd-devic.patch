@@ -1,0 +1,300 @@
+From 68506e494abdc4aa6fe85c19a36bc68195cd4c18 Mon Sep 17 00:00:00 2001
+From: Yong Zhao <yong.zhao@amd.com>
+Date: Fri, 25 Nov 2016 12:36:28 -0500
+Subject: [PATCH 1705/1722] drm/amdkfd: Make kfd debugfs independent of kfd
+ devices
+
+All the kfd devices should share the same debug file system rather
+than have their own one.
+
+Change-Id: Iea271d2149a5e8c1edd5572f9bcc3d5fd99d78e3
+Signed-off-by: Yong Zhao <yong.zhao@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/Makefile       |  2 +
+ drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c  | 76 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c   | 68 ---------------------------
+ drivers/gpu/drm/amd/amdkfd/kfd_module.c   |  7 ++-
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h     | 12 +++--
+ drivers/gpu/drm/amd/amdkfd/kfd_topology.c |  4 ++
+ 6 files changed, 94 insertions(+), 75 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/Makefile b/drivers/gpu/drm/amd/amdkfd/Makefile
+index aa367f7..b810844 100644
+--- a/drivers/gpu/drm/amd/amdkfd/Makefile
++++ b/drivers/gpu/drm/amd/amdkfd/Makefile
+@@ -20,4 +20,6 @@ amdkfd-y	:= kfd_module.o kfd_device.o kfd_chardev.o kfd_topology.o \
+ 		kfd_dbgdev.o kfd_dbgmgr.o kfd_flat_memory.o kfd_crat.o kfd_rdma.o \
+ 		kfd_peerdirect.o
+ 
++amdkfd-$(CONFIG_DEBUG_FS) += kfd_debugfs.o
++
+ obj-$(CONFIG_HSA_AMD)	+= amdkfd.o
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c b/drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c
+new file mode 100644
+index 0000000..ccf982d
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c
+@@ -0,0 +1,76 @@
++/*
++ * Copyright 2014 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include <linux/debugfs.h>
++#include "kfd_priv.h"
++
++static struct dentry *debugfs_root;
++
++static int kfd_debugfs_open(struct inode *inode, struct file *file)
++{
++	int (*show)(struct seq_file *, void *) = inode->i_private;
++
++	return single_open(file, show, NULL);
++}
++
++static const struct file_operations kfd_debugfs_fops = {
++	.owner = THIS_MODULE,
++	.open = kfd_debugfs_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++void kfd_debugfs_init(void)
++{
++	struct dentry *ent;
++
++	debugfs_root = debugfs_create_dir("kfd", NULL);
++	if (debugfs_root == NULL ||
++	    debugfs_root == ERR_PTR(-ENODEV)) {
++		pr_warn("Failed to create kfd debugfs dir\n");
++		return;
++	}
++
++	ent = debugfs_create_file("mqds", S_IFREG | S_IRUGO, debugfs_root,
++				  kfd_debugfs_mqds_by_process,
++				  &kfd_debugfs_fops);
++	if (ent == NULL)
++		pr_warn("Failed to create mqds in kfd debugfs\n");
++
++	ent = debugfs_create_file("hqds", S_IFREG | S_IRUGO, debugfs_root,
++				  kfd_debugfs_hqds_by_device,
++				  &kfd_debugfs_fops);
++	if (ent == NULL)
++		pr_warn("Failed to create hqds in kfd debugfs\n");
++
++	ent = debugfs_create_file("rls", S_IFREG | S_IRUGO, debugfs_root,
++				  kfd_debugfs_rls_by_device,
++				  &kfd_debugfs_fops);
++	if (ent == NULL)
++		pr_warn("Failed to create rls in kfd debugfs\n");
++}
++
++void kfd_debugfs_fini(void)
++{
++	debugfs_remove_recursive(debugfs_root);
++}
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index dbbe3cf..e426663 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -25,7 +25,6 @@
+ #include <linux/pci.h>
+ #include <linux/slab.h>
+ #include <linux/highmem.h>
+-#include <linux/debugfs.h>
+ #include <linux/fence.h>
+ #include "kfd_priv.h"
+ #include "kfd_device_queue_manager.h"
+@@ -381,70 +380,6 @@ static void kfd_ib_mem_init(struct kfd_dev *kdev)
+ 	kdev->ib_size = PAGE_SIZE;
+ }
+ 
+-#if defined(CONFIG_DEBUG_FS)
+-
+-static int kfd_debugfs_open(struct inode *inode, struct file *file)
+-{
+-	int (*show)(struct seq_file *, void *) = inode->i_private;
+-
+-	return single_open(file, show, NULL);
+-}
+-
+-static const struct file_operations kfd_debugfs_fops = {
+-	.owner = THIS_MODULE,
+-	.open = kfd_debugfs_open,
+-	.read = seq_read,
+-	.llseek = seq_lseek,
+-	.release = single_release,
+-};
+-
+-static void kfd_debugfs_init(struct kfd_dev *kfd)
+-{
+-	struct dentry *ent;
+-
+-	kfd->debugfs_root = debugfs_create_dir("kfd", NULL);
+-	if (kfd->debugfs_root == NULL ||
+-	    kfd->debugfs_root == ERR_PTR(-ENODEV)) {
+-		dev_warn(kfd_device, "Failed to create kfd debugfs dir\n");
+-		return;
+-	}
+-
+-	ent = debugfs_create_file("mqds", S_IFREG | S_IRUGO, kfd->debugfs_root,
+-				  kfd_debugfs_mqds_by_process,
+-				  &kfd_debugfs_fops);
+-	if (ent == NULL)
+-		dev_warn(kfd_device, "Failed to create mqds in kfd debugfs\n");
+-
+-	ent = debugfs_create_file("hqds", S_IFREG | S_IRUGO, kfd->debugfs_root,
+-				  kfd_debugfs_hqds_by_device,
+-				  &kfd_debugfs_fops);
+-	if (ent == NULL)
+-		dev_warn(kfd_device, "Failed to create hqds in kfd debugfs\n");
+-
+-	ent = debugfs_create_file("rls", S_IFREG | S_IRUGO, kfd->debugfs_root,
+-				  kfd_debugfs_rls_by_device,
+-				  &kfd_debugfs_fops);
+-	if (ent == NULL)
+-		dev_warn(kfd_device, "Failed to create rls in kfd debugfs\n");
+-}
+-
+-static void kfd_debugfs_fini(struct kfd_dev *kfd)
+-{
+-	debugfs_remove_recursive(kfd->debugfs_root);
+-}
+-
+-#else
+-
+-static void kfd_debugfs_init(struct kfd_dev *kfd)
+-{
+-}
+-
+-static void kfd_debugfs_fini(struct kfd_dev *kfd)
+-{
+-}
+-
+-#endif
+-
+ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+ 			 const struct kgd2kfd_shared_resources *gpu_resources)
+ {
+@@ -555,8 +490,6 @@ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+ 	if (kfd_resume(kfd))
+ 		goto kfd_resume_error;
+ 
+-	kfd_debugfs_init(kfd);
+-
+ 	kfd->dbgmgr = NULL;
+ 
+ 	kfd->init_complete = true;
+@@ -590,7 +523,6 @@ out:
+ void kgd2kfd_device_exit(struct kfd_dev *kfd)
+ {
+ 	if (kfd->init_complete) {
+-		kfd_debugfs_fini(kfd);
+ 		kgd2kfd_suspend(kfd);
+ 		kfd_cwsr_fini(kfd);
+ 		device_queue_manager_uninit(kfd->dqm);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_module.c b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+index dee66c6..ca82a02 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_module.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+@@ -135,10 +135,12 @@ static int __init kfd_module_init(void)
+ 
+ 	kfd_process_create_wq();
+ 
+-	amdkfd_init_completed = 1;
+-
+ 	kfd_init_peer_direct();
+ 
++	kfd_debugfs_init();
++
++	amdkfd_init_completed = 1;
++
+ 	dev_info(kfd_device, "Initialized module\n");
+ 
+ 	return 0;
+@@ -155,6 +157,7 @@ static void __exit kfd_module_exit(void)
+ {
+ 	amdkfd_init_completed = 0;
+ 
++	kfd_debugfs_fini();
+ 	kfd_close_peer_direct();
+ 	kfd_process_destroy_wq();
+ 	kfd_topology_shutdown();
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index b8907b5..a4964dd 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -278,11 +278,6 @@ struct kfd_dev {
+ 
+ 	/* IB usage */
+ 	uint32_t ib_size;
+-
+-	/* Debugfs */
+-#if defined(CONFIG_DEBUG_FS)
+-	struct dentry *debugfs_root;
+-#endif
+ };
+ 
+ struct kfd_bo {
+@@ -972,6 +967,8 @@ void kfd_close_peer_direct(void);
+ /* Debugfs */
+ #if defined(CONFIG_DEBUG_FS)
+ 
++void kfd_debugfs_init(void);
++void kfd_debugfs_fini(void);
+ int kfd_debugfs_mqds_by_process(struct seq_file *m, void *data);
+ int pqm_debugfs_mqds(struct seq_file *m, void *data);
+ int kfd_debugfs_hqds_by_device(struct seq_file *m, void *data);
+@@ -979,6 +976,11 @@ int device_queue_manager_debugfs_hqds(struct seq_file *m, void *data);
+ int kfd_debugfs_rls_by_device(struct seq_file *m, void *data);
+ int pm_debugfs_runlist(struct seq_file *m, void *data);
+ 
++#else
++
++static inline void kfd_debugfs_init(void) {}
++static inline void kfd_debugfs_fini(void) {}
++
+ #endif
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+index 71287fc..1aa6463 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+@@ -1258,6 +1258,8 @@ int kfd_get_proximity_domain(const struct pci_bus *bus)
+ 	return proximity_domain;
+ }
+ 
++#if defined(CONFIG_DEBUG_FS)
++
+ int kfd_debugfs_hqds_by_device(struct seq_file *m, void *data)
+ {
+ 	struct kfd_topology_device *dev;
+@@ -1307,3 +1309,5 @@ int kfd_debugfs_rls_by_device(struct seq_file *m, void *data)
+ 
+ 	return r;
+ }
++
++#endif
+-- 
+2.7.4
+

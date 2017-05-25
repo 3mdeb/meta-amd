@@ -1,0 +1,116 @@
+From 5f7f4f208f4766aae312325049ec54dcacf0b11b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 6 May 2016 15:31:19 +0200
+Subject: [PATCH 0050/1722] drm/amdgpu: move context switch handling into
+ common code v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+It was a source of bugs to repeat that in each IP version.
+
+v2: rename parameter
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c | 16 ++++++++--------
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c  |  2 +-
+ 3 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index caca87c..a2f5cfa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -2239,7 +2239,7 @@ amdgpu_get_sdma_instance(struct amdgpu_ring *ring)
+ #define amdgpu_ring_get_rptr(r) (r)->funcs->get_rptr((r))
+ #define amdgpu_ring_get_wptr(r) (r)->funcs->get_wptr((r))
+ #define amdgpu_ring_set_wptr(r) (r)->funcs->set_wptr((r))
+-#define amdgpu_ring_emit_ib(r, ib, f) (r)->funcs->emit_ib((r), (ib), (f))
++#define amdgpu_ring_emit_ib(r, ib, c) (r)->funcs->emit_ib((r), (ib), (c))
+ #define amdgpu_ring_emit_pipeline_sync(r) (r)->funcs->emit_pipeline_sync((r))
+ #define amdgpu_ring_emit_vm_flush(r, vmid, addr) (r)->funcs->emit_vm_flush((r), (vmid), (addr))
+ #define amdgpu_ring_emit_fence(r, addr, seq, flags) (r)->funcs->emit_fence((r), (addr), (seq), (flags))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 6f6ce69..ee3a3b1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -121,11 +121,10 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib *ib = &ibs[0];
+ 	uint64_t fence_context = 0, old = ring->last_fence_context;
+-        uint64_t ctx, old_ctx;
+ 	struct fence *hwf;
+ 	struct amdgpu_vm *vm = NULL;
+ 	unsigned i, patch_offset = ~0;
+-        bool skip_preamble;
++        bool skip_preamble, need_ctx_switch;
+ 
+ 	int r = 0;
+ 
+@@ -157,7 +156,6 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 		patch_offset = amdgpu_ring_init_cond_exec(ring);
+ 
+ 	if (vm) {
+-		/* do context switch */
+ 		r = amdgpu_vm_flush(ring, ib->vm_id, ib->vm_pd_addr,
+ 				    ib->gds_base, ib->gds_size,
+ 				    ib->gws_base, ib->gws_size,
+@@ -174,15 +172,17 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 	/* always set cond_exec_polling to CONTINUE */
+ 	*ring->cond_exe_cpu_addr = 1;
+  
+-        skip_preamble = ring->current_ctx == ctx;
+-	old_ctx = ring->current_ctx;
++        skip_preamble = ring->current_ctx == ib->ctx;
++        need_ctx_switch = ring->current_ctx != ib->ctx;
+ 	for (i = 0; i < num_ibs; ++i) {
++                ib = &ibs[i]; 
+  
+                 /* drop preamble IBs if we don't have a context switch */
+                 if ((ib->flags & AMDGPU_IB_FLAG_PREAMBLE) && skip_preamble)
+                         continue;
+ 
+-		amdgpu_ring_emit_ib(ring, ib, (i == 0 && old != fence_context));
++                amdgpu_ring_emit_ib(ring, ib, need_ctx_switch);
++                need_ctx_switch = false;
+ 	}
+ 	ring->last_fence_context = fence_context;
+ 
+@@ -192,7 +192,6 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 	r = amdgpu_fence_emit(ring, &hwf);
+ 	if (r) {
+ 		dev_err(adev->dev, "failed to emit fence (%d)\n", r);
+-		ring->last_fence_context = old;
+ 		if (ib->vm_id)
+ 			amdgpu_vm_reset_id(adev, ib->vm_id);
+ 		amdgpu_ring_undo(ring);
+@@ -212,7 +211,8 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 
+ 	if (patch_offset != ~0 && ring->funcs->patch_cond_exec)
+ 		amdgpu_ring_patch_cond_exec(ring, patch_offset);
+-
++ 
++        ring->current_ctx = ibs->ctx;
+ 	amdgpu_ring_commit(ring);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 85e78b8..5914a2e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -210,7 +210,7 @@ static void cik_sdma_ring_insert_nop(struct amdgpu_ring *ring, uint32_t count)
+  * Schedule an IB in the DMA ring (CIK).
+  */
+ static void cik_sdma_ring_emit_ib(struct amdgpu_ring *ring,
+-			   struct amdgpu_ib *ib)
++                           struct amdgpu_ib *ib, bool ctx_switch)
+ {
+ 	u32 extra_bits = ib->vm_id & 0xf;
+ 	u32 next_rptr = ring->wptr + 5;
+-- 
+2.7.4
+

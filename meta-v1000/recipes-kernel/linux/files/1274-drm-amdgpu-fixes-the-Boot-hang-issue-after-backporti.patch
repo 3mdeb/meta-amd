@@ -1,0 +1,174 @@
+From 1c26c07685de9a1cda55d27be76f04cc8d67c3eb Mon Sep 17 00:00:00 2001
+From: Kalyan Alle <kalyan.alle@amd.com>
+Date: Wed, 16 Nov 2016 18:22:07 +0530
+Subject: [PATCH 1274/1722] drm/amdgpu: fixes the Boot hang issue after
+ backporting to
+
+4.4.11 kernel from amd staging 4.7
+
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 117 ++++++++++++--------------------
+ 1 file changed, 45 insertions(+), 72 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index d1652dd..09d0813 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -280,84 +280,52 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
+ 			    struct ttm_mem_reg *new_mem,
+ 			    struct ttm_mem_reg *old_mem)
+ {
+-	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->bdev);
+-	struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
+-
+-	struct drm_mm_node *old_mm, *new_mm;
+-	uint64_t old_start, old_size, new_start, new_size;
+-	unsigned long num_pages;
+-	struct fence *fence = NULL;
++	struct amdgpu_device *adev;
++	struct amdgpu_ring *ring;
++	uint64_t old_start, new_start;
++	struct fence *fence;
+ 	int r;
+ 
+-	BUILD_BUG_ON((PAGE_SIZE % AMDGPU_GPU_PAGE_SIZE) != 0);
++	adev = amdgpu_ttm_adev(bo->bdev);
++	ring = adev->mman.buffer_funcs_ring;
++	old_start = old_mem->start << PAGE_SHIFT;
++	new_start = new_mem->start << PAGE_SHIFT;
+ 
++	switch (old_mem->mem_type) {
++	case TTM_PL_VRAM:
++		old_start += adev->mc.vram_start;
++		break;
++	case TTM_PL_TT:
++		old_start += adev->mc.gtt_start;
++		break;
++	default:
++		DRM_ERROR("Unknown placement %d\n", old_mem->mem_type);
++		return -EINVAL;
++	}
++	switch (new_mem->mem_type) {
++	case TTM_PL_VRAM:
++		new_start += adev->mc.vram_start;
++		break;
++	case TTM_PL_TT:
++		new_start += adev->mc.gtt_start;
++		break;
++	default:
++		DRM_ERROR("Unknown placement %d\n", old_mem->mem_type);
++		return -EINVAL;
++	}
+ 	if (!ring->ready) {
+ 		DRM_ERROR("Trying to move memory with ring turned off.\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	old_mm = old_mem->mm_node;
+-	r = amdgpu_mm_node_addr(bo, old_mm, old_mem, &old_start);
+-	if (r)
+-		return r;
+-	old_size = old_mm->size;
+-
+-
+-	new_mm = new_mem->mm_node;
+-	r = amdgpu_mm_node_addr(bo, new_mm, new_mem, &new_start);
+-	if (r)
+-		return r;
+-	new_size = new_mm->size;
+-
+-	num_pages = new_mem->num_pages;
+-	while (num_pages) {
+-		unsigned long cur_pages = min(old_size, new_size);
+-		struct fence *next;
+-
+-		r = amdgpu_copy_buffer(ring, old_start, new_start,
+-				       cur_pages * PAGE_SIZE,
+-				       bo->resv, &next, false);
+-		if (r)
+-			goto error;
+-
+-		fence_put(fence);
+-		fence = next;
+-
+-		num_pages -= cur_pages;
+-		if (!num_pages)
+-			break;
+-
+-		old_size -= cur_pages;
+-		if (!old_size) {
+-			r = amdgpu_mm_node_addr(bo, ++old_mm, old_mem,
+-						&old_start);
+-			if (r)
+-				goto error;
+-			old_size = old_mm->size;
+-		} else {
+-			old_start += cur_pages * PAGE_SIZE;
+-		}
+-
+-		new_size -= cur_pages;
+-		if (!new_size) {
+-			r = amdgpu_mm_node_addr(bo, ++new_mm, new_mem,
+-						&new_start);
+-			if (r)
+-				goto error;
+-
+-			new_size = new_mm->size;
+-		} else {
+-			new_start += cur_pages * PAGE_SIZE;
+-		}
+-	}
+-
+-	r = ttm_bo_pipeline_move(bo, fence, evict, new_mem);
+-	fence_put(fence);
+-	return r;
++	BUILD_BUG_ON((PAGE_SIZE % AMDGPU_GPU_PAGE_SIZE) != 0);
+ 
+-error:
+-	if (fence)
+-		fence_wait(fence, false);
++	r = amdgpu_copy_buffer(ring, old_start, new_start,
++			       new_mem->num_pages * PAGE_SIZE, /* bytes */
++			       bo->resv, &fence, false);
++	/* FIXME: handle copy error */
++	r = ttm_bo_move_accel_cleanup(bo, fence,
++				      evict, no_wait_gpu, new_mem);
+ 	fence_put(fence);
+ 	return r;
+ }
+@@ -382,7 +350,7 @@ static int amdgpu_move_vram_ram(struct ttm_buffer_object *bo,
+ 	placement.num_busy_placement = 1;
+ 	placement.busy_placement = &placements;
+ 	placements.fpfn = 0;
+-	placements.lpfn = adev->mc.gtt_size >> PAGE_SHIFT;
++	placements.lpfn = 0;
+ 	placements.flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_TT;
+ 	r = ttm_bo_mem_space(bo, &placement, &tmp_mem,
+ 			     interruptible, no_wait_gpu);
+@@ -429,7 +397,7 @@ static int amdgpu_move_ram_vram(struct ttm_buffer_object *bo,
+ 	placement.num_busy_placement = 1;
+ 	placement.busy_placement = &placements;
+ 	placements.fpfn = 0;
+-	placements.lpfn = adev->mc.gtt_size >> PAGE_SHIFT;
++	placements.lpfn = 0;
+ 	placements.flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_TT;
+ 	r = ttm_bo_mem_space(bo, &placement, &tmp_mem,
+ 			     interruptible, no_wait_gpu);
+@@ -1123,7 +1091,12 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
+ {
+ 	unsigned i, j;
+ 	int r;
+-
++	
++	r = amdgpu_ttm_global_init(adev);
++	if (r) {
++		return r;
++	}
++	
+ 	/* No others user of address space so set it to 0 */
+ 	r = ttm_bo_device_init(&adev->mman.bdev,
+ 			       adev->mman.bo_global_ref.ref.object,
+-- 
+2.7.4
+
