@@ -9,10 +9,12 @@ SECTION = "x11/base"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM_amd = "file://xf86drm.c;beginline=9;endline=32;md5=c8a3b961af7667c530816761e949dc71"
 PROVIDES = "drm"
-PV_amd = "git"
+PV = "git"
+
+inherit autotools pkgconfig
 
 SRCREV = "41be41f99eb53bd4998b1cd930fa63f0e552d971"
-DEPENDS_append = "libpthread-stubs udev libpciaccess freetype libxext cairo fontconfig libxrender libpng pixman"
+DEPENDS = "libpthread-stubs udev libpciaccess freetype libxext cairo fontconfig libxrender libpng pixman"
 
 SRC_URI = "git://anongit.freedesktop.org/mesa/drm;branch=master \
 	       file://0001-amdgpu-Implement-SVM-v3.patch \
@@ -57,9 +59,7 @@ SRC_URI = "git://anongit.freedesktop.org/mesa/drm;branch=master \
 
 S = "${WORKDIR}/git"
 
-inherit autotools pkgconfig
-
-EXTRA_OECONF_append = "--disable-cairo-tests \
+EXTRA_OECONF = "--disable-cairo-tests \
                  --enable-omap-experimental-api \
                  --enable-install-test-programs \
                  --disable-manpages \
