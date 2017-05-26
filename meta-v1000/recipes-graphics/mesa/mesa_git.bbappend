@@ -7,3 +7,5 @@ MESA_LLVM_RELEASE_v1000 = "5.0.0"
 SRC_URI_v1000 = "\
 			git://people.freedesktop.org/~mareko/mesa;branch=raven \
 "
+
+MESA_CRYPTO_v1000 = ""
