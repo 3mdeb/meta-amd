@@ -95,7 +95,6 @@ do_install() {
 
     # We'll have to delete the libLLVM.so due to multiple reasons...
     rm -rf ${D}${libdir}/${LLVM_DIR}/libLLVM.so
-    rm -rf ${D}${libdir}/${LLVM_DIR}/libLTO.*
 }
 
 SYSROOT_PREPROCESS_FUNCS += "llvm_sysroot_preprocess"
@@ -105,7 +104,6 @@ llvm_sysroot_preprocess() {
     cp ${LLVM_INSTALL_DIR}/llvm-config-host ${SYSROOT_DESTDIR}${bindir_crossscripts}/llvm-config${PV}
 }
 
-PACKAGES += "${PN}-bugpointpasses ${PN}-llvmhello"
 ALLOW_EMPTY_${PN} = "1"
 ALLOW_EMPTY_${PN}-staticdev = "1"
 FILES_${PN} = ""
@@ -120,26 +118,18 @@ FILES_${PN}-dev = " \
     ${bindir}/${LLVM_DIR} \
     ${includedir}/${LLVM_DIR} \
 "
-RRECOMMENDS_${PN}-dev += "${PN}-bugpointpasses ${PN}-llvmhello"
-
-FILES_${PN}-bugpointpasses = "\
-    ${libdir}/${LLVM_DIR}/BugpointPasses.so \
-"
-FILES_${PN}-llvmhello = "\
-    ${libdir}/${LLVM_DIR}/LLVMHello.so \
-"
 
 PACKAGES_DYNAMIC = "^libllvm${LLVM_RELEASE}-.*$"
 NOAUTOPACKAGEDEBUG = "1"
 
-INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-llvm-${LLVM_RELEASE} += "dev-so"
-INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-llvm += "dev-so"
+INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-libllvm-${LLVM_RELEASE} += "dev-so"
+INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-liblto += "dev-so"
 
-python llvm_populate_packages() {
+python populate_packages_prepend() {
     libdir = bb.data.expand('${libdir}', d)
     libllvm_libdir = bb.data.expand('${libdir}/${LLVM_DIR}', d)
     split_dbg_packages = do_split_packages(d, libllvm_libdir+'/.debug', '^lib(.*)\.so$', 'libllvm${LLVM_RELEASE}-%s-dbg', 'Split debug package for %s', allow_dirs=True)
-    split_packages = do_split_packages(d, libdir, '^lib(.*)\.so$', 'libllvm${LLVM_RELEASE}-%s', 'Split package for %s', allow_dirs=True, allow_links=True, recursive=True)
+    split_packages = do_split_packages(d, libdir, '^(.*)\.so\.*', 'libllvm${LLVM_RELEASE}-%s', 'Split package for %s', extra_depends='', allow_dirs=True, allow_links=True, recursive=True)
     split_staticdev_packages = do_split_packages(d, libllvm_libdir, '^lib(.*)\.a$', 'libllvm${LLVM_RELEASE}-%s-staticdev', 'Split staticdev package for %s', allow_dirs=True)
     if split_packages:
         pn = d.getVar('PN', True)
@@ -147,5 +137,3 @@ python llvm_populate_packages() {
         d.appendVar('RDEPENDS_' + pn + '-dbg', ' '+' '.join(split_dbg_packages))
         d.appendVar('RDEPENDS_' + pn + '-staticdev', ' '+' '.join(split_staticdev_packages))
 }
-
-PACKAGESPLITFUNCS_prepend = "llvm_populate_packages "
