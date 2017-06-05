@@ -23,7 +23,7 @@ SRCREV = "ebeeed1f0b22188f42c8bc8e489239386ab5f0a3"
 SRC_URI = "git://github.com/KhronosGroup/Vulkan-LoaderAndValidationLayers;branch=sdk-${PV} \
            file://0001-CMakeLists-add-include-path-so-Xlib.h-is-found-as-ne.patch \
            file://0002-install-demos.patch \
-           file://0003-demos-make-shader-location-relative-rework-for-cpp.patch"
+           file://0003-demos-make-shader-location-relative.patch"
 
 EXTRA_OECMAKE = " \
     -DCUSTOM_GLSLANG_BIN_ROOT=1 \
@@ -47,7 +47,4 @@ do_install_append() {
     cp -f ${B}/demos/*.ppm ${D}${bindir}
     mv ${D}${bindir}/cube ${D}${bindir}/cube-vulkan
     mv ${D}${bindir}/cubepp ${D}${bindir}/cubepp-vulkan
-
-    install -d ${D}${includedir}
-    cp -rf ${S}/include/vulkan ${D}${includedir}
 }
