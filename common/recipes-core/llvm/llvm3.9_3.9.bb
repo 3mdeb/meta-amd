@@ -17,7 +17,8 @@ LLVM_RELEASE = "${PV}"
 LLVM_DIR = "llvm${LLVM_RELEASE}"
 
 SRCREV = "a093ef43dd592b729da46db4ff3057fef9a46023"
-PV = "3.9.1"
+PV = "3.9"
+PATCH_VERSION = "1"
 SRC_URI = "git://llvm.org/git/llvm.git;branch=release_39;protocol=http \
            file://0001-CrossCompile.cmake-adjust-build-for-OE.patch \
            file://0002-CrossCompile.cmake-use-target-BuildVariables-include.patch \
@@ -132,6 +133,7 @@ FILES_${PN}-llvmhello = "\
 PACKAGES_DYNAMIC = "^libllvm${LLVM_RELEASE}-.*$"
 NOAUTOPACKAGEDEBUG = "1"
 
+INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-llvm-${LLVM_RELEASE}.${PATCH_VERSION} += "dev-so"
 INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-llvm-${LLVM_RELEASE} += "dev-so"
 INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-llvm += "dev-so"
 
