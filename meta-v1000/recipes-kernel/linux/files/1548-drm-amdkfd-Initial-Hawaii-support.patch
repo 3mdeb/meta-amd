@@ -1,0 +1,539 @@
+From 0bb5db4526b4d57d0cf7aac30c567aa9f929b336 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Fri, 22 Apr 2016 16:23:19 -0400
+Subject: [PATCH 1548/1722] drm/amdkfd: Initial Hawaii support
+
+Change-Id: I5dd4e190ee7796a5ea67eeeaa703ca24317695c2
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c           |  3 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_crat.c              |  5 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_dbgmgr.c            |  3 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c            | 26 +++++++++-
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 25 ++++++----
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.h  |  3 ++
+ .../drm/amd/amdkfd/kfd_device_queue_manager_cik.c  | 56 ++++++++++++++++++++++
+ .../drm/amd/amdkfd/kfd_device_queue_manager_vi.c   | 16 +++----
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c      |  1 +
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c       |  2 +
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c   | 39 ++++++++++++---
+ drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c    |  1 +
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h              |  6 ++-
+ .../gpu/drm/amd/amdkfd/kfd_process_queue_manager.c |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_topology.c          |  1 +
+ 15 files changed, 158 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index fe3caa16..032e287 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1098,7 +1098,8 @@ static int kfd_ioctl_alloc_scratch_memory(struct file *filep,
+ 
+ 	up_write(&p->lock);
+ 
+-	if (sched_policy == KFD_SCHED_POLICY_NO_HWS && pdd->qpd.vmid != 0) {
++	if (dev->dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS &&
++	    pdd->qpd.vmid != 0) {
+ 		err = dev->kfd2kgd->alloc_memory_of_scratch(
+ 			dev->kgd, args->va_addr, pdd->qpd.vmid);
+ 		if (err != 0)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+index 7001b59..2583ab1 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+@@ -103,6 +103,7 @@ static struct kfd_gpu_cache_info carrizo_cache_info[] = {
+ 
+ /* NOTE: In future if more information is added to struct kfd_gpu_cache_info
+  *	the following ASICs may need a separate table. */
++#define hawaii_cache_info kaveri_cache_info
+ #define tonga_cache_info carrizo_cache_info
+ #define fiji_cache_info  carrizo_cache_info
+ 
+@@ -560,6 +561,10 @@ static int kfd_fill_gpu_cache_info(struct kfd_dev *kdev,
+ 		pcache_info = kaveri_cache_info;
+ 		num_of_cache_types = ARRAY_SIZE(kaveri_cache_info);
+ 		break;
++	case CHIP_HAWAII:
++		pcache_info = hawaii_cache_info;
++		num_of_cache_types = ARRAY_SIZE(hawaii_cache_info);
++		break;
+ 	case CHIP_CARRIZO:
+ 		pcache_info = carrizo_cache_info;
+ 		num_of_cache_types = ARRAY_SIZE(carrizo_cache_info);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_dbgmgr.c b/drivers/gpu/drm/amd/amdkfd/kfd_dbgmgr.c
+index 5d269ea..426f776 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_dbgmgr.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_dbgmgr.c
+@@ -33,6 +33,7 @@
+ #include "kfd_pm4_headers_diq.h"
+ #include "kfd_dbgmgr.h"
+ #include "kfd_dbgdev.h"
++#include "kfd_device_queue_manager.h"
+ 
+ static DEFINE_MUTEX(kfd_dbgmgr_mutex);
+ 
+@@ -93,7 +94,7 @@ kfd_dbgmgr_create(struct kfd_dbgmgr **ppmgr, struct kfd_dev *pdev)
+ 	}
+ 
+ 	/* get actual type of DBGDevice cpsch or not */
+-	if (sched_policy == KFD_SCHED_POLICY_NO_HWS)
++	if (pdev->dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
+ 		type = DBGDEV_TYPE_NODIQ;
+ 
+ 	kfd_dbgdev_init(new_buff->dbgdev, pdev, type);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 20592ba..8bf209d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -44,6 +44,18 @@ static const struct kfd_device_info kaveri_device_info = {
+ 	.is_need_iommu_device = true
+ };
+ 
++static const struct kfd_device_info hawaii_device_info = {
++	.asic_family = CHIP_HAWAII,
++	.max_pasid_bits = 16,
++	/* max num of queues for KV.TODO should be a dynamic value */
++	.max_no_of_hqd	= 24,
++	.ih_ring_entry_size = 4 * sizeof(uint32_t),
++	.event_interrupt_class = &event_interrupt_class_cik,
++	.num_of_watch_points = 4,
++	.mqd_size_aligned = MQD_SIZE_ALIGNED,
++	.is_need_iommu_device = false
++};
++
+ static const struct kfd_device_info carrizo_device_info = {
+ 	.asic_family = CHIP_CARRIZO,
+ 	.max_pasid_bits = 16,
+@@ -120,6 +132,18 @@ static const struct kfd_deviceid supported_devices[] = {
+ 	{ 0x131B, &kaveri_device_info },	/* Kaveri */
+ 	{ 0x131C, &kaveri_device_info },	/* Kaveri */
+ 	{ 0x131D, &kaveri_device_info },	/* Kaveri */
++	{ 0x67A0, &hawaii_device_info },	/* Hawaii */
++	{ 0x67A1, &hawaii_device_info },	/* Hawaii */
++	{ 0x67A2, &hawaii_device_info },	/* Hawaii */
++	{ 0x67A8, &hawaii_device_info },	/* Hawaii */
++	{ 0x67A9, &hawaii_device_info },	/* Hawaii */
++	{ 0x67AA, &hawaii_device_info },	/* Hawaii */
++	{ 0x67B0, &hawaii_device_info },	/* Hawaii */
++	{ 0x67B1, &hawaii_device_info },	/* Hawaii */
++	{ 0x67B8, &hawaii_device_info },	/* Hawaii */
++	{ 0x67B9, &hawaii_device_info },	/* Hawaii */
++	{ 0x67BA, &hawaii_device_info },	/* Hawaii */
++	{ 0x67BE, &hawaii_device_info },	/* Hawaii */
+ 	{ 0x9870, &carrizo_device_info },	/* Carrizo */
+ 	{ 0x9874, &carrizo_device_info },	/* Carrizo */
+ 	{ 0x9875, &carrizo_device_info },	/* Carrizo */
+@@ -422,7 +446,7 @@ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+ 		 kfd->pdev->device);
+ 
+ 	pr_debug("kfd: Starting kfd with the following scheduling policy %d\n",
+-		sched_policy);
++		kfd->dqm->sched_policy);
+ 
+ 	goto out;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 463afb1..c74ef02 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -394,7 +394,7 @@ static int update_queue(struct device_queue_manager *dqm, struct queue *q)
+ 
+ 
+ 	retval = mqd->update_mqd(mqd, q->mqd, &q->properties);
+-	if (sched_policy == KFD_SCHED_POLICY_NO_HWS &&
++	if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS &&
+ 		q->properties.type == KFD_QUEUE_TYPE_COMPUTE)
+ 		retval = mqd->load_mqd(mqd, q->mqd, q->pipe,
+ 			q->queue,
+@@ -408,7 +408,7 @@ static int update_queue(struct device_queue_manager *dqm, struct queue *q)
+ 	else if ((!q->properties.is_active) && (prev_active))
+ 		dqm->queue_count--;
+ 
+-	if (sched_policy != KFD_SCHED_POLICY_NO_HWS)
++	if (dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS)
+ 		retval = execute_queues_cpsch(dqm);
+ 
+ 	mutex_unlock(&dqm->lock);
+@@ -462,7 +462,7 @@ int process_evict_queues(struct device_queue_manager *dqm,
+ 			q->properties.is_evicted = true;
+ 
+ 		retval = mqd->update_mqd(mqd, q->mqd, &q->properties);
+-		if (sched_policy == KFD_SCHED_POLICY_NO_HWS &&
++		if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS &&
+ 				q->properties.type == KFD_QUEUE_TYPE_COMPUTE)
+ 			retval = mqd->load_mqd(mqd, q->mqd, q->pipe,
+ 				q->queue,
+@@ -470,7 +470,7 @@ int process_evict_queues(struct device_queue_manager *dqm,
+ 		if (q->properties.is_evicted)
+ 			dqm->queue_count--;
+ 	}
+-	if (sched_policy != KFD_SCHED_POLICY_NO_HWS)
++	if (dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS)
+ 		retval = execute_queues_cpsch(dqm);
+ 
+ 	mutex_unlock(&dqm->lock);
+@@ -511,7 +511,7 @@ int process_restore_queues(struct device_queue_manager *dqm,
+ 		if (q->properties.is_evicted) {
+ 			q->properties.is_evicted = false;
+ 			retval = mqd->update_mqd(mqd, q->mqd, &q->properties);
+-			if (sched_policy == KFD_SCHED_POLICY_NO_HWS &&
++			if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS &&
+ 				q->properties.type == KFD_QUEUE_TYPE_COMPUTE)
+ 				retval =
+ 						mqd->load_mqd(
+@@ -524,7 +524,7 @@ int process_restore_queues(struct device_queue_manager *dqm,
+ 			dqm->queue_count++;
+ 		}
+ 	}
+-	if (sched_policy != KFD_SCHED_POLICY_NO_HWS)
++	if (dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS)
+ 		retval = execute_queues_cpsch(dqm);
+ 
+ 	if (retval == 0)
+@@ -1303,7 +1303,7 @@ static bool set_cache_memory_policy(struct device_queue_manager *dqm,
+ 			alternate_aperture_base,
+ 			alternate_aperture_size);
+ 
+-	if ((sched_policy == KFD_SCHED_POLICY_NO_HWS) && (qpd->vmid != 0))
++	if ((dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS) && (qpd->vmid != 0))
+ 		program_sh_mem_settings(dqm, qpd);
+ 
+ 	pr_debug("kfd: sh_mem_config: 0x%x, ape1_base: 0x%x, ape1_limit: 0x%x\n",
+@@ -1360,7 +1360,7 @@ static int set_page_directory_base(struct device_queue_manager *dqm,
+ 	 * Preempt queues, destroy runlist and create new runlist. Queues
+ 	 * will have the update PD base address
+ 	 */
+-	if (sched_policy != KFD_SCHED_POLICY_NO_HWS)
++	if (dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS)
+ 		retval = execute_queues_cpsch(dqm);
+ 
+ out:
+@@ -1496,8 +1496,11 @@ struct device_queue_manager *device_queue_manager_init(struct kfd_dev *dev)
+ 	if (!dqm)
+ 		return NULL;
+ 
++	dqm->sched_policy = (dev->device_info->asic_family == CHIP_HAWAII) ?
++		KFD_SCHED_POLICY_NO_HWS : sched_policy;
++
+ 	dqm->dev = dev;
+-	switch (sched_policy) {
++	switch (dqm->sched_policy) {
+ 	case KFD_SCHED_POLICY_HWS:
+ 	case KFD_SCHED_POLICY_HWS_NO_OVERSUBSCRIPTION:
+ 		/* initialize dqm for cp scheduling */
+@@ -1549,6 +1552,10 @@ struct device_queue_manager *device_queue_manager_init(struct kfd_dev *dev)
+ 		device_queue_manager_init_cik(&dqm->ops_asic_specific);
+ 		break;
+ 
++	case CHIP_HAWAII:
++		device_queue_manager_init_cik_hawaii(&dqm->ops_asic_specific);
++		break;
++
+ 	case CHIP_TONGA:
+ 	case CHIP_FIJI:
+ 		device_queue_manager_init_vi_tonga(&dqm->ops_asic_specific);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+index 19132d9..8452461 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+@@ -189,9 +189,12 @@ struct device_queue_manager {
+ 	unsigned int		*fence_addr;
+ 	struct kfd_mem_obj	*fence_mem;
+ 	bool			active_runlist;
++	int			sched_policy;
+ };
+ 
+ void device_queue_manager_init_cik(struct device_queue_manager_asic_ops *ops);
++void device_queue_manager_init_cik_hawaii(
++		struct device_queue_manager_asic_ops *ops);
+ void device_queue_manager_init_vi(struct device_queue_manager_asic_ops *ops);
+ void device_queue_manager_init_vi_tonga(
+ 		struct device_queue_manager_asic_ops *ops);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_cik.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_cik.c
+index fdcd517..20f38c2 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_cik.c
+@@ -34,9 +34,14 @@ static bool set_cache_memory_policy_cik(struct device_queue_manager *dqm,
+ 				   uint64_t alternate_aperture_size);
+ static int register_process_cik(struct device_queue_manager *dqm,
+ 					struct qcm_process_device *qpd);
++static int register_process_cik_hawaii(struct device_queue_manager *dqm,
++					struct qcm_process_device *qpd);
+ static int initialize_cpsch_cik(struct device_queue_manager *dqm);
+ static void init_sdma_vm(struct device_queue_manager *dqm, struct queue *q,
+ 				struct qcm_process_device *qpd);
++static void init_sdma_vm_hawaii(struct device_queue_manager *dqm,
++				struct queue *q,
++				struct qcm_process_device *qpd);
+ 
+ void device_queue_manager_init_cik(struct device_queue_manager_asic_ops *ops)
+ {
+@@ -46,6 +51,14 @@ void device_queue_manager_init_cik(struct device_queue_manager_asic_ops *ops)
+ 	ops->init_sdma_vm = init_sdma_vm;
+ }
+ 
++void device_queue_manager_init_cik_hawaii(struct device_queue_manager_asic_ops *ops)
++{
++	ops->set_cache_memory_policy = set_cache_memory_policy_cik;
++	ops->register_process = register_process_cik_hawaii;
++	ops->initialize = initialize_cpsch_cik;
++	ops->init_sdma_vm = init_sdma_vm_hawaii;
++}
++
+ static uint32_t compute_sh_mem_bases_64bit(unsigned int top_address_nybble)
+ {
+ 	/* In 64-bit mode, we can only control the top 3 bits of the LDS,
+@@ -135,6 +148,37 @@ static int register_process_cik(struct device_queue_manager *dqm,
+ 	return 0;
+ }
+ 
++static int register_process_cik_hawaii(struct device_queue_manager *dqm,
++		struct qcm_process_device *qpd)
++{
++	struct kfd_process_device *pdd;
++	unsigned int temp;
++
++	BUG_ON(!dqm || !qpd);
++
++	pdd = qpd_to_pdd(qpd);
++
++	/* check if sh_mem_config register already configured */
++	if (qpd->sh_mem_config == 0) {
++		qpd->sh_mem_config =
++			ALIGNMENT_MODE(SH_MEM_ALIGNMENT_MODE_UNALIGNED) |
++			DEFAULT_MTYPE(MTYPE_NONCACHED) |
++			APE1_MTYPE(MTYPE_NONCACHED);
++		qpd->sh_mem_ape1_limit = 0;
++		qpd->sh_mem_ape1_base = 0;
++	}
++
++	/* On dGPU we're always in GPUVM64 addressing mode with 64-bit
++	 * aperture addresses. */
++	temp = get_sh_mem_bases_nybble_64(pdd);
++	qpd->sh_mem_bases = compute_sh_mem_bases_64bit(temp);
++
++	pr_debug("kfd: is32bit process: %d sh_mem_bases nybble: 0x%X and register 0x%X\n",
++		qpd->pqm->process->is_32bit_user_mode, temp, qpd->sh_mem_bases);
++
++	return 0;
++}
++
+ static void init_sdma_vm(struct device_queue_manager *dqm, struct queue *q,
+ 				struct qcm_process_device *qpd)
+ {
+@@ -151,6 +195,18 @@ static void init_sdma_vm(struct device_queue_manager *dqm, struct queue *q,
+ 	q->properties.sdma_vm_addr = value;
+ }
+ 
++static void init_sdma_vm_hawaii(struct device_queue_manager *dqm,
++				struct queue *q,
++				struct qcm_process_device *qpd)
++{
++	/* On dGPU we're always in GPUVM64 addressing mode with 64-bit
++	 * aperture addresses. */
++	q->properties.sdma_vm_addr =
++		((get_sh_mem_bases_nybble_64(qpd_to_pdd(qpd))) <<
++		 SDMA0_RLC0_VIRTUAL_ADDR__SHARED_BASE__SHIFT) &
++		SDMA0_RLC0_VIRTUAL_ADDR__SHARED_BASE_MASK;
++}
++
+ static int initialize_cpsch_cik(struct device_queue_manager *dqm)
+ {
+ 	return init_pipelines(dqm, get_pipes_num(dqm), get_first_pipe(dqm));
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_vi.c
+index c023e50..981d4c9 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_vi.c
+@@ -254,16 +254,12 @@ static void init_sdma_vm_tonga(struct device_queue_manager *dqm,
+ 			struct queue *q,
+ 			struct qcm_process_device *qpd)
+ {
+-	uint32_t value = 0;
+-
+-	if (q->process->is_32bit_user_mode)
+-		value |= (1 << SDMA0_RLC0_VIRTUAL_ADDR__PTR32__SHIFT) |
+-				get_sh_mem_bases_32(qpd_to_pdd(qpd));
+-	else
+-		value |= ((get_sh_mem_bases_nybble_64(qpd_to_pdd(qpd))) <<
+-				SDMA0_RLC0_VIRTUAL_ADDR__SHARED_BASE__SHIFT) &
+-				SDMA0_RLC0_VIRTUAL_ADDR__SHARED_BASE_MASK;
+-	q->properties.sdma_vm_addr = value;
++	/* On dGPU we're always in GPUVM64 addressing mode with 64-bit
++	 * aperture addresses. */
++	q->properties.sdma_vm_addr =
++		((get_sh_mem_bases_nybble_64(qpd_to_pdd(qpd))) <<
++		 SDMA0_RLC0_VIRTUAL_ADDR__SHARED_BASE__SHIFT) &
++		SDMA0_RLC0_VIRTUAL_ADDR__SHARED_BASE_MASK;
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+index 513cfe6..fbee118 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+@@ -311,6 +311,7 @@ struct kernel_queue *kernel_queue_init(struct kfd_dev *dev,
+ 		break;
+ 
+ 	case CHIP_KAVERI:
++	case CHIP_HAWAII:
+ 		kernel_queue_init_cik(&kq->ops_asic_specific);
+ 		break;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c
+index ef1dc9b..3281eb1 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c
+@@ -29,6 +29,8 @@ struct mqd_manager *mqd_manager_init(enum KFD_MQD_TYPE type,
+ 	switch (dev->device_info->asic_family) {
+ 	case CHIP_KAVERI:
+ 		return mqd_manager_init_cik(type, dev);
++	case CHIP_HAWAII:
++		return mqd_manager_init_cik_hawaii(type, dev);
+ 	case CHIP_CARRIZO:
+ 		return mqd_manager_init_vi(type, dev);
+ 	case CHIP_TONGA:
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+index 44dcd9c..bf31b18 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -136,10 +136,6 @@ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 	m->cp_mqd_base_addr_lo        = lower_32_bits(addr);
+ 	m->cp_mqd_base_addr_hi        = upper_32_bits(addr);
+ 
+-	m->cp_hqd_ib_control = DEFAULT_MIN_IB_AVAIL_SIZE | IB_ATC_EN;
+-	/* Although WinKFD writes this, I suspect it should not be necessary */
+-	m->cp_hqd_ib_control = IB_ATC_EN | DEFAULT_MIN_IB_AVAIL_SIZE;
+-
+ 	m->cp_hqd_quantum = QUANTUM_EN | QUANTUM_SCALE_1MS |
+ 				QUANTUM_DURATION(10);
+ 
+@@ -224,8 +220,8 @@ static int load_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ 	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd);
+ }
+ 
+-static int update_mqd(struct mqd_manager *mm, void *mqd,
+-			struct queue_properties *q)
++static int __update_mqd(struct mqd_manager *mm, void *mqd,
++			struct queue_properties *q, unsigned int atc_bit)
+ {
+ 	struct cik_mqd *m;
+ 
+@@ -235,7 +231,12 @@ static int update_mqd(struct mqd_manager *mm, void *mqd,
+ 
+ 	m = get_mqd(mqd);
+ 	m->cp_hqd_pq_control = DEFAULT_RPTR_BLOCK_SIZE |
+-				DEFAULT_MIN_AVAIL_SIZE | PQ_ATC_EN;
++				DEFAULT_MIN_AVAIL_SIZE;
++	m->cp_hqd_ib_control = DEFAULT_MIN_IB_AVAIL_SIZE;
++        if (atc_bit) {
++		m->cp_hqd_pq_control |= PQ_ATC_EN;
++		m->cp_hqd_ib_control |= IB_ATC_EN;
++	}
+ 
+ 	/*
+ 	 * Calculating queue size which is log base 2 of actual queue size -1
+@@ -271,6 +272,18 @@ static int update_mqd(struct mqd_manager *mm, void *mqd,
+ 	return 0;
+ }
+ 
++static int update_mqd(struct mqd_manager *mm, void *mqd,
++			struct queue_properties *q)
++{
++	return __update_mqd(mm, mqd, q, 1);
++}
++
++static int update_mqd_hawaii(struct mqd_manager *mm, void *mqd,
++			struct queue_properties *q)
++{
++	return __update_mqd(mm, mqd, q, 0);
++}
++
+ static int update_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ 				struct queue_properties *q)
+ {
+@@ -511,3 +524,15 @@ struct mqd_manager *mqd_manager_init_cik(enum KFD_MQD_TYPE type,
+ 	return mqd;
+ }
+ 
++struct mqd_manager *mqd_manager_init_cik_hawaii(enum KFD_MQD_TYPE type,
++			struct kfd_dev *dev)
++{
++	struct mqd_manager *mqd;
++
++	mqd = mqd_manager_init_cik(type, dev);
++	if (!mqd)
++		return NULL;
++	if ((type == KFD_MQD_TYPE_CP) || (type == KFD_MQD_TYPE_COMPUTE))
++		mqd->update_mqd = update_mqd_hawaii;
++	return mqd;
++}
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+index c5356eb..d8dac47 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+@@ -569,6 +569,7 @@ int pm_init(struct packet_manager *pm, struct device_queue_manager *dqm,
+ 
+ 	switch (pm->dqm->dev->device_info->asic_family) {
+ 	case CHIP_KAVERI:
++	case CHIP_HAWAII:
+ 		if (fw_ver >= KFD_SCRATCH_KV_FW_VER) {
+ 			pm->pmf->map_process = pm_create_map_process_scratch_kv;
+ 			pm->pmf->get_map_process_packet_size =
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index ae636ae..cfa2283 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -158,13 +158,15 @@ enum cache_policy {
+ 
+ enum asic_family_type {
+ 	CHIP_KAVERI = 0,
++	CHIP_HAWAII,
+ 	CHIP_CARRIZO,
+ 	CHIP_TONGA,
+ 	CHIP_FIJI
+ };
+ 
+ #define KFD_IS_VI(chip) ((chip) >= CHIP_CARRIZO && (chip) <= CHIP_FIJI)
+-#define KFD_IS_DGPU(chip) ((chip) >= CHIP_TONGA && (chip) <= CHIP_FIJI)
++#define KFD_IS_DGPU(chip) (((chip) >= CHIP_TONGA && (chip) <= CHIP_FIJI) || \
++			   (chip) == CHIP_HAWAII)
+ 
+ struct kfd_event_interrupt_class {
+ 	bool (*interrupt_isr)(struct kfd_dev *dev, const uint32_t *ih_ring_entry);
+@@ -774,6 +776,8 @@ struct mqd_manager *mqd_manager_init(enum KFD_MQD_TYPE type,
+ 					struct kfd_dev *dev);
+ struct mqd_manager *mqd_manager_init_cik(enum KFD_MQD_TYPE type,
+ 		struct kfd_dev *dev);
++struct mqd_manager *mqd_manager_init_cik_hawaii(enum KFD_MQD_TYPE type,
++		struct kfd_dev *dev);
+ struct mqd_manager *mqd_manager_init_vi(enum KFD_MQD_TYPE type,
+ 		struct kfd_dev *dev);
+ struct mqd_manager *mqd_manager_init_vi_tonga(enum KFD_MQD_TYPE type,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+index 8e2c9a7..75c6f18 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -232,7 +232,7 @@ int pqm_create_queue(struct process_queue_manager *pqm,
+ 
+ 	case KFD_QUEUE_TYPE_COMPUTE:
+ 		/* check if there is over subscription */
+-		if ((sched_policy == KFD_SCHED_POLICY_HWS_NO_OVERSUBSCRIPTION) &&
++		if ((dev->dqm->sched_policy == KFD_SCHED_POLICY_HWS_NO_OVERSUBSCRIPTION) &&
+ 		((dev->dqm->processes_count >= dev->vm_info.vmid_num_kfd) ||
+ 		(dev->dqm->queue_count >= PIPE_PER_ME_CP_SCHEDULING * QUEUES_PER_PIPE))) {
+ 			pr_err("kfd: over-subscription is not allowed in radeon_kfd.sched_policy == 1\n");
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+index 46b9529..690464f0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+@@ -1081,6 +1081,7 @@ int kfd_topology_add_device(struct kfd_dev *gpu)
+ 
+ 	switch (dev->gpu->device_info->asic_family) {
+ 	case CHIP_KAVERI:
++	case CHIP_HAWAII:
+ 		dev->node_props.capability |= ((HSA_CAP_DOORBELL_TYPE_PRE_1_0 <<
+ 			HSA_CAP_DOORBELL_TYPE_TOTALBITS_SHIFT) &
+ 			HSA_CAP_DOORBELL_TYPE_TOTALBITS_MASK);
+-- 
+2.7.4
+

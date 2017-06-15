@@ -1,0 +1,615 @@
+From c5204c6125d383776b30ff6d42052369bddd37c7 Mon Sep 17 00:00:00 2001
+From: Tony Cheng <tony.cheng@amd.com>
+Date: Wed, 30 Nov 2016 16:15:47 -0500
+Subject: [PATCH 1771/3082] drm/amd/display: refactor DCE11 DVVM
+
+- move to new programming style
+- clean up table to make it obvious what we are programming
+
+Change-Id: I3eb96038c3fbdeed29d6c96da5832603cc1601c9
+Signed-off-by: Tony Cheng <tony.cheng@amd.com>
+Reviewed-by: Zeyu Fan <Zeyu.Fan@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.c | 135 ++++++++++++++++++++-
+ drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.h |  59 +++++++--
+ .../drm/amd/display/dc/dce100/dce100_resource.c    |   6 +-
+ .../drm/amd/display/dc/dce110/dce110_mem_input.c   | 113 +----------------
+ .../drm/amd/display/dc/dce110/dce110_mem_input.h   |  11 --
+ .../drm/amd/display/dc/dce110/dce110_mem_input_v.c |   8 +-
+ .../drm/amd/display/dc/dce110/dce110_resource.c    |   6 +-
+ .../drm/amd/display/dc/dce112/dce112_resource.c    |   6 +-
+ .../gpu/drm/amd/display/dc/dce80/dce80_resource.c  |   6 +-
+ drivers/gpu/drm/amd/display/dc/inc/hw/mem_input.h  |   4 +-
+ 10 files changed, 201 insertions(+), 153 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.c b/drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.c
+index 654731c..fd8a49a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.c
+@@ -35,6 +35,137 @@
+ #define FN(reg_name, field_name) \
+ 	mi->shifts->field_name, mi->masks->field_name
+ 
++struct pte_setting {
++	unsigned int bpp;
++	unsigned int page_width;
++	unsigned int page_height;
++	unsigned char min_pte_before_flip_horiz_scan;
++	unsigned char min_pte_before_flip_vert_scan;
++	unsigned char pte_req_per_chunk;
++	unsigned char param_6;
++	unsigned char param_7;
++	unsigned char param_8;
++};
++
++enum mi_bits_per_pixel {
++	mi_bpp_8 = 0,
++	mi_bpp_16,
++	mi_bpp_32,
++	mi_bpp_64,
++	mi_bpp_count,
++};
++
++enum mi_tiling_format {
++	mi_tiling_linear = 0,
++	mi_tiling_1D,
++	mi_tiling_2D,
++	mi_tiling_count,
++};
++
++static const struct pte_setting pte_settings[mi_tiling_count][mi_bpp_count] = {
++	[mi_tiling_linear] = {
++		{  8, 4096, 1, 8, 0, 1, 0, 0, 0},
++		{ 16, 2048, 1, 8, 0, 1, 0, 0, 0},
++		{ 32, 1024, 1, 8, 0, 1, 0, 0, 0},
++		{ 64,  512, 1, 8, 0, 1, 0, 0, 0}, /* new for 64bpp from HW */
++	},
++	[mi_tiling_1D] = {
++		{  8, 512, 8, 1, 0, 1, 0, 0, 0},  /* 0 for invalid */
++		{ 16, 256, 8, 2, 0, 1, 0, 0, 0},
++		{ 32, 128, 8, 4, 0, 1, 0, 0, 0},
++		{ 64,  64, 8, 4, 0, 1, 0, 0, 0}, /* fake */
++	},
++	[mi_tiling_2D] = {
++		{  8, 64, 64,  8,  8, 1, 4, 0, 0},
++		{ 16, 64, 32,  8, 16, 1, 8, 0, 0},
++		{ 32, 32, 32, 16, 16, 1, 8, 0, 0},
++		{ 64,  8, 32, 16, 16, 1, 8, 0, 0}, /* fake */
++	},
++};
++
++static enum mi_bits_per_pixel get_mi_bpp(
++		enum surface_pixel_format format)
++{
++	if (format >= SURFACE_PIXEL_FORMAT_GRPH_ARGB16161616)
++		return mi_bpp_64;
++	else if (format >= SURFACE_PIXEL_FORMAT_GRPH_ARGB8888)
++		return mi_bpp_32;
++	else if (format >= SURFACE_PIXEL_FORMAT_GRPH_ARGB1555)
++		return mi_bpp_16;
++	else
++		return mi_bpp_8;
++}
++
++static enum mi_tiling_format get_mi_tiling(
++		union dc_tiling_info *tiling_info)
++{
++	switch (tiling_info->gfx8.array_mode) {
++	case DC_ARRAY_1D_TILED_THIN1:
++	case DC_ARRAY_1D_TILED_THICK:
++	case DC_ARRAY_PRT_TILED_THIN1:
++		return mi_tiling_1D;
++	case DC_ARRAY_2D_TILED_THIN1:
++	case DC_ARRAY_2D_TILED_THICK:
++	case DC_ARRAY_2D_TILED_X_THICK:
++	case DC_ARRAY_PRT_2D_TILED_THIN1:
++	case DC_ARRAY_PRT_2D_TILED_THICK:
++		return mi_tiling_2D;
++	case DC_ARRAY_LINEAR_GENERAL:
++	case DC_ARRAY_LINEAR_ALLIGNED:
++		return mi_tiling_linear;
++	default:
++		return mi_tiling_2D;
++	}
++}
++
++static bool is_vert_scan(enum dc_rotation_angle rotation)
++{
++	switch (rotation) {
++	case ROTATION_ANGLE_90:
++	case ROTATION_ANGLE_270:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static unsigned int log_2(unsigned int num)
++{
++	unsigned int result = 0;
++
++	while ((num >>= 1) != 0)
++		result++;
++
++	return result;
++}
++
++void dce_mem_input_program_pte_vm(struct mem_input *mi,
++		enum surface_pixel_format format,
++		union dc_tiling_info *tiling_info,
++		enum dc_rotation_angle rotation)
++{
++	enum mi_bits_per_pixel mi_bpp = get_mi_bpp(format);
++	enum mi_tiling_format mi_tiling = get_mi_tiling(tiling_info);
++	const struct pte_setting *pte = &pte_settings[mi_tiling][mi_bpp];
++
++	unsigned int page_width = log_2(pte->page_width);
++	unsigned int page_height = log_2(pte->page_height);
++	unsigned int min_pte_before_flip = is_vert_scan(rotation) ?
++			pte->min_pte_before_flip_vert_scan :
++			pte->min_pte_before_flip_horiz_scan;
++
++	REG_UPDATE(GRPH_PIPE_OUTSTANDING_REQUEST_LIMIT,
++			GRPH_PIPE_OUTSTANDING_REQUEST_LIMIT, 0xff);
++
++	REG_UPDATE_3(DVMM_PTE_CONTROL,
++			DVMM_PAGE_WIDTH, page_width,
++			DVMM_PAGE_HEIGHT, page_height,
++			DVMM_MIN_PTE_BEFORE_FLIP, min_pte_before_flip);
++
++	REG_UPDATE_2(DVMM_PTE_ARB_CONTROL,
++			DVMM_PTE_REQ_PER_CHUNK, pte->pte_req_per_chunk,
++			DVMM_MAX_PTE_REQ_OUTSTANDING, 0xff);
++}
+ 
+ static void program_urgency_watermark(struct mem_input *mi,
+ 	uint32_t wm_select,
+@@ -244,7 +375,7 @@ static void program_grph_pixel_format(
+ 			GRPH_PRESCALE_B_SIGN, sign);
+ }
+ 
+-bool dce_mem_input_program_surface_config(struct mem_input *mi,
++void dce_mem_input_program_surface_config(struct mem_input *mi,
+ 	enum surface_pixel_format format,
+ 	union dc_tiling_info *tiling_info,
+ 	union plane_size *plane_size,
+@@ -260,8 +391,6 @@ bool dce_mem_input_program_surface_config(struct mem_input *mi,
+ 	if (format >= SURFACE_PIXEL_FORMAT_GRPH_BEGIN &&
+ 		format < SURFACE_PIXEL_FORMAT_VIDEO_BEGIN)
+ 		program_grph_pixel_format(mi, format);
+-
+-	return true;
+ }
+ 
+ static uint32_t get_dmif_switch_time_us(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.h b/drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.h
+index d5930a9..a366b3a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.h
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.h
+@@ -42,10 +42,22 @@
+ 	SRI(DPG_PIPE_STUTTER_CONTROL, DMIF_PG, id),\
+ 	SRI(DMIF_BUFFER_CONTROL, PIPE, id)
+ 
+-#define MI_REG_LIST(id)\
++#define MI_DCE_PTE_REG_LIST(id)\
++	SRI(DVMM_PTE_CONTROL, DCP, id),\
++	SRI(DVMM_PTE_ARB_CONTROL, DCP, id)
++
++#define MI_DCE8_REG_LIST(id)\
+ 	MI_DCE_BASE_REG_LIST(id),\
+ 	SRI(DPG_PIPE_NB_PSTATE_CHANGE_CONTROL, DMIF_PG, id)
+ 
++#define MI_DCE11_2_REG_LIST(id)\
++	MI_DCE8_REG_LIST(id),\
++	SRI(GRPH_PIPE_OUTSTANDING_REQUEST_LIMIT, DCP, id)
++
++#define MI_DCE11_REG_LIST(id)\
++	MI_DCE11_2_REG_LIST(id),\
++	MI_DCE_PTE_REG_LIST(id)
++
+ struct dce_mem_input_registers {
+ 	/* DCP */
+ 	uint32_t GRPH_ENABLE;
+@@ -58,6 +70,9 @@ struct dce_mem_input_registers {
+ 	uint32_t HW_ROTATION;
+ 	uint32_t GRPH_SWAP_CNTL;
+ 	uint32_t PRESCALE_GRPH_CONTROL;
++	uint32_t GRPH_PIPE_OUTSTANDING_REQUEST_LIMIT;
++	uint32_t DVMM_PTE_CONTROL;
++	uint32_t DVMM_PTE_ARB_CONTROL;
+ 	/* DMIF_PG */
+ 	uint32_t DPG_PIPE_ARBITRATION_CONTROL1;
+ 	uint32_t DPG_WATERMARK_MASK_CONTROL;
+@@ -103,6 +118,16 @@ struct dce_mem_input_registers {
+ 	SFB(blk, PRESCALE_GRPH_CONTROL, GRPH_PRESCALE_G_SIGN, mask_sh),\
+ 	SFB(blk, PRESCALE_GRPH_CONTROL, GRPH_PRESCALE_B_SIGN, mask_sh)
+ 
++#define MI_DCP_DCE11_MASK_SH_LIST(mask_sh, blk)\
++	SFB(blk, GRPH_PIPE_OUTSTANDING_REQUEST_LIMIT, GRPH_PIPE_OUTSTANDING_REQUEST_LIMIT, mask_sh)
++
++#define MI_DCP_PTE_MASK_SH_LIST(mask_sh, blk)\
++	SFB(blk, DVMM_PTE_CONTROL, DVMM_PAGE_WIDTH, mask_sh),\
++	SFB(blk, DVMM_PTE_CONTROL, DVMM_PAGE_HEIGHT, mask_sh),\
++	SFB(blk, DVMM_PTE_CONTROL, DVMM_MIN_PTE_BEFORE_FLIP, mask_sh),\
++	SFB(blk, DVMM_PTE_ARB_CONTROL, DVMM_PTE_REQ_PER_CHUNK, mask_sh),\
++	SFB(blk, DVMM_PTE_ARB_CONTROL, DVMM_MAX_PTE_REQ_OUTSTANDING, mask_sh)
++
+ #define MI_DMIF_PG_MASK_SH_LIST(mask_sh, blk)\
+ 	SFB(blk, DPG_PIPE_ARBITRATION_CONTROL1, PIXEL_DURATION, mask_sh),\
+ 	SFB(blk, DPG_WATERMARK_MASK_CONTROL, URGENCY_WATERMARK_MASK, mask_sh),\
+@@ -122,11 +147,19 @@ struct dce_mem_input_registers {
+ 	SFB(blk, DPG_PIPE_NB_PSTATE_CHANGE_CONTROL, NB_PSTATE_CHANGE_NOT_SELF_REFRESH_DURING_REQUEST, mask_sh),\
+ 	SFB(blk, DPG_PIPE_NB_PSTATE_CHANGE_CONTROL, NB_PSTATE_CHANGE_WATERMARK, mask_sh)
+ 
+-#define MI_DCE_MASK_SH_LIST(mask_sh)\
+-	MI_DCP_MASK_SH_LIST(mask_sh,),\
+-	MI_DMIF_PG_MASK_SH_LIST(mask_sh,),\
+-	MI_DMIF_PG_MASK_SH_DCE(mask_sh,),\
+-	MI_GFX8_TILE_MASK_SH_LIST(mask_sh,)
++#define MI_DCE8_MASK_SH_LIST(mask_sh)\
++	MI_DCP_MASK_SH_LIST(mask_sh, ),\
++	MI_DMIF_PG_MASK_SH_LIST(mask_sh, ),\
++	MI_DMIF_PG_MASK_SH_DCE(mask_sh, ),\
++	MI_GFX8_TILE_MASK_SH_LIST(mask_sh, )
++
++#define MI_DCE11_2_MASK_SH_LIST(mask_sh)\
++	MI_DCE8_MASK_SH_LIST(mask_sh),\
++	MI_DCP_DCE11_MASK_SH_LIST(mask_sh, )
++
++#define MI_DCE11_MASK_SH_LIST(mask_sh)\
++	MI_DCE11_2_MASK_SH_LIST(mask_sh),\
++	MI_DCP_PTE_MASK_SH_LIST(mask_sh, )
+ 
+ #define MI_REG_FIELD_LIST(type) \
+ 	type GRPH_ENABLE; \
+@@ -142,6 +175,12 @@ struct dce_mem_input_registers {
+ 	type GRPH_PRESCALE_R_SIGN; \
+ 	type GRPH_PRESCALE_G_SIGN; \
+ 	type GRPH_PRESCALE_B_SIGN; \
++	type GRPH_PIPE_OUTSTANDING_REQUEST_LIMIT; \
++	type DVMM_PAGE_WIDTH; \
++	type DVMM_PAGE_HEIGHT; \
++	type DVMM_MIN_PTE_BEFORE_FLIP; \
++	type DVMM_PTE_REQ_PER_CHUNK; \
++	type DVMM_MAX_PTE_REQ_OUTSTANDING; \
+ 	type GRPH_DEPTH; \
+ 	type GRPH_FORMAT; \
+ 	type GRPH_NUM_BANKS; \
+@@ -191,7 +230,13 @@ struct dce_mem_input_wa {
+ };
+ 
+ struct mem_input;
+-bool dce_mem_input_program_surface_config(struct mem_input *mi,
++
++void dce_mem_input_program_pte_vm(struct mem_input *mi,
++	enum surface_pixel_format format,
++	union dc_tiling_info *tiling_info,
++	enum dc_rotation_angle rotation);
++
++void dce_mem_input_program_surface_config(struct mem_input *mi,
+ 	enum surface_pixel_format format,
+ 	union dc_tiling_info *tiling_info,
+ 	union plane_size *plane_size,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+index 16595dc..9ace6d1 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+@@ -481,7 +481,7 @@ static const struct resource_create_funcs res_create_funcs = {
+ };
+ 
+ #define mi_inst_regs(id) { \
+-	MI_REG_LIST(id), \
++	MI_DCE8_REG_LIST(id), \
+ 	.MC_HUB_RDREQ_DMIF_LIMIT = mmMC_HUB_RDREQ_DMIF_LIMIT \
+ }
+ static const struct dce_mem_input_registers mi_regs[] = {
+@@ -494,12 +494,12 @@ static const struct dce_mem_input_registers mi_regs[] = {
+ };
+ 
+ static const struct dce_mem_input_shift mi_shifts = {
+-		MI_DCE_MASK_SH_LIST(__SHIFT),
++		MI_DCE8_MASK_SH_LIST(__SHIFT),
+ 		.ENABLE = MC_HUB_RDREQ_DMIF_LIMIT__ENABLE__SHIFT
+ };
+ 
+ static const struct dce_mem_input_mask mi_masks = {
+-		MI_DCE_MASK_SH_LIST(_MASK),
++		MI_DCE8_MASK_SH_LIST(_MASK),
+ 		.ENABLE = MC_HUB_RDREQ_DMIF_LIMIT__ENABLE_MASK
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.c
+index c0a68c6..af9d682 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.c
+@@ -150,117 +150,6 @@ bool dce110_mem_input_program_surface_flip_and_addr(
+ 	return true;
+ }
+ 
+-/* Scatter Gather param tables */
+-static const unsigned int dvmm_Hw_Setting_2DTiling[4][9] = {
+-		{  8, 64, 64,  8,  8, 1, 4, 0, 0},
+-		{ 16, 64, 32,  8, 16, 1, 8, 0, 0},
+-		{ 32, 32, 32, 16, 16, 1, 8, 0, 0},
+-		{ 64,  8, 32, 16, 16, 1, 8, 0, 0}, /* fake */
+-};
+-
+-static const unsigned int dvmm_Hw_Setting_1DTiling[4][9] = {
+-		{  8, 512, 8, 1, 0, 1, 0, 0, 0},  /* 0 for invalid */
+-		{ 16, 256, 8, 2, 0, 1, 0, 0, 0},
+-		{ 32, 128, 8, 4, 0, 1, 0, 0, 0},
+-		{ 64,  64, 8, 4, 0, 1, 0, 0, 0}, /* fake */
+-};
+-
+-static const unsigned int dvmm_Hw_Setting_Linear[4][9] = {
+-		{  8, 4096, 1, 8, 0, 1, 0, 0, 0},
+-		{ 16, 2048, 1, 8, 0, 1, 0, 0, 0},
+-		{ 32, 1024, 1, 8, 0, 1, 0, 0, 0},
+-		{ 64,  512, 1, 8, 0, 1, 0, 0, 0}, /* new for 64bpp from HW */
+-};
+-
+-/* Helper to get table entry from surface info */
+-static const unsigned int *get_dvmm_hw_setting(
+-		union dc_tiling_info *tiling_info,
+-		enum surface_pixel_format format)
+-{
+-	enum bits_per_pixel {
+-		bpp_8 = 0,
+-		bpp_16,
+-		bpp_32,
+-		bpp_64
+-	} bpp;
+-
+-	if (format >= SURFACE_PIXEL_FORMAT_GRPH_ARGB16161616)
+-		bpp = bpp_64;
+-	else if (format >= SURFACE_PIXEL_FORMAT_GRPH_ARGB8888)
+-		bpp = bpp_32;
+-	else if (format >= SURFACE_PIXEL_FORMAT_GRPH_ARGB1555)
+-		bpp = bpp_16;
+-	else
+-		bpp = bpp_8;
+-
+-	switch (tiling_info->gfx8.array_mode) {
+-	case DC_ARRAY_1D_TILED_THIN1:
+-	case DC_ARRAY_1D_TILED_THICK:
+-	case DC_ARRAY_PRT_TILED_THIN1:
+-		return dvmm_Hw_Setting_1DTiling[bpp];
+-	case DC_ARRAY_2D_TILED_THIN1:
+-	case DC_ARRAY_2D_TILED_THICK:
+-	case DC_ARRAY_2D_TILED_X_THICK:
+-	case DC_ARRAY_PRT_2D_TILED_THIN1:
+-	case DC_ARRAY_PRT_2D_TILED_THICK:
+-		return dvmm_Hw_Setting_2DTiling[bpp];
+-	case DC_ARRAY_LINEAR_GENERAL:
+-	case DC_ARRAY_LINEAR_ALLIGNED:
+-		return dvmm_Hw_Setting_Linear[bpp];
+-	default:
+-		return dvmm_Hw_Setting_2DTiling[bpp];
+-	}
+-}
+-
+-bool dce110_mem_input_program_pte_vm(
+-		struct mem_input *mem_input,
+-		enum surface_pixel_format format,
+-		union dc_tiling_info *tiling_info,
+-		enum dc_rotation_angle rotation)
+-{
+-	struct dce110_mem_input *mem_input110 = TO_DCE110_MEM_INPUT(mem_input);
+-	const unsigned int *pte = get_dvmm_hw_setting(tiling_info, format);
+-
+-	unsigned int page_width = 0;
+-	unsigned int page_height = 0;
+-	unsigned int temp_page_width = pte[1];
+-	unsigned int temp_page_height = pte[2];
+-	unsigned int min_pte_before_flip = 0;
+-	uint32_t value = 0;
+-
+-	while ((temp_page_width >>= 1) != 0)
+-		page_width++;
+-	while ((temp_page_height >>= 1) != 0)
+-		page_height++;
+-
+-	switch (rotation) {
+-	case ROTATION_ANGLE_90:
+-	case ROTATION_ANGLE_270:
+-		min_pte_before_flip = pte[4];
+-		break;
+-	default:
+-		min_pte_before_flip = pte[3];
+-		break;
+-	}
+-
+-	value = dm_read_reg(mem_input110->base.ctx, DCP_REG(mmGRPH_PIPE_OUTSTANDING_REQUEST_LIMIT));
+-	set_reg_field_value(value, 0xff, GRPH_PIPE_OUTSTANDING_REQUEST_LIMIT, GRPH_PIPE_OUTSTANDING_REQUEST_LIMIT);
+-	dm_write_reg(mem_input110->base.ctx, DCP_REG(mmGRPH_PIPE_OUTSTANDING_REQUEST_LIMIT), value);
+-
+-	value = dm_read_reg(mem_input110->base.ctx, DCP_REG(mmDVMM_PTE_CONTROL));
+-	set_reg_field_value(value, page_width, DVMM_PTE_CONTROL, DVMM_PAGE_WIDTH);
+-	set_reg_field_value(value, page_height, DVMM_PTE_CONTROL, DVMM_PAGE_HEIGHT);
+-	set_reg_field_value(value, min_pte_before_flip, DVMM_PTE_CONTROL, DVMM_MIN_PTE_BEFORE_FLIP);
+-	dm_write_reg(mem_input110->base.ctx, DCP_REG(mmDVMM_PTE_CONTROL), value);
+-
+-	value = dm_read_reg(mem_input110->base.ctx, DCP_REG(mmDVMM_PTE_ARB_CONTROL));
+-	set_reg_field_value(value, pte[5], DVMM_PTE_ARB_CONTROL, DVMM_PTE_REQ_PER_CHUNK);
+-	set_reg_field_value(value, 0xff, DVMM_PTE_ARB_CONTROL, DVMM_MAX_PTE_REQ_OUTSTANDING);
+-	dm_write_reg(mem_input110->base.ctx, DCP_REG(mmDVMM_PTE_ARB_CONTROL), value);
+-
+-	return true;
+-}
+-
+ static void program_urgency_watermark(
+ 	const struct dc_context *ctx,
+ 	const uint32_t offset,
+@@ -502,7 +391,7 @@ static struct mem_input_funcs dce110_mem_input_funcs = {
+ 	.mem_input_program_surface_flip_and_addr =
+ 			dce110_mem_input_program_surface_flip_and_addr,
+ 	.mem_input_program_pte_vm =
+-			dce110_mem_input_program_pte_vm,
++			dce_mem_input_program_pte_vm,
+ 	.mem_input_program_surface_config =
+ 			dce_mem_input_program_surface_config,
+ 	.mem_input_is_flip_pending =
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.h b/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.h
+index 83b2df9..a80a20c 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.h
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input.h
+@@ -108,17 +108,6 @@ bool  dce110_mem_input_program_surface_config(
+ 	bool horizontal_mirror);
+ 
+ /*
+- * dce110_mem_input_program_pte_vm
+- *
+- * This function will program pte vm registers.
+- */
+-bool  dce110_mem_input_program_pte_vm(
+-	struct mem_input *mem_input,
+-	enum surface_pixel_format format,
+-	union dc_tiling_info *tiling_info,
+-	enum dc_rotation_angle rotation);
+-
+-/*
+  * dce110_mem_input_is_flip_pending
+  *
+  * This function will wait until the surface update-pending bit is cleared.
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input_v.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input_v.c
+index f0310ba..757e946 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input_v.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input_v.c
+@@ -584,7 +584,7 @@ static const unsigned int *get_dvmm_hw_setting(
+ 	}
+ }
+ 
+-bool dce110_mem_input_v_program_pte_vm(
++void dce110_mem_input_v_program_pte_vm(
+ 		struct mem_input *mem_input,
+ 		enum surface_pixel_format format,
+ 		union dc_tiling_info *tiling_info,
+@@ -655,11 +655,9 @@ bool dce110_mem_input_v_program_pte_vm(
+ 	set_reg_field_value(value, pte_chroma[5], UNP_DVMM_PTE_ARB_CONTROL_C, DVMM_PTE_REQ_PER_CHUNK_C);
+ 	set_reg_field_value(value, 0xff, UNP_DVMM_PTE_ARB_CONTROL_C, DVMM_MAX_PTE_REQ_OUTSTANDING_C);
+ 	dm_write_reg(mem_input110->base.ctx, DCP_REG(mmUNP_DVMM_PTE_ARB_CONTROL_C), value);
+-
+-	return true;
+ }
+ 
+-bool dce110_mem_input_v_program_surface_config(
++void dce110_mem_input_v_program_surface_config(
+ 	struct mem_input *mem_input,
+ 	enum surface_pixel_format format,
+ 	union dc_tiling_info *tiling_info,
+@@ -674,8 +672,6 @@ bool dce110_mem_input_v_program_surface_config(
+ 	program_tiling(mem_input110, tiling_info, format);
+ 	program_size_and_rotation(mem_input110, rotation, plane_size);
+ 	program_pixel_format(mem_input110, format);
+-
+-	return true;
+ }
+ 
+ static void program_urgency_watermark(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+index 959467f..cac3dc4 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+@@ -474,7 +474,7 @@ static const struct resource_create_funcs res_create_funcs = {
+ };
+ 
+ #define mi_inst_regs(id) { \
+-	MI_REG_LIST(id), \
++	MI_DCE11_REG_LIST(id), \
+ 	.MC_HUB_RDREQ_DMIF_LIMIT = mmMC_HUB_RDREQ_DMIF_LIMIT \
+ }
+ static const struct dce_mem_input_registers mi_regs[] = {
+@@ -484,12 +484,12 @@ static const struct dce_mem_input_registers mi_regs[] = {
+ };
+ 
+ static const struct dce_mem_input_shift mi_shifts = {
+-		MI_DCE_MASK_SH_LIST(__SHIFT),
++		MI_DCE11_MASK_SH_LIST(__SHIFT),
+ 		.ENABLE = MC_HUB_RDREQ_DMIF_LIMIT__ENABLE__SHIFT
+ };
+ 
+ static const struct dce_mem_input_mask mi_masks = {
+-		MI_DCE_MASK_SH_LIST(_MASK),
++		MI_DCE11_MASK_SH_LIST(_MASK),
+ 		.ENABLE = MC_HUB_RDREQ_DMIF_LIMIT__ENABLE_MASK
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+index bfb2c3f..4e3273c 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+@@ -495,7 +495,7 @@ static const struct resource_create_funcs res_create_funcs = {
+ 	.create_hwseq = dce112_hwseq_create,
+ };
+ 
+-#define mi_inst_regs(id) { MI_REG_LIST(id) }
++#define mi_inst_regs(id) { MI_DCE11_2_REG_LIST(id) }
+ static const struct dce_mem_input_registers mi_regs[] = {
+ 		mi_inst_regs(0),
+ 		mi_inst_regs(1),
+@@ -506,11 +506,11 @@ static const struct dce_mem_input_registers mi_regs[] = {
+ };
+ 
+ static const struct dce_mem_input_shift mi_shifts = {
+-		MI_DCE_MASK_SH_LIST(__SHIFT)
++		MI_DCE11_2_MASK_SH_LIST(__SHIFT)
+ };
+ 
+ static const struct dce_mem_input_mask mi_masks = {
+-		MI_DCE_MASK_SH_LIST(_MASK)
++		MI_DCE11_2_MASK_SH_LIST(_MASK)
+ };
+ 
+ static struct mem_input *dce112_mem_input_create(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+index 0672040..3b626b7 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+@@ -462,7 +462,7 @@ static const struct resource_create_funcs res_create_funcs = {
+ };
+ 
+ #define mi_inst_regs(id) { \
+-	MI_REG_LIST(id), \
++	MI_DCE8_REG_LIST(id), \
+ 	.MC_HUB_RDREQ_DMIF_LIMIT = mmMC_HUB_RDREQ_DMIF_LIMIT \
+ }
+ static const struct dce_mem_input_registers mi_regs[] = {
+@@ -475,12 +475,12 @@ static const struct dce_mem_input_registers mi_regs[] = {
+ };
+ 
+ static const struct dce_mem_input_shift mi_shifts = {
+-		MI_DCE_MASK_SH_LIST(__SHIFT),
++		MI_DCE8_MASK_SH_LIST(__SHIFT),
+ 		.ENABLE = MC_HUB_RDREQ_DMIF_LIMIT__ENABLE__SHIFT
+ };
+ 
+ static const struct dce_mem_input_mask mi_masks = {
+-		MI_DCE_MASK_SH_LIST(_MASK),
++		MI_DCE8_MASK_SH_LIST(_MASK),
+ 		.ENABLE = MC_HUB_RDREQ_DMIF_LIMIT__ENABLE_MASK
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/mem_input.h b/drivers/gpu/drm/amd/display/dc/inc/hw/mem_input.h
+index 78dab74..80566c8 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/mem_input.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/mem_input.h
+@@ -82,13 +82,13 @@ struct mem_input_funcs {
+ 		const struct dc_plane_address *address,
+ 		bool flip_immediate);
+ 
+-	bool (*mem_input_program_pte_vm)(
++	void (*mem_input_program_pte_vm)(
+ 		struct mem_input *mem_input,
+ 		enum surface_pixel_format format,
+ 		union dc_tiling_info *tiling_info,
+ 		enum dc_rotation_angle rotation);
+ 
+-	bool (*mem_input_program_surface_config)(
++	void (*mem_input_program_surface_config)(
+ 		struct mem_input *mem_input,
+ 		enum surface_pixel_format format,
+ 		union dc_tiling_info *tiling_info,
+-- 
+2.7.4
+

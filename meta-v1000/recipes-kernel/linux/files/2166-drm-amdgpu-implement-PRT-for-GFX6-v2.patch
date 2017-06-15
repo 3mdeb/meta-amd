@@ -1,0 +1,124 @@
+From 614fdd857976e2cce318e020d8550e2811e7644a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 27 Jan 2017 11:56:05 +0100
+Subject: [PATCH 2166/3082] drm/amdgpu: implement PRT for GFX6 v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Enable/disable the handling globally for now and
+print a warning when we enable it for the first time.
+
+v2: write to the correct register, adjust bits to that hw generation
+v3: fix compilation, add the missing register bit definitions
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Nicolai Hähnle <nicolai.haehnle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h                |  1 +
+ drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c              | 55 ++++++++++++++++++++++
+ .../drm/amd/include/asic_reg/gmc/gmc_6_0_sh_mask.h |  4 ++
+ 3 files changed, 60 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index e89b74f..f0cc1bc79 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -571,6 +571,7 @@ struct amdgpu_mc {
+ 	uint32_t		vram_type;
+ 	uint32_t                srbm_soft_reset;
+ 	struct amdgpu_mode_mc_save save;
++	bool			prt_warning;
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+index 0635829..3328428 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+@@ -400,6 +400,60 @@ static void gmc_v6_0_set_fault_enable_default(struct amdgpu_device *adev,
+ 	WREG32(mmVM_CONTEXT1_CNTL, tmp);
+ }
+ 
++ /**
++   + * gmc_v8_0_set_prt - set PRT VM fault
++   + *
++   + * @adev: amdgpu_device pointer
++   + * @enable: enable/disable VM fault handling for PRT
++   +*/
++static void gmc_v6_0_set_prt(struct amdgpu_device *adev, bool enable)
++{
++	u32 tmp;
++
++	if (enable && !adev->mc.prt_warning) {
++		dev_warn(adev->dev, "Disabling VM faults because of PRT request!\n");
++		adev->mc.prt_warning = true;
++	}
++
++	tmp = RREG32(mmVM_PRT_CNTL);
++	tmp = REG_SET_FIELD(tmp, VM_PRT_CNTL,
++			    CB_DISABLE_FAULT_ON_UNMAPPED_ACCESS,
++			    enable);
++	tmp = REG_SET_FIELD(tmp, VM_PRT_CNTL,
++			    TC_DISABLE_FAULT_ON_UNMAPPED_ACCESS,
++			    enable);
++	tmp = REG_SET_FIELD(tmp, VM_PRT_CNTL,
++			    L2_CACHE_STORE_INVALID_ENTRIES,
++			    enable);
++	tmp = REG_SET_FIELD(tmp, VM_PRT_CNTL,
++			    L1_TLB_STORE_INVALID_ENTRIES,
++			    enable);
++	WREG32(mmVM_PRT_CNTL, tmp);
++
++	if (enable) {
++		uint32_t low = AMDGPU_VA_RESERVED_SIZE >> AMDGPU_GPU_PAGE_SHIFT;
++		uint32_t high = adev->vm_manager.max_pfn;
++
++		WREG32(mmVM_PRT_APERTURE0_LOW_ADDR, low);
++		WREG32(mmVM_PRT_APERTURE1_LOW_ADDR, low);
++		WREG32(mmVM_PRT_APERTURE2_LOW_ADDR, low);
++		WREG32(mmVM_PRT_APERTURE3_LOW_ADDR, low);
++		WREG32(mmVM_PRT_APERTURE0_HIGH_ADDR, high);
++		WREG32(mmVM_PRT_APERTURE1_HIGH_ADDR, high);
++		WREG32(mmVM_PRT_APERTURE2_HIGH_ADDR, high);
++		WREG32(mmVM_PRT_APERTURE3_HIGH_ADDR, high);
++	} else {
++		WREG32(mmVM_PRT_APERTURE0_LOW_ADDR, 0xfffffff);
++		WREG32(mmVM_PRT_APERTURE1_LOW_ADDR, 0xfffffff);
++		WREG32(mmVM_PRT_APERTURE2_LOW_ADDR, 0xfffffff);
++		WREG32(mmVM_PRT_APERTURE3_LOW_ADDR, 0xfffffff);
++		WREG32(mmVM_PRT_APERTURE0_HIGH_ADDR, 0x0);
++		WREG32(mmVM_PRT_APERTURE1_HIGH_ADDR, 0x0);
++		WREG32(mmVM_PRT_APERTURE2_HIGH_ADDR, 0x0);
++		WREG32(mmVM_PRT_APERTURE3_HIGH_ADDR, 0x0);
++	}
++}
++
+ static int gmc_v6_0_gart_enable(struct amdgpu_device *adev)
+ {
+ 	int r, i;
+@@ -1082,6 +1136,7 @@ static const struct amd_ip_funcs gmc_v6_0_ip_funcs = {
+ static const struct amdgpu_gart_funcs gmc_v6_0_gart_funcs = {
+ 	.flush_gpu_tlb = gmc_v6_0_gart_flush_gpu_tlb,
+ 	.set_pte_pde = gmc_v6_0_gart_set_pte_pde,
++	.set_prt = gmc_v6_0_set_prt,
+ };
+ 
+ static const struct amdgpu_irq_src_funcs gmc_v6_0_irq_funcs = {
+diff --git a/drivers/gpu/drm/amd/include/asic_reg/gmc/gmc_6_0_sh_mask.h b/drivers/gpu/drm/amd/include/asic_reg/gmc/gmc_6_0_sh_mask.h
+index 0f6c6c8..7155312 100644
+--- a/drivers/gpu/drm/amd/include/asic_reg/gmc/gmc_6_0_sh_mask.h
++++ b/drivers/gpu/drm/amd/include/asic_reg/gmc/gmc_6_0_sh_mask.h
+@@ -11891,5 +11891,9 @@
+ #define VM_PRT_CNTL__L1_TLB_STORE_INVALID_ENTRIES__SHIFT 0x00000003
+ #define VM_PRT_CNTL__L2_CACHE_STORE_INVALID_ENTRIES_MASK 0x00000004L
+ #define VM_PRT_CNTL__L2_CACHE_STORE_INVALID_ENTRIES__SHIFT 0x00000002
++#define VM_PRT_CNTL__CB_DISABLE_FAULT_ON_UNMAPPED_ACCESS_MASK 0x00000001L
++#define VM_PRT_CNTL__CB_DISABLE_FAULT_ON_UNMAPPED_ACCESS__SHIFT 0x00000000
++#define VM_PRT_CNTL__TC_DISABLE_FAULT_ON_UNMAPPED_ACCESS_MASK 0x00000002L
++#define VM_PRT_CNTL__TC_DISABLE_FAULT_ON_UNMAPPED_ACCESS__SHIFT 0x00000001
+ 
+ #endif
+-- 
+2.7.4
+

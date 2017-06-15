@@ -1,0 +1,132 @@
+From efd94ae20a34f51a865ae48345c09337cea75d6a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 28 Oct 2016 17:04:07 +0200
+Subject: [PATCH 1412/1722] drm/amd: fix scheduler fence teardown order v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Some fences might be alive even after we have stopped the scheduler leading
+to warnings about leaked objects from the SLUB allocator.
+
+Fix this by allocating/freeing the SLUB allocator from the module
+init/finfi functions just like we do it for hw fences.
+
+v2: make variable static, add link to bug
+
+Fixes: https://bugs.freedesktop.org/show_bug.cgi?id=97500
+
+Reported-by: Grazvydas Ignotas <notasas@gmail.com>
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com> (v1)
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c       |  2 ++
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 13 -------------
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  3 +++
+ drivers/gpu/drm/amd/scheduler/sched_fence.c   | 19 +++++++++++++++++++
+ 4 files changed, 24 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 50fa0c3..bb3e8c9 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -740,6 +740,7 @@ static int __init amdgpu_init(void)
+ {
+ 	amdgpu_sync_init();
+ 	amdgpu_fence_slab_init();
++	amd_sched_fence_slab_init();
+ 	if (vgacon_text_force()) {
+ 		DRM_ERROR("VGACON disables amdgpu kernel modesetting.\n");
+ 		return -EINVAL;
+@@ -761,6 +762,7 @@ static void __exit amdgpu_exit(void)
+ 	drm_pci_exit(driver, pdriver);
+ 	amdgpu_unregister_atpx_handler();
+ 	amdgpu_sync_fini();
++        amd_sched_fence_slab_fini();
+         amdgpu_fence_slab_fini();
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index 083dd7c..602d77b 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -34,9 +34,6 @@ static bool amd_sched_entity_is_ready(struct amd_sched_entity *entity);
+ static void amd_sched_wakeup(struct amd_gpu_scheduler *sched);
+ static void amd_sched_process_job(struct fence *f, struct fence_cb *cb);
+ 
+-struct kmem_cache *sched_fence_slab;
+-atomic_t sched_fence_slab_ref = ATOMIC_INIT(0);
+-
+ /* Initialize a given run queue struct */
+ static void amd_sched_rq_init(struct amd_sched_rq *rq)
+ {
+@@ -618,13 +615,6 @@ int amd_sched_init(struct amd_gpu_scheduler *sched,
+ 	INIT_LIST_HEAD(&sched->ring_mirror_list);
+ 	spin_lock_init(&sched->job_list_lock);
+ 	atomic_set(&sched->hw_rq_count, 0);
+-	if (atomic_inc_return(&sched_fence_slab_ref) == 1) {
+-		sched_fence_slab = kmem_cache_create(
+-			"amd_sched_fence", sizeof(struct amd_sched_fence), 0,
+-			SLAB_HWCACHE_ALIGN, NULL);
+-		if (!sched_fence_slab)
+-			return -ENOMEM;
+-	}
+ 
+ 	/* Each scheduler will run on a seperate kernel thread */
+ 	sched->thread = kthread_run(amd_sched_main, sched, sched->name);
+@@ -645,7 +635,4 @@ void amd_sched_fini(struct amd_gpu_scheduler *sched)
+ {
+ 	if (sched->thread)
+ 		kthread_stop(sched->thread);
+-	rcu_barrier();
+-	if (atomic_dec_and_test(&sched_fence_slab_ref))
+-		kmem_cache_destroy(sched_fence_slab);
+ }
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index a8a2d72..781c0db 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -146,6 +146,9 @@ void amd_sched_entity_fini(struct amd_gpu_scheduler *sched,
+ 			   struct amd_sched_entity *entity);
+ void amd_sched_entity_push_job(struct amd_sched_job *sched_job);
+ 
++int amd_sched_fence_slab_init(void);
++void amd_sched_fence_slab_fini(void);
++
+ struct amd_sched_fence *amd_sched_fence_create(
+ 	struct amd_sched_entity *s_entity, void *owner);
+ void amd_sched_fence_scheduled(struct amd_sched_fence *fence);
+diff --git a/drivers/gpu/drm/amd/scheduler/sched_fence.c b/drivers/gpu/drm/amd/scheduler/sched_fence.c
+index 3653b5a..88fc2d6 100644
+--- a/drivers/gpu/drm/amd/scheduler/sched_fence.c
++++ b/drivers/gpu/drm/amd/scheduler/sched_fence.c
+@@ -27,6 +27,25 @@
+ #include <drm/drmP.h>
+ #include "gpu_scheduler.h"
+ 
++static struct kmem_cache *sched_fence_slab;
++
++int amd_sched_fence_slab_init(void)
++{
++	sched_fence_slab = kmem_cache_create(
++		"amd_sched_fence", sizeof(struct amd_sched_fence), 0,
++		SLAB_HWCACHE_ALIGN, NULL);
++	if (!sched_fence_slab)
++		return -ENOMEM;
++
++	return 0;
++}
++
++void amd_sched_fence_slab_fini(void)
++{
++	rcu_barrier();
++	kmem_cache_destroy(sched_fence_slab);
++}
++
+ struct amd_sched_fence *amd_sched_fence_create(struct amd_sched_entity *entity,
+ 					       void *owner)
+ {
+-- 
+2.7.4
+

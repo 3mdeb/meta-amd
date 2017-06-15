@@ -1,0 +1,500 @@
+From 68a5116a3da1c9563b1cf8a87b8d476b61164a16 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Thu, 13 Oct 2016 16:07:03 -0400
+Subject: [PATCH 1227/1722] drm/amdgpu: fix amdgpu_need_full_reset (v3)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+IP types are not an index.  Each asic may have number and
+type of IPs.  Properly check the the type rather than
+using the type id as an index.
+
+v2: fix all the IPs to not use IP type as an idx as well.
+v3: fix DAL as well
+
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c    | 23 ++++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/dce_v10_0.c        | 12 ++----------
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c         | 17 +++++++++--------
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c         | 13 ++++++-------
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c        | 14 ++++++--------
+ drivers/gpu/drm/amd/amdgpu/tonga_ih.c         | 14 ++++++--------
+ drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c         | 14 +++++++-------
+ drivers/gpu/drm/amd/amdgpu/vce_v3_0.c         | 15 +++++++--------
+ drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c | 12 ++----------
+ drivers/gpu/drm/amd/include/amd_shared.h      |  2 +-
+ 10 files changed, 62 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index d0228a8..a4afc2c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2169,7 +2169,8 @@ static bool amdgpu_check_soft_reset(struct amdgpu_device *adev)
+ 		if (!adev->ip_block_status[i].valid)
+ 			continue;
+ 		if (adev->ip_blocks[i].funcs->check_soft_reset)
+-			adev->ip_blocks[i].funcs->check_soft_reset(adev);
++			adev->ip_block_status[i].hang =
++				adev->ip_blocks[i].funcs->check_soft_reset(adev);
+ 		if (adev->ip_block_status[i].hang) {
+ 			DRM_INFO("IP block:%d is hang!\n", i);
+ 			asic_hang = true;
+@@ -2198,12 +2199,20 @@ static int amdgpu_pre_soft_reset(struct amdgpu_device *adev)
+ 
+ static bool amdgpu_need_full_reset(struct amdgpu_device *adev)
+ {
+-	if (adev->ip_block_status[AMD_IP_BLOCK_TYPE_GMC].hang ||
+-	    adev->ip_block_status[AMD_IP_BLOCK_TYPE_SMC].hang ||
+-	    adev->ip_block_status[AMD_IP_BLOCK_TYPE_ACP].hang ||
+-	    adev->ip_block_status[AMD_IP_BLOCK_TYPE_DCE].hang) {
+-		DRM_INFO("Some block need full reset!\n");
+-		return true;
++	int i;
++
++	for (i = 0; i < adev->num_ip_blocks; i++) {
++		if (!adev->ip_block_status[i].valid)
++			continue;
++		if ((adev->ip_blocks[i].type == AMD_IP_BLOCK_TYPE_GMC) ||
++		    (adev->ip_blocks[i].type == AMD_IP_BLOCK_TYPE_SMC) ||
++		    (adev->ip_blocks[i].type == AMD_IP_BLOCK_TYPE_ACP) ||
++		    (adev->ip_blocks[i].type == AMD_IP_BLOCK_TYPE_DCE)) {
++			if (adev->ip_block_status[i].hang) {
++				DRM_INFO("Some block need full reset!\n");
++				return true;
++			}
++		}
+ 	}
+ 	return false;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
+index 0d78cbd..8623b61 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
+@@ -3100,16 +3100,11 @@ static int dce_v10_0_wait_for_idle(void *handle)
+ 	return 0;
+ }
+ 
+-static int dce_v10_0_check_soft_reset(void *handle)
++static bool dce_v10_0_check_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (dce_v10_0_is_display_hung(adev))
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_DCE].hang = true;
+-	else
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_DCE].hang = false;
+-
+-	return 0;
++	return dce_v10_0_is_display_hung(adev);
+ }
+ 
+ static int dce_v10_0_soft_reset(void *handle)
+@@ -3117,9 +3112,6 @@ static int dce_v10_0_soft_reset(void *handle)
+ 	u32 srbm_soft_reset = 0, tmp;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_DCE].hang)
+-		return 0;
+-
+ 	if (dce_v10_0_is_display_hung(adev))
+ 		srbm_soft_reset |= SRBM_SOFT_RESET__SOFT_RESET_DC_MASK;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 1878e57..9ffd1ed 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -5195,7 +5195,7 @@ static int gfx_v8_0_wait_for_idle(void *handle)
+ 	return -ETIMEDOUT;
+ }
+ 
+-static int gfx_v8_0_check_soft_reset(void *handle)
++static bool gfx_v8_0_check_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 grbm_soft_reset = 0, srbm_soft_reset = 0;
+@@ -5247,16 +5247,14 @@ static int gfx_v8_0_check_soft_reset(void *handle)
+ 						SRBM_SOFT_RESET, SOFT_RESET_SEM, 1);
+ 
+ 	if (grbm_soft_reset || srbm_soft_reset) {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_GFX].hang = true;
+ 		adev->gfx.grbm_soft_reset = grbm_soft_reset;
+ 		adev->gfx.srbm_soft_reset = srbm_soft_reset;
++		return true;
+ 	} else {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_GFX].hang = false;
+ 		adev->gfx.grbm_soft_reset = 0;
+ 		adev->gfx.srbm_soft_reset = 0;
++		return false;
+ 	}
+-
+-	return 0;
+ }
+ 
+ static void gfx_v8_0_inactive_hqd(struct amdgpu_device *adev,
+@@ -5284,7 +5282,8 @@ static int gfx_v8_0_pre_soft_reset(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 grbm_soft_reset = 0, srbm_soft_reset = 0;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_GFX].hang)
++	if ((!adev->gfx.grbm_soft_reset) &&
++	    (!adev->gfx.srbm_soft_reset))
+ 		return 0;
+ 
+ 	grbm_soft_reset = adev->gfx.grbm_soft_reset;
+@@ -5322,7 +5321,8 @@ static int gfx_v8_0_soft_reset(void *handle)
+ 	u32 grbm_soft_reset = 0, srbm_soft_reset = 0;
+ 	u32 tmp;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_GFX].hang)
++	if ((!adev->gfx.grbm_soft_reset) &&
++	    (!adev->gfx.srbm_soft_reset))
+ 		return 0;
+ 
+ 	grbm_soft_reset = adev->gfx.grbm_soft_reset;
+@@ -5392,7 +5392,8 @@ static int gfx_v8_0_post_soft_reset(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 grbm_soft_reset = 0, srbm_soft_reset = 0;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_GFX].hang)
++	if ((!adev->gfx.grbm_soft_reset) &&
++	    (!adev->gfx.srbm_soft_reset))
+ 		return 0;
+ 
+ 	grbm_soft_reset = adev->gfx.grbm_soft_reset;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index 61ac395..0b4f421 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -1099,7 +1099,7 @@ static int gmc_v8_0_wait_for_idle(void *handle)
+ 
+ }
+ 
+-static int gmc_v8_0_check_soft_reset(void *handle)
++static bool gmc_v8_0_check_soft_reset(void *handle)
+ {
+ 	u32 srbm_soft_reset = 0;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+@@ -1116,20 +1116,19 @@ static int gmc_v8_0_check_soft_reset(void *handle)
+ 							SRBM_SOFT_RESET, SOFT_RESET_MC, 1);
+ 	}
+ 	if (srbm_soft_reset) {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_GMC].hang = true;
+ 		adev->mc.srbm_soft_reset = srbm_soft_reset;
++		return true;
+ 	} else {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_GMC].hang = false;
+ 		adev->mc.srbm_soft_reset = 0;
++		return false;
+ 	}
+-	return 0;
+ }
+ 
+ static int gmc_v8_0_pre_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_GMC].hang)
++	if (!adev->mc.srbm_soft_reset)
+ 		return 0;
+ 
+ 	gmc_v8_0_mc_stop(adev, &adev->mc.save);
+@@ -1145,7 +1144,7 @@ static int gmc_v8_0_soft_reset(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 srbm_soft_reset;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_GMC].hang)
++	if (!adev->mc.srbm_soft_reset)
+ 		return 0;
+ 	srbm_soft_reset = adev->mc.srbm_soft_reset;
+ 
+@@ -1175,7 +1174,7 @@ static int gmc_v8_0_post_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_GMC].hang)
++	if (!adev->mc.srbm_soft_reset)
+ 		return 0;
+ 
+ 	gmc_v8_0_mc_resume(adev, &adev->mc.save);
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index f8ec370..83de13a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -1255,7 +1255,7 @@ static int sdma_v3_0_wait_for_idle(void *handle)
+ 	return -ETIMEDOUT;
+ }
+ 
+-static int sdma_v3_0_check_soft_reset(void *handle)
++static bool sdma_v3_0_check_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 srbm_soft_reset = 0;
+@@ -1268,14 +1268,12 @@ static int sdma_v3_0_check_soft_reset(void *handle)
+ 	}
+ 
+ 	if (srbm_soft_reset) {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_SDMA].hang = true;
+ 		adev->sdma.srbm_soft_reset = srbm_soft_reset;
++		return true;
+ 	} else {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_SDMA].hang = false;
+ 		adev->sdma.srbm_soft_reset = 0;
++		return false;
+ 	}
+-
+-	return 0;
+ }
+ 
+ static int sdma_v3_0_pre_soft_reset(void *handle)
+@@ -1283,7 +1281,7 @@ static int sdma_v3_0_pre_soft_reset(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 srbm_soft_reset = 0;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_SDMA].hang)
++	if (!adev->sdma.srbm_soft_reset)
+ 		return 0;
+ 
+ 	srbm_soft_reset = adev->sdma.srbm_soft_reset;
+@@ -1302,7 +1300,7 @@ static int sdma_v3_0_post_soft_reset(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 srbm_soft_reset = 0;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_SDMA].hang)
++	if (!adev->sdma.srbm_soft_reset)
+ 		return 0;
+ 
+ 	srbm_soft_reset = adev->sdma.srbm_soft_reset;
+@@ -1322,7 +1320,7 @@ static int sdma_v3_0_soft_reset(void *handle)
+ 	u32 srbm_soft_reset = 0;
+ 	u32 tmp;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_SDMA].hang)
++	if (!adev->sdma.srbm_soft_reset)
+ 		return 0;
+ 
+ 	srbm_soft_reset = adev->sdma.srbm_soft_reset;
+diff --git a/drivers/gpu/drm/amd/amdgpu/tonga_ih.c b/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
+index d127d59..b4ea229 100644
+--- a/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
+@@ -373,7 +373,7 @@ static int tonga_ih_wait_for_idle(void *handle)
+ 	return -ETIMEDOUT;
+ }
+ 
+-static int tonga_ih_check_soft_reset(void *handle)
++static bool tonga_ih_check_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 srbm_soft_reset = 0;
+@@ -384,21 +384,19 @@ static int tonga_ih_check_soft_reset(void *handle)
+ 						SOFT_RESET_IH, 1);
+ 
+ 	if (srbm_soft_reset) {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_IH].hang = true;
+ 		adev->irq.srbm_soft_reset = srbm_soft_reset;
++		return true;
+ 	} else {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_IH].hang = false;
+ 		adev->irq.srbm_soft_reset = 0;
++		return false;
+ 	}
+-
+-	return 0;
+ }
+ 
+ static int tonga_ih_pre_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_IH].hang)
++	if (!adev->irq.srbm_soft_reset)
+ 		return 0;
+ 
+ 	return tonga_ih_hw_fini(adev);
+@@ -408,7 +406,7 @@ static int tonga_ih_post_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_IH].hang)
++	if (!adev->irq.srbm_soft_reset)
+ 		return 0;
+ 
+ 	return tonga_ih_hw_init(adev);
+@@ -419,7 +417,7 @@ static int tonga_ih_soft_reset(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 srbm_soft_reset;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_IH].hang)
++	if (!adev->irq.srbm_soft_reset)
+ 		return 0;
+ 	srbm_soft_reset = adev->irq.srbm_soft_reset;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+index d8d7b78..8dc0e47 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+@@ -747,7 +747,7 @@ static int uvd_v6_0_wait_for_idle(void *handle)
+ }
+ 
+ #define AMDGPU_UVD_STATUS_BUSY_MASK    0xfd
+-static int uvd_v6_0_check_soft_reset(void *handle)
++static bool uvd_v6_0_check_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 srbm_soft_reset = 0;
+@@ -759,19 +759,19 @@ static int uvd_v6_0_check_soft_reset(void *handle)
+ 		srbm_soft_reset = REG_SET_FIELD(srbm_soft_reset, SRBM_SOFT_RESET, SOFT_RESET_UVD, 1);
+ 
+ 	if (srbm_soft_reset) {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_UVD].hang = true;
+ 		adev->uvd.srbm_soft_reset = srbm_soft_reset;
++		return true;
+ 	} else {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_UVD].hang = false;
+ 		adev->uvd.srbm_soft_reset = 0;
++		return false;
+ 	}
+-	return 0;
+ }
++
+ static int uvd_v6_0_pre_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_UVD].hang)
++	if (!adev->uvd.srbm_soft_reset)
+ 		return 0;
+ 
+ 	uvd_v6_0_stop(adev);
+@@ -783,7 +783,7 @@ static int uvd_v6_0_soft_reset(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 srbm_soft_reset;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_UVD].hang)
++	if (!adev->uvd.srbm_soft_reset)
+ 		return 0;
+ 	srbm_soft_reset = adev->uvd.srbm_soft_reset;
+ 
+@@ -813,7 +813,7 @@ static int uvd_v6_0_post_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_UVD].hang)
++	if (!adev->uvd.srbm_soft_reset)
+ 		return 0;
+ 
+ 	mdelay(5);
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+index c7ddbef..589fff1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+@@ -560,7 +560,7 @@ static int vce_v3_0_wait_for_idle(void *handle)
+ #define  AMDGPU_VCE_STATUS_BUSY_MASK (VCE_STATUS_VCPU_REPORT_AUTO_BUSY_MASK | \
+ 				      VCE_STATUS_VCPU_REPORT_RB0_BUSY_MASK)
+ 
+-static int vce_v3_0_check_soft_reset(void *handle)
++static bool vce_v3_0_check_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 srbm_soft_reset = 0;
+@@ -590,16 +590,15 @@ static int vce_v3_0_check_soft_reset(void *handle)
+ 		srbm_soft_reset = REG_SET_FIELD(srbm_soft_reset, SRBM_SOFT_RESET, SOFT_RESET_VCE1, 1);
+ 	}
+ 	WREG32_FIELD(GRBM_GFX_INDEX, INSTANCE_INDEX, 0);
++	mutex_unlock(&adev->grbm_idx_mutex);
+ 
+ 	if (srbm_soft_reset) {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_VCE].hang = true;
+ 		adev->vce.srbm_soft_reset = srbm_soft_reset;
++		return true;
+ 	} else {
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_VCE].hang = false;
+ 		adev->vce.srbm_soft_reset = 0;
++		return false;
+ 	}
+-	mutex_unlock(&adev->grbm_idx_mutex);
+-	return 0;
+ }
+ 
+ static int vce_v3_0_soft_reset(void *handle)
+@@ -607,7 +606,7 @@ static int vce_v3_0_soft_reset(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	u32 srbm_soft_reset;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_VCE].hang)
++	if (!adev->vce.srbm_soft_reset)
+ 		return 0;
+ 	srbm_soft_reset = adev->vce.srbm_soft_reset;
+ 
+@@ -637,7 +636,7 @@ static int vce_v3_0_pre_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_VCE].hang)
++	if (!adev->vce.srbm_soft_reset)
+ 		return 0;
+ 
+ 	mdelay(5);
+@@ -650,7 +649,7 @@ static int vce_v3_0_post_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_VCE].hang)
++	if (!adev->vce.srbm_soft_reset)
+ 		return 0;
+ 
+ 	mdelay(5);
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+index 4754b9f..6c4636b 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm.c
+@@ -127,25 +127,17 @@ static int dm_wait_for_idle(void *handle)
+ 	return 0;
+ }
+ 
+-static int dm_check_soft_reset(void *handle)
++static bool dm_check_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (amdgpu_display_is_display_hung(adev))
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_DCE].hang = true;
+-	else
+-		adev->ip_block_status[AMD_IP_BLOCK_TYPE_DCE].hang = false;
+-
+-	return 0;
++	return amdgpu_display_is_display_hung(adev);
+ }
+ 
+ static int dm_soft_reset(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (!adev->ip_block_status[AMD_IP_BLOCK_TYPE_DCE].hang)
+-		return 0;
+-
+ 	/* XXX todo */
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/include/amd_shared.h b/drivers/gpu/drm/amd/include/amd_shared.h
+index eaa90f2..d449f35 100644
+--- a/drivers/gpu/drm/amd/include/amd_shared.h
++++ b/drivers/gpu/drm/amd/include/amd_shared.h
+@@ -165,7 +165,7 @@ struct amd_ip_funcs {
+ 	/* poll for idle */
+ 	int (*wait_for_idle)(void *handle);
+         /* check soft reset the IP block */
+-        int (*check_soft_reset)(void *handle);
++        bool (*check_soft_reset)(void *handle);
+         /* pre soft reset the IP block */
+         int (*pre_soft_reset)(void *handle);
+ 	/* soft reset the IP block */
+-- 
+2.7.4
+

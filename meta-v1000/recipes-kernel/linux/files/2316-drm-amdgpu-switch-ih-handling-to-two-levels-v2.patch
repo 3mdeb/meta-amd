@@ -1,0 +1,996 @@
+From cd6878a85d230bbf091bfd83044111393e2e6da9 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Tue, 29 Mar 2016 18:28:50 -0400
+Subject: [PATCH 2316/3082] drm/amdgpu: switch ih handling to two levels (v2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Newer asics have a two levels of irq ids now:
+client id - the IP
+src id - the interrupt src within the IP
+
+v2: integrated Christian's comments.
+
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Ken Wang <Qingqing.Wang@amd.com>
+Reviewed-by: Ken Wang <Qingqing.Wang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c           |  24 +++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h            |   6 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c           | 111 +++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h           |  10 +-
+ drivers/gpu/drm/amd/amdgpu/ci_dpm.c               |   6 +-
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c             |   9 +-
+ drivers/gpu/drm/amd/amdgpu/cz_ih.c                |   1 +
+ drivers/gpu/drm/amd/amdgpu/dce_v10_0.c            |   6 +-
+ drivers/gpu/drm/amd/amdgpu/dce_v11_0.c            |   6 +-
+ drivers/gpu/drm/amd/amdgpu/dce_v6_0.c             |   6 +-
+ drivers/gpu/drm/amd/amdgpu/dce_v8_0.c             |   6 +-
+ drivers/gpu/drm/amd/amdgpu/dce_virtual.c          |   2 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c             |   6 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c             |   8 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c             |  10 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c             |   4 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c             |   4 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c             |   4 +-
+ drivers/gpu/drm/amd/amdgpu/iceland_ih.c           |   1 +
+ drivers/gpu/drm/amd/amdgpu/kv_dpm.c               |   6 +-
+ drivers/gpu/drm/amd/amdgpu/mxgpu_vi.c             |   4 +-
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c            |   9 +-
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c            |   9 +-
+ drivers/gpu/drm/amd/amdgpu/si_dma.c               |   4 +-
+ drivers/gpu/drm/amd/amdgpu/si_dpm.c               |   4 +-
+ drivers/gpu/drm/amd/amdgpu/tonga_ih.c             |   1 +
+ drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c             |   2 +-
+ drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c             |   2 +-
+ drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c             |   2 +-
+ drivers/gpu/drm/amd/amdgpu/vce_v2_0.c             |   2 +-
+ drivers/gpu/drm/amd/amdgpu/vce_v3_0.c             |   2 +-
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |   6 +-
+ drivers/gpu/drm/amd/include/cgs_linux.h           |  19 ++--
+ 33 files changed, 194 insertions(+), 108 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c
+index d9e5aa4..f0e3624 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c
+@@ -571,7 +571,9 @@ static const struct amdgpu_irq_src_funcs cgs_irq_funcs = {
+ 	.process = cgs_process_irq,
+ };
+ 
+-static int amdgpu_cgs_add_irq_source(struct cgs_device *cgs_device, unsigned src_id,
++static int amdgpu_cgs_add_irq_source(void *cgs_device,
++				     unsigned client_id,
++				     unsigned src_id,
+ 				     unsigned num_types,
+ 				     cgs_irq_source_set_func_t set,
+ 				     cgs_irq_handler_func_t handler,
+@@ -597,7 +599,7 @@ static int amdgpu_cgs_add_irq_source(struct cgs_device *cgs_device, unsigned src
+ 	irq_params->handler = handler;
+ 	irq_params->private_data = private_data;
+ 	source->data = (void *)irq_params;
+-	ret = amdgpu_irq_add_id(adev, src_id, source);
++	ret = amdgpu_irq_add_id(adev, client_id, src_id, source);
+ 	if (ret) {
+ 		kfree(irq_params);
+ 		kfree(source);
+@@ -606,16 +608,26 @@ static int amdgpu_cgs_add_irq_source(struct cgs_device *cgs_device, unsigned src
+ 	return ret;
+ }
+ 
+-static int amdgpu_cgs_irq_get(struct cgs_device *cgs_device, unsigned src_id, unsigned type)
++static int amdgpu_cgs_irq_get(void *cgs_device, unsigned client_id,
++			      unsigned src_id, unsigned type)
+ {
+ 	CGS_FUNC_ADEV;
+-	return amdgpu_irq_get(adev, adev->irq.sources[src_id], type);
++
++	if (!adev->irq.client[client_id].sources)
++		return -EINVAL;
++
++	return amdgpu_irq_get(adev, adev->irq.client[client_id].sources[src_id], type);
+ }
+ 
+-static int amdgpu_cgs_irq_put(struct cgs_device *cgs_device, unsigned src_id, unsigned type)
++static int amdgpu_cgs_irq_put(void *cgs_device, unsigned client_id,
++			      unsigned src_id, unsigned type)
+ {
+ 	CGS_FUNC_ADEV;
+-	return amdgpu_irq_put(adev, adev->irq.sources[src_id], type);
++
++	if (!adev->irq.client[client_id].sources)
++		return -EINVAL;
++
++	return amdgpu_irq_put(adev, adev->irq.client[client_id].sources[src_id], type);
+ }
+ 
+ static int amdgpu_cgs_set_clockgating_state(struct cgs_device *cgs_device,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
+index ba38ae6..d77c639 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
+@@ -26,6 +26,10 @@
+ 
+ struct amdgpu_device;
+ 
++#define AMDGPU_IH_CLIENTID_LEGACY 0
++
++#define AMDGPU_IH_CLIENTID_MAX 0x1f
++
+ /*
+  * R6xx+ IH ring
+  */
+@@ -47,10 +51,12 @@ struct amdgpu_ih_ring {
+ };
+ 
+ struct amdgpu_iv_entry {
++	unsigned client_id;
+ 	unsigned src_id;
+ 	unsigned src_data;
+ 	unsigned ring_id;
+ 	unsigned vm_id;
++	unsigned vm_id_src;
+ 	unsigned pas_id;
+ 	const uint32_t *iv_entry;
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+index efada947..9c98bee 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+@@ -95,23 +95,28 @@ static void amdgpu_irq_reset_work_func(struct work_struct *work)
+ static void amdgpu_irq_disable_all(struct amdgpu_device *adev)
+ {
+ 	unsigned long irqflags;
+-	unsigned i, j;
++	unsigned i, j, k;
+ 	int r;
+ 
+ 	spin_lock_irqsave(&adev->irq.lock, irqflags);
+-	for (i = 0; i < AMDGPU_MAX_IRQ_SRC_ID; ++i) {
+-		struct amdgpu_irq_src *src = adev->irq.sources[i];
+-
+-		if (!src || !src->funcs->set || !src->num_types)
++	for (i = 0; i < AMDGPU_IH_CLIENTID_MAX; ++i) {
++		if (!adev->irq.client[i].sources)
+ 			continue;
+ 
+-		for (j = 0; j < src->num_types; ++j) {
+-			atomic_set(&src->enabled_types[j], 0);
+-			r = src->funcs->set(adev, src, j,
+-					    AMDGPU_IRQ_STATE_DISABLE);
+-			if (r)
+-				DRM_ERROR("error disabling interrupt (%d)\n",
+-					  r);
++		for (j = 0; j < AMDGPU_MAX_IRQ_SRC_ID; ++j) {
++			struct amdgpu_irq_src *src = adev->irq.client[i].sources[j];
++
++			if (!src || !src->funcs->set || !src->num_types)
++				continue;
++
++			for (k = 0; k < src->num_types; ++k) {
++				atomic_set(&src->enabled_types[k], 0);
++				r = src->funcs->set(adev, src, k,
++						    AMDGPU_IRQ_STATE_DISABLE);
++				if (r)
++					DRM_ERROR("error disabling interrupt (%d)\n",
++						  r);
++			}
+ 		}
+ 	}
+ 	spin_unlock_irqrestore(&adev->irq.lock, irqflags);
+@@ -265,7 +270,7 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
+  */
+ void amdgpu_irq_fini(struct amdgpu_device *adev)
+ {
+-	unsigned i;
++	unsigned i, j;
+ 
+ 	drm_vblank_cleanup(adev->ddev);
+ 	if (adev->irq.installed) {
+@@ -277,19 +282,25 @@ void amdgpu_irq_fini(struct amdgpu_device *adev)
+ 		cancel_work_sync(&adev->reset_work);
+ 	}
+ 
+-	for (i = 0; i < AMDGPU_MAX_IRQ_SRC_ID; ++i) {
+-		struct amdgpu_irq_src *src = adev->irq.sources[i];
+-
+-		if (!src)
++	for (i = 0; i < AMDGPU_IH_CLIENTID_MAX; ++i) {
++		if (!adev->irq.client[i].sources)
+ 			continue;
+ 
+-		kfree(src->enabled_types);
+-		src->enabled_types = NULL;
+-		if (src->data) {
+-			kfree(src->data);
+-			kfree(src);
+-			adev->irq.sources[i] = NULL;
++		for (j = 0; j < AMDGPU_MAX_IRQ_SRC_ID; ++j) {
++			struct amdgpu_irq_src *src = adev->irq.client[i].sources[j];
++
++			if (!src)
++				continue;
++
++			kfree(src->enabled_types);
++			src->enabled_types = NULL;
++			if (src->data) {
++				kfree(src->data);
++				kfree(src);
++				adev->irq.client[i].sources[j] = NULL;
++			}
+ 		}
++		kfree(adev->irq.client[i].sources);
+ 	}
+ }
+ 
+@@ -301,18 +312,30 @@ void amdgpu_irq_fini(struct amdgpu_device *adev)
+  * @source: irq source
+  *
+  */
+-int amdgpu_irq_add_id(struct amdgpu_device *adev, unsigned src_id,
++int amdgpu_irq_add_id(struct amdgpu_device *adev,
++		      unsigned client_id, unsigned src_id,
+ 		      struct amdgpu_irq_src *source)
+ {
+-	if (src_id >= AMDGPU_MAX_IRQ_SRC_ID)
++	if (client_id >= AMDGPU_IH_CLIENTID_MAX)
+ 		return -EINVAL;
+ 
+-	if (adev->irq.sources[src_id] != NULL)
++	if (src_id >= AMDGPU_MAX_IRQ_SRC_ID)
+ 		return -EINVAL;
+ 
+ 	if (!source->funcs)
+ 		return -EINVAL;
+ 
++	if (!adev->irq.client[client_id].sources) {
++		adev->irq.client[client_id].sources = kcalloc(AMDGPU_MAX_IRQ_SRC_ID,
++							      sizeof(struct amdgpu_irq_src),
++							      GFP_KERNEL);
++		if (!adev->irq.client[client_id].sources)
++			return -ENOMEM;
++	}
++
++	if (adev->irq.client[client_id].sources[src_id] != NULL)
++		return -EINVAL;
++
+ 	if (source->num_types && !source->enabled_types) {
+ 		atomic_t *types;
+ 
+@@ -324,8 +347,7 @@ int amdgpu_irq_add_id(struct amdgpu_device *adev, unsigned src_id,
+ 		source->enabled_types = types;
+ 	}
+ 
+-	adev->irq.sources[src_id] = source;
+-
++	adev->irq.client[client_id].sources[src_id] = source;
+ 	return 0;
+ }
+ 
+@@ -340,10 +362,16 @@ int amdgpu_irq_add_id(struct amdgpu_device *adev, unsigned src_id,
+ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
+ 			 struct amdgpu_iv_entry *entry)
+ {
++	unsigned client_id = entry->client_id;
+ 	unsigned src_id = entry->src_id;
+ 	struct amdgpu_irq_src *src;
+ 	int r;
+ 
++	if (client_id >= AMDGPU_IH_CLIENTID_MAX) {
++		DRM_DEBUG("Invalid client_id in IV: %d\n", client_id);
++		return;
++	}
++
+ 	if (src_id >= AMDGPU_MAX_IRQ_SRC_ID) {
+ 		DRM_DEBUG("Invalid src_id in IV: %d\n", src_id);
+ 		return;
+@@ -352,7 +380,13 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
+ 	if (adev->irq.virq[src_id]) {
+ 		generic_handle_irq(irq_find_mapping(adev->irq.domain, src_id));
+ 	} else {
+-		src = adev->irq.sources[src_id];
++		if (!adev->irq.client[client_id].sources) {
++			DRM_DEBUG("Unregistered interrupt client_id: %d src_id: %d\n",
++				  client_id, src_id);
++			return;
++		}
++
++		src = adev->irq.client[client_id].sources[src_id];
+ 		if (!src) {
+ 			DRM_DEBUG("Unhandled interrupt src_id: %d\n", src_id);
+ 			return;
+@@ -396,13 +430,20 @@ int amdgpu_irq_update(struct amdgpu_device *adev,
+ 
+ void amdgpu_irq_gpu_reset_resume_helper(struct amdgpu_device *adev)
+ {
+-	int i, j;
+-	for (i = 0; i < AMDGPU_MAX_IRQ_SRC_ID; i++) {
+-		struct amdgpu_irq_src *src = adev->irq.sources[i];
+-		if (!src)
++	int i, j, k;
++
++	for (i = 0; i < AMDGPU_IH_CLIENTID_MAX; ++i) {
++		if (!adev->irq.client[i].sources)
+ 			continue;
+-		for (j = 0; j < src->num_types; j++)
+-			amdgpu_irq_update(adev, src, j);
++
++		for (j = 0; j < AMDGPU_MAX_IRQ_SRC_ID; ++j) {
++			struct amdgpu_irq_src *src = adev->irq.client[i].sources[j];
++
++			if (!src)
++				continue;
++			for (k = 0; k < src->num_types; k++)
++				amdgpu_irq_update(adev, src, k);
++		}
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
+index 1642f41..0610cc4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
+@@ -28,6 +28,7 @@
+ #include "amdgpu_ih.h"
+ 
+ #define AMDGPU_MAX_IRQ_SRC_ID	0x100
++#define AMDGPU_MAX_IRQ_CLIENT_ID	0x100
+ 
+ struct amdgpu_device;
+ struct amdgpu_iv_entry;
+@@ -44,6 +45,10 @@ struct amdgpu_irq_src {
+ 	void *data;
+ };
+ 
++struct amdgpu_irq_client {
++	struct amdgpu_irq_src **sources;
++};
++
+ /* provided by interrupt generating IP blocks */
+ struct amdgpu_irq_src_funcs {
+ 	int (*set)(struct amdgpu_device *adev, struct amdgpu_irq_src *source,
+@@ -58,7 +63,7 @@ struct amdgpu_irq {
+ 	bool				installed;
+ 	spinlock_t			lock;
+ 	/* interrupt sources */
+-	struct amdgpu_irq_src		*sources[AMDGPU_MAX_IRQ_SRC_ID];
++	struct amdgpu_irq_client	client[AMDGPU_IH_CLIENTID_MAX];
+ 
+ 	/* status, etc. */
+ 	bool				msi_enabled; /* msi enabled */
+@@ -80,7 +85,8 @@ irqreturn_t amdgpu_irq_handler(int irq, void *arg);
+ 
+ int amdgpu_irq_init(struct amdgpu_device *adev);
+ void amdgpu_irq_fini(struct amdgpu_device *adev);
+-int amdgpu_irq_add_id(struct amdgpu_device *adev, unsigned src_id,
++int amdgpu_irq_add_id(struct amdgpu_device *adev,
++		      unsigned client_id, unsigned src_id,
+ 		      struct amdgpu_irq_src *source);
+ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
+ 			 struct amdgpu_iv_entry *entry);
+diff --git a/drivers/gpu/drm/amd/amdgpu/ci_dpm.c b/drivers/gpu/drm/amd/amdgpu/ci_dpm.c
+index c8cb964..11ccda8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/ci_dpm.c
++++ b/drivers/gpu/drm/amd/amdgpu/ci_dpm.c
+@@ -6284,11 +6284,13 @@ static int ci_dpm_sw_init(void *handle)
+ 	int ret;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	ret = amdgpu_irq_add_id(adev, 230, &adev->pm.dpm.thermal.irq);
++	ret = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 230,
++				&adev->pm.dpm.thermal.irq);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = amdgpu_irq_add_id(adev, 231, &adev->pm.dpm.thermal.irq);
++	ret = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 231,
++				&adev->pm.dpm.thermal.irq);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index c853461..9342566 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -923,17 +923,20 @@ static int cik_sdma_sw_init(void *handle)
+ 	}
+ 
+ 	/* SDMA trap event */
+-	r = amdgpu_irq_add_id(adev, 224, &adev->sdma.trap_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 224,
++			      &adev->sdma.trap_irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* SDMA Privileged inst */
+-	r = amdgpu_irq_add_id(adev, 241, &adev->sdma.illegal_inst_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 241,
++			      &adev->sdma.illegal_inst_irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* SDMA Privileged inst */
+-	r = amdgpu_irq_add_id(adev, 247, &adev->sdma.illegal_inst_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 247,
++			      &adev->sdma.illegal_inst_irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/cz_ih.c b/drivers/gpu/drm/amd/amdgpu/cz_ih.c
+index fe7cbb2..f1ccbe6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cz_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/cz_ih.c
+@@ -227,6 +227,7 @@ static void cz_ih_decode_iv(struct amdgpu_device *adev,
+ 	dw[2] = le32_to_cpu(adev->irq.ih.ring[ring_index + 2]);
+ 	dw[3] = le32_to_cpu(adev->irq.ih.ring[ring_index + 3]);
+ 
++	entry->client_id = AMDGPU_IH_CLIENTID_LEGACY;
+ 	entry->src_id = dw[0] & 0xff;
+ 	entry->src_data = dw[1] & 0xfffffff;
+ 	entry->ring_id = dw[2] & 0xff;
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
+index db6e299..9370a1b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
+@@ -2948,19 +2948,19 @@ static int dce_v10_0_sw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	for (i = 0; i < adev->mode_info.num_crtc; i++) {
+-		r = amdgpu_irq_add_id(adev, i + 1, &adev->crtc_irq);
++		r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, i + 1, &adev->crtc_irq);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+ 	for (i = 8; i < 20; i += 2) {
+-		r = amdgpu_irq_add_id(adev, i, &adev->pageflip_irq);
++		r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, i, &adev->pageflip_irq);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+ 	/* HPD hotplug */
+-	r = amdgpu_irq_add_id(adev, 42, &adev->hpd_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 42, &adev->hpd_irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c
+index 459afac..1dd4085 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c
+@@ -3008,19 +3008,19 @@ static int dce_v11_0_sw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	for (i = 0; i < adev->mode_info.num_crtc; i++) {
+-		r = amdgpu_irq_add_id(adev, i + 1, &adev->crtc_irq);
++		r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, i + 1, &adev->crtc_irq);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+ 	for (i = 8; i < 20; i += 2) {
+-		r = amdgpu_irq_add_id(adev, i, &adev->pageflip_irq);
++		r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, i, &adev->pageflip_irq);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+ 	/* HPD hotplug */
+-	r = amdgpu_irq_add_id(adev, 42, &adev->hpd_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 42, &adev->hpd_irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c
+index 874ee22..8813cde 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c
+@@ -2800,19 +2800,19 @@ static int dce_v6_0_sw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	for (i = 0; i < adev->mode_info.num_crtc; i++) {
+-		r = amdgpu_irq_add_id(adev, i + 1, &adev->crtc_irq);
++		r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, i + 1, &adev->crtc_irq);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+ 	for (i = 8; i < 20; i += 2) {
+-		r = amdgpu_irq_add_id(adev, i, &adev->pageflip_irq);
++		r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, i, &adev->pageflip_irq);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+ 	/* HPD hotplug */
+-	r = amdgpu_irq_add_id(adev, 42, &adev->hpd_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 42, &adev->hpd_irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c
+index f6d16ed..9d07011 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c
+@@ -2795,19 +2795,19 @@ static int dce_v8_0_sw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	for (i = 0; i < adev->mode_info.num_crtc; i++) {
+-		r = amdgpu_irq_add_id(adev, i + 1, &adev->crtc_irq);
++		r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, i + 1, &adev->crtc_irq);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+ 	for (i = 8; i < 20; i += 2) {
+-		r = amdgpu_irq_add_id(adev, i, &adev->pageflip_irq);
++		r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, i, &adev->pageflip_irq);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+ 	/* HPD hotplug */
+-	r = amdgpu_irq_add_id(adev, 42, &adev->hpd_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 42, &adev->hpd_irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_virtual.c b/drivers/gpu/drm/amd/amdgpu/dce_virtual.c
+index efdade0..5ee139c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_virtual.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_virtual.c
+@@ -471,7 +471,7 @@ static int dce_virtual_sw_init(void *handle)
+ 	int r, i;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	r = amdgpu_irq_add_id(adev, 229, &adev->crtc_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 229, &adev->crtc_irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
+index 51731a6..6888883 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
+@@ -3242,15 +3242,15 @@ static int gfx_v6_0_sw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	int i, r;
+ 
+-	r = amdgpu_irq_add_id(adev, 181, &adev->gfx.eop_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 181, &adev->gfx.eop_irq);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_irq_add_id(adev, 184, &adev->gfx.priv_reg_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 184, &adev->gfx.priv_reg_irq);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_irq_add_id(adev, 185, &adev->gfx.priv_inst_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 185, &adev->gfx.priv_inst_irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index bbd62dc..421408e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -4669,17 +4669,19 @@ static int gfx_v7_0_sw_init(void *handle)
+ 	int i, r;
+ 
+ 	/* EOP Event */
+-	r = amdgpu_irq_add_id(adev, 181, &adev->gfx.eop_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 181, &adev->gfx.eop_irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* Privileged reg */
+-	r = amdgpu_irq_add_id(adev, 184, &adev->gfx.priv_reg_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 184,
++			      &adev->gfx.priv_reg_irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* Privileged inst */
+-	r = amdgpu_irq_add_id(adev, 185, &adev->gfx.priv_inst_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 185,
++			      &adev->gfx.priv_inst_irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 5469751..5dd5d39 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -2073,22 +2073,24 @@ static int gfx_v8_0_sw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	/* KIQ event */
+-	r = amdgpu_irq_add_id(adev, 178, &adev->gfx.kiq.irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 178, &adev->gfx.kiq.irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* EOP Event */
+-	r = amdgpu_irq_add_id(adev, 181, &adev->gfx.eop_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 181, &adev->gfx.eop_irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* Privileged reg */
+-	r = amdgpu_irq_add_id(adev, 184, &adev->gfx.priv_reg_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 184,
++			      &adev->gfx.priv_reg_irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* Privileged inst */
+-	r = amdgpu_irq_add_id(adev, 185, &adev->gfx.priv_inst_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 185,
++			      &adev->gfx.priv_inst_irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+index 3328428..01ce49f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+@@ -823,11 +823,11 @@ static int gmc_v6_0_sw_init(void *handle)
+ 	int dma_bits;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	r = amdgpu_irq_add_id(adev, 146, &adev->mc.vm_fault);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 146, &adev->mc.vm_fault);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_irq_add_id(adev, 147, &adev->mc.vm_fault);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 147, &adev->mc.vm_fault);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index 13efb67..4e41764 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -969,11 +969,11 @@ static int gmc_v7_0_sw_init(void *handle)
+ 		adev->mc.vram_type = gmc_v7_0_convert_vram_type(tmp);
+ 	}
+ 
+-	r = amdgpu_irq_add_id(adev, 146, &adev->mc.vm_fault);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 146, &adev->mc.vm_fault);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_irq_add_id(adev, 147, &adev->mc.vm_fault);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 147, &adev->mc.vm_fault);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index 952ba1e..c737ada 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -981,11 +981,11 @@ static int gmc_v8_0_sw_init(void *handle)
+ 		adev->mc.vram_type = gmc_v8_0_convert_vram_type(tmp);
+ 	}
+ 
+-	r = amdgpu_irq_add_id(adev, 146, &adev->mc.vm_fault);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 146, &adev->mc.vm_fault);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_irq_add_id(adev, 147, &adev->mc.vm_fault);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 147, &adev->mc.vm_fault);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/iceland_ih.c b/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
+index ac21bb7..5d5860c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
+@@ -227,6 +227,7 @@ static void iceland_ih_decode_iv(struct amdgpu_device *adev,
+ 	dw[2] = le32_to_cpu(adev->irq.ih.ring[ring_index + 2]);
+ 	dw[3] = le32_to_cpu(adev->irq.ih.ring[ring_index + 3]);
+ 
++	entry->client_id = AMDGPU_IH_CLIENTID_LEGACY;
+ 	entry->src_id = dw[0] & 0xff;
+ 	entry->src_data = dw[1] & 0xfffffff;
+ 	entry->ring_id = dw[2] & 0xff;
+diff --git a/drivers/gpu/drm/amd/amdgpu/kv_dpm.c b/drivers/gpu/drm/amd/amdgpu/kv_dpm.c
+index 13f3237..79a52ad2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/kv_dpm.c
++++ b/drivers/gpu/drm/amd/amdgpu/kv_dpm.c
+@@ -2981,11 +2981,13 @@ static int kv_dpm_sw_init(void *handle)
+ 	int ret;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	ret = amdgpu_irq_add_id(adev, 230, &adev->pm.dpm.thermal.irq);
++	ret = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 230,
++				&adev->pm.dpm.thermal.irq);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = amdgpu_irq_add_id(adev, 231, &adev->pm.dpm.thermal.irq);
++	ret = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 231,
++				&adev->pm.dpm.thermal.irq);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/mxgpu_vi.c b/drivers/gpu/drm/amd/amdgpu/mxgpu_vi.c
+index 3c6b0af..7bdc51b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mxgpu_vi.c
++++ b/drivers/gpu/drm/amd/amdgpu/mxgpu_vi.c
+@@ -569,11 +569,11 @@ int xgpu_vi_mailbox_add_irq_id(struct amdgpu_device *adev)
+ {
+ 	int r;
+ 
+-	r = amdgpu_irq_add_id(adev, 135, &adev->virt.rcv_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 135, &adev->virt.rcv_irq);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_irq_add_id(adev, 138, &adev->virt.ack_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 138, &adev->virt.ack_irq);
+ 	if (r) {
+ 		amdgpu_irq_put(adev, &adev->virt.rcv_irq, 0);
+ 		return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index 4b8efad..70525c8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -921,17 +921,20 @@ static int sdma_v2_4_sw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	/* SDMA trap event */
+-	r = amdgpu_irq_add_id(adev, 224, &adev->sdma.trap_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 224,
++			      &adev->sdma.trap_irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* SDMA Privileged inst */
+-	r = amdgpu_irq_add_id(adev, 241, &adev->sdma.illegal_inst_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 241,
++			      &adev->sdma.illegal_inst_irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* SDMA Privileged inst */
+-	r = amdgpu_irq_add_id(adev, 247, &adev->sdma.illegal_inst_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 247,
++			      &adev->sdma.illegal_inst_irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index 740ec8c..714c1d9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -1137,17 +1137,20 @@ static int sdma_v3_0_sw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	/* SDMA trap event */
+-	r = amdgpu_irq_add_id(adev, 224, &adev->sdma.trap_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 224,
++			      &adev->sdma.trap_irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* SDMA Privileged inst */
+-	r = amdgpu_irq_add_id(adev, 241, &adev->sdma.illegal_inst_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 241,
++			      &adev->sdma.illegal_inst_irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* SDMA Privileged inst */
+-	r = amdgpu_irq_add_id(adev, 247, &adev->sdma.illegal_inst_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 247,
++			      &adev->sdma.illegal_inst_irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/si_dma.c b/drivers/gpu/drm/amd/amdgpu/si_dma.c
+index a6631f5..9c12417 100644
+--- a/drivers/gpu/drm/amd/amdgpu/si_dma.c
++++ b/drivers/gpu/drm/amd/amdgpu/si_dma.c
+@@ -517,12 +517,12 @@ static int si_dma_sw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	/* DMA0 trap event */
+-	r = amdgpu_irq_add_id(adev, 224, &adev->sdma.trap_irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 224, &adev->sdma.trap_irq);
+ 	if (r)
+ 		return r;
+ 
+ 	/* DMA1 trap event */
+-	r = amdgpu_irq_add_id(adev, 244, &adev->sdma.trap_irq_1);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 244, &adev->sdma.trap_irq_1);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/si_dpm.c b/drivers/gpu/drm/amd/amdgpu/si_dpm.c
+index ded6b9b..42e95ee 100644
+--- a/drivers/gpu/drm/amd/amdgpu/si_dpm.c
++++ b/drivers/gpu/drm/amd/amdgpu/si_dpm.c
+@@ -7690,11 +7690,11 @@ static int si_dpm_sw_init(void *handle)
+ 	int ret;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	ret = amdgpu_irq_add_id(adev, 230, &adev->pm.dpm.thermal.irq);
++	ret = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 230, &adev->pm.dpm.thermal.irq);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = amdgpu_irq_add_id(adev, 231, &adev->pm.dpm.thermal.irq);
++	ret = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 231, &adev->pm.dpm.thermal.irq);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/tonga_ih.c b/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
+index 52b71ee..a6a2c2f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
+@@ -238,6 +238,7 @@ static void tonga_ih_decode_iv(struct amdgpu_device *adev,
+ 	dw[2] = le32_to_cpu(adev->irq.ih.ring[ring_index + 2]);
+ 	dw[3] = le32_to_cpu(adev->irq.ih.ring[ring_index + 3]);
+ 
++	entry->client_id = AMDGPU_IH_CLIENTID_LEGACY;
+ 	entry->src_id = dw[0] & 0xff;
+ 	entry->src_data = dw[1] & 0xfffffff;
+ 	entry->ring_id = dw[2] & 0xff;
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+index 4bcb2f3..9a4129d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v4_2.c
+@@ -107,7 +107,7 @@ static int uvd_v4_2_sw_init(void *handle)
+ 	int r;
+ 
+ 	/* UVD TRAP */
+-	r = amdgpu_irq_add_id(adev, 124, &adev->uvd.irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 124, &adev->uvd.irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+index 35008c1..e448f7d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c
+@@ -103,7 +103,7 @@ static int uvd_v5_0_sw_init(void *handle)
+ 	int r;
+ 
+ 	/* UVD TRAP */
+-	r = amdgpu_irq_add_id(adev, 124, &adev->uvd.irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 124, &adev->uvd.irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+index 46fe498..07aa245 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+@@ -106,7 +106,7 @@ static int uvd_v6_0_sw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	/* UVD TRAP */
+-	r = amdgpu_irq_add_id(adev, 124, &adev->uvd.irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 124, &adev->uvd.irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c
+index 3433a73..c7fd4b7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v2_0.c
+@@ -430,7 +430,7 @@ static int vce_v2_0_sw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	/* VCE */
+-	r = amdgpu_irq_add_id(adev, 167, &adev->vce.irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 167, &adev->vce.irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+index 2c5f88c..684e53f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+@@ -383,7 +383,7 @@ static int vce_v3_0_sw_init(void *handle)
+ 	int r, i;
+ 
+ 	/* VCE */
+-	r = amdgpu_irq_add_id(adev, 167, &adev->vce.irq);
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 167, &adev->vce.irq);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index fa4eaf5..eb10ac4 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -910,7 +910,7 @@ static int dce110_register_irq_handlers(struct amdgpu_device *adev)
+ 
+ 	/* Use VBLANK interrupt */
+ 	for (i = 1; i <= adev->mode_info.num_crtc; i++) {
+-		r = amdgpu_irq_add_id(adev, i, &adev->crtc_irq);
++		r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, i, &adev->crtc_irq);
+ 
+ 		if (r) {
+ 			DRM_ERROR("Failed to add crtc irq id!\n");
+@@ -933,7 +933,7 @@ static int dce110_register_irq_handlers(struct amdgpu_device *adev)
+ 	/* Use GRPH_PFLIP interrupt */
+ 	for (i = VISLANDS30_IV_SRCID_D1_GRPH_PFLIP;
+ 			i <= VISLANDS30_IV_SRCID_D6_GRPH_PFLIP; i += 2) {
+-		r = amdgpu_irq_add_id(adev, i, &adev->pageflip_irq);
++		r = amdgpu_irq_add_id(adev, i, AMDGPU_IH_CLIENTID_LEGACY, &adev->pageflip_irq);
+ 		if (r) {
+ 			DRM_ERROR("Failed to add page flip irq id!\n");
+ 			return r;
+@@ -954,7 +954,7 @@ static int dce110_register_irq_handlers(struct amdgpu_device *adev)
+ 	}
+ 
+ 	/* HPD */
+-	r = amdgpu_irq_add_id(adev, VISLANDS30_IV_SRCID_HOTPLUG_DETECT_A,
++	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, VISLANDS30_IV_SRCID_HOTPLUG_DETECT_A,
+ 			&adev->hpd_irq);
+ 	if (r) {
+ 		DRM_ERROR("Failed to add hpd irq id!\n");
+diff --git a/drivers/gpu/drm/amd/include/cgs_linux.h b/drivers/gpu/drm/amd/include/cgs_linux.h
+index ca4f600..bc7446c 100644
+--- a/drivers/gpu/drm/amd/include/cgs_linux.h
++++ b/drivers/gpu/drm/amd/include/cgs_linux.h
+@@ -66,7 +66,8 @@ typedef int (*cgs_irq_handler_func_t)(void *private_data,
+  *
+  * Return:  0 on success, -errno otherwise
+  */
+-typedef int (*cgs_add_irq_source_t)(struct cgs_device *cgs_device, unsigned src_id,
++typedef int (*cgs_add_irq_source_t)(void *cgs_device, unsigned client_id,
++				    unsigned src_id,
+ 				    unsigned num_types,
+ 				    cgs_irq_source_set_func_t set,
+ 				    cgs_irq_handler_func_t handler,
+@@ -83,7 +84,7 @@ typedef int (*cgs_add_irq_source_t)(struct cgs_device *cgs_device, unsigned src_
+  *
+  * Return:  0 on success, -errno otherwise
+  */
+-typedef int (*cgs_irq_get_t)(struct cgs_device *cgs_device, unsigned src_id, unsigned type);
++typedef int (*cgs_irq_get_t)(void *cgs_device, unsigned client_id, unsigned src_id, unsigned type);
+ 
+ /**
+  * cgs_irq_put() - Indicate IRQ source is no longer needed
+@@ -98,7 +99,7 @@ typedef int (*cgs_irq_get_t)(struct cgs_device *cgs_device, unsigned src_id, uns
+  *
+  * Return:  0 on success, -errno otherwise
+  */
+-typedef int (*cgs_irq_put_t)(struct cgs_device *cgs_device, unsigned src_id, unsigned type);
++typedef int (*cgs_irq_put_t)(void *cgs_device, unsigned client_id, unsigned src_id, unsigned type);
+ 
+ struct cgs_os_ops {
+ 	/* IRQ handling */
+@@ -107,12 +108,12 @@ struct cgs_os_ops {
+ 	cgs_irq_put_t irq_put;
+ };
+ 
+-#define cgs_add_irq_source(dev,src_id,num_types,set,handler,private_data) \
+-	CGS_OS_CALL(add_irq_source,dev,src_id,num_types,set,handler,	\
++#define cgs_add_irq_source(dev,client_id,src_id,num_types,set,handler,private_data) \
++	CGS_OS_CALL(add_irq_source,dev,client_id,src_id,num_types,set,handler, \
+ 		    private_data)
+-#define cgs_irq_get(dev,src_id,type)		\
+-	CGS_OS_CALL(irq_get,dev,src_id,type)
+-#define cgs_irq_put(dev,src_id,type)		\
+-	CGS_OS_CALL(irq_put,dev,src_id,type)
++#define cgs_irq_get(dev,client_id,src_id,type)	\
++	CGS_OS_CALL(irq_get,dev,client_id,src_id,type)
++#define cgs_irq_put(dev,client_id,src_id,type)	\
++	CGS_OS_CALL(irq_put,dev,client_id,src_id,type)
+ 
+ #endif /* _CGS_LINUX_H */
+-- 
+2.7.4
+

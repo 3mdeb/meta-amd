@@ -1,0 +1,200 @@
+From 8fb3874dfa0889139a55b52b3b57076052304b1a Mon Sep 17 00:00:00 2001
+From: Eric Yang <eric.yang2@amd.com>
+Date: Thu, 28 Jul 2016 11:20:24 -0400
+Subject: [PATCH 0671/1722] drm/amd/dal: Fix address reporting and context out
+ of sync
+
+Signed-off-by: Eric Yang <eric.yang2@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc_surface.c            | 10 ++++++----
+ drivers/gpu/drm/amd/dal/dc/dc.h                         | 10 ++++++----
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c | 15 ++++++++-------
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c    |  2 ++
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input_v.c  |  3 +++
+ drivers/gpu/drm/amd/dal/dc/inc/hw/mem_input.h           |  2 ++
+ 6 files changed, 27 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_surface.c b/drivers/gpu/drm/amd/dal/dc/core/dc_surface.c
+index 3e45992..158ccf4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_surface.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_surface.c
+@@ -103,6 +103,7 @@ alloc_fail:
+ }
+ 
+ const struct dc_surface_status *dc_surface_get_status(
++		struct validate_context *context,
+ 		struct dc_surface *dc_surface)
+ {
+ 	struct dc_surface_status *surface_status;
+@@ -125,22 +126,23 @@ const struct dc_surface_status *dc_surface_get_status(
+ 
+ 	core_dc = DC_TO_CORE(core_surface->ctx->dc);
+ 
++	if (!context)
++		context = core_dc->current_context;
++
+ 	if (core_dc->current_context == NULL)
+ 		return NULL;
+ 
+-	for (i = 0; i < core_dc->current_context->res_ctx.pool->pipe_count;
++	for (i = 0; i < context->res_ctx.pool->pipe_count;
+ 			i++) {
+ 		struct pipe_ctx *pipe_ctx =
+-				&core_dc->current_context->res_ctx.pipe_ctx[i];
++				&context->res_ctx.pipe_ctx[i];
+ 
+ 		if (pipe_ctx->surface !=
+ 				DC_SURFACE_TO_CORE(dc_surface))
+ 			continue;
+ 
+ 		core_dc->hwss.update_pending_status(pipe_ctx);
+-		surface_status->requested_address = dc_surface->address;
+ 	}
+-
+ 	return surface_status;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc.h b/drivers/gpu/drm/amd/dal/dc/dc.h
+index 13b8a04..4a5a4f9 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc.h
++++ b/drivers/gpu/drm/amd/dal/dc/dc.h
+@@ -49,8 +49,10 @@ struct dc_caps {
+ 	uint32_t i2c_speed_in_khz;
+ };
+ 
++/* Forward declaration*/
+ struct dc;
+ struct dc_surface;
++struct validate_context;
+ 
+ struct dc_stream_funcs {
+ 	bool (*adjust_vmin_vmax)(struct dc *dc,
+@@ -165,6 +167,7 @@ struct dc_surface {
+  */
+ struct dc_surface_status {
+ 	struct dc_plane_address requested_address;
++	struct dc_plane_address current_address;
+ 	bool is_flip_pending;
+ };
+ 
+@@ -172,8 +175,9 @@ struct dc_surface_status {
+  * Create a new surface with default parameters;
+  */
+ struct dc_surface *dc_create_surface(const struct dc *dc);
+-const struct dc_surface_status* dc_surface_get_status(
+-						struct dc_surface *dc_surface);
++const struct dc_surface_status *dc_surface_get_status(
++		struct validate_context *context,
++		struct dc_surface *dc_surface);
+ 
+ void dc_surface_retain(const struct dc_surface *dc_surface);
+ void dc_surface_release(const struct dc_surface *dc_surface);
+@@ -216,8 +220,6 @@ void dc_flip_surface_addrs(struct dc *dc,
+  *   This does not trigger a flip.  No surface address is programmed.
+  */
+ 
+-/* Forward declaration*/
+-struct validate_context;
+ 
+ void dc_flip_surface_addrs_on_context(
+ 		struct dc *dc,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 28810c5..34e13e3 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -1657,6 +1657,8 @@ static void update_pending_status(struct pipe_ctx *pipe_ctx)
+ 	surface->status.is_flip_pending =
+ 			pipe_ctx->mi->funcs->mem_input_is_flip_pending(
+ 					pipe_ctx->mi);
++
++	surface->status.current_address = pipe_ctx->mi->current_address;
+ }
+ 
+ static void power_down(struct core_dc *dc)
+@@ -1924,11 +1926,12 @@ static void dce110_program_front_end_for_pipe(struct core_dc *dc,
+ 	if (!pipe_ctx->surface->public.flip_immediate)
+ 		lock_mask |= PIPE_LOCK_CONTROL_SURFACE;
+ 
+-	dc->hwss.pipe_control_lock(
+-			dc->ctx,
+-			pipe_ctx->pipe_idx,
+-			lock_mask,
+-			true);
++	if (blender_configuration_changed(pipe_ctx, &dc->current_context->res_ctx.pipe_ctx[pipe_ctx->pipe_idx]))
++		dc->hwss.pipe_control_lock(
++				dc->ctx,
++				pipe_ctx->pipe_idx,
++				lock_mask,
++				true);
+ 
+ 	if (dc->current_context)
+ 		old_pipe = &dc->current_context->res_ctx.pipe_ctx[pipe_ctx->pipe_idx];
+@@ -1995,8 +1998,6 @@ static void dce110_program_front_end_for_pipe(struct core_dc *dc,
+ 				&surface->public.tiling_info,
+ 				surface->public.rotation);
+ 
+-	dc->hwss.update_plane_addr(dc, pipe_ctx);
+-
+ 	if (pipe_ctx->surface->public.gamma_correction)
+ 		gamma = DC_GAMMA_TO_CORE(
+ 			pipe_ctx->surface->public.gamma_correction);
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
+index 3b18d35..7e6ada3 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input.c
+@@ -359,6 +359,7 @@ bool dce110_mem_input_is_flip_pending(struct mem_input *mem_input)
+ 			GRPH_SURFACE_UPDATE_PENDING))
+ 		return true;
+ 
++	mem_input->current_address = mem_input->request_address;
+ 	return false;
+ }
+ 
+@@ -400,6 +401,7 @@ bool dce110_mem_input_program_surface_flip_and_addr(
+ 		break;
+ 	}
+ 
++	mem_input->request_address = *address;
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input_v.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input_v.c
+index c33d5b8..01bc9b7 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input_v.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_mem_input_v.c
+@@ -503,6 +503,7 @@ bool dce110_mem_input_v_is_surface_pending(struct mem_input *mem_input)
+ 			GRPH_SURFACE_UPDATE_PENDING))
+ 		return true;
+ 
++	mem_input->current_address = mem_input->request_address;
+ 	return false;
+ }
+ 
+@@ -517,6 +518,8 @@ bool dce110_mem_input_v_program_surface_flip_and_addr(
+ 	program_addr(mem_input110,
+ 		address);
+ 
++	mem_input->request_address = *address;
++
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw/mem_input.h b/drivers/gpu/drm/amd/dal/dc/inc/hw/mem_input.h
+index 55b90b3..28ebf3b 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw/mem_input.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw/mem_input.h
+@@ -32,6 +32,8 @@
+ struct mem_input {
+ 	struct mem_input_funcs *funcs;
+ 	struct dc_context *ctx;
++	struct dc_plane_address request_address;
++	struct dc_plane_address current_address;
+ 	uint32_t inst;
+ };
+ 
+-- 
+2.7.4
+

@@ -1,0 +1,104 @@
+From 71c28de49f59ea4151bf3a577881a25cdfe77950 Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Fri, 24 Feb 2017 12:06:22 +0800
+Subject: [PATCH 2568/3082] drm/amdgpu:change sequence of SDMA v4 init
+
+must set minor_update.enable before write smaller value
+to wptr/doorbell, so for sriov we need set that register
+bit in hw_init period.
+
+this could fix the SDMA ring test fail after guest reboot
+
+Change-Id: Id863396788cc5b35550cdcac405131d41690e77a
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c | 37 +++++++++++++++++++++++++---------
+ 1 file changed, 27 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+index 17da75c..f9d3d4b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+@@ -560,8 +560,14 @@ static int sdma_v4_0_gfx_resume(struct amdgpu_device *adev)
+ 		WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_BASE_HI), ring->gpu_addr >> 40);
+ 
+ 		ring->wptr = 0;
+-		WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_WPTR), lower_32_bits(ring->wptr) << 2);
+-		WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_WPTR_HI), upper_32_bits(ring->wptr) << 2);
++
++		/* before programing wptr to a less value, need set minor_ptr_update first */
++		WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_MINOR_PTR_UPDATE), 1);
++
++		if (!amdgpu_sriov_vf(adev)) { /* only bare-metal use register write for wptr */
++			WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_WPTR), lower_32_bits(ring->wptr) << 2);
++			WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_WPTR_HI), upper_32_bits(ring->wptr) << 2);
++		}
+ 
+ 		doorbell = RREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_DOORBELL));
+ 		doorbell_offset = RREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_DOORBELL_OFFSET));
+@@ -577,15 +583,23 @@ static int sdma_v4_0_gfx_resume(struct amdgpu_device *adev)
+ 		WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_DOORBELL_OFFSET), doorbell_offset);
+ 		nbio_v6_1_sdma_doorbell_range(adev, i, ring->use_doorbell, ring->doorbell_index);
+ 
++		if (amdgpu_sriov_vf(adev))
++			sdma_v4_0_ring_set_wptr(ring);
++
++		/* set minor_ptr_update to 0 after wptr programed */
++		WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_MINOR_PTR_UPDATE), 0);
++
+ 		/* set utc l1 enable flag always to 1 */
+ 		temp = RREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_CNTL));
+ 		temp = REG_SET_FIELD(temp, SDMA0_CNTL, UTC_L1_ENABLE, 1);
+ 		WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_CNTL), temp);
+ 
+-		/* unhalt engine */
+-		temp = RREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_F32_CNTL));
+-		temp = REG_SET_FIELD(temp, SDMA0_F32_CNTL, HALT, 0);
+-		WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_F32_CNTL), temp);
++		if (!amdgpu_sriov_vf(adev)) {
++			/* unhalt engine */
++			temp = RREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_F32_CNTL));
++			temp = REG_SET_FIELD(temp, SDMA0_F32_CNTL, HALT, 0);
++			WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_F32_CNTL), temp);
++		}
+ 
+ 		/* enable DMA RB */
+ 		rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_GFX_RB_CNTL, RB_ENABLE, 1);
+@@ -601,6 +615,11 @@ static int sdma_v4_0_gfx_resume(struct amdgpu_device *adev)
+ 
+ 		ring->ready = true;
+ 
++		if (amdgpu_sriov_vf(adev)) { /* bare-metal sequence doesn't need below to lines */
++			sdma_v4_0_ctx_switch_enable(adev, true);
++			sdma_v4_0_enable(adev, true);
++		}
++
+ 		r = amdgpu_ring_test_ring(ring);
+ 		if (r) {
+ 			ring->ready = false;
+@@ -671,8 +690,6 @@ static int sdma_v4_0_load_microcode(struct amdgpu_device *adev)
+ 			(adev->sdma.instance[i].fw->data +
+ 				le32_to_cpu(hdr->header.ucode_array_offset_bytes));
+ 
+-		sdma_v4_0_print_ucode_regs(adev);
+-
+ 		WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_UCODE_ADDR), 0);
+ 
+ 
+@@ -699,10 +716,10 @@ static int sdma_v4_0_load_microcode(struct amdgpu_device *adev)
+  */
+ static int sdma_v4_0_start(struct amdgpu_device *adev)
+ {
+-	int r;
++	int r = 0;
+ 
+ 	if (amdgpu_sriov_vf(adev)) {
+-		/* disable RB and halt engine */
++		sdma_v4_0_ctx_switch_enable(adev, false);
+ 		sdma_v4_0_enable(adev, false);
+ 
+ 		/* set RB registers */
+-- 
+2.7.4
+

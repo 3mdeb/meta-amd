@@ -1,0 +1,94 @@
+From 8e1c681de36d2dd7a6071675e1b4cefd970c7426 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Tue, 28 Mar 2017 20:36:12 -0400
+Subject: [PATCH 2596/3082] drm/amdgpu: Fix multi-level page table bugs for
+ large BOs v3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fix the start/end address calculation for address ranges that span
+multiple page directories in amdgpu_vm_alloc_levels.
+
+Add error messages if page tables aren't found. Otherwise the page
+table update would just fail silently.
+
+v2:
+ * Change WARN_ON to WARN_ON_ONCE
+ * Move masking of high address bits to caller
+ * Add range-check for "from" and "to"
+v3:
+ * Replace WARN_ON_ONCE in get_pt with pr_err in caller
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 24 ++++++++++++++++++------
+ 1 file changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 818747f..c11d15e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -275,13 +275,18 @@ static int amdgpu_vm_alloc_levels(struct amdgpu_device *adev,
+ 		memset(parent->entries, 0 , sizeof(struct amdgpu_vm_pt));
+ 	}
+ 
+-	from = (saddr >> shift) % amdgpu_vm_num_entries(adev, level);
+-	to = (eaddr >> shift) % amdgpu_vm_num_entries(adev, level);
++	from = saddr >> shift;
++	to = eaddr >> shift;
++	if (from >= amdgpu_vm_num_entries(adev, level) ||
++	    to >= amdgpu_vm_num_entries(adev, level))
++		return -EINVAL;
+ 
+ 	if (to > parent->last_entry_used)
+ 		parent->last_entry_used = to;
+ 
+ 	++level;
++	saddr = saddr & ((1 << shift) - 1);
++	eaddr = eaddr & ((1 << shift) - 1);
+ 
+ 	/* walk over the address space and allocate the page tables */
+ 	for (pt_idx = from; pt_idx <= to; ++pt_idx) {
+@@ -312,8 +317,11 @@ static int amdgpu_vm_alloc_levels(struct amdgpu_device *adev,
+ 		}
+ 
+ 		if (level < adev->vm_manager.num_level) {
+-			r = amdgpu_vm_alloc_levels(adev, vm, entry, saddr,
+-						   eaddr, level);
++			uint64_t sub_saddr = (pt_idx == from) ? saddr : 0;
++			uint64_t sub_eaddr = (pt_idx == to) ? eaddr :
++				((1 << shift) - 1);
++			r = amdgpu_vm_alloc_levels(adev, vm, entry, sub_saddr,
++						   sub_eaddr, level);
+ 			if (r)
+ 				return r;
+ 		}
+@@ -990,8 +998,10 @@ static void amdgpu_vm_update_ptes(struct amdgpu_pte_update_params *params,
+ 	/* initialize the variables */
+ 	addr = start;
+ 	pt = amdgpu_vm_get_pt(params, addr);
+-	if (!pt)
++	if (!pt) {
++		pr_err("PT not found, aborting update_ptes\n");
+ 		return;
++	}
+ 
+ 	if (params->shadow) {
+ 		if (!pt->shadow)
+@@ -1015,8 +1025,10 @@ static void amdgpu_vm_update_ptes(struct amdgpu_pte_update_params *params,
+ 	/* walk over the address space and update the page tables */
+ 	while (addr < end) {
+ 		pt = amdgpu_vm_get_pt(params, addr);
+-		if (!pt)
++		if (!pt) {
++			pr_err("PT not found, aborting update_ptes\n");
+ 			return;
++		}
+ 
+ 		if (params->shadow) {
+ 			if (!pt->shadow)
+-- 
+2.7.4
+

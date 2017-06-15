@@ -1,0 +1,933 @@
+From efe34e38338f9e91fa7f8a3af2d945c4eb60b359 Mon Sep 17 00:00:00 2001
+From: Tony Cheng <tony.cheng@amd.com>
+Date: Sat, 17 Sep 2016 15:08:35 -0400
+Subject: [PATCH 1102/1722] drm/amd/dal: refactor aux 3
+
+- switch register access to use macro
+- also add a few new macros for other common register access patterns
+
+Change-Id: Ib2c5392c5238e844f1b2555a7217885d9dd4704d
+Signed-off-by: Tony Cheng <tony.cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/dc_helper.c             |  66 ++-
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_audio.c   |   6 +-
+ .../drm/amd/dal/dc/dce110/dce110_stream_encoder.c  |   9 +-
+ drivers/gpu/drm/amd/dal/dc/dm_services.h           |   2 +-
+ drivers/gpu/drm/amd/dal/dc/i2caux/aux_engine.h     |   2 +
+ .../amd/dal/dc/i2caux/dce110/aux_engine_dce110.c   | 475 +++++----------------
+ .../amd/dal/dc/i2caux/dce110/aux_engine_dce110.h   |   6 +-
+ drivers/gpu/drm/amd/dal/dc/inc/reg_helper.h        |  50 ++-
+ 8 files changed, 206 insertions(+), 410 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/dc_helper.c b/drivers/gpu/drm/amd/dal/dc/dc_helper.c
+index 14f5343..86b0697 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dc_helper.c
++++ b/drivers/gpu/drm/amd/dal/dc/dc_helper.c
+@@ -7,19 +7,19 @@
+ #include "dm_services.h"
+ #include <stdarg.h>
+ 
+-void generic_reg_update_ex(const struct dc_context *ctx,
++uint32_t generic_reg_update_ex(const struct dc_context *ctx,
+ 		uint32_t addr, uint32_t reg_val, int n, ...)
+ {
+-	int shift, mask, field_value;
++	uint32_t shift, mask, field_value;
+ 	int i = 0;
+ 
+ 	va_list ap;
+ 	va_start(ap, n);
+ 
+ 	 while (i < n) {
+-		shift = va_arg(ap, int);
+-		mask = va_arg(ap, int);
+-		field_value = va_arg(ap, int);
++		shift = va_arg(ap, uint32_t);
++		mask = va_arg(ap, uint32_t);
++		field_value = va_arg(ap, uint32_t);
+ 
+ 		reg_val = set_reg_field_value_ex(reg_val, field_value, mask, shift);
+ 		i++;
+@@ -27,34 +27,62 @@ void generic_reg_update_ex(const struct dc_context *ctx,
+ 
+ 	 dm_write_reg(ctx, addr, reg_val);
+ 	 va_end(ap);
++
++	 return reg_val;
+ }
+ 
++uint32_t generic_reg_get(const struct dc_context *ctx,
++		uint32_t addr, int n, ...)
++{
++	uint32_t shift, mask;
++	uint32_t *field_value;
++	uint32_t reg_val;
++	int i = 0;
++
++	reg_val = dm_read_reg(ctx, addr);
++
++	va_list ap;
++	va_start(ap, n);
++
++	 while (i < n) {
++		shift = va_arg(ap, uint32_t);
++		mask = va_arg(ap, uint32_t);
++		field_value = va_arg(ap, uint32_t *);
++
++		*field_value = get_reg_field_value_ex(reg_val, mask, shift);
++		i++;
++	  }
++
++	 va_end(ap);
+ 
+-unsigned int generic_reg_wait(const struct dc_context *ctx,
+-	uint32_t addr, uint32_t mask, uint32_t shift, uint32_t condition_value,
++	 return reg_val;
++}
++
++uint32_t generic_reg_wait(const struct dc_context *ctx,
++	uint32_t addr, uint32_t shift, uint32_t mask, uint32_t condition_value,
+ 	unsigned int delay_between_poll_us, unsigned int time_out_num_tries)
+ {
+ 	uint32_t field_value;
+ 	uint32_t reg_val;
+ 	int i;
+ 
+-	reg_val = dm_read_reg(ctx, addr);
++	for (i = 0; i <= time_out_num_tries; i++) {
++		if (i) {
++			if (0 < delay_between_poll_us && delay_between_poll_us < 1000)
++				udelay(delay_between_poll_us);
+ 
+-	for (i = 1; i <= time_out_num_tries; i++) {
+-		field_value = get_reg_field_value_ex(reg_val, mask, shift);
++			if (delay_between_poll_us > 1000)
++				msleep(delay_between_poll_us/1000);
++		}
+ 
+-		if (field_value == condition_value)
+-			return i;
+-
+-		if (0 < delay_between_poll_us && delay_between_poll_us < 1000)
+-			udelay(delay_between_poll_us);
++		reg_val = dm_read_reg(ctx, addr);
+ 
+-		if (delay_between_poll_us > 1000)
+-			msleep(delay_between_poll_us/1000);
++		field_value = get_reg_field_value_ex(reg_val, mask, shift);
+ 
+-		reg_val = dm_read_reg(ctx, addr);
++		if (field_value == condition_value)
++			return reg_val;
+ 	}
+ 
+ 	BREAK_TO_DEBUGGER();
+-	return 0;
++	return reg_val;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_audio.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_audio.c
+index 007533e..436c98a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_audio.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_audio.c
+@@ -56,11 +56,11 @@ static void write_indirect_azalia_reg(struct audio *audio,
+ 	struct audio_dce110 *aud110 = DCE110_AUD(audio);
+ 
+ 	/* AZALIA_F0_CODEC_ENDPOINT_INDEX  endpoint index  */
+-	REG_SET(AZALIA_F0_CODEC_ENDPOINT_INDEX,
++	REG_SET(AZALIA_F0_CODEC_ENDPOINT_INDEX, 0,
+ 			AZALIA_ENDPOINT_REG_INDEX, reg_index);
+ 
+ 	/* AZALIA_F0_CODEC_ENDPOINT_DATA  endpoint data  */
+-	REG_SET(AZALIA_F0_CODEC_ENDPOINT_DATA,
++	REG_SET(AZALIA_F0_CODEC_ENDPOINT_DATA, 0,
+ 			AZALIA_ENDPOINT_REG_DATA, reg_data);
+ 
+ 	dal_logger_write(CTX->logger,
+@@ -76,7 +76,7 @@ static uint32_t read_indirect_azalia_reg(struct audio *audio, uint32_t reg_index
+ 	uint32_t value = 0;
+ 
+ 	/* AZALIA_F0_CODEC_ENDPOINT_INDEX  endpoint index  */
+-	REG_SET(AZALIA_F0_CODEC_ENDPOINT_INDEX,
++	REG_SET(AZALIA_F0_CODEC_ENDPOINT_INDEX, 0,
+ 			AZALIA_ENDPOINT_REG_INDEX, reg_index);
+ 
+ 	/* AZALIA_F0_CODEC_ENDPOINT_DATA  endpoint data  */
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.c
+index 12c0235..1e242c6 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.c
+@@ -1380,7 +1380,8 @@ static void dce110_se_audio_setup(
+ 	channels = speakers_to_channels(audio_info->flags.speaker_flags).all;
+ 
+ 	/* setup the audio stream source select (audio -> dig mapping) */
+-	REG_SET(AFMT_AUDIO_SRC_CONTROL, AFMT_AUDIO_SRC_SELECT, az_inst);
++	REG_SET(AFMT_AUDIO_SRC_CONTROL, 0,
++			AFMT_AUDIO_SRC_SELECT, az_inst);
+ 
+ 	/* Channel allocation */
+ 	REG_UPDATE(AFMT_AUDIO_PACKET_CONTROL2, AFMT_AUDIO_CHANNEL_ENABLE, channels);
+@@ -1481,10 +1482,12 @@ static void dce110_se_setup_dp_audio(
+ 	uint32_t value = 0;
+ 
+ 	/* ATP Configuration */
+-	REG_SET(DP_SEC_AUD_N, DP_SEC_AUD_N, DP_SEC_AUD_N__DP_SEC_AUD_N__DEFAULT);
++	REG_SET(DP_SEC_AUD_N, 0,
++			DP_SEC_AUD_N, DP_SEC_AUD_N__DP_SEC_AUD_N__DEFAULT);
+ 
+ 	/* Async/auto-calc timestamp mode */
+-	REG_SET(DP_SEC_TIMESTAMP, DP_SEC_TIMESTAMP_MODE,
++	REG_SET(DP_SEC_TIMESTAMP, 0,
++			DP_SEC_TIMESTAMP_MODE,
+ 			DP_SEC_TIMESTAMP__DP_SEC_TIMESTAMP_MODE__AUTO_CALC);
+ 
+ 	/* --- The following are the registers
+diff --git a/drivers/gpu/drm/amd/dal/dc/dm_services.h b/drivers/gpu/drm/amd/dal/dc/dm_services.h
+index 8176dce..fddd939 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dm_services.h
++++ b/drivers/gpu/drm/amd/dal/dc/dm_services.h
+@@ -139,7 +139,7 @@ static inline uint32_t set_reg_field_value_ex(
+ 		reg_name ## __ ## reg_field ## _MASK,\
+ 		reg_name ## __ ## reg_field ## __SHIFT)
+ 
+-void generic_reg_update_ex(const struct dc_context *ctx,
++uint32_t generic_reg_update_ex(const struct dc_context *ctx,
+ 		uint32_t addr, uint32_t reg_val, int n, ...);
+ 
+ #define FD(reg_field)	reg_field ## __SHIFT, \
+diff --git a/drivers/gpu/drm/amd/dal/dc/i2caux/aux_engine.h b/drivers/gpu/drm/amd/dal/dc/i2caux/aux_engine.h
+index 7c45b6b..b5d6c79 100644
+--- a/drivers/gpu/drm/amd/dal/dc/i2caux/aux_engine.h
++++ b/drivers/gpu/drm/amd/dal/dc/i2caux/aux_engine.h
+@@ -94,6 +94,8 @@ struct aux_engine {
+ 	/* following values are expressed in milliseconds */
+ 	uint32_t delay;
+ 	uint32_t max_defer_write_retry;
++
++	bool acquire_reset;
+ };
+ 
+ bool dal_aux_engine_construct(
+diff --git a/drivers/gpu/drm/amd/dal/dc/i2caux/dce110/aux_engine_dce110.c b/drivers/gpu/drm/amd/dal/dc/i2caux/dce110/aux_engine_dce110.c
+index bbf33bc..e280ed2 100644
+--- a/drivers/gpu/drm/amd/dal/dc/i2caux/dce110/aux_engine_dce110.c
++++ b/drivers/gpu/drm/amd/dal/dc/i2caux/dce110/aux_engine_dce110.c
+@@ -98,53 +98,40 @@ static void destroy(
+ static bool acquire_engine(
+ 	struct aux_engine *engine)
+ {
+-	struct aux_engine_dce110 *aux_engine = FROM_AUX_ENGINE(engine);
+-	uint32_t value;
+-	uint32_t field;
++	struct aux_engine_dce110 *aux110 = FROM_AUX_ENGINE(engine);
++	bool acquire_reset = true;  /*DCE11 = 1, DCE8 = 0 */
+ 
+ 	/* enable AUX before request SW to access AUX */
+-	{
+-		const uint32_t addr = aux_engine->addr.aux_control;
+-
+-		value = dm_read_reg(engine->base.ctx, addr);
+-
+-		field = get_reg_field_value(
+-				value,
++	uint32_t value = REG_READ(AUX_CONTROL);
++	uint32_t field = get_reg_field_value(value,
+ 				AUX_CONTROL,
+ 				AUX_EN);
+ 
+-		if (field == 0) {
+-			uint8_t counter = 0;
++	if (field == 0) {
++		uint8_t counter = 0;
+ 
+-			set_reg_field_value(
++		set_reg_field_value(
+ 				value,
+ 				1,
+ 				AUX_CONTROL,
+ 				AUX_EN);
+ 
++		if (acquire_reset) {
+ 			/*DP_AUX block as part of the enable sequence*/
+ 			set_reg_field_value(
+ 				value,
+ 				1,
+ 				AUX_CONTROL,
+ 				AUX_RESET);
++		}
+ 
+-			dm_write_reg(engine->base.ctx, addr, value);
++		REG_WRITE(AUX_CONTROL, value);
+ 
++		if (acquire_reset) {
+ 			/*poll HW to make sure reset it done*/
+-			do {
+-				udelay(1);
+-
+-				value = dm_read_reg(engine->base.ctx, addr);
+-
+-				field = get_reg_field_value(
+-						value,
+-						AUX_CONTROL,
+-						AUX_RESET_DONE);
+ 
+-				counter++;
+-
+-			} while ((field == 0) && (counter < 11));
++			REG_WAIT(AUX_CONTROL, AUX_RESET_DONE, 1,
++					1, 11);
+ 
+ 			set_reg_field_value(
+ 				value,
+@@ -152,68 +139,33 @@ static bool acquire_engine(
+ 				AUX_CONTROL,
+ 				AUX_RESET);
+ 
+-			dm_write_reg(engine->base.ctx, addr, value);
+-
+-			counter = 0;
++			REG_WRITE(AUX_CONTROL, value);
+ 
+-			do {
+-				udelay(1);
+-
+-				value = dm_read_reg(engine->base.ctx, addr);
+-
+-				field = get_reg_field_value(
+-						value,
+-						AUX_CONTROL,
+-						AUX_RESET_DONE);
+-
+-				counter++;
+-
+-			} while ((field == 1) && (counter < 11));
+-		} /*if (field)*/
+-	}
++			REG_WAIT(AUX_CONTROL, AUX_RESET_DONE, 0,
++					1, 11);
++		}
++	} /*if (field)*/
+ 
+ 	/* request SW to access AUX */
+-	{
+-		const uint32_t addr = aux_engine->addr.aux_arb_control;
+-
+-		value = dm_read_reg(engine->base.ctx, addr);
++	REG_UPDATE(AUX_ARB_CONTROL, AUX_SW_USE_AUX_REG_REQ, 1);
+ 
+-		set_reg_field_value(
++	value = REG_READ(AUX_ARB_CONTROL);
++	field = get_reg_field_value(
+ 			value,
+-			1,
+ 			AUX_ARB_CONTROL,
+-			AUX_SW_USE_AUX_REG_REQ);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
++			AUX_REG_RW_CNTL_STATUS);
+ 
+-		value = dm_read_reg(engine->base.ctx, addr);
+-
+-		field = get_reg_field_value(
+-				value,
+-				AUX_ARB_CONTROL,
+-				AUX_REG_RW_CNTL_STATUS);
+-
+-		return field == SW_CAN_ACCESS_AUX;
+-	}
++	return (field == SW_CAN_ACCESS_AUX);
+ }
+ 
+ static void configure(
+ 	struct aux_engine *engine,
+ 	union aux_config cfg)
+ {
+-	struct aux_engine_dce110 *aux_engine = FROM_AUX_ENGINE(engine);
+-
+-	const uint32_t addr = aux_engine->addr.aux_control;
+-
+-	uint32_t value = dm_read_reg(engine->base.ctx, addr);
++	struct aux_engine_dce110 *aux110 = FROM_AUX_ENGINE(engine);
+ 
+-	set_reg_field_value(
+-		value,
+-		(0 != cfg.bits.ALLOW_AUX_WHEN_HPD_LOW),
+-		AUX_CONTROL,
+-		AUX_IGNORE_HPD_DISCON);
+-
+-	dm_write_reg(engine->base.ctx, addr, value);
++	REG_UPDATE(AUX_CONTROL, AUX_IGNORE_HPD_DISCON,
++			(0 != cfg.bits.ALLOW_AUX_WHEN_HPD_LOW));
+ }
+ 
+ #define COMPOSE_AUX_SW_DATA_16_20(command, address) \
+@@ -229,7 +181,7 @@ static void submit_channel_request(
+ 	struct aux_engine *engine,
+ 	struct aux_request_transaction_data *request)
+ {
+-	struct aux_engine_dce110 *aux_engine = FROM_AUX_ENGINE(engine);
++	struct aux_engine_dce110 *aux110 = FROM_AUX_ENGINE(engine);
+ 	uint32_t value;
+ 	uint32_t length;
+ 
+@@ -241,246 +193,85 @@ static void submit_channel_request(
+ 		 (request->action == I2CAUX_TRANSACTION_ACTION_I2C_WRITE_MOT)));
+ 
+ 	/* clear_aux_error */
+-	{
+-		const uint32_t addr = mmAUXN_IMPCAL;
+-
+-		value = dm_read_reg(engine->base.ctx, addr);
+-
+-		set_reg_field_value(
+-			value,
++	REG_UPDATE_SEQ(AUXN_IMPCAL, AUXN_CALOUT_ERROR_AK,
+ 			1,
+-			AUXN_IMPCAL,
+-			AUXN_CALOUT_ERROR_AK);
++			0);
+ 
+-		dm_write_reg(engine->base.ctx, addr, value);
+-
+-		set_reg_field_value(
+-			value,
+-			0,
+-			AUXN_IMPCAL,
+-			AUXN_CALOUT_ERROR_AK);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-	}
+-	{
+-		const uint32_t addr = mmAUXP_IMPCAL;
+-
+-		value = dm_read_reg(engine->base.ctx, addr);
+-
+-		set_reg_field_value(
+-			value,
++	REG_UPDATE_SEQ(AUXP_IMPCAL, AUXP_CALOUT_ERROR_AK,
+ 			1,
+-			AUXP_IMPCAL,
+-			AUXP_CALOUT_ERROR_AK);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-
+-		set_reg_field_value(
+-			value,
+-			0,
+-			AUXP_IMPCAL,
+-			AUXP_CALOUT_ERROR_AK);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-	}
++			0);
+ 
+ 	/* force_default_calibrate */
+-	{
+-		const uint32_t addr = mmAUXN_IMPCAL;
++	REG_UPDATE_1BY1_2(AUXN_IMPCAL,
++			AUXN_IMPCAL_ENABLE, 1,
++			AUXN_IMPCAL_OVERRIDE_ENABLE, 0);
+ 
+-		value = dm_read_reg(engine->base.ctx, addr);
++	/* bug? why AUXN update EN and OVERRIDE_EN 1 by 1 while AUX P toggles OVERRIDE? */
+ 
+-		set_reg_field_value(
+-			value,
++	REG_UPDATE_SEQ(AUXP_IMPCAL, AUXP_IMPCAL_OVERRIDE_ENABLE,
+ 			1,
+-			AUXN_IMPCAL,
+-			AUXN_IMPCAL_ENABLE);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-
+-		set_reg_field_value(
+-			value,
+-			0,
+-			AUXN_IMPCAL,
+-			AUXN_IMPCAL_OVERRIDE_ENABLE);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-	}
+-	{
+-		const uint32_t addr = mmAUXP_IMPCAL;
+-
+-		value = dm_read_reg(engine->base.ctx, addr);
+-
+-		set_reg_field_value(
+-			value,
+-			1,
+-			AUXP_IMPCAL,
+-			AUXP_IMPCAL_OVERRIDE_ENABLE);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-
+-		set_reg_field_value(
+-			value,
+-			0,
+-			AUXP_IMPCAL,
+-			AUXP_IMPCAL_OVERRIDE_ENABLE);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-	}
++			0);
+ 
+ 	/* set the delay and the number of bytes to write */
+-	{
+-		const uint32_t addr = aux_engine->addr.aux_sw_control;
+-
+-		value = dm_read_reg(engine->base.ctx, addr);
+-
+-		set_reg_field_value(
+-			value,
+-			request->delay,
+-			AUX_SW_CONTROL,
+-			AUX_SW_START_DELAY);
+-
+-		/* The length include
+-		 * the 4 bit header and the 20 bit address
+-		 * (that is 3 byte).
+-		 * If the requested length is non zero this means
+-		 * an addition byte specifying the length is required. */
+ 
+-		length = request->length ? 4 : 3;
+-		if (is_write)
+-			length += request->length;
++	/* The length include
++	 * the 4 bit header and the 20 bit address
++	 * (that is 3 byte).
++	 * If the requested length is non zero this means
++	 * an addition byte specifying the length is required. */
+ 
+-		set_reg_field_value(
+-			value,
+-			length,
+-			AUX_SW_CONTROL,
+-			AUX_SW_WR_BYTES);
++	length = request->length ? 4 : 3;
++	if (is_write)
++		length += request->length;
+ 
+-		dm_write_reg(engine->base.ctx, addr, value);
+-	}
++	REG_UPDATE_2(AUX_SW_CONTROL,
++			AUX_SW_START_DELAY, request->delay,
++			AUX_SW_WR_BYTES, length);
+ 
+ 	/* program action and address and payload data (if 'is_write') */
+-	{
+-		const uint32_t addr = aux_engine->addr.aux_sw_data;
+-
+-		value = dm_read_reg(engine->base.ctx, addr);
+-
+-		set_reg_field_value(
+-			value,
+-			0,
+-			AUX_SW_DATA,
+-			AUX_SW_INDEX);
+-
+-		set_reg_field_value(
+-			value,
+-			0,
+-			AUX_SW_DATA,
+-			AUX_SW_DATA_RW);
+-
+-		set_reg_field_value(
+-			value,
+-			1,
+-			AUX_SW_DATA,
+-			AUX_SW_AUTOINCREMENT_DISABLE);
+-
+-		set_reg_field_value(
+-			value,
+-			COMPOSE_AUX_SW_DATA_16_20(
+-				request->action, request->address),
+-			AUX_SW_DATA,
+-			AUX_SW_DATA);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-
+-		set_reg_field_value(
+-			value,
+-			0,
+-			AUX_SW_DATA,
+-			AUX_SW_AUTOINCREMENT_DISABLE);
+-
+-		set_reg_field_value(
+-			value,
+-			COMPOSE_AUX_SW_DATA_8_15(request->address),
+-			AUX_SW_DATA,
+-			AUX_SW_DATA);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-
+-		set_reg_field_value(
+-			value,
+-			COMPOSE_AUX_SW_DATA_0_7(request->address),
+-			AUX_SW_DATA,
+-			AUX_SW_DATA);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-
+-		if (request->length) {
+-			set_reg_field_value(
+-				value,
+-				request->length - 1,
+-				AUX_SW_DATA,
+-				AUX_SW_DATA);
+-
+-			dm_write_reg(engine->base.ctx, addr, value);
+-		}
+-
+-		if (is_write) {
+-			/* Load the HW buffer with the Data to be sent.
+-			 * This is relevant for write operation.
+-			 * For read, the data recived data will be
+-			 * processed in process_channel_reply(). */
+-			uint32_t i = 0;
+-
+-			while (i < request->length) {
+-
+-				set_reg_field_value(
+-					value,
+-					request->data[i],
+-					AUX_SW_DATA,
+-					AUX_SW_DATA);
+-
+-				dm_write_reg(
+-					engine->base.ctx, addr, value);
+-
+-				++i;
+-			}
+-		}
++	value = REG_UPDATE_4(AUX_SW_DATA,
++			AUX_SW_INDEX, 0,
++			AUX_SW_DATA_RW, 0,
++			AUX_SW_AUTOINCREMENT_DISABLE, 1,
++			AUX_SW_DATA, COMPOSE_AUX_SW_DATA_16_20(request->action, request->address));
++
++	value = REG_SET_2(AUX_SW_DATA, value,
++			AUX_SW_AUTOINCREMENT_DISABLE, 0,
++			AUX_SW_DATA, COMPOSE_AUX_SW_DATA_8_15(request->address));
++
++	value = REG_SET(AUX_SW_DATA, value,
++			AUX_SW_DATA, COMPOSE_AUX_SW_DATA_0_7(request->address));
++
++	if (request->length) {
++		value = REG_SET(AUX_SW_DATA, value,
++				AUX_SW_DATA, request->length - 1);
+ 	}
+ 
+-	{
+-		const uint32_t addr = aux_engine->addr.aux_interrupt_control;
++	if (is_write) {
++		/* Load the HW buffer with the Data to be sent.
++		 * This is relevant for write operation.
++		 * For read, the data recived data will be
++		 * processed in process_channel_reply(). */
++		uint32_t i = 0;
+ 
+-		value = dm_read_reg(engine->base.ctx, addr);
++		while (i < request->length) {
++			value = REG_SET(AUX_SW_DATA, value,
++					AUX_SW_DATA, request->data[i]);
+ 
+-		set_reg_field_value(
+-			value,
+-			1,
+-			AUX_INTERRUPT_CONTROL,
+-			AUX_SW_DONE_ACK);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
++			++i;
++		}
+ 	}
+ 
+-	{
+-		const uint32_t addr = aux_engine->addr.aux_sw_control;
+-
+-		value = dm_read_reg(engine->base.ctx, addr);
+-
+-		set_reg_field_value(
+-			value,
+-			1,
+-			AUX_SW_CONTROL,
+-			AUX_SW_GO);
++	REG_UPDATE(AUX_INTERRUPT_CONTROL, AUX_SW_DONE_ACK, 1);
+ 
+-		dm_write_reg(engine->base.ctx, addr, value);
+-	}
++	REG_UPDATE(AUX_SW_CONTROL, AUX_SW_GO, 1);
+ }
+ 
+ static void process_channel_reply(
+ 	struct aux_engine *engine,
+ 	struct aux_reply_transaction_data *reply)
+ {
+-	struct aux_engine_dce110 *aux_engine = FROM_AUX_ENGINE(engine);
++	struct aux_engine_dce110 *aux110 = FROM_AUX_ENGINE(engine);
+ 
+ 	/* Need to do a read to get the number of bytes to process
+ 	 * Alternatively, this information can be passed -
+@@ -489,54 +280,19 @@ static void process_channel_reply(
+ 	uint32_t bytes_replied;
+ 	uint32_t value;
+ 
+-	{
+-		const uint32_t addr = aux_engine->addr.aux_sw_status;
+-
+-		value = dm_read_reg(engine->base.ctx, addr);
+-
+-		bytes_replied = get_reg_field_value(
+-				value,
+-				AUX_SW_STATUS,
+-				AUX_SW_REPLY_BYTE_COUNT);
+-	}
++	value = REG_GET(AUX_SW_STATUS,
++			AUX_SW_REPLY_BYTE_COUNT, &bytes_replied);
+ 
+ 	if (bytes_replied) {
+ 		uint32_t reply_result;
+ 
+-		const uint32_t addr = aux_engine->addr.aux_sw_data;
+-
+-		value = dm_read_reg(engine->base.ctx, addr);
+-
+-		set_reg_field_value(
+-			value,
+-			0,
+-			AUX_SW_DATA,
+-			AUX_SW_INDEX);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-
+-		set_reg_field_value(
+-			value,
+-			1,
+-			AUX_SW_DATA,
+-			AUX_SW_AUTOINCREMENT_DISABLE);
+-
+-		dm_write_reg(engine->base.ctx, addr, value);
+-
+-		set_reg_field_value(
+-			value,
+-			1,
+-			AUX_SW_DATA,
+-			AUX_SW_DATA_RW);
++		REG_UPDATE_1BY1_3(AUX_SW_DATA,
++				AUX_SW_INDEX, 0,
++				AUX_SW_AUTOINCREMENT_DISABLE, 1,
++				AUX_SW_DATA_RW, 1);
+ 
+-		dm_write_reg(engine->base.ctx, addr, value);
+-
+-		value = dm_read_reg(engine->base.ctx, addr);
+-
+-		reply_result = get_reg_field_value(
+-				value,
+-				AUX_SW_DATA,
+-				AUX_SW_DATA);
++		REG_GET(AUX_SW_DATA,
++				AUX_SW_DATA, &reply_result);
+ 
+ 		reply_result = reply_result >> 4;
+ 
+@@ -549,14 +305,9 @@ static void process_channel_reply(
+ 			--bytes_replied;
+ 
+ 			while (i < bytes_replied) {
+-				value = dm_read_reg(
+-					engine->base.ctx, addr);
+-
+-				reply->data[i] = get_reg_field_value(
+-						value,
+-						AUX_SW_DATA,
+-						AUX_SW_DATA);
+ 
++				REG_GET(AUX_SW_DATA,
++						AUX_SW_DATA, &reply->data[i]);
+ 				++i;
+ 			}
+ 
+@@ -594,12 +345,9 @@ static enum aux_channel_operation_result get_channel_status(
+ 	struct aux_engine *engine,
+ 	uint8_t *returned_bytes)
+ {
+-	struct aux_engine_dce110 *aux_engine = FROM_AUX_ENGINE(engine);
+-
+-	const uint32_t addr = aux_engine->addr.aux_sw_status;
++	struct aux_engine_dce110 *aux110 = FROM_AUX_ENGINE(engine);
+ 
+ 	uint32_t value;
+-	uint32_t aux_sw_done;
+ 
+ 	if (returned_bytes == NULL) {
+ 		/*caller pass NULL pointer*/
+@@ -609,26 +357,8 @@ static enum aux_channel_operation_result get_channel_status(
+ 	*returned_bytes = 0;
+ 
+ 	/* poll to make sure that SW_DONE is asserted */
+-	{
+-		uint32_t time_elapsed = 0;
+-
+-		do {
+-			value = dm_read_reg(engine->base.ctx, addr);
+-
+-			aux_sw_done = get_reg_field_value(
+-					value,
+-					AUX_SW_STATUS,
+-					AUX_SW_DONE);
+-
+-			if (aux_sw_done)
+-				break;
+-
+-			udelay(10);
+-
+-			time_elapsed += 10;
+-		} while (time_elapsed < aux_engine->timeout_period);
+-
+-	}
++	value = REG_WAIT(AUX_SW_STATUS, AUX_SW_DONE, 1,
++				10, aux110->timeout_period/10);
+ 
+ 	/* Note that the following bits are set in 'status.bits'
+ 	 * during CTS 4.2.1.2:
+@@ -637,26 +367,18 @@ static enum aux_channel_operation_result get_channel_status(
+ 	 *
+ 	 * AUX_SW_RX_MIN_COUNT_VIOL is an internal,
+ 	 * HW debugging bit and should be ignored. */
+-	if (aux_sw_done) {
+-		if (get_reg_field_value(
+-			value,
+-			AUX_SW_STATUS,
+-			AUX_SW_RX_TIMEOUT_STATE) ||
+-			get_reg_field_value(
+-				value,
+-				AUX_SW_STATUS,
+-				AUX_SW_RX_TIMEOUT))
++	if (value & AUX_SW_STATUS__AUX_SW_DONE_MASK) {
++		if ((value & AUX_SW_STATUS__AUX_SW_RX_TIMEOUT_STATE_MASK) ||
++			(value & AUX_SW_STATUS__AUX_SW_RX_TIMEOUT_MASK))
+ 			return AUX_CHANNEL_OPERATION_FAILED_TIMEOUT;
+-		else if (get_reg_field_value(
+-			value,
+-			AUX_SW_STATUS,
+-			AUX_SW_RX_INVALID_STOP))
++
++		else if (value & AUX_SW_STATUS__AUX_SW_RX_INVALID_STOP_MASK)
+ 			return AUX_CHANNEL_OPERATION_FAILED_INVALID_REPLY;
+ 
+-		*returned_bytes = get_reg_field_value(
+-				value,
++		*returned_bytes = get_reg_field_value(value,
+ 				AUX_SW_STATUS,
+ 				AUX_SW_REPLY_BYTE_COUNT);
++
+ 		if (*returned_bytes == 0)
+ 			return
+ 			AUX_CHANNEL_OPERATION_FAILED_INVALID_REPLY;
+@@ -668,6 +390,7 @@ static enum aux_channel_operation_result get_channel_status(
+ 		/*time_elapsed >= aux_engine->timeout_period */
+ 		if (!(value & AUX_SW_STATUS__AUX_SW_HPD_DISCON_MASK))
+ 			ASSERT_CRITICAL(false);
++
+ 		return AUX_CHANNEL_OPERATION_FAILED_TIMEOUT;
+ 	}
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/i2caux/dce110/aux_engine_dce110.h b/drivers/gpu/drm/amd/dal/dc/i2caux/dce110/aux_engine_dce110.h
+index be59f59..528baab 100644
+--- a/drivers/gpu/drm/amd/dal/dc/i2caux/dce110/aux_engine_dce110.h
++++ b/drivers/gpu/drm/amd/dal/dc/i2caux/dce110/aux_engine_dce110.h
+@@ -34,7 +34,9 @@
+ 	SRI(AUX_SW_DATA, DP_AUX, id), \
+ 	SRI(AUX_SW_CONTROL, DP_AUX, id), \
+ 	SRI(AUX_INTERRUPT_CONTROL, DP_AUX, id), \
+-	SRI(AUX_SW_STATUS, DP_AUX, id)
++	SRI(AUX_SW_STATUS, DP_AUX, id), \
++	SR(AUXN_IMPCAL), \
++	SR(AUXP_IMPCAL)
+ 
+ struct dce110_aux_registers {
+ 	uint32_t AUX_CONTROL;
+@@ -43,6 +45,8 @@ struct dce110_aux_registers {
+ 	uint32_t AUX_SW_CONTROL;
+ 	uint32_t AUX_INTERRUPT_CONTROL;
+ 	uint32_t AUX_SW_STATUS;
++	uint32_t AUXN_IMPCAL;
++	uint32_t AUXP_IMPCAL;
+ };
+ 
+ struct aux_engine_dce110 {
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/reg_helper.h b/drivers/gpu/drm/amd/dal/dc/inc/reg_helper.h
+index e1fcaae..f285f70 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/reg_helper.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/reg_helper.h
+@@ -41,17 +41,32 @@
+ 		dm_write_reg(CTX, REG(reg_name), value)
+ 
+ 
+-/* macro to set register fields.
+- * note: assume initial value of register is 0.  be careful about that assumption
+- */
+-#define REG_SET_N(reg_name, n, ...)	\
++/* macro to set register fields. */
++#define REG_SET_N(reg_name, n, initial_val, ...)	\
+ 		generic_reg_update_ex(CTX, \
+ 				REG(reg_name), \
+-				0, \
++				initial_val, \
++				n, __VA_ARGS__)
++
++#define REG_SET(reg_name, initial_val, field, val)	\
++		REG_SET_N(reg_name, 1, initial_val, \
++				FD(reg_name##__##field), val)
++
++#define REG_SET_2(reg, init_value, f1, v1, f2, v2)	\
++		REG_SET_N(reg, 2, init_value, \
++				FD(reg##__##f1), v1,\
++				FD(reg##__##f2), v2)
++
++
++/* macro to get register fields
++ * read given register and fill in field value in output parameter */
++#define REG_GET_N(reg_name, n, ...)	\
++		generic_reg_get(CTX, \
++				REG(reg_name), \
+ 				n, __VA_ARGS__)
+ 
+-#define REG_SET(reg_name, field, val)	\
+-		REG_SET_N(reg_name, 1, FD(reg_name##__##field), val)
++#define REG_GET(reg_name, field, val)	\
++		REG_GET_N(reg_name, 1, FD(reg_name##__##field), val)
+ 
+ /* macro to poll and wait for a register field to read back given value */
+ 
+@@ -140,4 +155,25 @@
+ 				FD(reg##__##f8), val8, \
+ 				FD(reg##__##f9), val9)
+ 
++/* macro to update a register field to specified values in given sequences.
++ * useful when toggling bits
++ */
++#define REG_UPDATE_SEQ(reg, field, value1, value2) \
++{	uint32_t val = REG_UPDATE(reg, field, value1); \
++	REG_SET(reg, val, field, value2); }
++
++/* macro to update fields in register 1 field at a time in given order */
++#define REG_UPDATE_1BY1_2(reg, f1, v1, f2, v2) \
++{	uint32_t val = REG_UPDATE(reg, f1, v1); \
++	REG_SET(reg, val, f2, v2); }
++
++#define REG_UPDATE_1BY1_3(reg, f1, v1, f2, v2, f3, v3) \
++{	uint32_t val = REG_UPDATE(reg, f1, v1); \
++	val = REG_SET(reg, val, f2, v2); \
++	REG_SET(reg, val, f3, v3); }
++
++
++uint32_t generic_reg_get(const struct dc_context *ctx,
++		uint32_t addr, int n, ...);
++
+ #endif /* DRIVERS_GPU_DRM_AMD_DAL_DEV_DC_INC_REG_HELPER_H_ */
+-- 
+2.7.4
+
