@@ -4,7 +4,7 @@ HOMEPAGE = "http://llvm.org"
 # 3-clause BSD-like
 # University of Illinois/NCSA Open Source License
 LICENSE = "NCSA"
-LIC_FILES_CHKSUM = "file://LICENSE.TXT;md5=b99eb43c934ceebecab85c6b9b1a08be"
+LIC_FILES_CHKSUM = "file://LICENSE.TXT;md5=e825e017edc35cfd58e26116e5251771"
 
 DEPENDS = "libffi libxml2-native llvm-common zlib ninja-native"
 RDEPENDS_${PN} += "ncurses-terminfo"
@@ -16,13 +16,14 @@ PROVIDES += "llvm"
 LLVM_RELEASE = "${PV}"
 LLVM_DIR = "llvm${LLVM_RELEASE}"
 
-SRCREV = "a093ef43dd592b729da46db4ff3057fef9a46023"
-PV = "3.9.1"
-SRC_URI = "git://llvm.org/git/llvm.git;branch=release_39;protocol=http \
-           file://0001-CrossCompile.cmake-adjust-build-for-OE.patch \
-           file://0002-CrossCompile.cmake-use-target-BuildVariables-include.patch \
-           file://0003-Cleanup-LLVM_OPTIMIZED_TABLEGEN.patch \
-           file://0004-Dont-build-llvm-config-and-tblgen-concurrently.patch"
+SRCREV = "24aaeeb480bf8d17697922f4e4b7648f26e80bae"
+PV = "5.0"
+PATCH_VERSION = "0"
+SRC_URI = "git://llvm.org/git/llvm.git;branch=master;protocol=http \
+	   file://0001-CrossCompile.cmake-adjust-build-for-OE.patch \
+	   file://0002-CrossCompile.cmake-use-target-BuildVariables-include.patch \
+           file://0003-CMakeLists-don-t-use-a-version-suffix.patch \
+"
 S = "${WORKDIR}/git"
 
 LLVM_INSTALL_DIR = "${WORKDIR}/llvm-install"
@@ -104,15 +105,13 @@ llvm_sysroot_preprocess() {
     cp ${LLVM_INSTALL_DIR}/llvm-config-host ${SYSROOT_DESTDIR}${bindir_crossscripts}/llvm-config${PV}
 }
 
-PACKAGES += "${PN}-bugpointpasses ${PN}-llvmhello"
 ALLOW_EMPTY_${PN} = "1"
 ALLOW_EMPTY_${PN}-staticdev = "1"
 FILES_${PN} = ""
 FILES_${PN}-staticdev = ""
 FILES_${PN}-dbg = " \
     ${bindir}/${LLVM_DIR}/.debug \
-    ${libdir}/${LLVM_DIR}/.debug/BugpointPasses.so \
-    ${libdir}/${LLVM_DIR}/.debug/LLVMHello.so \
+    ${libdir}/${LLVM_DIR}/.debug/* \
     /usr/src/debug \
 "
 
@@ -120,26 +119,19 @@ FILES_${PN}-dev = " \
     ${bindir}/${LLVM_DIR} \
     ${includedir}/${LLVM_DIR} \
 "
-RRECOMMENDS_${PN}-dev += "${PN}-bugpointpasses ${PN}-llvmhello"
-
-FILES_${PN}-bugpointpasses = "\
-    ${libdir}/${LLVM_DIR}/BugpointPasses.so \
-"
-FILES_${PN}-llvmhello = "\
-    ${libdir}/${LLVM_DIR}/LLVMHello.so \
-"
 
 PACKAGES_DYNAMIC = "^libllvm${LLVM_RELEASE}-.*$"
 NOAUTOPACKAGEDEBUG = "1"
 
-INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-llvm-${LLVM_RELEASE} += "dev-so"
-INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-llvm += "dev-so"
+INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-libllvm-${LLVM_RELEASE}.${PATCH_VERSION} += "dev-so"
+INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-libllvm-${LLVM_RELEASE} += "dev-so"
+INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-liblto += "dev-so"
 
-python llvm_populate_packages() {
+python populate_packages_prepend() {
     libdir = bb.data.expand('${libdir}', d)
     libllvm_libdir = bb.data.expand('${libdir}/${LLVM_DIR}', d)
     split_dbg_packages = do_split_packages(d, libllvm_libdir+'/.debug', '^lib(.*)\.so$', 'libllvm${LLVM_RELEASE}-%s-dbg', 'Split debug package for %s', allow_dirs=True)
-    split_packages = do_split_packages(d, libdir, '^lib(.*)\.so$', 'libllvm${LLVM_RELEASE}-%s', 'Split package for %s', allow_dirs=True, allow_links=True, recursive=True)
+    split_packages = do_split_packages(d, libdir, '^(.*)\.so\.*', 'libllvm${LLVM_RELEASE}-%s', 'Split package for %s', allow_dirs=True, allow_links=True, recursive=True)
     split_staticdev_packages = do_split_packages(d, libllvm_libdir, '^lib(.*)\.a$', 'libllvm${LLVM_RELEASE}-%s-staticdev', 'Split staticdev package for %s', allow_dirs=True)
     if split_packages:
         pn = d.getVar('PN', True)
@@ -147,5 +139,3 @@ python llvm_populate_packages() {
         d.appendVar('RDEPENDS_' + pn + '-dbg', ' '+' '.join(split_dbg_packages))
         d.appendVar('RDEPENDS_' + pn + '-staticdev', ' '+' '.join(split_staticdev_packages))
 }
-
-PACKAGESPLITFUNCS_prepend = "llvm_populate_packages "
