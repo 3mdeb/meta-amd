@@ -1,0 +1,491 @@
+From 6ec845040ab3a01de606cc0d2bee5c83af53b337 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 5 Jul 2016 21:07:17 +0200
+Subject: [PATCH 0358/1722] drm/amdgpu: add a fence timeout for the IB tests v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+10ms should be enough for now.
+
+v2: fix some typos in CIK code
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Edward O'Callaghan <funfunctor@folklore1984.net>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c  |  4 +++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c | 25 +++++++++++++++----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.h |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c | 18 +++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h |  2 +-
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c   | 19 ++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c   | 19 ++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c   | 19 ++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c  | 19 ++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c  | 19 ++++++++++++-------
+ 11 files changed, 93 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 71cecd0..2fc17da 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -317,7 +317,7 @@ struct amdgpu_ring_funcs {
+ 				uint32_t oa_base, uint32_t oa_size);
+ 	/* testing functions */
+ 	int (*test_ring)(struct amdgpu_ring *ring);
+-	int (*test_ib)(struct amdgpu_ring *ring);
++	int (*test_ib)(struct amdgpu_ring *ring, long timeout);
+ 	/* insert NOP packets */
+ 	void (*insert_nop)(struct amdgpu_ring *ring, uint32_t count);
+ 	/* pad the indirect buffer to the necessary number of dw */
+@@ -2262,7 +2262,7 @@ amdgpu_get_sdma_instance(struct amdgpu_ring *ring)
+ #define amdgpu_vm_set_pte_pde(adev, ib, pe, addr, count, incr, flags) ((adev)->vm_manager.vm_pte_funcs->set_pte_pde((ib), (pe), (addr), (count), (incr), (flags)))
+ #define amdgpu_ring_parse_cs(r, p, ib) ((r)->funcs->parse_cs((p), (ib)))
+ #define amdgpu_ring_test_ring(r) (r)->funcs->test_ring((r))
+-#define amdgpu_ring_test_ib(r) (r)->funcs->test_ib((r))
++#define amdgpu_ring_test_ib(r, t) (r)->funcs->test_ib((r), (t))
+ #define amdgpu_ring_get_rptr(r) (r)->funcs->get_rptr((r))
+ #define amdgpu_ring_get_wptr(r) (r)->funcs->get_wptr((r))
+ #define amdgpu_ring_set_wptr(r) (r)->funcs->set_wptr((r))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index b347bc1..6b81a9a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -33,6 +33,8 @@
+ #include "amdgpu.h"
+ #include "atom.h"
+ 
++#define AMDGPU_IB_TEST_TIMEOUT	msecs_to_jiffies(10)
++
+ /*
+  * IB
+  * IBs (Indirect Buffers) and areas of GPU accessible memory where
+@@ -288,7 +290,7 @@ int amdgpu_ib_ring_tests(struct amdgpu_device *adev)
+ 		if (!ring || !ring->ready)
+ 			continue;
+ 
+-		r = amdgpu_ring_test_ib(ring);
++		r = amdgpu_ring_test_ib(ring, AMDGPU_IB_TEST_TIMEOUT);
+ 		if (r) {
+ 			ring->ready = false;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+index b5f6619..d4777ba 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+@@ -1125,29 +1125,34 @@ void amdgpu_uvd_ring_end_use(struct amdgpu_ring *ring)
+  *
+  * Test if we can successfully execute an IB
+  */
+-int amdgpu_uvd_ring_test_ib(struct amdgpu_ring *ring)
++int amdgpu_uvd_ring_test_ib(struct amdgpu_ring *ring, long timeout)
+ {
+-	struct fence *fence = NULL;
+-	int r;
++	struct fence *fence;
++	long r;
+ 
+ 	r = amdgpu_uvd_get_create_msg(ring, 1, NULL);
+ 	if (r) {
+-		DRM_ERROR("amdgpu: failed to get create msg (%d).\n", r);
++		DRM_ERROR("amdgpu: failed to get create msg (%ld).\n", r);
+ 		goto error;
+ 	}
+ 
+ 	r = amdgpu_uvd_get_destroy_msg(ring, 1, true, &fence);
+ 	if (r) {
+-		DRM_ERROR("amdgpu: failed to get destroy ib (%d).\n", r);
++		DRM_ERROR("amdgpu: failed to get destroy ib (%ld).\n", r);
+ 		goto error;
+ 	}
+ 
+-	r = fence_wait(fence, false);
+-	if (r) {
+-		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
+-		goto error;
++	r = fence_wait_timeout(fence, false, timeout);
++	if (r == 0) {
++		DRM_ERROR("amdgpu: IB test timed out.\n");
++		r = -ETIMEDOUT;
++	} else if (r < 0) {
++		DRM_ERROR("amdgpu: fence wait failed (%ld).\n", r);
++	} else {
++		DRM_INFO("ib test on ring %d succeeded\n",  ring->idx);
++		r = 0;
+ 	}
+-	DRM_INFO("ib test on ring %d succeeded\n",  ring->idx);
++
+ error:
+ 	fence_put(fence);
+ 	return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.h
+index 224359e..c850009 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.h
+@@ -37,6 +37,6 @@ void amdgpu_uvd_free_handles(struct amdgpu_device *adev,
+ int amdgpu_uvd_ring_parse_cs(struct amdgpu_cs_parser *parser, uint32_t ib_idx);
+ void amdgpu_uvd_ring_begin_use(struct amdgpu_ring *ring);
+ void amdgpu_uvd_ring_end_use(struct amdgpu_ring *ring);
+-int amdgpu_uvd_ring_test_ib(struct amdgpu_ring *ring);
++int amdgpu_uvd_ring_test_ib(struct amdgpu_ring *ring, long timeout);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+index 63e36e1..bff52e5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+@@ -844,10 +844,10 @@ int amdgpu_vce_ring_test_ring(struct amdgpu_ring *ring)
+  * @ring: the engine to test on
+  *
+  */
+-int amdgpu_vce_ring_test_ib(struct amdgpu_ring *ring)
++int amdgpu_vce_ring_test_ib(struct amdgpu_ring *ring, long timeout)
+ {
+ 	struct fence *fence = NULL;
+-	int r;
++	long r;
+ 
+ 	/* skip vce ring1 ib test for now, since it's not reliable */
+ 	if (ring == &ring->adev->vce.ring[1])
+@@ -855,21 +855,25 @@ int amdgpu_vce_ring_test_ib(struct amdgpu_ring *ring)
+ 
+ 	r = amdgpu_vce_get_create_msg(ring, 1, NULL);
+ 	if (r) {
+-		DRM_ERROR("amdgpu: failed to get create msg (%d).\n", r);
++		DRM_ERROR("amdgpu: failed to get create msg (%ld).\n", r);
+ 		goto error;
+ 	}
+ 
+ 	r = amdgpu_vce_get_destroy_msg(ring, 1, true, &fence);
+ 	if (r) {
+-		DRM_ERROR("amdgpu: failed to get destroy ib (%d).\n", r);
++		DRM_ERROR("amdgpu: failed to get destroy ib (%ld).\n", r);
+ 		goto error;
+ 	}
+ 
+-	r = fence_wait(fence, false);
+-	if (r) {
+-		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
++	r = fence_wait_timeout(fence, false, timeout);
++	if (r == 0) {
++		DRM_ERROR("amdgpu: IB test timed out.\n");
++		r = -ETIMEDOUT;
++	} else if (r < 0) {
++		DRM_ERROR("amdgpu: fence wait failed (%ld).\n", r);
+ 	} else {
+ 		DRM_INFO("ib test on ring %d succeeded\n", ring->idx);
++		r = 0;
+ 	}
+ error:
+ 	fence_put(fence);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h
+index fe84b80..63f83d0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h
+@@ -39,7 +39,7 @@ void amdgpu_vce_ring_emit_ib(struct amdgpu_ring *ring, struct amdgpu_ib *ib,
+ void amdgpu_vce_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 seq,
+ 				unsigned flags);
+ int amdgpu_vce_ring_test_ring(struct amdgpu_ring *ring);
+-int amdgpu_vce_ring_test_ib(struct amdgpu_ring *ring);
++int amdgpu_vce_ring_test_ib(struct amdgpu_ring *ring, long timeout);
+ void amdgpu_vce_ring_begin_use(struct amdgpu_ring *ring);
+ void amdgpu_vce_ring_end_use(struct amdgpu_ring *ring);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 4d3c109..e718bf2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -617,19 +617,19 @@ static int cik_sdma_ring_test_ring(struct amdgpu_ring *ring)
+  * Test a simple IB in the DMA ring (CIK).
+  * Returns 0 on success, error on failure.
+  */
+-static int cik_sdma_ring_test_ib(struct amdgpu_ring *ring)
++static int cik_sdma_ring_test_ib(struct amdgpu_ring *ring, long timeout)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib ib;
+ 	struct fence *f = NULL;
+ 	unsigned index;
+-	int r;
+ 	u32 tmp = 0;
+ 	u64 gpu_addr;
++	long r;
+ 
+ 	r = amdgpu_wb_get(adev, &index);
+ 	if (r) {
+-		dev_err(adev->dev, "(%d) failed to allocate wb slot\n", r);
++		dev_err(adev->dev, "(%ld) failed to allocate wb slot\n", r);
+ 		return r;
+ 	}
+ 
+@@ -639,7 +639,7 @@ static int cik_sdma_ring_test_ib(struct amdgpu_ring *ring)
+ 	memset(&ib, 0, sizeof(ib));
+ 	r = amdgpu_ib_get(adev, NULL, 256, &ib);
+ 	if (r) {
+-		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
++		DRM_ERROR("amdgpu: failed to get ib (%ld).\n", r);
+ 		goto err0;
+ 	}
+ 
+@@ -654,14 +654,19 @@ static int cik_sdma_ring_test_ib(struct amdgpu_ring *ring)
+ 	if (r)
+ 		goto err1;
+ 
+-	r = fence_wait(f, false);
+-	if (r) {
+-		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
++	r = fence_wait_timeout(f, false, timeout);
++	if (r == 0) {
++		DRM_ERROR("amdgpu: IB test timed out\n");
++		r = -ETIMEDOUT;
++		goto err1;
++	} else if (r < 0) {
++		DRM_ERROR("amdgpu: fence wait failed (%ld).\n", r);
+ 		goto err1;
+ 	}
+ 	tmp = le32_to_cpu(adev->wb.wb[index]);
+ 	if (tmp == 0xDEADBEEF) {
+ 		DRM_INFO("ib test on ring %d succeeded\n", ring->idx);
++		r = 0;
+ 	} else {
+ 		DRM_ERROR("amdgpu: ib test failed (0x%08X)\n", tmp);
+ 		r = -EINVAL;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 2357a68..1aa3c31 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2106,25 +2106,25 @@ static void gfx_v7_0_ring_emit_ib_compute(struct amdgpu_ring *ring,
+  * Provides a basic gfx ring test to verify that IBs are working.
+  * Returns 0 on success, error on failure.
+  */
+-static int gfx_v7_0_ring_test_ib(struct amdgpu_ring *ring)
++static int gfx_v7_0_ring_test_ib(struct amdgpu_ring *ring, long timeout)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib ib;
+ 	struct fence *f = NULL;
+ 	uint32_t scratch;
+ 	uint32_t tmp = 0;
+-	int r;
++	long r;
+ 
+ 	r = amdgpu_gfx_scratch_get(adev, &scratch);
+ 	if (r) {
+-		DRM_ERROR("amdgpu: failed to get scratch reg (%d).\n", r);
++		DRM_ERROR("amdgpu: failed to get scratch reg (%ld).\n", r);
+ 		return r;
+ 	}
+ 	WREG32(scratch, 0xCAFEDEAD);
+ 	memset(&ib, 0, sizeof(ib));
+ 	r = amdgpu_ib_get(adev, NULL, 256, &ib);
+ 	if (r) {
+-		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
++		DRM_ERROR("amdgpu: failed to get ib (%ld).\n", r);
+ 		goto err1;
+ 	}
+ 	ib.ptr[0] = PACKET3(PACKET3_SET_UCONFIG_REG, 1);
+@@ -2136,14 +2136,19 @@ static int gfx_v7_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	if (r)
+ 		goto err2;
+ 
+-	r = fence_wait(f, false);
+-	if (r) {
+-		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
++	r = fence_wait_timeout(f, false, timeout);
++	if (r == 0) {
++		DRM_ERROR("amdgpu: IB test timed out\n");
++		r = -ETIMEDOUT;
++		goto err2;
++	} else if (r < 0) {
++		DRM_ERROR("amdgpu: fence wait failed (%ld).\n", r);
+ 		goto err2;
+ 	}
+ 	tmp = RREG32(scratch);
+ 	if (tmp == 0xDEADBEEF) {
+ 		DRM_INFO("ib test on ring %d succeeded\n", ring->idx);
++		r = 0;
+ 	} else {
+ 		DRM_ERROR("amdgpu: ib test failed (scratch(0x%04X)=0x%08X)\n",
+ 			  scratch, tmp);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index eca15f6..6d64aec 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -788,25 +788,25 @@ static int gfx_v8_0_ring_test_ring(struct amdgpu_ring *ring)
+ 	return r;
+ }
+ 
+-static int gfx_v8_0_ring_test_ib(struct amdgpu_ring *ring)
++static int gfx_v8_0_ring_test_ib(struct amdgpu_ring *ring, long timeout)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib ib;
+ 	struct fence *f = NULL;
+ 	uint32_t scratch;
+ 	uint32_t tmp = 0;
+-	int r;
++	long r;
+ 
+ 	r = amdgpu_gfx_scratch_get(adev, &scratch);
+ 	if (r) {
+-		DRM_ERROR("amdgpu: failed to get scratch reg (%d).\n", r);
++		DRM_ERROR("amdgpu: failed to get scratch reg (%ld).\n", r);
+ 		return r;
+ 	}
+ 	WREG32(scratch, 0xCAFEDEAD);
+ 	memset(&ib, 0, sizeof(ib));
+ 	r = amdgpu_ib_get(adev, NULL, 256, &ib);
+ 	if (r) {
+-		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
++		DRM_ERROR("amdgpu: failed to get ib (%ld).\n", r);
+ 		goto err1;
+ 	}
+ 	ib.ptr[0] = PACKET3(PACKET3_SET_UCONFIG_REG, 1);
+@@ -818,14 +818,19 @@ static int gfx_v8_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	if (r)
+ 		goto err2;
+ 
+-	r = fence_wait(f, false);
+-	if (r) {
+-		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
++	r = fence_wait_timeout(f, false, timeout);
++	if (r == 0) {
++		DRM_ERROR("amdgpu: IB test timed out.\n");
++		r = -ETIMEDOUT;
++		goto err2;
++	} else if (r < 0) {
++		DRM_ERROR("amdgpu: fence wait failed (%ld).\n", r);
+ 		goto err2;
+ 	}
+ 	tmp = RREG32(scratch);
+ 	if (tmp == 0xDEADBEEF) {
+ 		DRM_INFO("ib test on ring %d succeeded\n", ring->idx);
++		r = 0;
+ 	} else {
+ 		DRM_ERROR("amdgpu: ib test failed (scratch(0x%04X)=0x%08X)\n",
+ 			  scratch, tmp);
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index 4e20aac..80c913b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -668,19 +668,19 @@ static int sdma_v2_4_ring_test_ring(struct amdgpu_ring *ring)
+  * Test a simple IB in the DMA ring (VI).
+  * Returns 0 on success, error on failure.
+  */
+-static int sdma_v2_4_ring_test_ib(struct amdgpu_ring *ring)
++static int sdma_v2_4_ring_test_ib(struct amdgpu_ring *ring, long timeout)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib ib;
+ 	struct fence *f = NULL;
+ 	unsigned index;
+-	int r;
+ 	u32 tmp = 0;
+ 	u64 gpu_addr;
++	long r;
+ 
+ 	r = amdgpu_wb_get(adev, &index);
+ 	if (r) {
+-		dev_err(adev->dev, "(%d) failed to allocate wb slot\n", r);
++		dev_err(adev->dev, "(%ld) failed to allocate wb slot\n", r);
+ 		return r;
+ 	}
+ 
+@@ -690,7 +690,7 @@ static int sdma_v2_4_ring_test_ib(struct amdgpu_ring *ring)
+ 	memset(&ib, 0, sizeof(ib));
+ 	r = amdgpu_ib_get(adev, NULL, 256, &ib);
+ 	if (r) {
+-		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
++		DRM_ERROR("amdgpu: failed to get ib (%ld).\n", r);
+ 		goto err0;
+ 	}
+ 
+@@ -709,14 +709,19 @@ static int sdma_v2_4_ring_test_ib(struct amdgpu_ring *ring)
+ 	if (r)
+ 		goto err1;
+ 
+-	r = fence_wait(f, false);
+-	if (r) {
+-		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
++	r = fence_wait_timeout(f, false, timeout);
++	if (r == 0) {
++		DRM_ERROR("amdgpu: IB test timed out\n");
++		r = -ETIMEDOUT;
++		goto err1;
++	} else if (r) {
++		DRM_ERROR("amdgpu: fence wait failed (%ld).\n", r);
+ 		goto err1;
+ 	}
+ 	tmp = le32_to_cpu(adev->wb.wb[index]);
+ 	if (tmp == 0xDEADBEEF) {
+ 		DRM_INFO("ib test on ring %d succeeded\n", ring->idx);
++		r = 0;
+ 	} else {
+ 		DRM_ERROR("amdgpu: ib test failed (0x%08X)\n", tmp);
+ 		r = -EINVAL;
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index 4debd0d..653ce5e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -896,19 +896,19 @@ static int sdma_v3_0_ring_test_ring(struct amdgpu_ring *ring)
+  * Test a simple IB in the DMA ring (VI).
+  * Returns 0 on success, error on failure.
+  */
+-static int sdma_v3_0_ring_test_ib(struct amdgpu_ring *ring)
++static int sdma_v3_0_ring_test_ib(struct amdgpu_ring *ring, long timeout)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib ib;
+ 	struct fence *f = NULL;
+ 	unsigned index;
+-	int r;
+ 	u32 tmp = 0;
+ 	u64 gpu_addr;
++	long r;
+ 
+ 	r = amdgpu_wb_get(adev, &index);
+ 	if (r) {
+-		dev_err(adev->dev, "(%d) failed to allocate wb slot\n", r);
++		dev_err(adev->dev, "(%ld) failed to allocate wb slot\n", r);
+ 		return r;
+ 	}
+ 
+@@ -918,7 +918,7 @@ static int sdma_v3_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	memset(&ib, 0, sizeof(ib));
+ 	r = amdgpu_ib_get(adev, NULL, 256, &ib);
+ 	if (r) {
+-		DRM_ERROR("amdgpu: failed to get ib (%d).\n", r);
++		DRM_ERROR("amdgpu: failed to get ib (%ld).\n", r);
+ 		goto err0;
+ 	}
+ 
+@@ -937,14 +937,19 @@ static int sdma_v3_0_ring_test_ib(struct amdgpu_ring *ring)
+ 	if (r)
+ 		goto err1;
+ 
+-	r = fence_wait(f, false);
+-	if (r) {
+-		DRM_ERROR("amdgpu: fence wait failed (%d).\n", r);
++	r = fence_wait_timeout(f, false, timeout);
++	if (r == 0) {
++		DRM_ERROR("amdgpu: IB test timed out\n");
++		r = -ETIMEDOUT;
++		goto err1;
++	} else if (r < 0) {
++		DRM_ERROR("amdgpu: fence wait failed (%ld).\n", r);
+ 		goto err1;
+ 	}
+ 	tmp = le32_to_cpu(adev->wb.wb[index]);
+ 	if (tmp == 0xDEADBEEF) {
+ 		DRM_INFO("ib test on ring %d succeeded\n", ring->idx);
++		r = 0;
+ 	} else {
+ 		DRM_ERROR("amdgpu: ib test failed (0x%08X)\n", tmp);
+ 		r = -EINVAL;
+-- 
+2.7.4
+

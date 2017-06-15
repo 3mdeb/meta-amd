@@ -1,0 +1,632 @@
+From d617fb9a84b3006b5035ca2228fdd40c18722b57 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Tue, 17 May 2016 13:23:48 -0400
+Subject: [PATCH 0495/1722] drm/amd/dal: fix dvi single link
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Jordan Lazare <Jordan.Lazare@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    |  4 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |  2 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          | 26 +++++------
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      | 50 ++++++++++------------
+ .../gpu/drm/amd/dal/dc/dce100/dce100_resource.c    |  2 +-
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 46 ++++++++++----------
+ .../drm/amd/dal/dc/dce110/dce110_link_encoder.c    |  4 +-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    |  4 +-
+ .../drm/amd/dal/dc/dce112/dce112_link_encoder.c    |  4 +-
+ .../gpu/drm/amd/dal/dc/dce112/dce112_resource.c    |  6 +--
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c  |  2 +-
+ drivers/gpu/drm/amd/dal/dc/inc/core_types.h        |  5 +--
+ 12 files changed, 75 insertions(+), 80 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index bc9ec07..60d8ce5 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -781,8 +781,8 @@ static void fill_stream_properties_from_drm_display_mode(
+ 	timing_out->v_border_bottom = 0;
+ 	/* TODO: un-hardcode */
+ 
+-	if (stream->sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A &&
+-			(connector->display_info.color_formats & DRM_COLOR_FORMAT_YCRCB444))
++	if ((connector->display_info.color_formats & DRM_COLOR_FORMAT_YCRCB444)
++			&& stream->sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A)
+ 		timing_out->pixel_encoding = PIXEL_ENCODING_YCBCR444;
+ 	else
+ 		timing_out->pixel_encoding = PIXEL_ENCODING_RGB;
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index c15c1ed..823d6ca 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -648,7 +648,7 @@ static void fill_display_configs(
+ 			ASSERT(pipe_ctx != NULL);
+ 
+ 			num_cfgs++;
+-			cfg->signal = pipe_ctx->signal;
++			cfg->signal = pipe_ctx->stream->signal;
+ 			cfg->pipe_idx = pipe_ctx->pipe_idx;
+ 			cfg->src_height = stream->public.src.height;
+ 			cfg->src_width = stream->public.src.width;
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 5934447..86c4f37c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -1203,7 +1203,7 @@ static enum dc_status enable_link_dp(struct pipe_ctx *pipe_ctx)
+ 	decide_link_settings(stream, &link_settings);
+ 	dp_enable_link_phy(
+ 		link,
+-		pipe_ctx->signal,
++		pipe_ctx->stream->signal,
+ 		pipe_ctx->clock_source->id,
+ 		&link_settings);
+ 
+@@ -1249,7 +1249,7 @@ static void enable_link_hdmi(struct pipe_ctx *pipe_ctx)
+ 	struct core_stream *stream = pipe_ctx->stream;
+ 	struct core_link *link = stream->sink->link;
+ 
+-	if (dc_is_hdmi_signal(pipe_ctx->signal))
++	if (dc_is_hdmi_signal(pipe_ctx->stream->signal))
+ 		dal_ddc_service_write_scdc_data(
+ 			stream->sink->link->ddc,
+ 			stream->phy_pix_clk,
+@@ -1262,11 +1262,11 @@ static void enable_link_hdmi(struct pipe_ctx *pipe_ctx)
+ 			link->link_enc,
+ 			pipe_ctx->clock_source->id,
+ 			stream->public.timing.display_color_depth,
+-			pipe_ctx->signal == SIGNAL_TYPE_HDMI_TYPE_A,
+-			pipe_ctx->signal == SIGNAL_TYPE_DVI_DUAL_LINK,
++			pipe_ctx->stream->signal == SIGNAL_TYPE_HDMI_TYPE_A,
++			pipe_ctx->stream->signal == SIGNAL_TYPE_DVI_DUAL_LINK,
+ 			stream->phy_pix_clk);
+ 
+-	if (pipe_ctx->signal == SIGNAL_TYPE_HDMI_TYPE_A)
++	if (pipe_ctx->stream->signal == SIGNAL_TYPE_HDMI_TYPE_A)
+ 		dal_ddc_service_read_scdc_data(link->ddc);
+ }
+ 
+@@ -1274,7 +1274,7 @@ static void enable_link_hdmi(struct pipe_ctx *pipe_ctx)
+ static enum dc_status enable_link(struct pipe_ctx *pipe_ctx)
+ {
+ 	enum dc_status status = DC_ERROR_UNEXPECTED;
+-	switch (pipe_ctx->signal) {
++	switch (pipe_ctx->stream->signal) {
+ 	case SIGNAL_TYPE_DISPLAY_PORT:
+ 	case SIGNAL_TYPE_EDP:
+ 		status = enable_link_dp(pipe_ctx);
+@@ -1303,7 +1303,7 @@ static enum dc_status enable_link(struct pipe_ctx *pipe_ctx)
+ 
+ 		/* un-mute audio */
+ 		dal_audio_unmute(pipe_ctx->audio, pipe_ctx->stream_enc->id,
+-				pipe_ctx->signal);
++				pipe_ctx->stream->signal);
+ 	}
+ 
+ 	return status;
+@@ -1332,16 +1332,16 @@ static void disable_link(struct core_link *link, enum signal_type signal)
+ }
+ 
+ enum dc_status dc_link_validate_mode_timing(
+-		const struct core_sink *sink,
++		const struct core_stream *stream,
+ 		struct core_link *link,
+ 		const struct dc_crtc_timing *timing)
+ {
+-	uint32_t max_pix_clk = sink->dongle_max_pix_clk;
++	uint32_t max_pix_clk = stream->sink->dongle_max_pix_clk;
+ 
+ 	if (0 != max_pix_clk && timing->pix_clk_khz > max_pix_clk)
+ 		return DC_EXCEED_DONGLE_MAX_CLK;
+ 
+-	switch (sink->public.sink_signal) {
++	switch (stream->signal) {
+ 		case SIGNAL_TYPE_DISPLAY_PORT:
+ 			if(!dp_validate_mode_timing(
+ 					link,
+@@ -1661,7 +1661,7 @@ void core_link_enable_stream(struct pipe_ctx *pipe_ctx)
+ 
+ 	pipe_ctx->stream->status.link = &pipe_ctx->stream->sink->link->public;
+ 
+-	if (pipe_ctx->signal == SIGNAL_TYPE_DISPLAY_PORT_MST)
++	if (pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT_MST)
+ 		allocate_mst_payload(pipe_ctx);
+ }
+ 
+@@ -1669,12 +1669,12 @@ void core_link_disable_stream(struct pipe_ctx *pipe_ctx)
+ {
+ 	struct core_dc *core_dc = DC_TO_CORE(pipe_ctx->stream->ctx->dc);
+ 
+-	if (pipe_ctx->signal == SIGNAL_TYPE_DISPLAY_PORT_MST)
++	if (pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT_MST)
+ 		deallocate_mst_payload(pipe_ctx);
+ 
+ 	core_dc->hwss.disable_stream(pipe_ctx);
+ 
+-	disable_link(pipe_ctx->stream->sink->link, pipe_ctx->signal);
++	disable_link(pipe_ctx->stream->sink->link, pipe_ctx->stream->signal);
+ 
+ 	pipe_ctx->stream->status.link = NULL;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index 6c3e533..437a662 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -184,8 +184,8 @@ bool resource_are_streams_clk_sharable(
+ 		return false;
+ 
+ 	if (stream1->phy_pix_clk != stream2->phy_pix_clk
+-			&& !dc_is_dp_signal(stream1->public.sink->sink_signal)
+-			&& !dc_is_dp_signal(stream2->public.sink->sink_signal))
++			&& !dc_is_dp_signal(stream1->signal)
++			&& !dc_is_dp_signal(stream2->signal))
+ 		return false;
+ 
+ 	return true;
+@@ -198,7 +198,7 @@ static bool is_sharable_clk_src(
+ 	if (pipe_with_clk_src->clock_source == NULL)
+ 		return false;
+ 
+-	if (dc_is_dp_signal(pipe_with_clk_src->signal))
++	if (dc_is_dp_signal(pipe_with_clk_src->stream->signal))
+ 		return false;
+ 
+ 	if (!resource_are_streams_clk_sharable(
+@@ -640,11 +640,11 @@ static int acquire_first_free_pipe(
+ 
+ static struct stream_encoder *find_first_free_match_stream_enc_for_link(
+ 		struct resource_context *res_ctx,
+-		struct core_link *link)
++		struct core_stream *stream)
+ {
+ 	int i;
+ 	int j = -1;
+-	const struct dc_sink *sink = NULL;
++	struct core_link *link = stream->sink->link;
+ 
+ 	for (i = 0; i < res_ctx->pool.stream_enc_count; i++) {
+ 		if (!res_ctx->is_stream_enc_acquired[i] &&
+@@ -671,9 +671,7 @@ static struct stream_encoder *find_first_free_match_stream_enc_for_link(
+ 	 * required for non DP connectors.
+ 	 */
+ 
+-	sink = link->public.local_sink ? link->public.local_sink : link->public.remote_sinks[0];
+-
+-	if (sink && j >= 0 &&  dc_is_dp_signal(sink->sink_signal))
++	if (j >= 0 && dc_is_dp_signal(stream->signal))
+ 		return res_ctx->pool.stream_enc[j];
+ 
+ 	return NULL;
+@@ -691,22 +689,22 @@ static struct audio *find_first_free_audio(struct resource_context *res_ctx)
+ 	return 0;
+ }
+ 
+-static void set_stream_signal(struct pipe_ctx *pipe_ctx)
++static void update_stream_signal(struct core_stream *stream)
+ {
+-	const struct dc_sink *dc_sink = pipe_ctx->stream->public.sink;
++	const struct dc_sink *dc_sink = stream->public.sink;
+ 
+-	pipe_ctx->signal = dc_sink->sink_signal;
++	stream->signal = dc_sink->sink_signal;
+ 	/* For asic supports dual link DVI, we should adjust signal type
+ 	 * based on timing pixel clock. If pixel clock more than 165Mhz,
+ 	 * signal is dual link, otherwise, single link.
+ 	 */
+ 	if (dc_sink->sink_signal == SIGNAL_TYPE_DVI_SINGLE_LINK ||
+ 			dc_sink->sink_signal == SIGNAL_TYPE_DVI_DUAL_LINK) {
+-		if (pipe_ctx->stream->public.timing.pix_clk_khz >
++		if (stream->public.timing.pix_clk_khz >
+ 						TMDS_MAX_PIXEL_CLOCK_IN_KHZ)
+-			pipe_ctx->signal = SIGNAL_TYPE_DVI_DUAL_LINK;
++			stream->signal = SIGNAL_TYPE_DVI_DUAL_LINK;
+ 		else
+-			pipe_ctx->signal = SIGNAL_TYPE_DVI_SINGLE_LINK;
++			stream->signal = SIGNAL_TYPE_DVI_SINGLE_LINK;
+ 	}
+ }
+ 
+@@ -758,8 +756,7 @@ static struct core_stream *find_pll_sharable_stream(
+ 			/* We are looking for non dp, non virtual stream */
+ 			if (resource_are_streams_clk_sharable(
+ 						stream_needs_pll, stream_has_pll)
+-				&& !dc_is_dp_signal(
+-					stream_has_pll->sink->public.sink_signal)
++				&& !dc_is_dp_signal(stream_has_pll->signal)
+ 				&& stream_has_pll->sink->link->public.connector_signal
+ 							!= SIGNAL_TYPE_VIRTUAL)
+ 					return stream_has_pll;
+@@ -811,8 +808,10 @@ static void calculate_phy_pix_clks(
+ 			struct core_stream *stream =
+ 				DC_STREAM_TO_CORE(target->public.streams[j]);
+ 
++			update_stream_signal(stream);
++
+ 			/* update actual pixel clock on all streams */
+-			if (dc_is_hdmi_signal(stream->sink->public.sink_signal))
++			if (dc_is_hdmi_signal(stream->signal))
+ 				stream->phy_pix_clk = get_norm_pix_clk(
+ 					&stream->public.timing);
+ 			else
+@@ -861,7 +860,7 @@ enum dc_status resource_map_pool_resources(
+ 				 * no non dp stream that shares the same timing
+ 				 * with the dp stream.
+ 				 */
+-				if (dc_is_dp_signal(pipe_ctx->signal) &&
++				if (dc_is_dp_signal(pipe_ctx->stream->signal) &&
+ 					!find_pll_sharable_stream(stream, context))
+ 					pipe_ctx->clock_source =
+ 						context->res_ctx.pool.dp_clock_source;
+@@ -896,12 +895,9 @@ enum dc_status resource_map_pool_resources(
+ 
+ 			pipe_ctx = &context->res_ctx.pipe_ctx[pipe_idx];
+ 
+-			set_stream_signal(pipe_ctx);
+-
+ 			pipe_ctx->stream_enc =
+ 				find_first_free_match_stream_enc_for_link(
+-					&context->res_ctx,
+-					stream->sink->link);
++					&context->res_ctx, stream);
+ 
+ 			if (!pipe_ctx->stream_enc)
+ 				return DC_NO_STREAM_ENG_RESOURCE;
+@@ -912,7 +908,7 @@ enum dc_status resource_map_pool_resources(
+ 
+ 			/* TODO: Add check if ASIC support and EDID audio */
+ 			if (!stream->sink->converter_disable_audio &&
+-						dc_is_audio_capable_signal(pipe_ctx->signal) &&
++						dc_is_audio_capable_signal(pipe_ctx->stream->signal) &&
+ 						stream->public.audio_info.mode_count) {
+ 				pipe_ctx->audio = find_first_free_audio(
+ 						&context->res_ctx);
+@@ -1465,7 +1461,7 @@ void resource_build_info_frame(struct pipe_ctx *pipe_ctx)
+ 	info_frame.spd_packet.valid = false;
+ 	info_frame.vsc_packet.valid = false;
+ 
+-	signal = pipe_ctx->stream->sink->public.sink_signal;
++	signal = pipe_ctx->stream->signal;
+ 
+ 	/* HDMi and DP have different info packets*/
+ 	if (signal == SIGNAL_TYPE_HDMI_TYPE_A) {
+@@ -1503,8 +1499,8 @@ enum dc_status resource_map_clock_resources(
+ 				if (context->res_ctx.pipe_ctx[k].stream != stream)
+ 					continue;
+ 
+-				if (dc_is_dp_signal(pipe_ctx->signal)
+-					|| pipe_ctx->signal == SIGNAL_TYPE_VIRTUAL)
++				if (dc_is_dp_signal(pipe_ctx->stream->signal)
++					|| pipe_ctx->stream->signal == SIGNAL_TYPE_VIRTUAL)
+ 					pipe_ctx->clock_source =
+ 						context->res_ctx.pool.dp_clock_source;
+ 				else {
+@@ -1559,7 +1555,7 @@ bool pipe_need_reprogram(
+ 	if (pipe_ctx_old->stream->sink != pipe_ctx->stream->sink)
+ 		return true;
+ 
+-	if (pipe_ctx_old->signal != pipe_ctx->signal)
++	if (pipe_ctx_old->stream->signal != pipe_ctx->stream->signal)
+ 		return true;
+ 
+ 	if (pipe_ctx_old->audio != pipe_ctx->audio)
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+index eb7ba39..bfd4513 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+@@ -620,7 +620,7 @@ static enum dc_status validate_mapped_resource(
+ 					return DC_FAIL_ENC_VALIDATE;
+ 
+ 				/* TODO: validate audio ASIC caps, encoder */
+-				status = dc_link_validate_mode_timing(stream->sink,
++				status = dc_link_validate_mode_timing(stream,
+ 						link,
+ 						&stream->public.timing);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 0f12cca..1e517c3 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -484,9 +484,9 @@ static enum dc_status bios_parser_crtc_source_select(
+ 	/*TODO: Need to un-hardcode color depth, dp_audio and account for
+ 	 * the case where signal and sink signal is different (translator
+ 	 * encoder)*/
+-	crtc_source_select.signal = sink->public.sink_signal;
++	crtc_source_select.signal = pipe_ctx->stream->signal;
+ 	crtc_source_select.enable_dp_audio = false;
+-	crtc_source_select.sink_signal = sink->public.sink_signal;
++	crtc_source_select.sink_signal = pipe_ctx->stream->signal;
+ 	crtc_source_select.display_output_bit_depth = PANEL_8BIT_COLOR;
+ 
+ 	dcb = dal_adapter_service_get_bios_parser(sink->link->adapter_srv);
+@@ -510,11 +510,11 @@ static void update_bios_scratch_critical_state(struct core_dc *dc,
+ 
+ static void update_info_frame(struct pipe_ctx *pipe_ctx)
+ {
+-	if (dc_is_hdmi_signal(pipe_ctx->signal))
++	if (dc_is_hdmi_signal(pipe_ctx->stream->signal))
+ 		pipe_ctx->stream_enc->funcs->update_hdmi_info_packets(
+ 			pipe_ctx->stream_enc,
+ 			&pipe_ctx->encoder_info_frame);
+-	else if (dc_is_dp_signal(pipe_ctx->signal))
++	else if (dc_is_dp_signal(pipe_ctx->stream->signal))
+ 		pipe_ctx->stream_enc->funcs->update_dp_info_packets(
+ 			pipe_ctx->stream_enc,
+ 			&pipe_ctx->encoder_info_frame);
+@@ -555,7 +555,7 @@ static void enable_stream(struct pipe_ctx *pipe_ctx)
+ 		dal_audio_enable_output(
+ 			pipe_ctx->audio,
+ 			pipe_ctx->stream_enc->id,
+-			pipe_ctx->signal);
++			pipe_ctx->stream->signal);
+ 	}
+ 
+ 	/* For MST, there are multiply stream go to only one link.
+@@ -572,18 +572,18 @@ static void disable_stream(struct pipe_ctx *pipe_ctx)
+ 	struct core_stream *stream = pipe_ctx->stream;
+ 	struct core_link *link = stream->sink->link;
+ 
+-	if (dc_is_hdmi_signal(pipe_ctx->signal))
++	if (dc_is_hdmi_signal(pipe_ctx->stream->signal))
+ 		pipe_ctx->stream_enc->funcs->stop_hdmi_info_packets(
+ 			pipe_ctx->stream_enc);
+ 
+-	if (dc_is_dp_signal(pipe_ctx->signal))
++	if (dc_is_dp_signal(pipe_ctx->stream->signal))
+ 		pipe_ctx->stream_enc->funcs->stop_dp_info_packets(
+ 			pipe_ctx->stream_enc);
+ 
+ 	if (pipe_ctx->audio) {
+ 		/* mute audio */
+ 		dal_audio_mute(pipe_ctx->audio, pipe_ctx->stream_enc->id,
+-				pipe_ctx->signal);
++				pipe_ctx->stream->signal);
+ 
+ 		/* TODO: notify audio driver for if audio modes list changed
+ 		 * add audio mode list change flag */
+@@ -593,7 +593,7 @@ static void disable_stream(struct pipe_ctx *pipe_ctx)
+ 	}
+ 
+ 	/* blank at encoder level */
+-	if (dc_is_dp_signal(pipe_ctx->signal))
++	if (dc_is_dp_signal(pipe_ctx->stream->signal))
+ 		pipe_ctx->stream_enc->funcs->dp_blank(pipe_ctx->stream_enc);
+ 
+ 	link->link_enc->funcs->connect_dig_be_to_fe(
+@@ -642,7 +642,7 @@ static void build_audio_output(
+ 	const struct core_stream *stream = pipe_ctx->stream;
+ 	audio_output->engine_id = pipe_ctx->stream_enc->id;
+ 
+-	audio_output->signal = pipe_ctx->signal;
++	audio_output->signal = pipe_ctx->stream->signal;
+ 
+ 	/* audio_crtc_info  */
+ 
+@@ -685,8 +685,8 @@ static void build_audio_output(
+ 	audio_output->crtc_info.calculated_pixel_clock =
+ 			pipe_ctx->pix_clk_params.requested_pix_clk;
+ 
+-	if (pipe_ctx->signal == SIGNAL_TYPE_DISPLAY_PORT ||
+-			pipe_ctx->signal == SIGNAL_TYPE_DISPLAY_PORT_MST) {
++	if (pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT ||
++			pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT_MST) {
+ 		audio_output->pll_info.dp_dto_source_clock_in_khz =
+ 			dal_display_clock_get_dp_ref_clk_frequency(
+ 				pipe_ctx->dis_clk);
+@@ -753,7 +753,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 	}
+ 
+ 	/* TODO: move to stream encoder */
+-	if (pipe_ctx->signal != SIGNAL_TYPE_VIRTUAL)
++	if (pipe_ctx->stream->signal != SIGNAL_TYPE_VIRTUAL)
+ 		if (DC_OK != bios_parser_crtc_source_select(pipe_ctx)) {
+ 			BREAK_TO_DEBUGGER();
+ 			return DC_ERROR_UNEXPECTED;
+@@ -763,7 +763,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 			pipe_ctx->opp,
+ 			COLOR_SPACE_YCBCR601,
+ 			stream->public.timing.display_color_depth,
+-			stream->sink->public.sink_signal);
++			pipe_ctx->stream->signal);
+ 
+ 	pipe_ctx->opp->funcs->opp_program_fmt(
+ 			pipe_ctx->opp,
+@@ -772,25 +772,25 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 
+ 	stream->sink->link->link_enc->funcs->setup(
+ 		stream->sink->link->link_enc,
+-		pipe_ctx->signal);
++		pipe_ctx->stream->signal);
+ 
+-	if (dc_is_dp_signal(pipe_ctx->signal))
++	if (dc_is_dp_signal(pipe_ctx->stream->signal))
+ 		pipe_ctx->stream_enc->funcs->dp_set_stream_attribute(
+ 			pipe_ctx->stream_enc,
+ 			&stream->public.timing);
+ 
+-	if (dc_is_hdmi_signal(pipe_ctx->signal))
++	if (dc_is_hdmi_signal(pipe_ctx->stream->signal))
+ 		pipe_ctx->stream_enc->funcs->hdmi_set_stream_attribute(
+ 			pipe_ctx->stream_enc,
+ 			&stream->public.timing,
+ 			stream->phy_pix_clk,
+ 			pipe_ctx->audio != NULL);
+ 
+-	if (dc_is_dvi_signal(pipe_ctx->signal))
++	if (dc_is_dvi_signal(pipe_ctx->stream->signal))
+ 		pipe_ctx->stream_enc->funcs->dvi_set_stream_attribute(
+ 			pipe_ctx->stream_enc,
+ 			&stream->public.timing,
+-			(pipe_ctx->signal == SIGNAL_TYPE_DVI_DUAL_LINK) ?
++			(pipe_ctx->stream->signal == SIGNAL_TYPE_DVI_DUAL_LINK) ?
+ 			true : false);
+ 
+ 	/* program blank color */
+@@ -801,7 +801,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 	if (!pipe_ctx_old->stream) {
+ 		core_link_enable_stream(pipe_ctx);
+ 
+-		if (dc_is_dp_signal(pipe_ctx->signal))
++		if (dc_is_dp_signal(pipe_ctx->stream->signal))
+ 			unblank_stream(pipe_ctx,
+ 				&stream->sink->link->public.cur_link_settings);
+ 	}
+@@ -1117,7 +1117,7 @@ static void switch_dp_clock_sources(
+ 		if (pipe_ctx->stream == NULL)
+ 			continue;
+ 
+-		if (dc_is_dp_signal(pipe_ctx->signal)) {
++		if (dc_is_dp_signal(pipe_ctx->stream->signal)) {
+ 			struct clock_source *clk_src =
+ 				resource_find_used_clk_src_for_sharing(
+ 						res_ctx, pipe_ctx);
+@@ -1150,7 +1150,7 @@ static void reset_single_pipe_hw_ctx(
+ 	if (pipe_ctx->audio) {
+ 		dal_audio_disable_output(pipe_ctx->audio,
+ 				pipe_ctx->stream_enc->id,
+-				pipe_ctx->signal);
++				pipe_ctx->stream->signal);
+ 		pipe_ctx->audio = NULL;
+ 	}
+ 
+@@ -1307,7 +1307,7 @@ static enum dc_status apply_ctx_to_hw(
+ 			if (!programmed_audio_dto) {
+ 				dal_audio_setup_audio_wall_dto(
+ 					pipe_ctx->audio,
+-					pipe_ctx->signal,
++					pipe_ctx->stream->signal,
+ 					&audio_output.crtc_info,
+ 					&audio_output.pll_info);
+ 				programmed_audio_dto = true;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
+index 3dfbb33..44d1cb1 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
+@@ -1135,13 +1135,13 @@ bool dce110_link_encoder_validate_output_with_stream(
+ 	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+ 	bool is_valid;
+ 
+-	switch (pipe_ctx->signal) {
++	switch (pipe_ctx->stream->signal) {
+ 	case SIGNAL_TYPE_DVI_SINGLE_LINK:
+ 	case SIGNAL_TYPE_DVI_DUAL_LINK:
+ 		is_valid = dce110_link_encoder_validate_dvi_output(
+ 			enc110,
+ 			stream->sink->link->public.connector_signal,
+-			pipe_ctx->signal,
++			pipe_ctx->stream->signal,
+ 			&stream->public.timing);
+ 	break;
+ 	case SIGNAL_TYPE_HDMI_TYPE_A:
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index 15bd9141..5826455 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -536,7 +536,7 @@ static void get_pixel_clock_parameters(
+ 	 */
+ 	pixel_clk_params->requested_pix_clk = stream->public.timing.pix_clk_khz;
+ 	pixel_clk_params->encoder_object_id = stream->sink->link->link_enc->id;
+-	pixel_clk_params->signal_type = stream->sink->public.sink_signal;
++	pixel_clk_params->signal_type = pipe_ctx->stream->signal;
+ 	pixel_clk_params->controller_id = pipe_ctx->pipe_idx + 1;
+ 	/* TODO: un-hardcode*/
+ 	pixel_clk_params->requested_sym_clk = LINK_RATE_LOW *
+@@ -648,7 +648,7 @@ static enum dc_status validate_mapped_resource(
+ 
+ 				/* TODO: validate audio ASIC caps, encoder */
+ 
+-				status = dc_link_validate_mode_timing(stream->sink,
++				status = dc_link_validate_mode_timing(stream,
+ 						link,
+ 						&stream->public.timing);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_link_encoder.c b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_link_encoder.c
+index 79898fc..caf8913 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_link_encoder.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_link_encoder.c
+@@ -105,13 +105,13 @@ bool dce112_link_encoder_validate_output_with_stream(
+ 	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+ 	bool is_valid;
+ 
+-	switch (pipe_ctx->signal) {
++	switch (pipe_ctx->stream->signal) {
+ 	case SIGNAL_TYPE_DVI_SINGLE_LINK:
+ 	case SIGNAL_TYPE_DVI_DUAL_LINK:
+ 		is_valid = dce110_link_encoder_validate_dvi_output(
+ 			enc110,
+ 			stream->sink->link->public.connector_signal,
+-			pipe_ctx->signal,
++			pipe_ctx->stream->signal,
+ 			&stream->public.timing);
+ 	break;
+ 	case SIGNAL_TYPE_HDMI_TYPE_A:
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
+index 0ca073c..914e408 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
+@@ -671,7 +671,7 @@ static enum dc_status validate_mapped_resource(
+ 
+ 				/* TODO: validate audio ASIC caps, encoder */
+ 
+-				status = dc_link_validate_mode_timing(stream->sink,
++				status = dc_link_validate_mode_timing(stream,
+ 						link,
+ 						&stream->public.timing);
+ 
+@@ -886,8 +886,8 @@ static enum dc_status map_clock_resources(
+ 				if (context->res_ctx.pipe_ctx[k].stream != stream)
+ 					continue;
+ 
+-				if (dc_is_dp_signal(pipe_ctx->signal)
+-					|| pipe_ctx->signal == SIGNAL_TYPE_VIRTUAL)
++				if (dc_is_dp_signal(pipe_ctx->stream->signal)
++					|| pipe_ctx->stream->signal == SIGNAL_TYPE_VIRTUAL)
+ 					pipe_ctx->clock_source =
+ 						context->res_ctx.pool.dp_clock_source;
+ 				else
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+index 7751fc6..d025f44 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+@@ -575,7 +575,7 @@ static enum dc_status validate_mapped_resource(
+ 
+ 				/* TODO: validate audio ASIC caps, encoder */
+ 
+-				status = dc_link_validate_mode_timing(stream->sink,
++				status = dc_link_validate_mode_timing(stream,
+ 						link,
+ 						&stream->public.timing);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+index aef49c2..01b276a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/core_types.h
+@@ -94,6 +94,7 @@ struct core_stream {
+ 	struct clamping_and_pixel_encoding_params clamping;
+ 
+ 	int phy_pix_clk;
++	enum signal_type signal;
+ 
+ 	struct dc_stream_status status;
+ };
+@@ -197,7 +198,7 @@ struct core_link *link_create(const struct link_init_data *init_params);
+ void link_destroy(struct core_link **link);
+ 
+ enum dc_status dc_link_validate_mode_timing(
+-		const struct core_sink *sink,
++		const struct core_stream *stream,
+ 		struct core_link *link,
+ 		const struct dc_crtc_timing *timing);
+ 
+@@ -285,8 +286,6 @@ struct pipe_ctx {
+ 
+ 	struct audio *audio;
+ 
+-	enum signal_type signal;
+-
+ 	struct pixel_clk_params pix_clk_params;
+ 	struct pll_settings pll_settings;
+ 
+-- 
+2.7.4
+

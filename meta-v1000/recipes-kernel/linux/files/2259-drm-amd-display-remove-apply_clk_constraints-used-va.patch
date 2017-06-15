@@ -1,0 +1,333 @@
+From d75dc2c49933a4ca9e5eb6a41af1964d5c703717 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Fri, 24 Feb 2017 14:19:40 -0500
+Subject: [PATCH 2259/3082] drm/amd/display: remove apply_clk_constraints, used
+ validate_bandwidth universally
+
+Change-Id: I4264c415862c6b4e64546a04c90b4be41496a0fa
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Reviewed-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           | 50 ++++++++++++++--------
+ .../drm/amd/display/dc/dce100/dce100_resource.c    | 10 +++--
+ .../drm/amd/display/dc/dce110/dce110_resource.c    | 18 ++++----
+ .../drm/amd/display/dc/dce112/dce112_resource.c    | 18 ++++----
+ .../drm/amd/display/dc/dce112/dce112_resource.h    |  2 +-
+ .../gpu/drm/amd/display/dc/dce80/dce80_resource.c  |  4 +-
+ drivers/gpu/drm/amd/display/dc/inc/core_status.h   |  1 -
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h    |  6 +--
+ 8 files changed, 59 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index e0d9572..da0f720 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1144,12 +1144,11 @@ bool dc_pre_update_surfaces_to_stream(
+ 			}
+ 		}
+ 
+-	if (core_dc->res_pool->funcs->validate_bandwidth)
+-		if (core_dc->res_pool->funcs->validate_bandwidth(core_dc, context) != DC_OK) {
+-			BREAK_TO_DEBUGGER();
+-			ret = false;
+-			goto unexpected_fail;
+-		}
++	if (!core_dc->res_pool->funcs->validate_bandwidth(core_dc, context)) {
++		BREAK_TO_DEBUGGER();
++		ret = false;
++		goto unexpected_fail;
++	}
+ 
+ 	if (!IS_FPGA_MAXIMUS_DC(core_dc->ctx->dce_environment)
+ 			&& prev_disp_clk < context->dispclk_khz) {
+@@ -1184,28 +1183,36 @@ val_ctx_fail:
+ 
+ bool dc_post_update_surfaces_to_stream(struct dc *dc)
+ {
+-	struct core_dc *core_dc = DC_TO_CORE(dc);
+ 	int i;
++	struct core_dc *core_dc = DC_TO_CORE(dc);
++	struct validate_context *context = dm_alloc(sizeof(struct validate_context));
++
++	if (!context) {
++		dm_error("%s: failed to create validate ctx\n", __func__);
++		return false;
++	}
++	resource_validate_ctx_copy_construct(core_dc->current_context, context);
+ 
+ 	post_surface_trace(dc);
+ 
+-	for (i = 0; i < core_dc->current_context->res_ctx.pool->pipe_count; i++)
+-		if (core_dc->current_context->res_ctx.pipe_ctx[i].stream == NULL) {
+-			core_dc->current_context->res_ctx.pipe_ctx[i].pipe_idx = i;
++	for (i = 0; i < context->res_ctx.pool->pipe_count; i++)
++		if (context->res_ctx.pipe_ctx[i].stream == NULL) {
++			context->res_ctx.pipe_ctx[i].pipe_idx = i;
+ 			core_dc->hwss.power_down_front_end(
+-					core_dc, &core_dc->current_context->res_ctx.pipe_ctx[i]);
+-		}
+-	if (core_dc->res_pool->funcs->validate_bandwidth)
+-		if (core_dc->res_pool->funcs->validate_bandwidth(
+-				core_dc, core_dc->current_context) != DC_OK) {
+-			BREAK_TO_DEBUGGER();
+-			return false;
++					core_dc, &context->res_ctx.pipe_ctx[i]);
+ 		}
++	if (!core_dc->res_pool->funcs->validate_bandwidth(core_dc, context)) {
++		BREAK_TO_DEBUGGER();
++		return false;
++	}
+ 
+ 	core_dc->hwss.set_bandwidth(core_dc);
+ 
+-	pplib_apply_display_requirements(
+-			core_dc, core_dc->current_context, &core_dc->current_context->pp_display_cfg);
++	/*TODO: dce specific*/
++	pplib_apply_display_requirements(core_dc, context, &context->pp_display_cfg);
++
++	resource_validate_ctx_destruct(core_dc->current_context);
++	core_dc->current_context = context;
+ 
+ 	return true;
+ }
+@@ -1472,6 +1479,11 @@ void dc_update_surfaces_for_stream(struct dc *dc,
+ 				*(updates[i].hdr_static_metadata);
+ 	}
+ 
++	if (update_type == UPDATE_TYPE_FULL &&
++			!core_dc->res_pool->funcs->validate_bandwidth(core_dc, context)) {
++		BREAK_TO_DEBUGGER();
++		return;
++	}
+ 
+ 	if (!surface_count)  /* reset */
+ 		core_dc->hwss.apply_ctx_for_surface(core_dc, NULL, context);
+diff --git a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+index 9ed7c06..fc85efa 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+@@ -765,14 +765,14 @@ static enum dc_status validate_mapped_resource(
+ 	return DC_OK;
+ }
+ 
+-enum dc_status dce100_validate_bandwidth(
++bool dce100_validate_bandwidth(
+ 	const struct core_dc *dc,
+ 	struct validate_context *context)
+ {
+ 	/* TODO implement when needed but for now hardcode max value*/
+ 	context->dispclk_khz = 681000;
+ 
+-	return DC_OK;
++	return false;
+ }
+ 
+ static bool dce100_validate_surface_sets(
+@@ -840,7 +840,8 @@ enum dc_status dce100_validate_with_context(
+ 		result = resource_build_scaling_params_for_context(dc, context);
+ 
+ 	if (result == DC_OK)
+-		result = dce100_validate_bandwidth(dc, context);
++		if (!dce100_validate_bandwidth(dc, context))
++			result = DC_FAIL_BANDWIDTH_VALIDATE;
+ 
+ 	return result;
+ }
+@@ -873,7 +874,8 @@ enum dc_status dce100_validate_guaranteed(
+ 	}
+ 
+ 	if (result == DC_OK)
+-		result = dce100_validate_bandwidth(dc, context);
++		if (!dce100_validate_bandwidth(dc, context))
++			result = DC_FAIL_BANDWIDTH_VALIDATE;
+ 
+ 	return result;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+index 80b2359..b9d0b5e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+@@ -912,30 +912,28 @@ static enum dc_status validate_mapped_resource(
+ 	return DC_OK;
+ }
+ 
+-enum dc_status dce110_validate_bandwidth(
++bool dce110_validate_bandwidth(
+ 	const struct core_dc *dc,
+ 	struct validate_context *context)
+ {
+-	enum dc_status result = DC_ERROR_UNEXPECTED;
++	bool result = false;
+ 
+ 	dm_logger_write(
+ 		dc->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"%s: start",
+ 		__func__);
+ 
+-	if (!bw_calcs(
++	if (bw_calcs(
+ 			dc->ctx,
+ 			&dc->bw_dceip,
+ 			&dc->bw_vbios,
+ 			context->res_ctx.pipe_ctx,
+ 			context->res_ctx.pool->pipe_count,
+ 			&context->bw_results))
+-		result =  DC_FAIL_BANDWIDTH_VALIDATE;
+-	else
+-		result =  DC_OK;
++		result =  true;
+ 	context->dispclk_khz = context->bw_results.dispclk_khz;
+ 
+-	if (result == DC_FAIL_BANDWIDTH_VALIDATE)
++	if (!result)
+ 		dm_logger_write(dc->ctx->logger, LOG_BANDWIDTH_VALIDATION,
+ 			"%s: %dx%d@%d Bandwidth validation failed!\n",
+ 			__func__,
+@@ -1073,7 +1071,8 @@ enum dc_status dce110_validate_with_context(
+ 		result = resource_build_scaling_params_for_context(dc, context);
+ 
+ 	if (result == DC_OK)
+-		result = dce110_validate_bandwidth(dc, context);
++		if (!dce110_validate_bandwidth(dc, context))
++			result = DC_FAIL_BANDWIDTH_VALIDATE;
+ 
+ 	return result;
+ }
+@@ -1106,7 +1105,8 @@ enum dc_status dce110_validate_guaranteed(
+ 	}
+ 
+ 	if (result == DC_OK)
+-		result = dce110_validate_bandwidth(dc, context);
++		if (!dce110_validate_bandwidth(dc, context))
++			result = DC_FAIL_BANDWIDTH_VALIDATE;
+ 
+ 	return result;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+index ce6c69f..32aa1b5 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+@@ -836,30 +836,28 @@ static enum dc_status validate_mapped_resource(
+ 	return DC_OK;
+ }
+ 
+-enum dc_status dce112_validate_bandwidth(
++bool dce112_validate_bandwidth(
+ 	const struct core_dc *dc,
+ 	struct validate_context *context)
+ {
+-	enum dc_status result = DC_ERROR_UNEXPECTED;
++	bool result = false;
+ 
+ 	dm_logger_write(
+ 		dc->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"%s: start",
+ 		__func__);
+ 
+-	if (!bw_calcs(
++	if (bw_calcs(
+ 			dc->ctx,
+ 			&dc->bw_dceip,
+ 			&dc->bw_vbios,
+ 			context->res_ctx.pipe_ctx,
+ 			context->res_ctx.pool->pipe_count,
+ 			&context->bw_results))
+-		result =  DC_FAIL_BANDWIDTH_VALIDATE;
+-	else
+-		result =  DC_OK;
++		result = true;
+ 	context->dispclk_khz = context->bw_results.dispclk_khz;
+ 
+-	if (result == DC_FAIL_BANDWIDTH_VALIDATE)
++	if (!result)
+ 		dm_logger_write(dc->ctx->logger, LOG_BANDWIDTH_VALIDATION,
+ 			"%s: Bandwidth validation failed!",
+ 			__func__);
+@@ -1026,7 +1024,8 @@ enum dc_status dce112_validate_with_context(
+ 		result = resource_build_scaling_params_for_context(dc, context);
+ 
+ 	if (result == DC_OK)
+-		result = dce112_validate_bandwidth(dc, context);
++		if (!dce112_validate_bandwidth(dc, context))
++			result = DC_FAIL_BANDWIDTH_VALIDATE;
+ 
+ 	return result;
+ }
+@@ -1059,7 +1058,8 @@ enum dc_status dce112_validate_guaranteed(
+ 	}
+ 
+ 	if (result == DC_OK)
+-		result = dce112_validate_bandwidth(dc, context);
++		if (!dce112_validate_bandwidth(dc, context))
++			result = DC_FAIL_BANDWIDTH_VALIDATE;
+ 
+ 	return result;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h
+index faa8c45..dc842aa 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h
++++ b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h
+@@ -46,7 +46,7 @@ enum dc_status dce112_validate_guaranteed(
+ 		const struct dc_stream *dc_stream,
+ 		struct validate_context *context);
+ 
+-enum dc_status dce112_validate_bandwidth(
++bool dce112_validate_bandwidth(
+ 	const struct core_dc *dc,
+ 	struct validate_context *context);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+index fbbdd0e..a3e8182 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+@@ -780,7 +780,7 @@ static enum dc_status validate_mapped_resource(
+ 	return DC_OK;
+ }
+ 
+-enum dc_status dce80_validate_bandwidth(
++bool dce80_validate_bandwidth(
+ 	const struct core_dc *dc,
+ 	struct validate_context *context)
+ {
+@@ -788,7 +788,7 @@ enum dc_status dce80_validate_bandwidth(
+ 	context->dispclk_khz = 681000;
+ 	context->bw_results.required_yclk = 250000 * MEMORY_TYPE_MULTIPLIER;
+ 
+-	return DC_OK;
++	return true;
+ }
+ 
+ static bool dce80_validate_surface_sets(
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_status.h b/drivers/gpu/drm/amd/display/dc/inc/core_status.h
+index 23d52ae..128617d 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_status.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_status.h
+@@ -41,7 +41,6 @@ enum dc_status {
+ 	DC_SURFACE_PIXEL_FORMAT_UNSUPPORTED = 11,
+ 	DC_FAIL_BANDWIDTH_VALIDATE = 12, /* BW and Watermark validation */
+ 	DC_FAIL_SCALING = 13,
+-	DC_FAIL_CLK_CONSTRAINT = 14,
+ 
+ 	DC_ERROR_UNEXPECTED = -1
+ };
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index 124df67..e8fe333 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -207,11 +207,7 @@ struct resource_funcs {
+ 					const struct dc_stream *stream,
+ 					struct validate_context *context);
+ 
+-	enum dc_status (*validate_bandwidth)(
+-					const struct core_dc *dc,
+-					struct validate_context *context);
+-
+-	struct validate_context *(*apply_clk_constraints)(
++	bool (*validate_bandwidth)(
+ 					const struct core_dc *dc,
+ 					struct validate_context *context);
+ 
+-- 
+2.7.4
+

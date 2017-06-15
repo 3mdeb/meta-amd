@@ -1,0 +1,495 @@
+From 320172a4d4b0ff8fc48eecdd3f76f284c95c01b8 Mon Sep 17 00:00:00 2001
+From: Jay Cornwall <Jay.Cornwall@amd.com>
+Date: Mon, 24 Oct 2016 17:12:50 -0500
+Subject: [PATCH 1701/1722] drm/amdgpu: Load write pointer manually during KFD
+ MQD setup
+
+CP_HQD_PQ_WPTR_POLL* fails intermittently on Tonga due to an RTL bug
+in CP clock gating logic.
+
+Load the write pointer inside the driver after the doorbell logic
+has been enabled. Apply the same shift/mask used by CP microcode to
+populate CP_HQD_PQ_WPTR manually. Unify this code path with MQD setup
+for SDMA queues.
+
+Change-Id: I3f4b8a3b778d00310c85c17f5af740cb3aa2844b
+Signed-off-by: Jay Cornwall <Jay.Cornwall@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c         | 23 +++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h         |  3 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c  | 59 +++++-----------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c  | 59 +++++-----------------
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 21 +++-----
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c      |  3 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h       |  3 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c   | 19 ++++---
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c    | 17 +++++--
+ drivers/gpu/drm/amd/include/kgd_kfd_interface.h    |  7 +--
+ 10 files changed, 93 insertions(+), 121 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index e81e8e4..edca508 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -25,6 +25,7 @@
+ #include <drm/drmP.h>
+ #include "amdgpu.h"
+ #include <linux/module.h>
++#include <linux/mmu_context.h>
+ 
+ #define AMDKFD_SKIP_UNCOMPILED_CODE 1
+ 
+@@ -516,3 +517,25 @@ out_put:
+ 	dma_buf_put(dma_buf);
+ 	return r;
+ }
++
++bool read_user_wptr(struct mm_struct *mm, uint32_t __user *wptr,
++		    uint32_t *wptr_val)
++{
++	bool wptr_valid = false;
++
++	if (mm && wptr) {
++		if (mm == current->mm) {
++			/* Running in the correct user process context */
++			wptr_valid = !get_user(*wptr_val, wptr);
++		} else if (current->mm == NULL) {
++			/* A kernel thread can temporarily use a user
++			 * process context for AIO
++			 */
++			use_mm(mm);
++			wptr_valid = !get_user(*wptr_val, wptr);
++			unuse_mm(mm);
++		}
++	}
++
++	return wptr_valid;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 5497494..8481fe4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -151,6 +151,9 @@ int amdgpu_amdkfd_get_dmabuf_info(struct kgd_dev *kgd, int dma_buf_fd,
+ 				  size_t buffer_size, uint32_t *metadata_size,
+ 				  uint32_t *flags);
+ 
++bool read_user_wptr(struct mm_struct *mm, uint32_t __user *wptr,
++		    uint32_t *wptr_val);
++
+ /* GPUVM API */
+ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
+ 		struct kgd_dev *kgd, uint64_t va, uint64_t size,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+index 9b67fb3..f8397b4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+@@ -23,7 +23,6 @@
+ #include <linux/fdtable.h>
+ #include <linux/uaccess.h>
+ #include <linux/firmware.h>
+-#include <linux/mmu_context.h>
+ #include <drm/drmP.h>
+ #include "amdgpu.h"
+ #include "amdgpu_amdkfd.h"
+@@ -106,7 +105,9 @@ static int kgd_set_pasid_vmid_mapping(struct kgd_dev *kgd, unsigned int pasid, u
+ static int kgd_init_pipeline(struct kgd_dev *kgd, uint32_t pipe_id, uint32_t hpd_size, uint64_t hpd_gpu_addr);
+ static int kgd_init_interrupts(struct kgd_dev *kgd, uint32_t pipe_id);
+ static int kgd_hqd_load(struct kgd_dev *kgd, void *mqd, uint32_t pipe_id,
+-			uint32_t queue_id, uint32_t __user *wptr);
++			uint32_t queue_id, uint32_t __user *wptr,
++			uint32_t wptr_shift, uint32_t wptr_mask,
++			struct mm_struct *mm);
+ static int kgd_hqd_dump(struct kgd_dev *kgd,
+ 			uint32_t pipe_id, uint32_t queue_id,
+ 			uint32_t (**dump)[2], uint32_t *n_regs);
+@@ -273,16 +274,6 @@ static void acquire_queue(struct kgd_dev *kgd, uint32_t pipe_id,
+ 	lock_srbm(kgd, mec, pipe, queue_id, 0);
+ }
+ 
+-static uint32_t get_queue_mask(uint32_t pipe_id, uint32_t queue_id)
+-{
+-	/* assumes that pipe0 is used by graphics and that the correct
+-	 * MEC is selected by acquire_queue already
+-	 */
+-	unsigned bit = ((pipe_id+1) * CIK_QUEUES_PER_PIPE_MEC + queue_id) & 31;
+-
+-	return ((uint32_t)1) << bit;
+-}
+-
+ static void release_queue(struct kgd_dev *kgd)
+ {
+ 	unlock_srbm(kgd);
+@@ -390,12 +381,14 @@ static inline struct cik_sdma_rlc_registers *get_sdma_mqd(void *mqd)
+ }
+ 
+ static int kgd_hqd_load(struct kgd_dev *kgd, void *mqd, uint32_t pipe_id,
+-		uint32_t queue_id, uint32_t __user *wptr)
++			uint32_t queue_id, uint32_t __user *wptr,
++			uint32_t wptr_shift, uint32_t wptr_mask,
++			struct mm_struct *mm)
+ {
+ 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
+ 	struct cik_mqd *m;
+ 	uint32_t *mqd_hqd;
+-	uint32_t reg;
++	uint32_t reg, wptr_val;
+ 
+ 	m = get_mqd(mqd);
+ 
+@@ -407,23 +400,11 @@ static int kgd_hqd_load(struct kgd_dev *kgd, void *mqd, uint32_t pipe_id,
+ 	for (reg = mmCP_HQD_VMID; reg <= mmCP_MQD_CONTROL; reg++)
+ 		WREG32(reg, mqd_hqd[reg - mmCP_MQD_BASE_ADDR]);
+ 
+-	if (wptr) {
+-		/* Don't read wptr with get_user because the user
+-		 * context may not be accessible (if this function
+-		 * runs in a work queue). Instead trigger a one-shot
+-		 * polling read from memory in the CP. This assumes
+-		 * that wptr is GPU-accessible in the queue's VMID via
+-		 * ATC or SVM. WPTR==RPTR before starting the poll so
+-		 * the CP starts fetching new commands from the right
+-		 * place.
+-		 */
+-		WREG32(mmCP_HQD_PQ_WPTR, m->cp_hqd_pq_rptr);
+-		WREG32(mmCP_HQD_PQ_WPTR_POLL_ADDR, (uint32_t)(uint64_t)wptr);
+-		WREG32(mmCP_HQD_PQ_WPTR_POLL_ADDR_HI,
+-		       (uint32_t)((uint64_t)wptr >> 32));
+-		WREG32(mmCP_PQ_WPTR_POLL_CNTL1,
+-		       get_queue_mask(pipe_id, queue_id));
+-	}
++	/* Copy userspace write pointer value to register.
++	 * Doorbell logic is active and will monitor subsequent changes.
++	 */
++	if (read_user_wptr(mm, wptr, &wptr_val))
++		WREG32(mmCP_HQD_PQ_WPTR, (wptr_val << wptr_shift) & wptr_mask);
+ 
+ 	/* Write CP_HQD_ACTIVE last. */
+ 	for (reg = mmCP_MQD_BASE_ADDR; reg <= mmCP_HQD_ACTIVE; reg++)
+@@ -478,7 +459,6 @@ static int kgd_hqd_sdma_load(struct kgd_dev *kgd, void *mqd,
+ 	uint32_t sdma_base_addr;
+ 	uint32_t temp, timeout = 2000;
+ 	uint32_t data;
+-	bool wptr_valid = false;
+ 
+ 	m = get_sdma_mqd(mqd);
+ 	sdma_base_addr = get_sdma_base_addr(m);
+@@ -510,20 +490,7 @@ static int kgd_hqd_sdma_load(struct kgd_dev *kgd, void *mqd,
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_DOORBELL, m->sdma_rlc_doorbell);
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_RPTR, m->sdma_rlc_rb_rptr);
+ 
+-	if (mm) {
+-		if (mm == current->mm) {
+-			/* Running in the correct user process context */
+-			wptr_valid = !get_user(data, wptr);
+-		} else if (current->mm == NULL) {
+-			/* A kernel thread can temporarily use a user
+-			 * process context for AIO
+-			 */
+-			use_mm(mm);
+-			wptr_valid = !get_user(data, wptr);
+-			unuse_mm(mm);
+-		}
+-	}
+-	if (wptr_valid)
++	if (read_user_wptr(mm, wptr, &data))
+ 		WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_WPTR, data);
+ 	else
+ 		WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_WPTR,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+index c8e129f..d499436 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+@@ -24,7 +24,6 @@
+ #include <linux/fdtable.h>
+ #include <linux/uaccess.h>
+ #include <linux/firmware.h>
+-#include <linux/mmu_context.h>
+ #include <drm/drmP.h>
+ #include "amdgpu.h"
+ #include "amdgpu_amdkfd.h"
+@@ -83,7 +82,9 @@ static int kgd_init_pipeline(struct kgd_dev *kgd, uint32_t pipe_id,
+ 		uint32_t hpd_size, uint64_t hpd_gpu_addr);
+ static int kgd_init_interrupts(struct kgd_dev *kgd, uint32_t pipe_id);
+ static int kgd_hqd_load(struct kgd_dev *kgd, void *mqd, uint32_t pipe_id,
+-			uint32_t queue_id, uint32_t __user *wptr);
++			uint32_t queue_id, uint32_t __user *wptr,
++			uint32_t wptr_shift, uint32_t wptr_mask,
++			struct mm_struct *mm);
+ static int kgd_hqd_dump(struct kgd_dev *kgd,
+ 			uint32_t pipe_id, uint32_t queue_id,
+ 			uint32_t (**dump)[2], uint32_t *n_regs);
+@@ -264,16 +265,6 @@ static void acquire_queue(struct kgd_dev *kgd, uint32_t pipe_id,
+ 	lock_srbm(kgd, mec, pipe, queue_id, 0);
+ }
+ 
+-static uint32_t get_queue_mask(uint32_t pipe_id, uint32_t queue_id)
+-{
+-	/* assumes that pipe0 is used by graphics and that the correct
+-	 * MEC is selected by acquire_queue already
+-	 */
+-	unsigned bit = ((pipe_id+1) * VI_QUEUES_PER_PIPE_MEC + queue_id) & 31;
+-
+-	return ((uint32_t)1) << bit;
+-}
+-
+ static void release_queue(struct kgd_dev *kgd)
+ {
+ 	unlock_srbm(kgd);
+@@ -370,12 +361,14 @@ static inline struct vi_sdma_mqd *get_sdma_mqd(void *mqd)
+ }
+ 
+ static int kgd_hqd_load(struct kgd_dev *kgd, void *mqd, uint32_t pipe_id,
+-			uint32_t queue_id, uint32_t __user *wptr)
++			uint32_t queue_id, uint32_t __user *wptr,
++			uint32_t wptr_shift, uint32_t wptr_mask,
++			struct mm_struct *mm)
+ {
+ 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
+ 	struct vi_mqd *m;
+ 	uint32_t *mqd_hqd;
+-	uint32_t reg;
++	uint32_t reg, wptr_val;
+ 
+ 	m = get_mqd(mqd);
+ 
+@@ -401,23 +394,11 @@ static int kgd_hqd_load(struct kgd_dev *kgd, void *mqd, uint32_t pipe_id,
+ 	for (reg = mmCP_HQD_EOP_EVENTS; reg <= mmCP_HQD_ERROR; reg++)
+ 		WREG32(reg, mqd_hqd[reg - mmCP_MQD_BASE_ADDR]);
+ 
+-	if (wptr) {
+-		/* Don't read wptr with get_user because the user
+-		 * context may not be accessible (if this function
+-		 * runs in a work queue). Instead trigger a one-shot
+-		 * polling read from memory in the CP. This assumes
+-		 * that wptr is GPU-accessible in the queue's VMID via
+-		 * ATC or SVM. WPTR==RPTR before starting the poll so
+-		 * the CP starts fetching new commands from the right
+-		 * place.
+-		 */
+-		WREG32(mmCP_HQD_PQ_WPTR, m->cp_hqd_pq_rptr);
+-		WREG32(mmCP_HQD_PQ_WPTR_POLL_ADDR, (uint32_t)(uint64_t)wptr);
+-		WREG32(mmCP_HQD_PQ_WPTR_POLL_ADDR_HI,
+-		       (uint32_t)((uint64_t)wptr >> 32));
+-		WREG32(mmCP_PQ_WPTR_POLL_CNTL1,
+-		       get_queue_mask(pipe_id, queue_id));
+-	}
++	/* Copy userspace write pointer value to register.
++	 * Doorbell logic is active and will monitor subsequent changes.
++	 */
++	if (read_user_wptr(mm, wptr, &wptr_val))
++		WREG32(mmCP_HQD_PQ_WPTR, (wptr_val << wptr_shift) & wptr_mask);
+ 
+ 	/* Write CP_HQD_ACTIVE last. */
+ 	for (reg = mmCP_MQD_BASE_ADDR; reg <= mmCP_HQD_ACTIVE; reg++)
+@@ -472,7 +453,6 @@ static int kgd_hqd_sdma_load(struct kgd_dev *kgd, void *mqd,
+ 	uint32_t sdma_base_addr;
+ 	uint32_t temp, timeout = 2000;
+ 	uint32_t data;
+-	bool wptr_valid = false;
+ 
+ 	m = get_sdma_mqd(mqd);
+ 	sdma_base_addr = get_sdma_base_addr(m);
+@@ -503,20 +483,7 @@ static int kgd_hqd_sdma_load(struct kgd_dev *kgd, void *mqd,
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_DOORBELL, m->sdmax_rlcx_doorbell);
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_RPTR, m->sdmax_rlcx_rb_rptr);
+ 
+-	if (mm) {
+-		if (mm == current->mm) {
+-			/* Running in the correct user process context */
+-			wptr_valid = !get_user(data, wptr);
+-		} else if (current->mm == NULL) {
+-			/* A kernel thread can temporarily use a user
+-			 * process context for AIO
+-			 */
+-			use_mm(mm);
+-			wptr_valid = !get_user(data, wptr);
+-			unuse_mm(mm);
+-		}
+-	}
+-	if (wptr_valid)
++	if (read_user_wptr(mm, wptr, &data))
+ 		WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_WPTR, data);
+ 	else
+ 		WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_WPTR,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 7eceeda..600d6c3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -308,9 +308,8 @@ static int create_compute_queue_nocpsch(struct device_queue_manager *dqm,
+ 	if (!q->properties.is_active)
+ 		return 0;
+ 
+-	retval = mqd->load_mqd(mqd, q->mqd, q->pipe,
+-			q->queue, (uint32_t __user *) q->properties.write_ptr,
+-			q->process->mm);
++	retval = mqd->load_mqd(mqd, q->mqd, q->pipe, q->queue, &q->properties,
++			       q->process->mm);
+ 	if (retval != 0) {
+ 		deallocate_hqd(dqm, q);
+ 		mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
+@@ -427,10 +426,8 @@ static int update_queue(struct device_queue_manager *dqm, struct queue *q)
+ 	    (q->properties.type == KFD_QUEUE_TYPE_COMPUTE ||
+ 	     q->properties.type == KFD_QUEUE_TYPE_SDMA)) {
+ 		if (q->properties.is_active)
+-			retval = mqd->load_mqd(mqd, q->mqd, q->pipe,
+-				q->queue,
+-				(uint32_t __user *)q->properties.write_ptr,
+-				q->process->mm);
++			retval = mqd->load_mqd(mqd, q->mqd, q->pipe, q->queue,
++					       &q->properties, q->process->mm);
+ 		else if (prev_active)
+ 			retval = mqd->destroy_mqd(mqd, q->mqd,
+ 				KFD_PREEMPT_TYPE_WAVEFRONT_DRAIN,
+@@ -570,11 +567,9 @@ int process_restore_queues(struct device_queue_manager *dqm,
+ 			if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS &&
+ 			    (q->properties.type == KFD_QUEUE_TYPE_COMPUTE ||
+ 			     q->properties.type == KFD_QUEUE_TYPE_SDMA))
+-				retval = mqd->load_mqd(
+-					mqd, q->mqd, q->pipe, q->queue,
+-					(uint32_t __user *)
+-					q->properties.write_ptr,
+-					q->process->mm);
++				retval = mqd->load_mqd(mqd, q->mqd, q->pipe,
++						       q->queue, &q->properties,
++						       q->process->mm);
+ 			dqm->queue_count++;
+ 		}
+ 	}
+@@ -861,7 +856,7 @@ static int create_sdma_queue_nocpsch(struct device_queue_manager *dqm,
+ 		return retval;
+ 	}
+ 
+-	retval = mqd->load_mqd(mqd, q->mqd, 0, 0, NULL, NULL);
++	retval = mqd->load_mqd(mqd, q->mqd, 0, 0, &q->properties, NULL);
+ 	if (retval != 0) {
+ 		deallocate_sdma_queue(dqm, q->sdma_id);
+ 		mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+index f19f2b3..126d848 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+@@ -144,7 +144,8 @@ static bool initialize(struct kernel_queue *kq, struct kfd_dev *dev,
+ 		kq->queue->pipe = KFD_CIK_HIQ_PIPE;
+ 		kq->queue->queue = KFD_CIK_HIQ_QUEUE;
+ 		kq->mqd->load_mqd(kq->mqd, kq->queue->mqd, kq->queue->pipe,
+-					kq->queue->queue, NULL, NULL);
++				  kq->queue->queue, &kq->queue->properties,
++				  NULL);
+ 	} else {
+ 		/* allocate fence for DIQ */
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+index 4be3267..8972bcf 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+@@ -67,7 +67,8 @@ struct mqd_manager {
+ 
+ 	int	(*load_mqd)(struct mqd_manager *mm, void *mqd,
+ 				uint32_t pipe_id, uint32_t queue_id,
+-				uint32_t __user *wptr, struct mm_struct *mms);
++				struct queue_properties *p,
++				struct mm_struct *mms);
+ 
+ 	int	(*update_mqd)(struct mqd_manager *mm, void *mqd,
+ 				struct queue_properties *q);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+index e3638e1..43a0aa3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -205,18 +205,25 @@ static void uninit_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ }
+ 
+ static int load_mqd(struct mqd_manager *mm, void *mqd, uint32_t pipe_id,
+-		    uint32_t queue_id, uint32_t __user *wptr,
++		    uint32_t queue_id, struct queue_properties *p,
+ 		    struct mm_struct *mms)
+ {
+-	return mm->dev->kfd2kgd->hqd_load
+-		(mm->dev->kgd, mqd, pipe_id, queue_id, wptr);
++	/* AQL write pointer counts in 64B packets, PM4/CP counts in dwords. */
++	uint32_t wptr_shift = (p->format == KFD_QUEUE_FORMAT_AQL ? 4 : 0);
++	uint32_t wptr_mask = (uint32_t)((p->queue_size / sizeof(uint32_t)) - 1);
++
++	return mm->dev->kfd2kgd->hqd_load(mm->dev->kgd, mqd, pipe_id, queue_id,
++					  (uint32_t __user *)p->write_ptr,
++					  wptr_shift, wptr_mask, mms);
+ }
+ 
+ static int load_mqd_sdma(struct mqd_manager *mm, void *mqd,
+-			uint32_t pipe_id, uint32_t queue_id,
+-			uint32_t __user *wptr, struct mm_struct *mms)
++			 uint32_t pipe_id, uint32_t queue_id,
++			 struct queue_properties *p, struct mm_struct *mms)
+ {
+-	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd, wptr, mms);
++	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd,
++					       (uint32_t __user *)p->write_ptr,
++					       mms);
+ }
+ 
+ static int __update_mqd(struct mqd_manager *mm, void *mqd,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+index 11dc691..2d06221 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -171,10 +171,15 @@ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 
+ static int load_mqd(struct mqd_manager *mm, void *mqd,
+ 			uint32_t pipe_id, uint32_t queue_id,
+-			uint32_t __user *wptr, struct mm_struct *mms)
++			struct queue_properties *p, struct mm_struct *mms)
+ {
+-	return mm->dev->kfd2kgd->hqd_load
+-		(mm->dev->kgd, mqd, pipe_id, queue_id, wptr);
++	/* AQL write pointer counts in 64B packets, PM4/CP counts in dwords. */
++	uint32_t wptr_shift = (p->format == KFD_QUEUE_FORMAT_AQL ? 4 : 0);
++	uint32_t wptr_mask = (uint32_t)((p->queue_size / sizeof(uint32_t)) - 1);
++
++	return mm->dev->kfd2kgd->hqd_load(mm->dev->kgd, mqd, pipe_id, queue_id,
++					  (uint32_t __user *)p->write_ptr,
++					  wptr_shift, wptr_mask, mms);
+ }
+ 
+ static int __update_mqd(struct mqd_manager *mm, void *mqd,
+@@ -369,9 +374,11 @@ static void uninit_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ 
+ static int load_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ 		uint32_t pipe_id, uint32_t queue_id,
+-		uint32_t __user *wptr, struct mm_struct *mms)
++		struct queue_properties *p, struct mm_struct *mms)
+ {
+-	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd, wptr, mms);
++	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd,
++					       (uint32_t __user *)p->write_ptr,
++					       mms);
+ }
+ 
+ static int update_mqd_sdma(struct mqd_manager *mm, void *mqd,
+diff --git a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+index 759d13a..f93d497 100644
+--- a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+@@ -180,8 +180,7 @@ struct tile_config {
+  * sceduling mode.
+  *
+  * @hqd_sdma_load: Loads the SDMA mqd structure to a H/W SDMA hqd slot.
+- * used only for no HWS mode. If mm is passed in, its mmap_sem must be
+- * read-locked.
++ * used only for no HWS mode.
+  *
+  * @hqd_dump: Dumps CPC HQD registers to an array of address-value pairs.
+  * Array is allocated with kmalloc, needs to be freed with kfree by caller.
+@@ -264,7 +263,9 @@ struct kfd2kgd_calls {
+ 	
+ 
+ 	int (*hqd_load)(struct kgd_dev *kgd, void *mqd, uint32_t pipe_id,
+-				uint32_t queue_id, uint32_t __user *wptr);
++			uint32_t queue_id, uint32_t __user *wptr,
++			uint32_t wptr_shift, uint32_t wptr_mask,
++			struct mm_struct *mm);
+ 
+ 	int (*hqd_sdma_load)(struct kgd_dev *kgd, void *mqd,
+ 			     uint32_t __user *wptr, struct mm_struct *mm);
+-- 
+2.7.4
+

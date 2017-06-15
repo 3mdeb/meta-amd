@@ -1,0 +1,110 @@
+From fec317dbc8bb6028bcbdad619f4cbcb31c608e24 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 23 May 2016 14:26:39 +0200
+Subject: [PATCH 0196/1722] drm/amdgpu: add optional ring to
+ amdgpu_sync_is_idle
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Check if the sync object is idle depending on the ring a submission works with.
+
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h      |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c  |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c | 17 +++++++++++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c   |  4 ++--
+ 4 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 8b9addf..63bd661 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -608,7 +608,8 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 		     struct amdgpu_sync *sync,
+ 		     struct reservation_object *resv,
+ 		     void *owner);
+-bool amdgpu_sync_is_idle(struct amdgpu_sync *sync);
++bool amdgpu_sync_is_idle(struct amdgpu_sync *sync,
++			 struct amdgpu_ring *ring);
+ int amdgpu_sync_cycle_fences(struct amdgpu_sync *dst, struct amdgpu_sync *src,
+ 			     struct fence *fence);
+ struct fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index 50c180e..4a82173 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -164,7 +164,7 @@ static struct fence *amdgpu_job_run(struct amd_sched_job *sched_job)
+ 	}
+ 	job = to_amdgpu_job(sched_job);
+ 
+-	BUG_ON(!amdgpu_sync_is_idle(&job->sync));
++	BUG_ON(!amdgpu_sync_is_idle(&job->sync, NULL));
+ 
+ 	trace_amdgpu_sched_run_job(job);
+ 	r = amdgpu_ib_schedule(job->ring, job->num_ibs, job->ibs,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+index c0ed5b9..a2766d7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+@@ -226,10 +226,13 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+  * amdgpu_sync_is_idle - test if all fences are signaled
+  *
+  * @sync: the sync object
++ * @ring: optional ring to use for test
+  *
+- * Returns true if all fences in the sync object are signaled.
++ * Returns true if all fences in the sync object are signaled or scheduled to
++ * the ring (if provided).
+  */
+-bool amdgpu_sync_is_idle(struct amdgpu_sync *sync)
++bool amdgpu_sync_is_idle(struct amdgpu_sync *sync,
++			 struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_sync_entry *e;
+ 	struct hlist_node *tmp;
+@@ -237,6 +240,16 @@ bool amdgpu_sync_is_idle(struct amdgpu_sync *sync)
+ 
+ 	hash_for_each_safe(sync->fences, i, tmp, e, node) {
+ 		struct fence *f = e->fence;
++		struct amd_sched_fence *s_fence = to_amd_sched_fence(f);
++
++		if (ring && s_fence) {
++			/* For fences from the same ring it is sufficient
++			 * when they are scheduled.
++			 */
++			if (s_fence->sched == &ring->sched &&
++			    fence_is_signaled(&s_fence->scheduled))
++				continue;
++		}
+ 
+ 		if (fence_is_signaled(f)) {
+ 			hash_del(&e->node);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index e0e40e4..db56621 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -239,13 +239,13 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 			      struct amdgpu_vm_id,
+ 			      list);
+ 
+-	if (!amdgpu_sync_is_idle(&id->active)) {
++	if (!amdgpu_sync_is_idle(&id->active, NULL)) {
+ 		struct list_head *head = &adev->vm_manager.ids_lru;
+ 		struct amdgpu_vm_id *tmp;
+ 
+ 		list_for_each_entry_safe(id, tmp, &adev->vm_manager.ids_lru,
+ 					 list) {
+-			if (amdgpu_sync_is_idle(&id->active)) {
++			if (amdgpu_sync_is_idle(&id->active, NULL)) {
+ 				list_move(&id->list, head);
+ 				head = &id->list;
+ 			}
+-- 
+2.7.4
+

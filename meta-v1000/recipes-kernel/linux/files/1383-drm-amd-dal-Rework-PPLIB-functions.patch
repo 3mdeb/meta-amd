@@ -1,0 +1,270 @@
+From 5020aea13b94488a1ad76b2311f6c7ba96eaf782 Mon Sep 17 00:00:00 2001
+From: Hersen Wu <hersenxs.wu@amd.com>
+Date: Tue, 18 Oct 2016 14:40:11 -0400
+Subject: [PATCH 1383/1722] drm/amd/dal: Rework PPLIB functions
+
+Some of these don't need to be defined for all ASICs. Make sure
+we handle that gracefully.
+
+Change-Id: Ie49dcd7810ea69f4090b163854edbd4d77fda3c0
+Signed-off-by: Hersen Wu <hersenxs.wu@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          | 18 ++++++------
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 33 +++++++++++-----------
+ .../amd/dal/dc/gpu/dce112/display_clock_dce112.h   |  1 +
+ drivers/gpu/drm/amd/dal/dc/gpu/display_clock.c     | 30 +++++++++++++++-----
+ drivers/gpu/drm/amd/dal/dc/gpu/display_clock.h     | 16 +----------
+ .../drm/amd/dal/include/display_clock_interface.h  | 14 ++++-----
+ 6 files changed, 57 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index 4801b14..39bf829a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -1240,18 +1240,20 @@ static enum dc_status enable_link_dp(struct pipe_ctx *pipe_ctx)
+ 	/* raise clock state for HBR3 if required. Confirmed with HW DCE/DPCS
+ 	 * logic for HBR3 still needs Nominal (0.8V) on VDDC rail
+ 	 */
+-
+ 	if (link->link_enc->features.flags.bits.IS_HBR3_CAPABLE)
+ 		max_link_rate = LINK_RATE_HIGH3;
+ 
+ 	if (link_settings.link_rate == max_link_rate) {
+-		cur_min_clock_state = dal_display_clock_get_min_clocks_state(
+-				pipe_ctx->dis_clk);
+-
+-		if (cur_min_clock_state < CLOCKS_STATE_NOMINAL)
+-			dal_display_clock_set_min_clocks_state(
+-					pipe_ctx->dis_clk,
+-					CLOCKS_STATE_NOMINAL);
++		cur_min_clock_state = CLOCKS_STATE_INVALID;
++
++		if (dal_display_clock_get_min_clocks_state(
++				pipe_ctx->dis_clk, &cur_min_clock_state)) {
++			if (cur_min_clock_state < CLOCKS_STATE_NOMINAL)
++				dal_display_clock_set_min_clocks_state(
++						pipe_ctx->dis_clk,
++						CLOCKS_STATE_NOMINAL);
++		} else {
++		}
+ 	}
+ 
+ 	dp_enable_link_phy(
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 324a7ae..1690770 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -1278,14 +1278,15 @@ static uint32_t get_max_pixel_clock_for_all_paths(
+ 	return max_pix_clk;
+ }
+ 
+-/* Find clock state based on clock requested. if clock value is 0, simply
++/*
++ * Find clock state based on clock requested. if clock value is 0, simply
+  * set clock state as requested without finding clock state by clock value
+  */
+-static void set_clock_state(
++static void apply_min_clocks(
+ 	struct core_dc *dc,
+ 	struct validate_context *context,
+ 	enum clocks_state *clocks_state,
+-	bool set_stsate_only)
++	bool pre_mode_set)
+ {
+ 	struct state_dependent_clocks req_clocks = {0};
+ 	struct pipe_ctx *pipe_ctx;
+@@ -1297,12 +1298,12 @@ static void set_clock_state(
+ 			break;
+ 	}
+ 
+-	if (set_stsate_only) {
++	if (!pre_mode_set) {
+ 		/* set clock_state without verification */
+-		dal_display_clock_set_min_clocks_state(
+-				pipe_ctx->dis_clk, *clocks_state);
++		if (dal_display_clock_set_min_clocks_state(
++				pipe_ctx->dis_clk, *clocks_state))
++			return;
+ 
+-		return;
+ 	}
+ 
+ 	/* get the required state based on state dependent clocks:
+@@ -1313,13 +1314,12 @@ static void set_clock_state(
+ 	req_clocks.pixel_clk_khz = get_max_pixel_clock_for_all_paths(
+ 			dc, context, true);
+ 
+-	*clocks_state =
+-		dal_display_clock_get_required_clocks_state(
+-				pipe_ctx->dis_clk, &req_clocks);
+-
+-
+-	dal_display_clock_set_min_clocks_state(
++	if (dal_display_clock_get_required_clocks_state(
++				pipe_ctx->dis_clk, &req_clocks, clocks_state)) {
++		dal_display_clock_set_min_clocks_state(
+ 			pipe_ctx->dis_clk, *clocks_state);
++	} else {
++	}
+ }
+ 
+ /*TODO: const validate_context*/
+@@ -1384,8 +1384,7 @@ static enum dc_status apply_ctx_to_hw(
+ 
+ 	set_safe_displaymarks(&context->res_ctx);
+ 	/*TODO: when pplib works*/
+-	/* dc_set_clocks_and_clock_state(context); */
+-	set_clock_state(dc, context, &clocks_state, false);
++	apply_min_clocks(dc, context, &clocks_state, true);
+ 
+ 	if (context->bw_results.dispclk_khz
+ 		> dc->current_context->bw_results.dispclk_khz)
+@@ -1467,8 +1466,8 @@ static enum dc_status apply_ctx_to_hw(
+ 
+ 	dc->hwss.set_displaymarks(dc, context);
+ 
+-	/* TODO dc_set_clocks_and_clock_state(context); to save power */
+-	set_clock_state(dc, context, &clocks_state, true);
++	/* to save power */
++	apply_min_clocks(dc, context, &clocks_state, false);
+ 
+ 	dcb->funcs->set_scratch_critical_state(dcb, false);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/gpu/dce112/display_clock_dce112.h b/drivers/gpu/drm/amd/dal/dc/gpu/dce112/display_clock_dce112.h
+index 6f29dad..88b9214 100644
+--- a/drivers/gpu/drm/amd/dal/dc/gpu/dce112/display_clock_dce112.h
++++ b/drivers/gpu/drm/amd/dal/dc/gpu/dce112/display_clock_dce112.h
+@@ -47,6 +47,7 @@ struct display_clock_dce112 {
+ 	uint32_t dfs_bypass_disp_clk;
+ 	struct display_clock_state clock_state;
+ 	struct state_dependent_clocks *max_clks_by_state;
++
+ };
+ 
+ #define DCLCK112_FROM_BASE(dc_base) \
+diff --git a/drivers/gpu/drm/amd/dal/dc/gpu/display_clock.c b/drivers/gpu/drm/amd/dal/dc/gpu/display_clock.c
+index 1319248..47734e5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/gpu/display_clock.c
++++ b/drivers/gpu/drm/amd/dal/dc/gpu/display_clock.c
+@@ -117,24 +117,39 @@ uint32_t dal_display_clock_get_clock(struct display_clock *disp_clk)
+ 	return disp_clk->funcs->get_clock(disp_clk);
+ }
+ 
+-enum clocks_state dal_display_clock_get_min_clocks_state(
+-	struct display_clock *disp_clk)
++bool dal_display_clock_get_min_clocks_state(
++	struct display_clock *disp_clk,
++	enum clocks_state *clocks_state)
+ {
+-	return disp_clk->funcs->get_min_clocks_state(disp_clk);
++	if (!disp_clk->funcs->get_min_clocks_state)
++		false;
++
++	*clocks_state = disp_clk->funcs->get_min_clocks_state(disp_clk);
++	return true;
+ }
+ 
+-enum clocks_state dal_display_clock_get_required_clocks_state(
++bool dal_display_clock_get_required_clocks_state(
+ 	struct display_clock *disp_clk,
+-	struct state_dependent_clocks *req_clocks)
++	struct state_dependent_clocks *req_clocks,
++	enum clocks_state *clocks_state)
+ {
+-	return disp_clk->funcs->get_required_clocks_state(disp_clk, req_clocks);
++	if (!disp_clk->funcs->get_required_clocks_state)
++		return false;
++
++	*clocks_state = disp_clk->funcs->get_required_clocks_state(
++			disp_clk, req_clocks);
++	return true;
+ }
+ 
+ bool dal_display_clock_set_min_clocks_state(
+ 	struct display_clock *disp_clk,
+ 	enum clocks_state clocks_state)
+ {
+-	return disp_clk->funcs->set_min_clocks_state(disp_clk, clocks_state);
++	if (!disp_clk->funcs->set_min_clocks_state)
++		return false;
++
++	disp_clk->funcs->set_min_clocks_state(disp_clk, clocks_state);
++	return true;
+ }
+ 
+ uint32_t dal_display_clock_get_dp_ref_clk_frequency(
+@@ -203,3 +218,4 @@ void dal_display_clock_invalid_clock_state(
+ {
+ 	disp_clk->cur_min_clks_state = CLOCKS_STATE_INVALID;
+ }
++
+diff --git a/drivers/gpu/drm/amd/dal/dc/gpu/display_clock.h b/drivers/gpu/drm/amd/dal/dc/gpu/display_clock.h
+index ce5dd3d..52662b3 100644
+--- a/drivers/gpu/drm/amd/dal/dc/gpu/display_clock.h
++++ b/drivers/gpu/drm/amd/dal/dc/gpu/display_clock.h
+@@ -55,10 +55,7 @@ struct display_clock_funcs {
+ 	struct display_clock_state (*get_clock_state)(
+ 		struct display_clock *disp_clk);
+ 	uint32_t (*get_dfs_bypass_threshold)(struct display_clock *disp_clk);
+-	bool (*apply_clock_voltage_request)(
+-		struct display_clock *disp_clk,
+-		enum dm_pp_clock_type clocks_type,
+-		uint32_t clocks_in_khz);
++
+ };
+ 
+ struct display_clock {
+@@ -84,17 +81,6 @@ bool dal_display_clock_construct_base(
+ 	struct dc_context *ctx,
+ 	struct adapter_service *as);
+ 
+-enum clocks_state dal_display_clock_get_min_clocks_state(
+-	struct display_clock *disp_clk);
+-
+-enum clocks_state dal_display_clock_get_required_clocks_state(
+-	struct display_clock *disp_clk,
+-	struct state_dependent_clocks *req_clocks);
+-
+-bool dal_display_clock_set_min_clocks_state(
+-	struct display_clock *disp_clk,
+-	enum clocks_state clocks_state);
+-
+ uint32_t dal_display_clock_get_validation_clock(struct display_clock *disp_clk);
+ 
+ void dal_display_clock_store_max_clocks_state(
+diff --git a/drivers/gpu/drm/amd/dal/include/display_clock_interface.h b/drivers/gpu/drm/amd/dal/include/display_clock_interface.h
+index 5819676..3d394be 100644
+--- a/drivers/gpu/drm/amd/dal/include/display_clock_interface.h
++++ b/drivers/gpu/drm/amd/dal/include/display_clock_interface.h
+@@ -142,11 +142,13 @@ void dal_display_clock_set_clock(
+ 	struct display_clock *disp_clk,
+ 	uint32_t requested_clock_khz);
+ uint32_t dal_display_clock_get_clock(struct display_clock *disp_clk);
+-enum clocks_state dal_display_clock_get_min_clocks_state(
+-	struct display_clock *disp_clk);
+-enum clocks_state dal_display_clock_get_required_clocks_state(
++bool dal_display_clock_get_min_clocks_state(
++	struct display_clock *disp_clk,
++	enum clocks_state *clocks_state);
++bool dal_display_clock_get_required_clocks_state(
+ 	struct display_clock *disp_clk,
+-	struct state_dependent_clocks *req_clocks);
++	struct state_dependent_clocks *req_clocks,
++	enum clocks_state *clocks_state);
+ bool dal_display_clock_set_min_clocks_state(
+ 	struct display_clock *disp_clk,
+ 	enum clocks_state clocks_state);
+@@ -173,9 +175,5 @@ uint32_t dal_display_clock_get_dfs_bypass_threshold(
+ 	struct display_clock *disp_clk);
+ void dal_display_clock_invalid_clock_state(
+ 	struct display_clock *disp_clk);
+-bool dal_display_clock_apply_clock_voltage_request(
+-	struct display_clock *disp_clk,
+-	enum dm_pp_clock_type clocks_type,
+-	uint32_t clocks_in_khz);
+ 
+ #endif /* __DISPLAY_CLOCK_INTERFACE_H__ */
+-- 
+2.7.4
+

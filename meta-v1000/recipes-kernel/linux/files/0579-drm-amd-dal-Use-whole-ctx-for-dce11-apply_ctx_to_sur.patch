@@ -1,0 +1,544 @@
+From 04c5e8fc801af376286794a5d01e87b83177ec2c Mon Sep 17 00:00:00 2001
+From: Eric Yang <eric.yang2@amd.com>
+Date: Fri, 10 Jun 2016 17:21:03 -0400
+Subject: [PATCH 0579/1722] drm/amd/dal: Use whole ctx for dce11
+ apply_ctx_to_surface
+
+Make apply_ctx_to_surface look at whole ctx for delta instead of just
+newly arrived surfaces.
+
+Make front end programming pipe group based
+instead of pipe based, i.e. MPO pipes will be programmed together. This
+is in preparation for a change in locking scheme
+
+pipe power on sequence is added so that the underlay pipe can be
+programmed generically as any other pipe
+
+hacked safemark to be always programmed when mpo is enabled to make mpo
+work
+
+Change-Id: I2d175ea5641b51760740c0690f2c6238810751d1
+Signed-off-by: Eric Yang <eric.yang2@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/Makefile                |   2 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |  17 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_hw_sequencer.c  |  66 +++----
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      |  20 ++
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 219 ++++++++++++---------
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    |  25 ---
+ drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h      |  13 +-
+ 7 files changed, 191 insertions(+), 171 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/Makefile b/drivers/gpu/drm/amd/dal/dc/Makefile
+index e5ce905..a1ae19d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/Makefile
++++ b/drivers/gpu/drm/amd/dal/dc/Makefile
+@@ -25,7 +25,7 @@ AMD_DC = $(addsuffix /Makefile, $(addprefix $(FULL_AMD_DAL_PATH)/dc/,$(DC_LIBS))
+ 
+ include $(AMD_DC)
+ 
+-DISPLAY_CORE = dc.o dc_link.o dc_resource.o dc_target.o dc_sink.o dc_stream.o \
++DISPLAY_CORE = dc.o dc_link.o dc_resource.o dc_hw_sequencer.o dc_target.o dc_sink.o dc_stream.o \
+ dc_surface.o dc_link_hwss.o dc_link_dp.o dc_link_ddc.o
+ 
+ AMD_DISPLAY_CORE = $(addprefix $(AMDDALPATH)/dc/core/,$(DISPLAY_CORE))
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 96455ed..7c42bfc 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -838,7 +838,6 @@ bool dc_commit_surfaces_to_target(
+ 
+ 	int current_enabled_surface_count = 0;
+ 	int new_enabled_surface_count = 0;
+-	bool is_mpo_turning_on = false;
+ 
+ 	if (core_dc->current_context->target_count == 0)
+ 		return false;
+@@ -916,24 +915,22 @@ bool dc_commit_surfaces_to_target(
+                 dm_free(context);
+                 context = temp_context;
+         }
+-
+-	if (prev_disp_clk < context->bw_results.dispclk_khz ||
+-		(is_mpo_turning_on &&
+-			prev_disp_clk == context->bw_results.dispclk_khz)) {
+-		core_dc->hwss.program_bw(core_dc, context);
++        if (prev_disp_clk < context->bw_results.dispclk_khz) {
+ 		pplib_apply_display_requirements(core_dc, context,
+-						&context->pp_display_cfg);
++                                                                &context->pp_display_cfg);
++                core_dc->hwss.program_bw(core_dc, context);
+ 	}
+ 
+ 	if (current_enabled_surface_count > 0 && new_enabled_surface_count == 0)
+ 		target_disable_memory_requests(dc_target,
+ 				&core_dc->current_context->res_ctx);
+ 
+-        core_dc->hwss.apply_ctx_to_surface(core_dc, context, new_surfaces,
+-                        new_surface_count);
++        core_dc->hwss.apply_ctx_to_surface(core_dc, context);
++
++        /* TODO: decouple wm programming and display clock and unhack this condition*/
+ 
+ 	/* Lower display clock if necessary */
+-	if (prev_disp_clk > context->bw_results.dispclk_khz) {
++        if (prev_disp_clk > context->bw_results.dispclk_khz || new_surface_count > 1) {
+ 		core_dc->hwss.program_bw(core_dc, context);
+ 		pplib_apply_display_requirements(core_dc, context,
+ 						&context->pp_display_cfg);
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/core/dc_hw_sequencer.c
+index fb4dce3..57ff87a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_hw_sequencer.c
+@@ -25,47 +25,37 @@
+ 
+ #include "dm_services.h"
+ #include "core_types.h"
++#include "core_dc.h"
++#include "hw_sequencer.h"
+ 
+-#if defined(CONFIG_DRM_AMD_DAL_DCE8_0)
+-#include "dce80/dce80_hw_sequencer.h"
+-#endif
+-#if defined(CONFIG_DRM_AMD_DAL_DCE10_0)
+-#include "dce100/dce100_hw_sequencer.h"
+-#endif
+-#if defined(CONFIG_DRM_AMD_DAL_DCE11_0)
+-#include "dce110/dce110_hw_sequencer.h"
+-#endif
+-#if defined(CONFIG_DRM_AMD_DAL_DCE11_2)
+-#include "dce112/dce112_hw_sequencer.h"
+-#endif
+ 
+-bool dc_construct_hw_sequencer(
+-				struct adapter_service *adapter_serv,
+-				struct core_dc *dc)
++bool front_end_need_program(struct pipe_ctx *old_pipe, struct pipe_ctx *new_pipe)
+ {
+-	enum dce_version dce_ver = dal_adapter_service_get_dce_version(adapter_serv);
++	/*TODO: Findout if this is sufficient comparison*/
+ 
+-	switch (dce_ver)
+-	{
+-#if defined(CONFIG_DRM_AMD_DAL_DCE8_0)
+-	case DCE_VERSION_8_0:
+-		return dce80_hw_sequencer_construct(dc);
+-#endif
+-#if defined(CONFIG_DRM_AMD_DAL_DCE10_0)
+-	case DCE_VERSION_10_0:
+-		return dce100_hw_sequencer_construct(dc);
+-#endif
+-#if defined(CONFIG_DRM_AMD_DAL_DCE11_0)
+-	case DCE_VERSION_11_0:
+-		return dce110_hw_sequencer_construct(dc);
+-#endif
+-#if defined(CONFIG_DRM_AMD_DAL_DCE11_2)
+-	case DCE_VERSION_11_2:
+-		return dce112_hw_sequencer_construct(dc);
+-#endif
+-	default:
+-		break;
+-	}
++	/* The scl_data comparison handles the hsplit case where the surface is unmodified*/
++	return new_pipe->surface != old_pipe->surface || memcmp(&old_pipe->scl_data,
++			&new_pipe->scl_data,
++			sizeof(struct scaler_data));
++}
++
++/* loop all children pipes belong to one otg */
++void hw_sequencer_program_pipe_tree(
++	struct core_dc *dc,
++	struct validate_context *context,
++	struct pipe_ctx *const head_pipe_ctx,
++	void (*program_func)(struct core_dc *dc,
++			struct pipe_ctx *pipe_ctx,
++			struct validate_context *context))
++{
++	struct pipe_ctx *pipe_ctx_cur = head_pipe_ctx;
++
++	do {
++		struct pipe_ctx *old_pipe_ctx = &dc->current_context->res_ctx.pipe_ctx[pipe_ctx_cur->pipe_idx];
++		if (front_end_need_program(old_pipe_ctx, pipe_ctx_cur))
++			program_func(dc, pipe_ctx_cur, context);
+ 
+-	return false;
++		/* get pointer to child pipe */
++		pipe_ctx_cur = pipe_ctx_cur->bottom_pipe;
++	} while (pipe_ctx_cur != NULL);
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index 67f9d16..8a096bb 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -533,6 +533,10 @@ struct pipe_ctx *resource_get_head_pipe_for_stream(
+ 	return NULL;
+ }
+ 
++/*
++ * A free_pipe for a target is defined here as a pipe with a stream that belongs
++ * to the target but has no surface attached yet
++ */
+ static struct pipe_ctx *acquire_free_pipe_for_target(
+ 		struct resource_context *res_ctx,
+ 		const struct dc_target *dc_target)
+@@ -572,6 +576,21 @@ static struct pipe_ctx *acquire_free_pipe_for_target(
+ 
+ }
+ 
++static void release_free_pipes_for_target(
++		struct resource_context *res_ctx,
++		const struct dc_target *dc_target)
++{
++	int i;
++	struct core_stream *stream = DC_STREAM_TO_CORE(dc_target->streams[0]);
++
++	for (i = res_ctx->pool->pipe_count - 1; i >= 0; i--) {
++		if (res_ctx->pipe_ctx[i].stream == stream &&
++				!res_ctx->pipe_ctx[i].surface) {
++			res_ctx->pipe_ctx[i].stream = NULL;
++		}
++	}
++}
++
+ bool resource_attach_surfaces_to_context(
+ 		struct dc_surface *surfaces[],
+ 		int surface_count,
+@@ -635,6 +654,7 @@ bool resource_attach_surfaces_to_context(
+ 		tail_pipe = free_pipe;
+ 	}
+ 
++	release_free_pipes_for_target(&context->res_ctx, dc_target);
+ 
+ 	/* assign new surfaces*/
+ 	for (i = 0; i < surface_count; i++)
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 398f4aa..4d9af39 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -1106,6 +1106,7 @@ static void program_bw(struct core_dc *dc, struct validate_context *context)
+ 	/*dc_set_clocks_and_clock_state(context);*/
+ 
+ 	dc->hwss.set_display_clock(context);
++
+ 	dc->hwss.set_displaymarks(dc, context);
+ }
+ 
+@@ -1622,117 +1623,147 @@ static void print_context_timing_status(
+ 	dal_logger_close(&entry);
+ }
+ 
+-static enum dc_status apply_ctx_to_surface(
++/* TODO: move this to apply_ctx_tohw some how?*/
++static void dce110_power_on_pipe_if_needed(
+ 		struct core_dc *dc,
+-		struct validate_context *context,
+-		struct dc_surface *new_surfaces[],
+-		uint8_t new_surface_count)
++		struct pipe_ctx *pipe_ctx,
++		struct validate_context *context)
+ {
+-	int i, j;
++	struct pipe_ctx *old_pipe_ctx = &dc->current_context->res_ctx.pipe_ctx[pipe_ctx->pipe_idx];
++	struct dc_bios *dcb = dal_adapter_service_get_bios_parser(
++					context->res_ctx.pool->adapter_srv);
+ 
+-	for (i = 0; i < new_surface_count; i++)
+-		for (j = 0; j < context->res_ctx.pool->pipe_count; j++) {
+-			struct dc_surface *dc_surface = new_surfaces[i];
+-			struct core_surface *surface =
+-						DC_SURFACE_TO_CORE(dc_surface);
+-			struct pipe_ctx *pipe_ctx =
+-						&context->res_ctx.pipe_ctx[j];
+-			struct core_gamma *gamma = NULL;
+-			int lock_mask =
+-				PIPE_LOCK_CONTROL_GRAPHICS |
+-				PIPE_LOCK_CONTROL_SCL |
+-				PIPE_LOCK_CONTROL_BLENDER |
+-				PIPE_LOCK_CONTROL_MODE;
++	if (!old_pipe_ctx->stream && pipe_ctx->stream) {
++		dc->hwss.enable_display_power_gating(
++				dc->ctx,
++				pipe_ctx->pipe_idx,
++				dcb, PIPE_GATING_CONTROL_DISABLE);
++		if (!pipe_ctx->tg->funcs->set_blank(pipe_ctx->tg, true)) {
++			dm_error("DC: failed to blank crtc!\n");
++			BREAK_TO_DEBUGGER();
++		}
+ 
+-			if (pipe_ctx->surface !=
+-					DC_SURFACE_TO_CORE(new_surfaces[i]))
+-				continue;
++		if (!pipe_ctx->tg->funcs->enable_crtc(pipe_ctx->tg)) {
++			BREAK_TO_DEBUGGER();
++		}
+ 
++		pipe_ctx->tg->funcs->set_blank_color(
++				pipe_ctx->tg,
++				COLOR_SPACE_YCBCR601);/* TODO unhardcode*/
++	}
++}
+ 
+-			dal_logger_write(dc->ctx->logger,
+-					LOG_MAJOR_INTERFACE_TRACE,
+-					LOG_MINOR_COMPONENT_DC,
+-					"Pipe:%d 0x%x: addr hi:0x%x, "
+-					"addr low:0x%x, "
+-					"src: %d, %d, %d,"
+-					" %d; dst: %d, %d, %d, %d;\n",
+-					pipe_ctx->pipe_idx,
+-					dc_surface,
+-					dc_surface->address.grph.addr.high_part,
+-					dc_surface->address.grph.addr.low_part,
+-					dc_surface->src_rect.x,
+-					dc_surface->src_rect.y,
+-					dc_surface->src_rect.width,
+-					dc_surface->src_rect.height,
+-					dc_surface->dst_rect.x,
+-					dc_surface->dst_rect.y,
+-					dc_surface->dst_rect.width,
+-					dc_surface->dst_rect.height);
+-
+-
+-			dal_logger_write(dc->ctx->logger,
+-					LOG_MAJOR_HW_TRACE,
+-					LOG_MINOR_HW_TRACE_SET_MODE,
+-					"Pipe %d: width, height, x, y\n"
+-					"viewport:%d, %d, %d, %d\n"
+-					"recout:  %d, %d, %d, %d\n",
+-					pipe_ctx->pipe_idx,
+-					pipe_ctx->scl_data.viewport.width,
+-					pipe_ctx->scl_data.viewport.height,
+-					pipe_ctx->scl_data.viewport.x,
+-					pipe_ctx->scl_data.viewport.y,
+-					pipe_ctx->scl_data.recout.width,
+-					pipe_ctx->scl_data.recout.height,
+-					pipe_ctx->scl_data.recout.x,
+-					pipe_ctx->scl_data.recout.y);
+-
+-			if (!pipe_ctx->surface->public.flip_immediate)
+-				lock_mask |= PIPE_LOCK_CONTROL_SURFACE;
+-
+-			dc->hwss.pipe_control_lock(
+-					dc->ctx,
+-					pipe_ctx->pipe_idx,
+-					lock_mask,
+-					true);
++static void dce110_program_front_end_for_pipe(struct core_dc *dc,
++		struct pipe_ctx *pipe_ctx,
++		struct validate_context *context)
++{
++	struct core_gamma *gamma = NULL;
++	int lock_mask =
++		PIPE_LOCK_CONTROL_GRAPHICS |
++		PIPE_LOCK_CONTROL_SCL |
++		PIPE_LOCK_CONTROL_BLENDER |
++		PIPE_LOCK_CONTROL_MODE;
+ 
+-			dc->hwss.set_plane_config(
+-					dc, pipe_ctx, &context->res_ctx);
++	if (!pipe_ctx->surface->public.flip_immediate)
++		lock_mask |= PIPE_LOCK_CONTROL_SURFACE;
++
++	dc->hwss.pipe_control_lock(
++			dc->ctx,
++			pipe_ctx->pipe_idx,
++			lock_mask,
++			true);
+ 
+-			dc->hwss.update_plane_addr(dc, pipe_ctx);
+ 
+-			if (surface->public.gamma_correction)
+-				gamma = DC_GAMMA_TO_CORE(
+-					surface->public.gamma_correction);
++	dc->hwss.set_plane_config(
++			dc, pipe_ctx, &context->res_ctx);
+ 
+-			dc->hwss.set_gamma_correction(
+-					pipe_ctx->ipp,
+-					pipe_ctx->opp,
+-					gamma, surface);
++	dc->hwss.update_plane_addr(dc, pipe_ctx);
+ 
+-		}
++	if (pipe_ctx->surface->public.gamma_correction)
++		gamma = DC_GAMMA_TO_CORE(
++			pipe_ctx->surface->public.gamma_correction);
++
++	dc->hwss.set_gamma_correction(
++			pipe_ctx->ipp,
++			pipe_ctx->opp,
++			gamma, pipe_ctx->surface);
++
++	dal_logger_write(dc->ctx->logger,
++			LOG_MAJOR_INTERFACE_TRACE,
++			LOG_MINOR_COMPONENT_DC,
++			"Pipe:%d 0x%x: addr hi:0x%x, "
++			"addr low:0x%x, "
++			"src: %d, %d, %d,"
++			" %d; dst: %d, %d, %d, %d;\n",
++			pipe_ctx->pipe_idx,
++			pipe_ctx->surface,
++			pipe_ctx->surface->public.address.grph.addr.high_part,
++			pipe_ctx->surface->public.address.grph.addr.low_part,
++			pipe_ctx->surface->public.src_rect.x,
++			pipe_ctx->surface->public.src_rect.y,
++			pipe_ctx->surface->public.src_rect.width,
++			pipe_ctx->surface->public.src_rect.height,
++			pipe_ctx->surface->public.dst_rect.x,
++			pipe_ctx->surface->public.dst_rect.y,
++			pipe_ctx->surface->public.dst_rect.width,
++			pipe_ctx->surface->public.dst_rect.height);
++
++
++	dal_logger_write(dc->ctx->logger,
++			LOG_MAJOR_HW_TRACE,
++			LOG_MINOR_HW_TRACE_SET_MODE,
++			"Pipe %d: width, height, x, y\n"
++			"viewport:%d, %d, %d, %d\n"
++			"recout:  %d, %d, %d, %d\n",
++			pipe_ctx->pipe_idx,
++			pipe_ctx->scl_data.viewport.width,
++			pipe_ctx->scl_data.viewport.height,
++			pipe_ctx->scl_data.viewport.x,
++			pipe_ctx->scl_data.viewport.y,
++			pipe_ctx->scl_data.recout.width,
++			pipe_ctx->scl_data.recout.height,
++			pipe_ctx->scl_data.recout.x,
++			pipe_ctx->scl_data.recout.y);
++}
++
++static enum dc_status apply_ctx_to_surface(
++		struct core_dc *dc,
++		struct validate_context *context)
++{
++	int i;
++
++	for (i = 0; i < context->res_ctx.pool->pipe_count; i++) {
++		struct pipe_ctx *head_pipe = &context->res_ctx.pipe_ctx[i];
++
++		if (!head_pipe->surface || head_pipe->top_pipe != NULL)
++			continue;
++
++		hw_sequencer_program_pipe_tree(dc, context, head_pipe,
++				dce110_power_on_pipe_if_needed);
++
++		hw_sequencer_program_pipe_tree(dc, context, head_pipe,
++				dce110_program_front_end_for_pipe);
++
++
++	}
+ 
+ 	/* Go in reverse order so that all pipes are unlocked simultaneously
+ 	 * when pipe 0 is unlocked
+ 	 * Need PIPE_LOCK_CONTROL_MODE to be 1 for this
+ 	 */
+-	for (j = context->res_ctx.pool->pipe_count - 1; j >= 0; j--)
+-		for (i = new_surface_count - 1; i >= 0; i--) {
+-			struct pipe_ctx *pipe_ctx =
+-						&context->res_ctx.pipe_ctx[j];
++	for (i = context->res_ctx.pool->pipe_count - 1; i >= 0; i--) {
++		struct pipe_ctx *pipe_ctx =
++					&context->res_ctx.pipe_ctx[i];
+ 
+-			if (pipe_ctx->surface !=
+-					DC_SURFACE_TO_CORE(new_surfaces[i]))
+-				continue;
+-
+-			dc->hwss.pipe_control_lock(
+-					dc->ctx,
+-					pipe_ctx->pipe_idx,
+-					PIPE_LOCK_CONTROL_GRAPHICS |
+-					PIPE_LOCK_CONTROL_SCL |
+-					PIPE_LOCK_CONTROL_BLENDER |
+-					PIPE_LOCK_CONTROL_SURFACE,
+-					false);
+-		}
++		dc->hwss.pipe_control_lock(
++				dc->ctx,
++				pipe_ctx->pipe_idx,
++				PIPE_LOCK_CONTROL_GRAPHICS |
++				PIPE_LOCK_CONTROL_SCL |
++				PIPE_LOCK_CONTROL_BLENDER |
++				PIPE_LOCK_CONTROL_SURFACE,
++				false);
++	}
+ 
+ 	print_context_timing_status(dc, &context->res_ctx);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index ac162b2..e579589 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -935,7 +935,6 @@ static struct pipe_ctx *dce110_acquire_idle_pipe_for_layer(
+                 struct resource_context *res_ctx,
+                 struct core_stream *stream)
+ {
+-        struct dc_bios *dcb;
+         struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[DCE110_UNDERLAY_IDX];
+  
+         if (res_ctx->pipe_ctx[DCE110_UNDERLAY_IDX].stream) {
+@@ -950,30 +949,6 @@ static struct pipe_ctx *dce110_acquire_idle_pipe_for_layer(
+         pipe_ctx->dis_clk = res_ctx->pool->display_clock;
+         pipe_ctx->pipe_idx = DCE110_UNDERLAY_IDX;
+  
+-        dcb = dal_adapter_service_get_bios_parser(
+-                                        res_ctx->pool->adapter_srv);
+- 
+-        /* TODO move underlay pipe enable to apply_ctx_to_surface for dce11*/
+-#if 0
+-       dc->hwss.enable_display_power_gating(
+-                dc->ctx,
+-                DCE110_UNDERLAY_IDX,
+-                dcb, PIPE_GATING_CONTROL_DISABLE);
+- 
+-        if (!pipe_ctx->tg->funcs->set_blank(pipe_ctx->tg, true)) {
+-                dm_error("DC: failed to blank crtc!\n");
+-                BREAK_TO_DEBUGGER();
+-        }
+- 
+-        if (!pipe_ctx->tg->funcs->enable_crtc(pipe_ctx->tg)) {
+-                BREAK_TO_DEBUGGER();
+-        }
+- 
+-        pipe_ctx->tg->funcs->set_blank_color(
+-                        pipe_ctx->tg,
+-                        COLOR_SPACE_YCBCR601);/* TODO unhardcode*/
+-#endif
+- 
+         pipe_ctx->stream = stream;
+  
+         return pipe_ctx;
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+index 5757cc7..4d76e2e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+@@ -51,9 +51,7 @@ struct hw_sequencer_funcs {
+ 			struct core_dc *dc, struct validate_context *context);
+ 
+ 	enum dc_status (*apply_ctx_to_surface)(
+-			struct core_dc *dc, struct validate_context *context,
+-			struct dc_surface *new_surfaces[],
+-			uint8_t new_surface_count);
++			struct core_dc *dc, struct validate_context *context);
+ 
+ 	void (*set_plane_config)(
+ 			const struct core_dc *dc,
+@@ -135,4 +133,13 @@ struct hw_sequencer_funcs {
+ 			int vmin, int vmax);
+ };
+ 
++void hw_sequencer_program_pipe_tree(
++	struct core_dc *dc,
++	struct validate_context *context,
++	struct pipe_ctx *const head_pipe_ctx,
++	void (*program_func)(struct core_dc *dc,
++			struct pipe_ctx *pipe_ctx,
++			struct validate_context *context));
++
++
+ #endif /* __DC_HW_SEQUENCER_H__ */
+-- 
+2.7.4
+

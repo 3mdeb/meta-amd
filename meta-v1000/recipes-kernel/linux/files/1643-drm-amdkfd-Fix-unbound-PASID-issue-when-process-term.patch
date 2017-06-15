@@ -1,0 +1,87 @@
+From f564b59016654d10fd70c98875940b020f704a26 Mon Sep 17 00:00:00 2001
+From: Yong Zhao <yong.zhao@amd.com>
+Date: Wed, 7 Sep 2016 19:44:21 -0400
+Subject: [PATCH 1643/1722] drm/amdkfd: Fix unbound PASID issue when process
+ terminates on APU
+
+When a process with a long wave running is terminated using Ctrl+C on
+APU, we may hang the HW because when dequeueing the terminating queues
+on HW scheduler, the ATC translation fails due to unbound PASID. We
+should bring forward the dequeueing into IOMMU callback when PASID is
+still bound.
+
+BUG: SWDEV-101676
+
+Change-Id: I258551a449fb9e6acbff005e7f13f4cebd9966dd
+Signed-off-by: Yong Zhao <yong.zhao@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h                  |  7 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c               | 10 ++++++----
+ drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c |  4 ++++
+ 3 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index cfc8e97..f513d3c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -598,6 +598,13 @@ struct kfd_process_device {
+ 	 * wavefronts on process termination
+ 	 */
+ 	bool reset_wavefronts;
++
++	/* Flag used to tell the pdd has dequeued from the dqm.
++	 * This is used to prevent dev->dqm->ops.process_termination() from
++	 * being called twice when it is already called in IOMMU callback
++	 * function.
++	 */
++	bool already_dequeued;
+ };
+ 
+ #define qpd_to_pdd(x) container_of(x, struct kfd_process_device, qpd)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index f2d3541..a9f0d08 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -715,6 +715,7 @@ struct kfd_process_device *kfd_create_process_device_data(struct kfd_dev *dev,
+ 		pdd->reset_wavefronts = false;
+ 		pdd->process = p;
+ 		pdd->bound = PDD_UNBOUND;
++		pdd->already_dequeued = false;
+ 		list_add(&pdd->per_device_list, &p->per_device_data);
+ 
+ 		/* Init idr used for memory handle translation */
+@@ -853,10 +854,11 @@ void kfd_process_iommu_unbind_callback(struct kfd_dev *dev, unsigned int pasid)
+ 	down_write(&p->lock);
+ 
+ 	pdd = kfd_get_process_device_data(dev, p);
+-	if (pdd->reset_wavefronts) {
+-		dbgdev_wave_reset_wavefronts(pdd->dev, p);
+-		pdd->reset_wavefronts = false;
+-	}
++	if (pdd)
++		/* For GPU relying on IOMMU, we need to dequeue here
++		 * when PASID is still bound.
++		 */
++		kfd_process_dequeue_from_device(pdd);
+ 
+ 	up_write(&p->lock);
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+index ae65600..564d1cd 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -76,7 +76,11 @@ void kfd_process_dequeue_from_device(struct kfd_process_device *pdd)
+ 	struct kfd_process *p = pdd->process;
+ 	int retval;
+ 
++	if (pdd->already_dequeued)
++		return;
++
+ 	retval = dev->dqm->ops.process_termination(dev->dqm, &pdd->qpd);
++	pdd->already_dequeued = true;
+ 	/* Checking pdd->reset_wavefronts may not be needed, because
+ 	 * if reset_wavefronts was set to true before, which means unmapping
+ 	 * failed, process_termination should fail too until we reset
+-- 
+2.7.4
+

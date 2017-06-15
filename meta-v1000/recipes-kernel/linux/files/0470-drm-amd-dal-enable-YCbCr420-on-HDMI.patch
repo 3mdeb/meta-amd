@@ -1,0 +1,1392 @@
+From 192a93f017943996852fafda7d37973920c8f8fb Mon Sep 17 00:00:00 2001
+From: Eric Yang <eric.yang2@amd.com>
+Date: Thu, 28 Apr 2016 11:26:01 -0400
+Subject: [PATCH 0470/1722] drm/amd/dal: enable YCbCr420 on HDMI
+
+Signed-off-by: Eric Yang <eric.yang2@amd.com>
+Acked-by: Jordan Lazare <Jordan.Lazare@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ .../gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c    |   2 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_link.c          |  18 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_resource.c      |  11 +-
+ drivers/gpu/drm/amd/dal/dc/core/dc_stream.c        |  33 +---
+ .../gpu/drm/amd/dal/dc/dce100/dce100_resource.c    |  31 +--
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    |  25 +--
+ .../drm/amd/dal/dc/dce110/dce110_link_encoder.c    |  20 +-
+ .../drm/amd/dal/dc/dce110/dce110_link_encoder.h    |  17 ++
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c     |   3 +-
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h     |  10 +
+ .../drm/amd/dal/dc/dce110/dce110_opp_formatter.c   |  23 ++-
+ drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c   |  10 +-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.c    |  38 +++-
+ .../gpu/drm/amd/dal/dc/dce110/dce110_resource.h    |   2 +
+ .../drm/amd/dal/dc/dce110/dce110_stream_encoder.c  |  12 +-
+ drivers/gpu/drm/amd/dal/dc/dce112/Makefile         |   3 +-
+ .../drm/amd/dal/dc/dce112/dce112_clock_source.c    |  18 +-
+ .../drm/amd/dal/dc/dce112/dce112_link_encoder.c    |  92 ++++++++-
+ drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp.c     |  70 +++++++
+ drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp.h     |  48 +++++
+ .../drm/amd/dal/dc/dce112/dce112_opp_formatter.c   | 216 +++++++++++++++++++++
+ .../gpu/drm/amd/dal/dc/dce112/dce112_resource.c    |  41 +---
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_opp.c       |   5 +-
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_opp.h       |   1 +
+ drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c  |  31 +--
+ drivers/gpu/drm/amd/dal/dc/inc/clock_source.h      |   1 +
+ drivers/gpu/drm/amd/dal/dc/inc/hw/opp.h            |  10 +-
+ 27 files changed, 593 insertions(+), 198 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp.c
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp.h
+ create mode 100644 drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp_formatter.c
+
+diff --git a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+index e74cf75..b6e8579 100644
+--- a/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/dal/amdgpu_dm/amdgpu_dm_types.c
+@@ -773,7 +773,6 @@ static void fill_stream_properties_from_drm_display_mode(
+ 	const struct drm_connector *connector)
+ {
+ 	struct dc_crtc_timing *timing_out = &stream->timing;
+-
+ 	memset(timing_out, 0, sizeof(struct dc_crtc_timing));
+ 
+ 	timing_out->h_border_left = 0;
+@@ -1511,6 +1510,7 @@ int dm_create_validation_set_for_target(struct drm_connector *connector,
+ 	}
+ 
+ 	drm_mode_set_crtcinfo(mode, 0);
++
+ 	fill_stream_properties_from_drm_display_mode(streams[0], mode, connector);
+ 
+ 	target = dc_create_target_for_streams(streams, 1);
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+index f6ff1b7..2dbcce5 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_link.c
+@@ -1249,20 +1249,28 @@ static void enable_link_hdmi(struct pipe_ctx *pipe_ctx)
+ 	 * need to be calculated as for the set mode,
+ 	 * it will lead to querying dynamic link capabilities
+ 	 * which should be done before enable output */
+-	uint32_t normalized_pix_clk = stream->public.timing.pix_clk_khz;
++	uint32_t pix_clk = stream->public.timing.pix_clk_khz;
++	uint32_t normalized_pix_clk = pix_clk;
++
++	if (stream->sink->public.sink_signal == SIGNAL_TYPE_HDMI_TYPE_A &&
++			stream->public.timing.pixel_encoding == PIXEL_ENCODING_YCBCR420)
++		pix_clk /= 2;
++
+ 	switch (stream->public.timing.display_color_depth) {
+ 	case COLOR_DEPTH_888:
++		normalized_pix_clk = pix_clk;
+ 		break;
+ 	case COLOR_DEPTH_101010:
+-		normalized_pix_clk = (normalized_pix_clk * 30) / 24;
++		normalized_pix_clk = (pix_clk * 30) / 24;
+ 		break;
+ 	case COLOR_DEPTH_121212:
+-		normalized_pix_clk = (normalized_pix_clk * 36) / 24;
++		normalized_pix_clk = (pix_clk * 36) / 24;
+ 		break;
+ 	case COLOR_DEPTH_161616:
+-		normalized_pix_clk = (normalized_pix_clk * 48) / 24;
++		normalized_pix_clk = (pix_clk * 48) / 24;
+ 		break;
+ 	default:
++		ASSERT(0);
+ 		break;
+ 	}
+ 
+@@ -1281,7 +1289,7 @@ static void enable_link_hdmi(struct pipe_ctx *pipe_ctx)
+ 			stream->public.timing.display_color_depth,
+ 			pipe_ctx->signal == SIGNAL_TYPE_HDMI_TYPE_A,
+ 			pipe_ctx->signal == SIGNAL_TYPE_DVI_DUAL_LINK,
+-			stream->public.timing.pix_clk_khz);
++			pix_clk);
+ 
+ 	if (pipe_ctx->signal == SIGNAL_TYPE_HDMI_TYPE_A)
+ 		dal_ddc_service_read_scdc_data(link->ddc);
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+index b596675..fd164a4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_resource.c
+@@ -962,10 +962,10 @@ static void set_avi_info_frame(
+ 	info_frame.avi_info_packet.info_packet_hdmi.bits.header.length =
+ 			INFO_FRAME_SIZE_AVI;
+ 
+-	/* IDO-defined (Y2,Y1,Y0 = 1,1,1) shall not be used by devices built
+-	* according to HDMI 2.0 spec (Section 10.1)
+-	* Add "case PixelEncoding_YCbCr420:    pixelEncoding = 3; break;"
+-	* when YCbCr 4:2:0 is supported by DAL hardware. */
++	/*
++	 * IDO-defined (Y2,Y1,Y0 = 1,1,1) shall not be used by devices built
++	 * according to HDMI 2.0 spec (Section 10.1)
++	 */
+ 
+ 	switch (stream->public.timing.pixel_encoding) {
+ 	case PIXEL_ENCODING_YCBCR422:
+@@ -975,6 +975,9 @@ static void set_avi_info_frame(
+ 	case PIXEL_ENCODING_YCBCR444:
+ 		pixel_encoding = 2;
+ 		break;
++	case PIXEL_ENCODING_YCBCR420:
++		pixel_encoding = 3;
++		break;
+ 
+ 	case PIXEL_ENCODING_RGB:
+ 	default:
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_stream.c b/drivers/gpu/drm/amd/dal/dc/core/dc_stream.c
+index a24b9f9..44bde4c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_stream.c
+@@ -42,34 +42,6 @@ struct stream {
+ /*******************************************************************************
+  * Private functions
+  ******************************************************************************/
+-static void build_bit_depth_reduction_params(
+-		const struct core_stream *stream,
+-		struct bit_depth_reduction_params *fmt_bit_depth)
+-{
+-	memset(fmt_bit_depth, 0, sizeof(*fmt_bit_depth));
+-
+-	/*TODO: Need to un-hardcode, refer to function with same name
+-	 * in dal2 hw_sequencer*/
+-
+-	fmt_bit_depth->flags.TRUNCATE_ENABLED = 0;
+-	fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 0;
+-	fmt_bit_depth->flags.FRAME_MODULATION_ENABLED = 0;
+-
+-	/* Diagnostics need consistent CRC of the image, that means
+-	 * dithering should not be enabled for Diagnostics. */
+-	if (IS_DIAG_DC(stream->ctx->dce_environment) == false) {
+-
+-		fmt_bit_depth->flags.SPATIAL_DITHER_DEPTH = 1;
+-		fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 1;
+-
+-		/* frame random is on by default */
+-		fmt_bit_depth->flags.FRAME_RANDOM = 1;
+-		/* apply RGB dithering */
+-		fmt_bit_depth->flags.RGB_RANDOM = true;
+-	}
+-
+-	return;
+-}
+ 
+ static bool construct(struct core_stream *stream,
+ 	const struct dc_sink *dc_sink_data)
+@@ -82,10 +54,6 @@ static bool construct(struct core_stream *stream,
+ 
+ 	dc_sink_retain(dc_sink_data);
+ 
+-	build_bit_depth_reduction_params(stream, &stream->bit_depth_params);
+-
+-	stream->clamping.pixel_encoding = stream->public.timing.pixel_encoding;
+-
+ 	/* Copy audio modes */
+ 	/* TODO - Remove this translation */
+ 	for (i = 0; i < (dc_sink_data->edid_caps.audio_mode_count); i++)
+@@ -112,6 +80,7 @@ static bool construct(struct core_stream *stream,
+ 
+ 	/* EDID CAP translation for HDMI 2.0 */
+ 	stream->public.timing.flags.LTE_340MCSC_SCRAMBLE = dc_sink_data->edid_caps.lte_340mcsc_scramble;
++
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+index 165c0ef..ed2fbaf 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce100/dce100_resource.c
+@@ -580,35 +580,6 @@ void dce100_destruct_resource_pool(struct resource_pool *pool)
+ 		dal_adapter_service_destroy(&pool->adapter_srv);
+ }
+ 
+-static void get_pixel_clock_parameters(
+-	const struct pipe_ctx *pipe_ctx,
+-	struct pixel_clk_params *pixel_clk_params)
+-{
+-	const struct core_stream *stream = pipe_ctx->stream;
+-	pixel_clk_params->requested_pix_clk = stream->public.timing.pix_clk_khz;
+-	pixel_clk_params->encoder_object_id = stream->sink->link->link_enc->id;
+-	pixel_clk_params->signal_type = stream->sink->public.sink_signal;
+-	pixel_clk_params->controller_id = pipe_ctx->pipe_idx + 1;
+-	/* TODO: un-hardcode*/
+-	pixel_clk_params->requested_sym_clk = LINK_RATE_LOW *
+-		LINK_RATE_REF_FREQ_IN_KHZ;
+-	pixel_clk_params->flags.ENABLE_SS = 0;
+-	pixel_clk_params->color_depth =
+-		stream->public.timing.display_color_depth;
+-	pixel_clk_params->flags.DISPLAY_BLANKED = 1;
+-}
+-
+-static enum dc_status build_pipe_hw_param(struct pipe_ctx *pipe_ctx)
+-{
+-	get_pixel_clock_parameters(pipe_ctx, &pipe_ctx->pix_clk_params);
+-	pipe_ctx->clock_source->funcs->get_pix_clk_dividers(
+-		pipe_ctx->clock_source,
+-		&pipe_ctx->pix_clk_params,
+-		&pipe_ctx->pll_settings);
+-
+-	return DC_OK;
+-}
+-
+ static enum dc_status validate_mapped_resource(
+ 		const struct core_dc *dc,
+ 		struct validate_context *context)
+@@ -638,7 +609,7 @@ static enum dc_status validate_mapped_resource(
+ 						pipe_ctx->tg, &stream->public.timing))
+ 					return DC_FAIL_CONTROLLER_VALIDATE;
+ 
+-				status = build_pipe_hw_param(pipe_ctx);
++				status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+ 				if (status != DC_OK)
+ 					return status;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 70bd6ac..89d9a54 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -495,26 +495,6 @@ static enum dc_status bios_parser_crtc_source_select(
+ 	return DC_OK;
+ }
+ 
+-/*******************************FMT**************************************/
+-static void program_fmt(
+-		struct output_pixel_processor *opp,
+-		struct bit_depth_reduction_params *fmt_bit_depth,
+-		struct clamping_and_pixel_encoding_params *clamping)
+-{
+-	/* dithering is affected by <CrtcSourceSelect>, hence should be
+-	 * programmed afterwards */
+-
+-	opp->funcs->opp_program_bit_depth_reduction(
+-		opp,
+-		fmt_bit_depth);
+-
+-	opp->funcs->opp_program_clamping_and_pixel_encoding(
+-		opp,
+-		clamping);
+-
+-	return;
+-}
+-
+ static void update_bios_scratch_critical_state(struct core_dc *dc,
+ 					       bool state)
+ {
+@@ -780,7 +760,10 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 			stream->public.timing.display_color_depth,
+ 			stream->sink->public.sink_signal);
+ 
+-	program_fmt(pipe_ctx->opp, &stream->bit_depth_params, &stream->clamping);
++	pipe_ctx->opp->funcs->opp_program_fmt(
++			pipe_ctx->opp,
++			&stream->bit_depth_params,
++			&stream->clamping);
+ 
+ 	stream->sink->link->link_enc->funcs->setup(
+ 		stream->sink->link->link_enc,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
+index 1d5f79b..6e21d4e 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.c
+@@ -879,7 +879,7 @@ static void hpd_initialize(
+ 	dm_write_reg(ctx, addr, value);
+ }
+ 
+-static bool validate_dvi_output(
++bool dce110_link_encoder_validate_dvi_output(
+ 	const struct dce110_link_encoder *enc110,
+ 	enum signal_type connector_signal,
+ 	enum signal_type signal,
+@@ -927,7 +927,7 @@ static bool validate_dvi_output(
+ 	return true;
+ }
+ 
+-static bool validate_hdmi_output(
++static bool dce110_link_encoder_validate_hdmi_output(
+ 	const struct dce110_link_encoder *enc110,
+ 	const struct dc_crtc_timing *crtc_timing)
+ {
+@@ -977,7 +977,7 @@ static bool validate_hdmi_output(
+ 	return true;
+ }
+ 
+-static bool validate_rgb_output(
++bool dce110_link_encoder_validate_rgb_output(
+ 	const struct dce110_link_encoder *enc110,
+ 	const struct dc_crtc_timing *crtc_timing)
+ {
+@@ -990,7 +990,7 @@ static bool validate_rgb_output(
+ 	return true;
+ }
+ 
+-static bool validate_dp_output(
++bool dce110_link_encoder_validate_dp_output(
+ 	const struct dce110_link_encoder *enc110,
+ 	const struct dc_crtc_timing *crtc_timing)
+ {
+@@ -1014,7 +1014,7 @@ static bool validate_dp_output(
+ 	return false;
+ }
+ 
+-static bool validate_wireless_output(
++bool dce110_link_encoder_validate_wireless_output(
+ 	const struct dce110_link_encoder *enc110,
+ 	const struct dc_crtc_timing *crtc_timing)
+ {
+@@ -1159,29 +1159,29 @@ bool dce110_link_encoder_validate_output_with_stream(
+ 	switch (pipe_ctx->signal) {
+ 	case SIGNAL_TYPE_DVI_SINGLE_LINK:
+ 	case SIGNAL_TYPE_DVI_DUAL_LINK:
+-		is_valid = validate_dvi_output(
++		is_valid = dce110_link_encoder_validate_dvi_output(
+ 			enc110,
+ 			stream->sink->link->public.connector_signal,
+ 			pipe_ctx->signal,
+ 			&stream->public.timing);
+ 	break;
+ 	case SIGNAL_TYPE_HDMI_TYPE_A:
+-		is_valid = validate_hdmi_output(
++		is_valid = dce110_link_encoder_validate_hdmi_output(
+ 				enc110,
+ 				&stream->public.timing);
+ 	break;
+ 	case SIGNAL_TYPE_RGB:
+-		is_valid = validate_rgb_output(
++		is_valid = dce110_link_encoder_validate_rgb_output(
+ 			enc110, &stream->public.timing);
+ 	break;
+ 	case SIGNAL_TYPE_DISPLAY_PORT:
+ 	case SIGNAL_TYPE_DISPLAY_PORT_MST:
+ 	case SIGNAL_TYPE_EDP:
+-		is_valid = validate_dp_output(
++		is_valid = dce110_link_encoder_validate_dp_output(
+ 			enc110, &stream->public.timing);
+ 	break;
+ 	case SIGNAL_TYPE_WIRELESS:
+-		is_valid = validate_wireless_output(
++		is_valid = dce110_link_encoder_validate_wireless_output(
+ 			enc110, &stream->public.timing);
+ 	break;
+ 	default:
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h
+index 45dfc60..7d1625d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_link_encoder.h
+@@ -78,6 +78,23 @@ bool dce110_link_encoder_construct(
+ 	const struct dce110_link_enc_registers *link_regs,
+ 	const struct dce110_link_enc_aux_registers *aux_regs,
+ 	const struct dce110_link_enc_bl_registers *bl_regs);
++bool dce110_link_encoder_validate_dvi_output(
++	const struct dce110_link_encoder *enc110,
++	enum signal_type connector_signal,
++	enum signal_type signal,
++	const struct dc_crtc_timing *crtc_timing);
++
++bool dce110_link_encoder_validate_rgb_output(
++	const struct dce110_link_encoder *enc110,
++	const struct dc_crtc_timing *crtc_timing);
++
++bool dce110_link_encoder_validate_dp_output(
++	const struct dce110_link_encoder *enc110,
++	const struct dc_crtc_timing *crtc_timing);
++
++bool dce110_link_encoder_validate_wireless_output(
++	const struct dce110_link_encoder *enc110,
++	const struct dc_crtc_timing *crtc_timing);
+ 
+ bool dce110_link_encoder_validate_output_with_stream(
+ 	struct link_encoder *enc,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
+index d3da726..6b9bf2d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.c
+@@ -44,14 +44,13 @@ enum {
+ 
+ static struct opp_funcs funcs = {
+ 		.opp_power_on_regamma_lut = dce110_opp_power_on_regamma_lut,
+-		.opp_program_bit_depth_reduction = dce110_opp_program_bit_depth_reduction,
+-		.opp_program_clamping_and_pixel_encoding = dce110_opp_program_clamping_and_pixel_encoding,
+ 		.opp_set_csc_adjustment = dce110_opp_set_csc_adjustment,
+ 		.opp_set_csc_default = dce110_opp_set_csc_default,
+ 		.opp_set_dyn_expansion = dce110_opp_set_dyn_expansion,
+ 		.opp_program_regamma_pwl = dce110_opp_program_regamma_pwl,
+ 		.opp_set_regamma_mode = dce110_opp_set_regamma_mode,
+ 		.opp_destroy = dce110_opp_destroy,
++		.opp_program_fmt = dce110_opp_program_fmt,
+ };
+ 
+ bool dce110_opp_construct(struct dce110_opp *opp110,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h
+index a0b6d8e..f388584 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp.h
+@@ -84,6 +84,7 @@ struct dce110_regamma {
+ 
+ struct dce110_opp_reg_offsets {
+ 	uint32_t fmt_offset;
++	uint32_t fmt_mem_offset;
+ 	uint32_t dcp_offset;
+ 	uint32_t dcfe_offset;
+ };
+@@ -136,4 +137,13 @@ void dce110_opp_set_dyn_expansion(
+ 	enum dc_color_depth color_dpth,
+ 	enum signal_type signal);
+ 
++void dce110_opp_program_fmt(
++	struct output_pixel_processor *opp,
++	struct bit_depth_reduction_params *fmt_bit_depth,
++	struct clamping_and_pixel_encoding_params *clamping);
++
++void dce110_opp_set_clamping(
++	struct dce110_opp *opp110,
++	const struct clamping_and_pixel_encoding_params *params);
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_formatter.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_formatter.c
+index 2abc01c..0382f7c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_formatter.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_formatter.c
+@@ -32,7 +32,6 @@
+ 
+ #define FMT_REG(reg)\
+ 	(reg + opp110->offsets.fmt_offset)
+-
+ /**
+  *	set_truncation
+  *	1) set truncation depth: 0 for 18 bpp or 1 for 24 bpp
+@@ -368,7 +367,7 @@ static void set_temporal_dither(
+  *		7 for programable
+  *	2) Enable clamp if Limited range requested
+  */
+-static void set_clamping(
++void dce110_opp_set_clamping(
+ 	struct dce110_opp *opp110,
+ 	const struct clamping_and_pixel_encoding_params *params)
+ {
+@@ -555,7 +554,7 @@ void dce110_opp_program_clamping_and_pixel_encoding(
+ {
+ 	struct dce110_opp *opp110 = TO_DCE110_OPP(opp);
+ 
+-	set_clamping(opp110, params);
++	dce110_opp_set_clamping(opp110, params);
+ 	set_pixel_encoding(opp110, params);
+ }
+ 
+@@ -608,3 +607,21 @@ void dce110_opp_set_dyn_expansion(
+ 
+ 	dm_write_reg(opp->ctx, addr, value);
+ }
++
++void dce110_opp_program_fmt(
++	struct output_pixel_processor *opp,
++	struct bit_depth_reduction_params *fmt_bit_depth,
++	struct clamping_and_pixel_encoding_params *clamping)
++{
++	/* dithering is affected by <CrtcSourceSelect>, hence should be
++	 * programmed afterwards */
++	dce110_opp_program_bit_depth_reduction(
++		opp,
++		fmt_bit_depth);
++
++	dce110_opp_program_clamping_and_pixel_encoding(
++		opp,
++		clamping);
++
++	return;
++}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c
+index 7413db4..2ca5b77 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_opp_v.c
+@@ -47,17 +47,13 @@ struct opp_funcs funcs = {
+ 
+ 		.opp_set_csc_adjustment = dce110_opp_v_set_csc_adjustment,
+ 
+-		.opp_program_bit_depth_reduction =
+-				dce110_opp_program_bit_depth_reduction,
+-
+-		.opp_program_clamping_and_pixel_encoding =
+-				dce110_opp_program_clamping_and_pixel_encoding,
+-
+ 		.opp_set_dyn_expansion = dce110_opp_set_dyn_expansion,
+ 
+ 		.opp_set_regamma_mode = dce110_opp_set_regamma_mode,
+ 
+-		.opp_destroy = dce110_opp_destroy
++		.opp_destroy = dce110_opp_destroy,
++
++		.opp_program_fmt = dce110_opp_program_fmt,
+ };
+ 
+ bool dce110_opp_v_construct(struct dce110_opp *opp110,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+index 0f3895a..aaf22bf 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.c
+@@ -540,15 +540,49 @@ static void get_pixel_clock_parameters(
+ 	pixel_clk_params->color_depth =
+ 		stream->public.timing.display_color_depth;
+ 	pixel_clk_params->flags.DISPLAY_BLANKED = 1;
++	pixel_clk_params->flags.SUPPORT_YCBCR420 = (stream->public.timing.pixel_encoding ==
++			PIXEL_ENCODING_YCBCR420);
+ }
+ 
+-static enum dc_status build_pipe_hw_param(struct pipe_ctx *pipe_ctx)
++void dce110_resource_build_bit_depth_reduction_params(
++		const struct core_stream *stream,
++		struct bit_depth_reduction_params *fmt_bit_depth)
++{
++	memset(fmt_bit_depth, 0, sizeof(*fmt_bit_depth));
++
++	/*TODO: Need to un-hardcode, refer to function with same name
++	 * in dal2 hw_sequencer*/
++
++	fmt_bit_depth->flags.TRUNCATE_ENABLED = 0;
++	fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 0;
++	fmt_bit_depth->flags.FRAME_MODULATION_ENABLED = 0;
++
++	/* Diagnostics need consistent CRC of the image, that means
++	 * dithering should not be enabled for Diagnostics. */
++	if (IS_DIAG_DC(stream->ctx->dce_environment) == false) {
++
++		fmt_bit_depth->flags.SPATIAL_DITHER_DEPTH = 1;
++		fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 1;
++
++		/* frame random is on by default */
++		fmt_bit_depth->flags.FRAME_RANDOM = 1;
++		/* apply RGB dithering */
++		fmt_bit_depth->flags.RGB_RANDOM = true;
++	}
++
++	return;
++}
++
++enum dc_status dce110_resource_build_pipe_hw_param(struct pipe_ctx *pipe_ctx)
+ {
+ 	get_pixel_clock_parameters(pipe_ctx, &pipe_ctx->pix_clk_params);
+ 	pipe_ctx->clock_source->funcs->get_pix_clk_dividers(
+ 		pipe_ctx->clock_source,
+ 		&pipe_ctx->pix_clk_params,
+ 		&pipe_ctx->pll_settings);
++	dce110_resource_build_bit_depth_reduction_params(pipe_ctx->stream,
++			&pipe_ctx->stream->bit_depth_params);
++	pipe_ctx->stream->clamping.pixel_encoding = pipe_ctx->stream->public.timing.pixel_encoding;
+ 
+ 	return DC_OK;
+ }
+@@ -597,7 +631,7 @@ static enum dc_status validate_mapped_resource(
+ 					pipe_ctx->tg, &stream->public.timing))
+ 					return DC_FAIL_CONTROLLER_VALIDATE;
+ 
+-				status = build_pipe_hw_param(pipe_ctx);
++				status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+ 				if (status != DC_OK)
+ 					return status;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
+index cf79abe..3a93c75 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_resource.h
+@@ -32,6 +32,8 @@ struct adapter_service;
+ struct core_dc;
+ struct resource_pool;
+ 
++enum dc_status dce110_resource_build_pipe_hw_param(struct pipe_ctx *pipe_ctx);
++
+ bool dce110_construct_resource_pool(
+ 	struct adapter_service *adapter_serv,
+ 	uint8_t num_virtual_links,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.c
+index 0ff37da..efb0df4 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_stream_encoder.c
+@@ -397,7 +397,9 @@ void dce110_stream_encoder_hdmi_set_stream_attribute(
+ {
+ 	struct dce110_stream_encoder *enc110 = DCE110STRENC_FROM_STRENC(enc);
+ 	struct dc_context *ctx = enc110->base.ctx;
+-	uint32_t output_pixel_clock = crtc_timing->pix_clk_khz;
++	uint32_t output_pixel_clock = (crtc_timing->pixel_encoding ==
++			PIXEL_ENCODING_YCBCR420) ?
++			crtc_timing->pix_clk_khz / 2 : crtc_timing->pix_clk_khz;
+ 	uint32_t value;
+ 	uint32_t addr;
+ 	struct bp_encoder_control cntl = {0};
+@@ -406,7 +408,7 @@ void dce110_stream_encoder_hdmi_set_stream_attribute(
+ 	cntl.engine_id = enc110->base.id;
+ 	cntl.signal = SIGNAL_TYPE_HDMI_TYPE_A;
+ 	cntl.enable_dp_audio = enable_audio;
+-	cntl.pixel_clock = crtc_timing->pix_clk_khz;
++	cntl.pixel_clock = output_pixel_clock;
+ 	cntl.lanes_number = LANE_COUNT_FOUR;
+ 	cntl.color_depth = crtc_timing->display_color_depth;
+ 
+@@ -455,7 +457,7 @@ void dce110_stream_encoder_hdmi_set_stream_attribute(
+ 			1,
+ 			HDMI_CONTROL,
+ 			HDMI_DEEP_COLOR_ENABLE);
+-		output_pixel_clock = (crtc_timing->pix_clk_khz * 30) / 24;
++		output_pixel_clock = (output_pixel_clock * 30) / 24;
+ 		break;
+ 	case COLOR_DEPTH_121212:
+ 		set_reg_field_value(
+@@ -468,7 +470,7 @@ void dce110_stream_encoder_hdmi_set_stream_attribute(
+ 			1,
+ 			HDMI_CONTROL,
+ 			HDMI_DEEP_COLOR_ENABLE);
+-		output_pixel_clock = (crtc_timing->pix_clk_khz * 36) / 24;
++		output_pixel_clock = (output_pixel_clock * 36) / 24;
+ 		break;
+ 	case COLOR_DEPTH_161616:
+ 		set_reg_field_value(
+@@ -481,7 +483,7 @@ void dce110_stream_encoder_hdmi_set_stream_attribute(
+ 			1,
+ 			HDMI_CONTROL,
+ 			HDMI_DEEP_COLOR_ENABLE);
+-		output_pixel_clock = (crtc_timing->pix_clk_khz * 48) / 24;
++		output_pixel_clock = (output_pixel_clock * 48) / 24;
+ 		break;
+ 	default:
+ 		break;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce112/Makefile b/drivers/gpu/drm/amd/dal/dc/dce112/Makefile
+index c7d61d9..c6e3c8c 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce112/Makefile
++++ b/drivers/gpu/drm/amd/dal/dc/dce112/Makefile
+@@ -3,7 +3,8 @@
+ # It provides the control and status of HW CRTC block.
+ 
+ DCE112 = dce112_link_encoder.o dce112_compressor.o dce112_hw_sequencer.o \
+-dce112_resource.o dce112_clock_source.o dce112_mem_input.o
++dce112_resource.o dce112_clock_source.o dce112_mem_input.o dce112_opp_formatter.o \
++dce112_opp.o
+ 
+ AMD_DAL_DCE112 = $(addprefix $(AMDDALPATH)/dc/dce112/,$(DCE112))
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_clock_source.c b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_clock_source.c
+index 65ddb80..91716a8 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_clock_source.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_clock_source.c
+@@ -104,7 +104,8 @@ static uint32_t dce112_get_pix_clk_dividers(
+ static void program_pixel_clk_resync(
+ 		struct dce112_clk_src *clk_src,
+ 		enum signal_type signal_type,
+-		enum dc_color_depth colordepth)
++		enum dc_color_depth colordepth,
++		bool enable_ycbcr420)
+ {
+ 	uint32_t value = 0;
+ 
+@@ -159,6 +160,12 @@ static void program_pixel_clk_resync(
+ 		break;
+ 	}
+ 
++	set_reg_field_value(
++		value,
++		enable_ycbcr420,
++		PHYPLLA_PIXCLK_RESYNC_CNTL,
++		PHYPLLA_PIXCLK_DOUBLE_RATE_ENABLE);
++
+ 	dm_write_reg(
+ 		clk_src->base.ctx,
+ 		clk_src->offsets.pixclk_resync_cntl,
+@@ -186,6 +193,12 @@ static bool dce112_program_pix_clk(
+ 		bp_pc_params.flags.SET_XTALIN_REF_SRC =
+ 						!pll_settings->use_external_clk;
+ 		bp_pc_params.flags.SUPPORT_YUV_420 = 0;
++ 
++                if (pix_clk_params->flags.SUPPORT_YCBCR420) {
++                        bp_pc_params.target_pixel_clock = pll_settings->actual_pix_clk / 2;
++                        bp_pc_params.flags.SUPPORT_YUV_420 = 1;
++                }
++
+ 	}
+ 
+ 	if (dc_bios_set_pixel_clock(
+@@ -198,7 +211,8 @@ static bool dce112_program_pix_clk(
+ 	if (clk_src->id != CLOCK_SOURCE_ID_DP_DTO)
+ 		program_pixel_clk_resync(dce112_clk_src,
+ 					pix_clk_params->signal_type,
+-					pix_clk_params->color_depth);
++					pix_clk_params->color_depth,
++					pix_clk_params->flags.SUPPORT_YCBCR420);
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_link_encoder.c b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_link_encoder.c
+index 23e127c..5124c90 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_link_encoder.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_link_encoder.c
+@@ -72,9 +72,99 @@ static void dce112_link_encoder_dp_set_phy_pattern(
+ 	}
+ }
+ 
++static bool dce112_link_encoder_validate_hdmi_output(
++	const struct dce110_link_encoder *enc110,
++	const struct dc_crtc_timing *crtc_timing)
++{
++	enum dc_color_depth max_deep_color =
++			enc110->base.features.max_hdmi_deep_color;
++	/* expressed in KHz */
++	uint32_t pixel_clock = 0;
++
++	if (max_deep_color > enc110->base.features.max_deep_color)
++		max_deep_color = enc110->base.features.max_deep_color;
++
++	if (max_deep_color < crtc_timing->display_color_depth)
++		return false;
++
++	if (crtc_timing->pix_clk_khz < TMDS_MIN_PIXEL_CLOCK)
++		return false;
++
++	switch (crtc_timing->display_color_depth) {
++	case COLOR_DEPTH_666:
++		pixel_clock = (crtc_timing->pix_clk_khz * 3) >> 2;
++	break;
++	case COLOR_DEPTH_888:
++		pixel_clock = crtc_timing->pix_clk_khz;
++	break;
++	case COLOR_DEPTH_101010:
++		pixel_clock = (crtc_timing->pix_clk_khz * 10) >> 3;
++	break;
++	case COLOR_DEPTH_121212:
++		pixel_clock = (crtc_timing->pix_clk_khz * 3) >> 1;
++	break;
++	case COLOR_DEPTH_161616:
++		pixel_clock = crtc_timing->pix_clk_khz << 1;
++	break;
++	default:
++	break;
++	}
++
++	if ((pixel_clock == 0) ||
++		(pixel_clock > enc110->base.features.max_hdmi_pixel_clock) ||
++		(pixel_clock > enc110->base.features.max_pixel_clock))
++		return false;
++
++	return true;
++}
++
++bool dce112_link_encoder_validate_output_with_stream(
++	struct link_encoder *enc,
++	struct pipe_ctx *pipe_ctx)
++{
++	struct core_stream *stream = pipe_ctx->stream;
++	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
++	bool is_valid;
++
++	switch (pipe_ctx->signal) {
++	case SIGNAL_TYPE_DVI_SINGLE_LINK:
++	case SIGNAL_TYPE_DVI_DUAL_LINK:
++		is_valid = dce110_link_encoder_validate_dvi_output(
++			enc110,
++			stream->sink->link->public.connector_signal,
++			pipe_ctx->signal,
++			&stream->public.timing);
++	break;
++	case SIGNAL_TYPE_HDMI_TYPE_A:
++		is_valid = dce112_link_encoder_validate_hdmi_output(
++				enc110,
++				&stream->public.timing);
++	break;
++	case SIGNAL_TYPE_RGB:
++		is_valid = dce110_link_encoder_validate_rgb_output(
++			enc110, &stream->public.timing);
++	break;
++	case SIGNAL_TYPE_DISPLAY_PORT:
++	case SIGNAL_TYPE_DISPLAY_PORT_MST:
++	case SIGNAL_TYPE_EDP:
++		is_valid = dce110_link_encoder_validate_dp_output(
++			enc110, &stream->public.timing);
++	break;
++	case SIGNAL_TYPE_WIRELESS:
++		is_valid = dce110_link_encoder_validate_wireless_output(
++			enc110, &stream->public.timing);
++	break;
++	default:
++		is_valid = true;
++	break;
++	}
++
++	return is_valid;
++}
++
+ static struct link_encoder_funcs dce112_lnk_enc_funcs = {
+ 	.validate_output_with_stream =
+-		dce110_link_encoder_validate_output_with_stream,
++		dce112_link_encoder_validate_output_with_stream,
+ 	.hw_init = dce110_link_encoder_hw_init,
+ 	.setup = dce110_link_encoder_setup,
+ 	.enable_tmds_output = dce110_link_encoder_enable_tmds_output,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp.c b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp.c
+new file mode 100644
+index 0000000..66b3609
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp.c
+@@ -0,0 +1,70 @@
++/*
++ * Copyright 2012-15 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#include "dm_services.h"
++
++/* include DCE11 register header files */
++#include "dce/dce_11_2_d.h"
++#include "dce/dce_11_2_sh_mask.h"
++
++#include "dce112_opp.h"
++
++#include "gamma_types.h"
++
++enum {
++	MAX_LUT_ENTRY = 256,
++	MAX_NUMBER_OF_ENTRIES = 256
++};
++
++/*****************************************/
++/* Constructor, Destructor               */
++/*****************************************/
++
++static struct opp_funcs funcs = {
++		.opp_power_on_regamma_lut = dce110_opp_power_on_regamma_lut,
++		.opp_set_csc_adjustment = dce110_opp_set_csc_adjustment,
++		.opp_set_csc_default = dce110_opp_set_csc_default,
++		.opp_set_dyn_expansion = dce110_opp_set_dyn_expansion,
++		.opp_program_regamma_pwl = dce110_opp_program_regamma_pwl,
++		.opp_set_regamma_mode = dce110_opp_set_regamma_mode,
++		.opp_destroy = dce110_opp_destroy,
++		.opp_program_fmt = dce112_opp_program_fmt,
++};
++
++bool dce112_opp_construct(struct dce110_opp *opp110,
++	struct dc_context *ctx,
++	uint32_t inst,
++	const struct dce110_opp_reg_offsets *offsets)
++{
++	opp110->base.funcs = &funcs;
++
++	opp110->base.ctx = ctx;
++
++	opp110->base.inst = inst;
++
++	opp110->offsets = *offsets;
++
++	return true;
++}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp.h b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp.h
+new file mode 100644
+index 0000000..9443b87
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp.h
+@@ -0,0 +1,48 @@
++/* Copyright 2012-15 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#ifndef __DC_OPP_DCE112_H__
++#define __DC_OPP_DCE112_H__
++
++#include "dc_types.h"
++#include "opp.h"
++#include "../dce110/dce110_opp.h"
++#include "core_types.h"
++
++void dce112_opp_program_clamping_and_pixel_encoding(
++	struct output_pixel_processor *opp,
++	const struct clamping_and_pixel_encoding_params *params);
++
++void dce112_opp_program_fmt(
++		struct output_pixel_processor *opp,
++		struct bit_depth_reduction_params *fmt_bit_depth,
++		struct clamping_and_pixel_encoding_params *clamping);
++
++bool dce112_opp_construct(struct dce110_opp *opp110,
++	struct dc_context *ctx,
++	uint32_t inst,
++	const struct dce110_opp_reg_offsets *offsets);
++
++
++#endif
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp_formatter.c b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp_formatter.c
+new file mode 100644
+index 0000000..c39251a
+--- /dev/null
++++ b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_opp_formatter.c
+@@ -0,0 +1,216 @@
++/*
++ * Copyright 2012-15 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ *  and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#include "dm_services.h"
++
++#include "dce/dce_11_2_d.h"
++#include "dce/dce_11_2_sh_mask.h"
++
++#include "dce112_opp.h"
++
++#define FMT_REG(reg)\
++	(reg + opp110->offsets.fmt_offset)
++#define FMT_MEM_REG(reg)\
++	(reg + opp110->offsets.fmt_mem_offset)
++
++/**
++ *	Set Clamping
++ *	1) Set clamping format based on bpc - 0 for 6bpc (No clamping)
++ *		1 for 8 bpc
++ *		2 for 10 bpc
++ *		3 for 12 bpc
++ *		7 for programable
++ *	2) Enable clamp if Limited range requested
++ */
++
++/**
++ *	set_pixel_encoding
++ *
++ *	Set Pixel Encoding
++ *		0: RGB 4:4:4 or YCbCr 4:4:4 or YOnly
++ *		1: YCbCr 4:2:2
++ *		2: YCbCr 4:2:0
++ */
++static void set_pixel_encoding(
++	struct dce110_opp *opp110,
++	const struct clamping_and_pixel_encoding_params *params)
++{
++	uint32_t fmt_cntl_value;
++	uint32_t addr = FMT_REG(mmFMT_CONTROL);
++
++	/*RGB 4:4:4 or YCbCr 4:4:4 - 0; YCbCr 4:2:2 -1.*/
++	fmt_cntl_value = dm_read_reg(opp110->base.ctx, addr);
++
++	set_reg_field_value(fmt_cntl_value,
++		0,
++		FMT_CONTROL,
++		FMT_PIXEL_ENCODING);
++
++	/*00 - Pixels drop mode HW default*/
++	set_reg_field_value(fmt_cntl_value,
++		0,
++		FMT_CONTROL,
++		FMT_SUBSAMPLING_MODE);
++
++	/* By default no bypass*/
++	set_reg_field_value(fmt_cntl_value,
++		0,
++		FMT_CONTROL,
++		FMT_CBCR_BIT_REDUCTION_BYPASS);
++
++	if (params->pixel_encoding == PIXEL_ENCODING_YCBCR422) {
++		set_reg_field_value(fmt_cntl_value,
++			1,
++			FMT_CONTROL,
++			FMT_PIXEL_ENCODING);
++
++		/*00 - Cb before Cr ,01 - Cr before Cb*/
++		set_reg_field_value(fmt_cntl_value,
++			0,
++			FMT_CONTROL,
++			FMT_SUBSAMPLING_ORDER);
++	}
++
++	if (params->pixel_encoding == PIXEL_ENCODING_YCBCR420) {
++		set_reg_field_value(fmt_cntl_value,
++			2,
++			FMT_CONTROL,
++			FMT_PIXEL_ENCODING);
++
++		/* 02 - Subsampling mode, 3 taps*/
++		set_reg_field_value(fmt_cntl_value,
++			2,
++			FMT_CONTROL,
++			FMT_SUBSAMPLING_MODE);
++
++		/* 00 - Enable CbCr bit reduction bypass to preserve precision*/
++		set_reg_field_value(fmt_cntl_value,
++			1,
++			FMT_CONTROL,
++			FMT_CBCR_BIT_REDUCTION_BYPASS);
++	}
++	dm_write_reg(opp110->base.ctx, addr, fmt_cntl_value);
++
++}
++
++void dce112_opp_program_clamping_and_pixel_encoding(
++	struct output_pixel_processor *opp,
++	const struct clamping_and_pixel_encoding_params *params)
++{
++	struct dce110_opp *opp110 = TO_DCE110_OPP(opp);
++
++	dce110_opp_set_clamping(opp110, params);
++	set_pixel_encoding(opp110, params);
++}
++
++static void program_formatter_420_memory(struct output_pixel_processor *opp)
++{
++	struct dce110_opp *opp110 = TO_DCE110_OPP(opp);
++	uint32_t fmt_cntl_value;
++	uint32_t fmt_mem_cntl_value;
++	uint32_t fmt_cntl_addr = FMT_REG(mmFMT_CONTROL);
++	uint32_t fmt_mem_cntl_addr = FMT_MEM_REG(mmFMT_MEMORY0_CONTROL);
++
++	fmt_mem_cntl_value = dm_read_reg(opp110->base.ctx, fmt_mem_cntl_addr);
++	fmt_cntl_value = dm_read_reg(opp110->base.ctx, fmt_cntl_addr);
++	/* Program source select*/
++	/* Use HW default source select for FMT_MEMORYx_CONTROL */
++	/* Use that value for FMT_SRC_SELECT as well*/
++	set_reg_field_value(fmt_cntl_value,
++		get_reg_field_value(fmt_mem_cntl_value, FMT_MEMORY0_CONTROL, FMT420_MEM0_SOURCE_SEL),
++		FMT_CONTROL,
++		FMT_SRC_SELECT);
++	dm_write_reg(opp110->base.ctx, fmt_cntl_addr, fmt_cntl_value);
++
++	/* Turn on the memory */
++	set_reg_field_value(fmt_mem_cntl_value,
++		0,
++		FMT_MEMORY0_CONTROL,
++		FMT420_MEM0_PWR_FORCE);
++	dm_write_reg(opp110->base.ctx, fmt_mem_cntl_addr, fmt_mem_cntl_value);
++}
++
++static void program_formatter_reset_dig_resync_fifo(struct output_pixel_processor *opp)
++{
++	struct dce110_opp *opp110 = TO_DCE110_OPP(opp);
++	uint32_t value;
++	uint32_t addr = FMT_REG(mmFMT_CONTROL);
++	uint8_t counter = 10;
++
++
++	value = dm_read_reg(opp110->base.ctx, addr);
++
++	/* clear previous phase lock status*/
++	set_reg_field_value(value,
++		1,
++		FMT_CONTROL,
++		FMT_420_PIXEL_PHASE_LOCKED_CLEAR);
++	dm_write_reg(opp110->base.ctx, addr, value);
++
++	/* poll until FMT_420_PIXEL_PHASE_LOCKED become 1*/
++	while (counter > 0) {
++		value = dm_read_reg(opp110->base.ctx, addr);
++
++		if (get_reg_field_value(
++			value,
++			FMT_CONTROL,
++			FMT_420_PIXEL_PHASE_LOCKED) == 1)
++			break;
++
++		msleep(10);
++		counter--;
++	}
++
++	if (counter == 0)
++		dal_logger_write(opp->ctx->logger, LOG_MAJOR_ERROR,
++				LOG_MINOR_COMPONENT_CONTROLLER,
++				"%s:opp program formattter reset dig resync info time out.\n",
++				__func__);
++}
++
++void dce112_opp_program_fmt(
++		struct output_pixel_processor *opp,
++		struct bit_depth_reduction_params *fmt_bit_depth,
++		struct clamping_and_pixel_encoding_params *clamping)
++{
++	/* dithering is affected by <CrtcSourceSelect>, hence should be
++	 * programmed afterwards */
++
++	if (clamping->pixel_encoding == PIXEL_ENCODING_YCBCR420)
++		program_formatter_420_memory(opp);
++
++	dce110_opp_program_bit_depth_reduction(
++		opp,
++		fmt_bit_depth);
++
++	dce112_opp_program_clamping_and_pixel_encoding(
++		opp,
++		clamping);
++
++	if (clamping->pixel_encoding == PIXEL_ENCODING_YCBCR420)
++		program_formatter_reset_dig_resync_fifo(opp);
++
++	return;
++}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
+index 79a5b93..7c808d6d 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce112/dce112_resource.c
+@@ -38,7 +38,7 @@
+ #include "dce110/dce110_link_encoder.h"
+ #include "dce110/dce110_transform.h"
+ #include "dce110/dce110_stream_encoder.h"
+-#include "dce110/dce110_opp.h"
++#include "dce112/dce112_opp.h"
+ #include "dce110/dce110_ipp.h"
+ #include "dce112/dce112_clock_source.h"
+ 
+@@ -293,27 +293,33 @@ static const struct dce110_stream_enc_registers stream_enc_regs[] = {
+ static const struct dce110_opp_reg_offsets dce112_opp_reg_offsets[] = {
+ {
+ 	.fmt_offset = (mmFMT0_FMT_CONTROL - mmFMT0_FMT_CONTROL),
++	.fmt_mem_offset = (mmFMT_MEMORY0_CONTROL - mmFMT_MEMORY0_CONTROL),
+ 	.dcfe_offset = (mmDCFE0_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+ 	.dcp_offset = (mmDCP0_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
+ },
+ {	.fmt_offset = (mmFMT1_FMT_CONTROL - mmFMT0_FMT_CONTROL),
++	.fmt_mem_offset = (mmFMT_MEMORY1_CONTROL - mmFMT_MEMORY0_CONTROL),
+ 	.dcfe_offset = (mmDCFE1_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+ 	.dcp_offset = (mmDCP1_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
+ },
+ {	.fmt_offset = (mmFMT2_FMT_CONTROL - mmFMT0_FMT_CONTROL),
++	.fmt_mem_offset = (mmFMT_MEMORY2_CONTROL - mmFMT_MEMORY0_CONTROL),
+ 	.dcfe_offset = (mmDCFE2_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+ 	.dcp_offset = (mmDCP2_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
+ },
+ {
+ 	.fmt_offset = (mmFMT3_FMT_CONTROL - mmFMT0_FMT_CONTROL),
++	.fmt_mem_offset = (mmFMT_MEMORY3_CONTROL - mmFMT_MEMORY0_CONTROL),
+ 	.dcfe_offset = (mmDCFE3_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+ 	.dcp_offset = (mmDCP3_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
+ },
+ {	.fmt_offset = (mmFMT4_FMT_CONTROL - mmFMT0_FMT_CONTROL),
++	.fmt_mem_offset = (mmFMT_MEMORY4_CONTROL - mmFMT_MEMORY0_CONTROL),
+ 	.dcfe_offset = (mmDCFE4_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+ 	.dcp_offset = (mmDCP4_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
+ },
+ {	.fmt_offset = (mmFMT5_FMT_CONTROL - mmFMT0_FMT_CONTROL),
++	.fmt_mem_offset = (mmFMT_MEMORY5_CONTROL - mmFMT_MEMORY0_CONTROL),
+ 	.dcfe_offset = (mmDCFE5_DCFE_MEM_PWR_CTRL - mmDCFE0_DCFE_MEM_PWR_CTRL),
+ 	.dcp_offset = (mmDCP5_GRPH_CONTROL - mmDCP0_GRPH_CONTROL),
+ }
+@@ -482,7 +488,7 @@ struct output_pixel_processor *dce112_opp_create(
+ 	if (!opp)
+ 		return NULL;
+ 
+-	if (dce110_opp_construct(opp,
++	if (dce112_opp_construct(opp,
+ 			ctx, inst, offset))
+ 		return &opp->base;
+ 
+@@ -624,35 +630,6 @@ static struct clock_source *find_matching_pll(struct resource_context *res_ctx,
+ 	return 0;
+ }
+ 
+-static void get_pixel_clock_parameters(
+-	const struct pipe_ctx *pipe_ctx,
+-	struct pixel_clk_params *pixel_clk_params)
+-{
+-	const struct core_stream *stream = pipe_ctx->stream;
+-	pixel_clk_params->requested_pix_clk = stream->public.timing.pix_clk_khz;
+-	pixel_clk_params->encoder_object_id = stream->sink->link->link_enc->id;
+-	pixel_clk_params->signal_type = stream->sink->public.sink_signal;
+-	pixel_clk_params->controller_id = pipe_ctx->pipe_idx + 1;
+-	/* TODO: un-hardcode*/
+-	pixel_clk_params->requested_sym_clk = LINK_RATE_LOW *
+-		LINK_RATE_REF_FREQ_IN_KHZ;
+-	pixel_clk_params->flags.ENABLE_SS = 0;
+-	pixel_clk_params->color_depth =
+-		stream->public.timing.display_color_depth;
+-	pixel_clk_params->flags.DISPLAY_BLANKED = 1;
+-}
+-
+-static enum dc_status build_pipe_hw_param(struct pipe_ctx *pipe_ctx)
+-{
+-	get_pixel_clock_parameters(pipe_ctx, &pipe_ctx->pix_clk_params);
+-	pipe_ctx->clock_source->funcs->get_pix_clk_dividers(
+-		pipe_ctx->clock_source,
+-		&pipe_ctx->pix_clk_params,
+-		&pipe_ctx->pll_settings);
+-
+-	return DC_OK;
+-}
+-
+ static enum dc_status validate_mapped_resource(
+ 		const struct core_dc *dc,
+ 		struct validate_context *context)
+@@ -682,7 +659,7 @@ static enum dc_status validate_mapped_resource(
+ 						pipe_ctx->tg, &stream->public.timing))
+ 					return DC_FAIL_CONTROLLER_VALIDATE;
+ 
+-				status = build_pipe_hw_param(pipe_ctx);
++				status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+ 				if (status != DC_OK)
+ 					return status;
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_opp.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_opp.c
+index 9a3f674..3c2358a 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_opp.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_opp.c
+@@ -78,16 +78,13 @@ static const struct dce80_opp_reg_offsets reg_offsets[] = {
+ 
+ static struct opp_funcs funcs = {
+ 		.opp_power_on_regamma_lut = dce80_opp_power_on_regamma_lut,
+-		.opp_program_bit_depth_reduction =
+-				dce80_opp_program_bit_depth_reduction,
+-		.opp_program_clamping_and_pixel_encoding =
+-				dce80_opp_program_clamping_and_pixel_encoding,
+ 		.opp_set_csc_adjustment = dce80_opp_set_csc_adjustment,
+ 		.opp_set_csc_default = dce80_opp_set_csc_default,
+ 		.opp_set_dyn_expansion = dce80_opp_set_dyn_expansion,
+ 		.opp_program_regamma_pwl = dce80_opp_program_regamma_pwl,
+ 		.opp_set_regamma_mode = dce80_opp_set_regamma_mode,
+ 		.opp_destroy = dce80_opp_destroy,
++		.opp_program_fmt = dce110_opp_program_fmt,
+ };
+ 
+ /*****************************************/
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_opp.h b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_opp.h
+index a8a8813..6fe79872 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_opp.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_opp.h
+@@ -28,6 +28,7 @@
+ #include "dc_types.h"
+ #include "opp.h"
+ #include "gamma_types.h"
++#include "../dce110/dce110_opp.h"
+ 
+ struct gamma_parameters;
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+index 2de7aa0..a71aa14 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce80/dce80_resource.c
+@@ -534,35 +534,6 @@ void dce80_destruct_resource_pool(struct resource_pool *pool)
+ 	}
+ }
+ 
+-static void get_pixel_clock_parameters(
+-	const struct pipe_ctx *pipe_ctx,
+-	struct pixel_clk_params *pixel_clk_params)
+-{
+-	const struct core_stream *stream = pipe_ctx->stream;
+-	pixel_clk_params->requested_pix_clk = stream->public.timing.pix_clk_khz;
+-	pixel_clk_params->encoder_object_id = stream->sink->link->link_enc->id;
+-	pixel_clk_params->signal_type = stream->sink->public.sink_signal;
+-	pixel_clk_params->controller_id = pipe_ctx->pipe_idx + 1;
+-	/* TODO: un-hardcode*/
+-	pixel_clk_params->requested_sym_clk = LINK_RATE_LOW *
+-		LINK_RATE_REF_FREQ_IN_KHZ;
+-	pixel_clk_params->flags.ENABLE_SS = 0;
+-	pixel_clk_params->color_depth =
+-		stream->public.timing.display_color_depth;
+-	pixel_clk_params->flags.DISPLAY_BLANKED = 1;
+-}
+-
+-static enum dc_status build_pipe_hw_param(struct pipe_ctx *pipe_ctx)
+-{
+-	get_pixel_clock_parameters(pipe_ctx, &pipe_ctx->pix_clk_params);
+-	pipe_ctx->clock_source->funcs->get_pix_clk_dividers(
+-		pipe_ctx->clock_source,
+-		&pipe_ctx->pix_clk_params,
+-		&pipe_ctx->pll_settings);
+-
+-	return DC_OK;
+-}
+-
+ static enum dc_status validate_mapped_resource(
+ 		const struct core_dc *dc,
+ 		struct validate_context *context)
+@@ -592,7 +563,7 @@ static enum dc_status validate_mapped_resource(
+ 						pipe_ctx->tg, &stream->public.timing))
+ 					return DC_FAIL_CONTROLLER_VALIDATE;
+ 
+-				status = build_pipe_hw_param(pipe_ctx);
++				status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+ 				if (status != DC_OK)
+ 					return status;
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/clock_source.h b/drivers/gpu/drm/amd/dal/dc/inc/clock_source.h
+index 0120ee2..57743cc 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/clock_source.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/clock_source.h
+@@ -58,6 +58,7 @@ struct pixel_clk_flags {
+ 	uint32_t DISPLAY_BLANKED:1;
+ 	uint32_t PROGRAM_PIXEL_CLOCK:1;
+ 	uint32_t PROGRAM_ID_CLOCK:1;
++	uint32_t SUPPORT_YCBCR420:1;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw/opp.h b/drivers/gpu/drm/amd/dal/dc/inc/hw/opp.h
+index 3410357..b7dc40b9 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw/opp.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw/opp.h
+@@ -288,13 +288,11 @@ struct opp_funcs {
+ 		const struct default_adjustment *default_adjust);
+ 
+ 	/* FORMATTER RELATED */
+-	void (*opp_program_bit_depth_reduction)(
+-		struct output_pixel_processor *opp,
+-		const struct bit_depth_reduction_params *params);
+ 
+-	void (*opp_program_clamping_and_pixel_encoding)(
+-		struct output_pixel_processor *opp,
+-		const struct clamping_and_pixel_encoding_params *params);
++	void (*opp_program_fmt)(
++			struct output_pixel_processor *opp,
++			struct bit_depth_reduction_params *fmt_bit_depth,
++			struct clamping_and_pixel_encoding_params *clamping);
+ 
+ 	void (*opp_set_dyn_expansion)(
+ 		struct output_pixel_processor *opp,
+-- 
+2.7.4
+

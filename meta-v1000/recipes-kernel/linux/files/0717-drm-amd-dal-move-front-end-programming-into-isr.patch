@@ -1,0 +1,150 @@
+From cc51ada38a273eac89ee95af3e52e90d66f57f79 Mon Sep 17 00:00:00 2001
+From: Eric Yang <eric.yang2@amd.com>
+Date: Wed, 3 Aug 2016 11:52:19 -0400
+Subject: [PATCH 0717/1722] drm/amd/dal: move front end programming into isr
+
+Move all front end programming except gamma watermark and power on
+into isr
+
+Signed-off-by: Eric Yang <eric.yang2@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc.c               |  8 +++-
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 43 +++++++++++++---------
+ 2 files changed, 32 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc.c b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+index 879409b..a48bb57 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc.c
+@@ -913,6 +913,7 @@ struct validate_context *dc_pre_commit_surfaces_to_target(
+ 	struct dc_target_status *target_status = NULL;
+ 	struct validate_context *context;
+ 	struct validate_context *temp_context;
++	bool bw_increased = false;
+ 
+ 	int current_enabled_surface_count = 0;
+ 	int new_enabled_surface_count = 0;
+@@ -1002,6 +1003,7 @@ struct validate_context *dc_pre_commit_surfaces_to_target(
+ 		pplib_apply_display_requirements(core_dc, context,
+                                                 &context->pp_display_cfg);
+                 core_dc->hwss.set_display_clock(context);
++                bw_increased = true;
+ 	}
+ 
+ 	if (current_enabled_surface_count > 0 && new_enabled_surface_count == 0)
+@@ -1009,9 +1011,11 @@ struct validate_context *dc_pre_commit_surfaces_to_target(
+ 				&core_dc->current_context->res_ctx);
+ 
+         core_dc->hwss.apply_ctx_to_surface_locked(core_dc, context);
+- 
+         context->locked = true;
+-
++ 
++        if (bw_increased)
++                core_dc->current_context->bw_results = context->bw_results;
++ 
+         return context;
+  
+ unexpected_fail:
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index e4c795ec..4907d58 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -1618,10 +1618,8 @@ static void set_plane_config(
+ 
+ 	pipe_ctx->xfm->funcs->transform_set_gamut_remap(pipe_ctx->xfm, &adjust);
+ 
+-	if (!old_pipe || memcmp(&old_pipe->scl_data,
+-				&pipe_ctx->scl_data,
+-				sizeof(struct scaler_data)) != 0)
+-		program_scaler(dc, pipe_ctx);
++
++	program_scaler(dc, pipe_ctx);
+ 
+ 	program_blender_if_needed(dc, pipe_ctx);
+ 
+@@ -1923,7 +1921,6 @@ static void dce110_program_front_end_for_pipe(struct core_dc *dc,
+ 		struct pipe_ctx *pipe_ctx,
+ 		struct validate_context *context)
+ {
+-	struct core_gamma *gamma = NULL;
+ 	struct mem_input *mi = pipe_ctx->mi;
+ 	struct pipe_ctx *old_pipe = NULL;
+ 	struct dc_context *ctx = pipe_ctx->stream->ctx;
+@@ -1936,8 +1933,6 @@ static void dce110_program_front_end_for_pipe(struct core_dc *dc,
+ 		PIPE_LOCK_CONTROL_BLENDER |
+ 		PIPE_LOCK_CONTROL_MODE;
+ 
+-	dc->hwss.increase_watermarks_for_pipe(dc, pipe_ctx, context);
+-
+ 	if (!pipe_ctx->surface->public.flip_immediate)
+ 		lock_mask |= PIPE_LOCK_CONTROL_SURFACE;
+ 
+@@ -2015,15 +2010,6 @@ static void dce110_program_front_end_for_pipe(struct core_dc *dc,
+ 
+ 	dc->hwss.update_plane_addr(dc, pipe_ctx);
+ 
+-	if (pipe_ctx->surface->public.gamma_correction)
+-		gamma = DC_GAMMA_TO_CORE(
+-			pipe_ctx->surface->public.gamma_correction);
+-
+-	dc->hwss.set_gamma_correction(
+-			pipe_ctx->ipp,
+-			pipe_ctx->opp,
+-			gamma, pipe_ctx->surface);
+-
+ 	dal_logger_write(dc->ctx->logger,
+ 			LOG_MAJOR_INTERFACE_TRACE,
+ 			LOG_MINOR_COMPONENT_SURFACE,
+@@ -2066,6 +2052,26 @@ static void dce110_program_front_end_for_pipe(struct core_dc *dc,
+ 			pipe_ctx->scl_data.recout.y);
+ }
+ 
++
++
++static void dce110_prepare_pipe_for_surface_commit(
++		struct core_dc *dc,
++		struct pipe_ctx *pipe_ctx,
++		struct validate_context *context) {
++	struct core_gamma *gamma = NULL;
++
++	dc->hwss.increase_watermarks_for_pipe(dc, pipe_ctx, context);
++
++	if (pipe_ctx->surface->public.gamma_correction)
++		gamma = DC_GAMMA_TO_CORE(
++			pipe_ctx->surface->public.gamma_correction);
++
++	dc->hwss.set_gamma_correction(
++			pipe_ctx->ipp,
++			pipe_ctx->opp,
++			gamma, pipe_ctx->surface);
++}
++
+ static enum dc_status apply_ctx_to_surface_locked(
+ 		struct core_dc *dc,
+ 		struct validate_context *context)
+@@ -2082,7 +2088,7 @@ static enum dc_status apply_ctx_to_surface_locked(
+ 				dce110_power_on_pipe_if_needed);
+ 
+ 		hw_sequencer_program_pipe_tree(dc, context, head_pipe,
+-				dce110_program_front_end_for_pipe);
++				dce110_prepare_pipe_for_surface_commit);
+ 
+ 	}
+ 
+@@ -2103,6 +2109,9 @@ static enum dc_status apply_ctx_to_surface_unlock(
+ 			continue;
+ 
+ 		hw_sequencer_program_pipe_tree(dc, context, head_pipe,
++				dce110_program_front_end_for_pipe);
++
++		hw_sequencer_program_pipe_tree(dc, context, head_pipe,
+ 				dce110_program_blending);
+ 	}
+ 
+-- 
+2.7.4
+

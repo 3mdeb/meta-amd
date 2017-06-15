@@ -1,0 +1,410 @@
+From e9a75b0ee33de116f6a38ab7b9300c55b4005010 Mon Sep 17 00:00:00 2001
+From: Yongqiang Sun <yongqiang.sun@amd.com>
+Date: Thu, 7 Jul 2016 10:15:50 -0400
+Subject: [PATCH 0609/1722] drm/amd/dal: Refactor color space to black color
+ processing.
+
+Signed-off-by: Yongqiang Sun <yongqiang.sun@amd.com>
+
+Change-Id: Iad76d68404ebcc3f1aa13c2ddf5db58d9d43b483
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/core/dc_hw_sequencer.c  | 55 +++++++++++++++++++
+ .../drm/amd/dal/dc/dce110/dce110_hw_sequencer.c    | 55 +++++--------------
+ .../amd/dal/dc/dce110/dce110_timing_generator.c    | 64 ++--------------------
+ .../amd/dal/dc/dce110/dce110_timing_generator.h    |  2 +-
+ .../amd/dal/dc/dce110/dce110_timing_generator_v.c  | 13 ++---
+ .../gpu/drm/amd/dal/dc/inc/hw/timing_generator.h   |  2 +-
+ drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h      |  4 ++
+ 7 files changed, 82 insertions(+), 113 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/core/dc_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/core/dc_hw_sequencer.c
+index 57ff87a..afc5b44 100644
+--- a/drivers/gpu/drm/amd/dal/dc/core/dc_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/core/dc_hw_sequencer.c
+@@ -26,8 +26,32 @@
+ #include "dm_services.h"
+ #include "core_types.h"
+ #include "core_dc.h"
++#include "timing_generator.h"
+ #include "hw_sequencer.h"
+ 
++/* used as index in array of black_color_format */
++enum black_color_format {
++	BLACK_COLOR_FORMAT_RGB_FULLRANGE = 0,
++	BLACK_COLOR_FORMAT_RGB_LIMITED,
++	BLACK_COLOR_FORMAT_YUV_TV,
++	BLACK_COLOR_FORMAT_YUV_CV,
++	BLACK_COLOR_FORMAT_YUV_SUPER_AA,
++
++	BLACK_COLOR_FORMAT_COUNT
++};
++
++static const struct tg_color black_color_format[] = {
++	/* BlackColorFormat_RGB_FullRange */
++	{0, 0, 0},
++	/* BlackColorFormat_RGB_Limited */
++	{0x40, 0x40, 0x40},
++	/* BlackColorFormat_YUV_TV */
++	{0x200, 0x40, 0x200},
++	/* BlackColorFormat_YUV_CV */
++	{0x1f4, 0x40, 0x1f4},
++	/* BlackColorFormat_YUV_SuperAA */
++	{0x1a2, 0x20, 0x1a2},
++};
+ 
+ bool front_end_need_program(struct pipe_ctx *old_pipe, struct pipe_ctx *new_pipe)
+ {
+@@ -59,3 +83,34 @@ void hw_sequencer_program_pipe_tree(
+ 		pipe_ctx_cur = pipe_ctx_cur->bottom_pipe;
+ 	} while (pipe_ctx_cur != NULL);
+ }
++
++void color_space_to_black_color(
++		enum dc_color_space colorspace,
++	struct tg_color *black_color)
++{
++	switch (colorspace) {
++	case COLOR_SPACE_YPBPR601:
++		*black_color = black_color_format[BLACK_COLOR_FORMAT_YUV_TV];
++		break;
++
++	case COLOR_SPACE_YPBPR709:
++	case COLOR_SPACE_YCBCR601:
++	case COLOR_SPACE_YCBCR709:
++	case COLOR_SPACE_YCBCR601_LIMITED:
++	case COLOR_SPACE_YCBCR709_LIMITED:
++		*black_color = black_color_format[BLACK_COLOR_FORMAT_YUV_CV];
++		break;
++
++	case COLOR_SPACE_SRGB_LIMITED:
++		*black_color =
++			black_color_format[BLACK_COLOR_FORMAT_RGB_LIMITED];
++		break;
++
++	default:
++		/* fefault is sRGB black (full range). */
++		*black_color =
++			black_color_format[BLACK_COLOR_FORMAT_RGB_FULLRANGE];
++		/* default is sRGB black 0. */
++		break;
++	}
++}
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+index 84fe29e..0e8ebd0 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_hw_sequencer.c
+@@ -715,6 +715,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 	struct core_stream *stream = pipe_ctx->stream;
+ 	struct pipe_ctx *pipe_ctx_old = &dc->current_context->res_ctx.
+ 			pipe_ctx[pipe_ctx->pipe_idx];
++	struct tg_color black_color = {0};
+ 
+ 	if (!pipe_ctx_old->stream) {
+ 		/*
+@@ -796,9 +797,10 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 			true : false);
+ 
+ 	/* program blank color */
++	color_space_to_black_color(stream->public.output_color_space, &black_color);
+ 	pipe_ctx->tg->funcs->set_blank_color(
+ 			pipe_ctx->tg,
+-			stream->public.output_color_space);
++			&black_color);
+ 
+ 	if (!pipe_ctx_old->stream) {
+ 		core_link_enable_stream(pipe_ctx);
+@@ -1422,43 +1424,6 @@ static void set_default_colors(struct pipe_ctx *pipe_ctx)
+ 					pipe_ctx->opp, &default_adjust);
+ }
+ 
+-static void get_overscan_black_color(enum dc_color_space color_space, struct tg_color *color)
+-{
+-	/* Overscan Color for YUV display modes:
+-	 * to achieve a black color for both the explicit and implicit overscan,
+-	 * the overscan color registers should be programmed to: */
+-
+-	switch (color_space) {
+-	case COLOR_SPACE_YPBPR601:
+-		color->color_b_cb = 0x200; 	/* BLACK_COLOR_B_CB_YUV_4TV */
+-		color->color_g_y = 0x40; 	/* BLACK_COLOR_G_Y_YUV_4TV  */
+-		color->color_r_cr = 0x200; 	/* BLACK_COLOR_R_CR_YUV_4TV */
+-		break;
+-
+-	case COLOR_SPACE_YPBPR709:
+-	case COLOR_SPACE_YCBCR601:
+-	case COLOR_SPACE_YCBCR709:
+-	case COLOR_SPACE_YCBCR601_LIMITED:
+-	case COLOR_SPACE_YCBCR709_LIMITED:
+-		color->color_b_cb = 0x1f4;	/* BLACK_COLOR_B_CB_YUV_4CV */
+-		color->color_g_y = 0x40; 	/* BLACK_COLOR_G_Y_YUV_4TV  */
+-		color->color_r_cr = 0x1f4;	/* BLACK_COLOR_R_CR_YUV_4CV */
+-		break;
+-
+-	case COLOR_SPACE_SRGB_LIMITED:
+-		/* OVERSCAN COLOR FOR RGB LIMITED RANGE
+-		 * (16~253) 16*4 (Multiple over 256 code leve) =64 (0x40) */
+-		color->color_b_cb = 0x40;
+-		color->color_g_y = 0x40;
+-		color->color_r_cr = 0x40;
+-		break;
+-
+-	default:
+-		/* default is sRGB black 0. */
+-		break;
+-	}
+-}
+-
+ static void get_surface_visual_confirm_color(const struct pipe_ctx *pipe_ctx,
+ 		struct tg_color *color)
+ {
+@@ -1489,14 +1454,16 @@ static void get_surface_visual_confirm_color(const struct pipe_ctx *pipe_ctx,
+ 	}
+ }
+ 
+-static void program_scaler(const struct core_dc *dc, const struct pipe_ctx *pipe_ctx)
++static void program_scaler(const struct core_dc *dc,
++		const struct pipe_ctx *pipe_ctx)
+ {
+ 	struct tg_color color = {0};
+ 
+ 	if (dc->public.debug.surface_visual_confirm)
+ 		get_surface_visual_confirm_color(pipe_ctx, &color);
+ 	else
+-		get_overscan_black_color(pipe_ctx->stream->public.output_color_space, &color);
++		color_space_to_black_color(pipe_ctx->stream->public.output_color_space,
++									&color);
+ 
+ 	pipe_ctx->xfm->funcs->transform_set_pixel_storage_depth(
+ 		pipe_ctx->xfm,
+@@ -1507,7 +1474,8 @@ static void program_scaler(const struct core_dc *dc, const struct pipe_ctx *pipe
+ 		pipe_ctx->tg,
+ 		&color);
+ 
+-	pipe_ctx->xfm->funcs->transform_set_scaler(pipe_ctx->xfm, &pipe_ctx->scl_data);
++	pipe_ctx->xfm->funcs->transform_set_scaler(pipe_ctx->xfm,
++		&pipe_ctx->scl_data);
+ }
+ 
+ /**
+@@ -1783,6 +1751,7 @@ static void dce110_power_on_pipe_if_needed(
+ 	struct pipe_ctx *old_pipe_ctx = &dc->current_context->res_ctx.pipe_ctx[pipe_ctx->pipe_idx];
+ 	struct dc_bios *dcb = dal_adapter_service_get_bios_parser(
+ 					context->res_ctx.pool->adapter_srv);
++	struct tg_color black_color = {0};
+ 
+ 	if (!old_pipe_ctx->stream && pipe_ctx->stream) {
+ 		dc->hwss.enable_display_power_gating(
+@@ -1805,9 +1774,11 @@ static void dce110_power_on_pipe_if_needed(
+ 				pipe_ctx->stream->public.timing.pix_clk_khz,
+ 				context->target_count);
+ 
++		/* TODO unhardcode*/
++		color_space_to_black_color(COLOR_SPACE_YCBCR601, &black_color);
+ 		pipe_ctx->tg->funcs->set_blank_color(
+ 				pipe_ctx->tg,
+-				COLOR_SPACE_YCBCR601);/* TODO unhardcode*/
++				&black_color);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
+index 1beed55..8d4c5cf 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.c
+@@ -40,15 +40,6 @@
+ 
+ #include "timing_generator.h"
+ 
+-enum black_color_format {
+-	BLACK_COLOR_FORMAT_RGB_FULLRANGE = 0,	/* used as index in array */
+-	BLACK_COLOR_FORMAT_RGB_LIMITED,
+-	BLACK_COLOR_FORMAT_YUV_TV,
+-	BLACK_COLOR_FORMAT_YUV_CV,
+-	BLACK_COLOR_FORMAT_YUV_SUPER_AA,
+-
+-	BLACK_COLOR_FORMAT_COUNT
+-};
+ 
+ #define NUMBER_OF_FRAME_TO_WAIT_ON_TRIGGERED_RESET 10
+ 
+@@ -155,19 +146,6 @@ static const struct timing_generator_funcs dce110_tg_funcs = {
+ 
+ };
+ 
+-static const struct tg_color black_color_format[] = {
+-	/* BlackColorFormat_RGB_FullRange */
+-	{0, 0, 0},
+-	/* BlackColorFormat_RGB_Limited */
+-	{0x40, 0x40, 0x40},
+-	/* BlackColorFormat_YUV_TV */
+-	{0x200, 0x40, 0x200},
+-	/* BlackColorFormat_YUV_CV */
+-	{0x1f4, 0x40, 0x1f4},
+-	/* BlackColorFormat_YUV_SuperAA */
+-	{0x1a2, 0x20, 0x1a2},
+-};
+-
+ /**
+ * apply_front_porch_workaround
+ *
+@@ -187,35 +165,6 @@ static void dce110_timing_generator_apply_front_porch_workaround(
+ 	}
+ }
+ 
+-void dce110_timing_generator_color_space_to_black_color(
+-		enum dc_color_space colorspace,
+-	struct tg_color *black_color)
+-{
+-	switch (colorspace) {
+-	case COLOR_SPACE_YPBPR601:
+-		*black_color = black_color_format[BLACK_COLOR_FORMAT_YUV_TV];
+-		break;
+-
+-	case COLOR_SPACE_YPBPR709:
+-	case COLOR_SPACE_YCBCR601:
+-	case COLOR_SPACE_YCBCR709:
+-		*black_color = black_color_format[BLACK_COLOR_FORMAT_YUV_CV];
+-		break;
+-
+-	case COLOR_SPACE_SRGB_LIMITED:
+-		*black_color =
+-			black_color_format[BLACK_COLOR_FORMAT_RGB_LIMITED];
+-		break;
+-
+-	default:
+-		/* fefault is sRGB black (full range). */
+-		*black_color =
+-			black_color_format[BLACK_COLOR_FORMAT_RGB_FULLRANGE];
+-		/* default is sRGB black 0. */
+-		break;
+-	}
+-}
+-
+ /**
+  *****************************************************************************
+  *  Function: is_in_vertical_blank
+@@ -291,30 +240,25 @@ bool dce110_timing_generator_enable_crtc(struct timing_generator *tg)
+ 
+ void dce110_timing_generator_program_blank_color(
+ 		struct timing_generator *tg,
+-		enum dc_color_space color_space)
++		const struct tg_color *black_color)
+ {
+-	struct tg_color black_color;
+ 	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t addr = CRTC_REG(mmCRTC_BLACK_COLOR);
+ 	uint32_t value = dm_read_reg(tg->ctx, addr);
+ 
+-	dce110_timing_generator_color_space_to_black_color(
+-		color_space,
+-		&black_color);
+-
+ 	set_reg_field_value(
+ 		value,
+-		black_color.color_b_cb,
++		black_color->color_b_cb,
+ 		CRTC_BLACK_COLOR,
+ 		CRTC_BLACK_COLOR_B_CB);
+ 	set_reg_field_value(
+ 		value,
+-		black_color.color_g_y,
++		black_color->color_g_y,
+ 		CRTC_BLACK_COLOR,
+ 		CRTC_BLACK_COLOR_G_Y);
+ 	set_reg_field_value(
+ 		value,
+-		black_color.color_r_cr,
++		black_color->color_r_cr,
+ 		CRTC_BLACK_COLOR,
+ 		CRTC_BLACK_COLOR_R_CR);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+index c1cb75d..9bac222 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator.h
+@@ -145,7 +145,7 @@ void dce110_timing_generator_program_blanking(
+ /* Combine with below and move YUV/RGB color conversion to SW layer */
+ void dce110_timing_generator_program_blank_color(
+ 	struct timing_generator *tg,
+-	enum dc_color_space color_space);
++	const struct tg_color *black_color);
+ /* Combine with above and move YUV/RGB color conversion to SW layer */
+ void dce110_timing_generator_set_overscan_color_black(
+ 	struct timing_generator *tg,
+diff --git a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator_v.c b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator_v.c
+index 21ec085..b2661a0 100644
+--- a/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator_v.c
++++ b/drivers/gpu/drm/amd/dal/dc/dce110/dce110_timing_generator_v.c
+@@ -452,29 +452,24 @@ static void dce110_timing_generator_v_program_timing(struct timing_generator *tg
+ 
+ static void dce110_timing_generator_v_program_blank_color(
+ 		struct timing_generator *tg,
+-		enum dc_color_space color_space)
++		const struct tg_color *black_color)
+ {
+-	struct tg_color black_color;
+ 	uint32_t addr = mmCRTCV_BLACK_COLOR;
+ 	uint32_t value = dm_read_reg(tg->ctx, addr);
+ 
+-	dce110_timing_generator_color_space_to_black_color(
+-		color_space,
+-		&black_color);
+-
+ 	set_reg_field_value(
+ 		value,
+-		black_color.color_b_cb,
++		black_color->color_b_cb,
+ 		CRTCV_BLACK_COLOR,
+ 		CRTC_BLACK_COLOR_B_CB);
+ 	set_reg_field_value(
+ 		value,
+-		black_color.color_g_y,
++		black_color->color_g_y,
+ 		CRTCV_BLACK_COLOR,
+ 		CRTC_BLACK_COLOR_G_Y);
+ 	set_reg_field_value(
+ 		value,
+-		black_color.color_r_cr,
++		black_color->color_r_cr,
+ 		CRTCV_BLACK_COLOR,
+ 		CRTC_BLACK_COLOR_R_CR);
+ 
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h b/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h
+index f5f654a..894ba59 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw/timing_generator.h
+@@ -132,7 +132,7 @@ struct timing_generator_funcs {
+ 	bool (*set_blank)(struct timing_generator *tg,
+ 					   bool enable_blanking);
+ 	void (*set_overscan_blank_color) (struct timing_generator *tg, const struct tg_color *color);
+-	void (*set_blank_color)(struct timing_generator *tg, enum dc_color_space black_color);
++	void (*set_blank_color)(struct timing_generator *tg, const struct tg_color *color);
+ 	void (*set_colors)(struct timing_generator *tg,
+ 						const struct tg_color *blank_color,
+ 						const struct tg_color *overscan_color);
+diff --git a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+index ec55823..caf3664 100644
+--- a/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/dal/dc/inc/hw_sequencer.h
+@@ -26,6 +26,7 @@
+ #ifndef __DC_HW_SEQUENCER_H__
+ #define __DC_HW_SEQUENCER_H__
+ #include "core_types.h"
++#include "timing_generator.h"
+ 
+ struct gamma_parameters;
+ 
+@@ -148,5 +149,8 @@ void hw_sequencer_program_pipe_tree(
+ 			struct pipe_ctx *pipe_ctx,
+ 			struct validate_context *context));
+ 
++void color_space_to_black_color(
++		enum dc_color_space colorspace,
++	struct tg_color *black_color);
+ 
+ #endif /* __DC_HW_SEQUENCER_H__ */
+-- 
+2.7.4
+

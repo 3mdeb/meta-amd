@@ -1,0 +1,113 @@
+From 556077f9d159451132cf49ce46f04c1ec7d61024 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 30 Mar 2017 16:56:20 +0200
+Subject: [PATCH 2744/3082] drm/amdgpu: allow concurrent VM flushes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Enable concurrent VM flushes for Vega10.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Andres Rodriguez <andresx7@gmail.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 50 +++++++++++++++++++---------------
+ 1 file changed, 28 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index d6a6873..d0b6f20 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -462,10 +462,11 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 	}
+ 	kfree(fences);
+ 
+-	job->vm_needs_flush = true;
++	job->vm_needs_flush = false;
+ 	/* Check if we can use a VMID already assigned to this VM */
+ 	list_for_each_entry_reverse(id, &id_mgr->ids_lru, list) {
+ 		struct fence *flushed;
++		bool needs_flush = false;
+ 
+ 		/* Check all the prerequisites to using this VMID */
+ 		if (amdgpu_vm_had_gpu_reset(adev, id))
+@@ -477,16 +478,17 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 		if (job->vm_pd_addr != id->pd_gpu_addr)
+ 			continue;
+ 
+-		if (!id->last_flush)
+-			continue;
+-
+-		if (id->last_flush->context != fence_context &&
+-		    !fence_is_signaled(id->last_flush))
+-			continue;
++		if (!id->last_flush ||
++		    (id->last_flush->context != fence_context &&
++		     !fence_is_signaled(id->last_flush)))
++			needs_flush = true;
+ 
+ 		flushed  = id->flushed_updates;
+-		if (updates &&
+-		    (!flushed || fence_is_later(updates, flushed)))
++		if (updates && (!flushed || fence_is_later(updates, flushed)))
++			needs_flush = true;
++
++		/* Concurrent flushes are only possible starting with Vega10 */
++		if (adev->asic_type < CHIP_VEGA10 && needs_flush)
+ 			continue;
+ 
+ 		/* Good we can use this VMID. Remember this submission as
+@@ -496,14 +498,15 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 		if (r)
+ 			goto error;
+ 
+-		list_move_tail(&id->list, &id_mgr->ids_lru);
+-
+-		job->vm_id = id - id_mgr->ids;
+-		job->vm_needs_flush = false;
+-		trace_amdgpu_vm_grab_id(vm, ring->idx, job);
++		if (updates && (!flushed || fence_is_later(updates, flushed))) {
++			fence_put(id->flushed_updates);
++			id->flushed_updates = fence_get(updates);
++		}
+ 
+-		mutex_unlock(&id_mgr->lock);
+-		return 0;
++		if (needs_flush)
++			goto needs_flush;
++		else
++			goto no_flush_needed;
+ 
+ 	};
+ 
+@@ -515,17 +518,20 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 	if (r)
+ 		goto error;
+ 
+-	fence_put(id->last_flush);
+-	id->last_flush = NULL;
+-
++	id->pd_gpu_addr = job->vm_pd_addr;
+ 	fence_put(id->flushed_updates);
+ 	id->flushed_updates = fence_get(updates);
+-
+-	id->pd_gpu_addr = job->vm_pd_addr;
+ 	id->current_gpu_reset_count = atomic_read(&adev->gpu_reset_counter);
+-	list_move_tail(&id->list, &id_mgr->ids_lru);
+ 	atomic64_set(&id->owner, vm->client_id);
+ 
++needs_flush:
++	job->vm_needs_flush = true;
++	fence_put(id->last_flush);
++	id->last_flush = NULL;
++
++no_flush_needed:
++	list_move_tail(&id->list, &id_mgr->ids_lru);
++
+ 	job->vm_id = id - id_mgr->ids;
+ 	trace_amdgpu_vm_grab_id(vm, ring->idx, job);
+ 
+-- 
+2.7.4
+

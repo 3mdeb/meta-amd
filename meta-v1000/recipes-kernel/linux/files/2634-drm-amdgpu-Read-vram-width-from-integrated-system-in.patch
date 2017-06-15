@@ -1,0 +1,294 @@
+From 44fcb8b81a912700a5df6d4f5d800a95bd1df612 Mon Sep 17 00:00:00 2001
+From: Harry Wentland <harry.wentland@amd.com>
+Date: Fri, 31 Mar 2017 20:14:33 -0400
+Subject: [PATCH 2634/3082] drm/amdgpu: Read vram width from integrated system
+ info table
+
+On KB, KV, CZ we should read the vram width from integrated system
+table, if we can. The NOOFCHAN in MC_SHARED_CHMAP is not accurate.
+
+With this change we can enable two 4k displays on CZ again. This use
+case was broken sometime in January when we started looking at
+vram_width for bandwidth calculations instead of hardcoding this value.
+
+v2:
+  Return 0 if integrated system info table is not available.
+
+Tested-by: Roman Li <roman.li@amd.com>
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c | 29 ++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.h |  2 +
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c        | 87 +++++++++++++++-------------
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c        | 87 +++++++++++++++-------------
+ 4 files changed, 123 insertions(+), 82 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
+index f52b1bf..ad43299 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
+@@ -754,6 +754,35 @@ union igp_info {
+ 	struct _ATOM_INTEGRATED_SYSTEM_INFO_V1_9 info_9;
+ };
+ 
++/*
++ * Return vram width from integrated system info table, if available,
++ * or 0 if not.
++ */
++int amdgpu_atombios_get_vram_width(struct amdgpu_device *adev)
++{
++	struct amdgpu_mode_info *mode_info = &adev->mode_info;
++	int index = GetIndexIntoMasterTable(DATA, IntegratedSystemInfo);
++	u16 data_offset, size;
++	union igp_info *igp_info;
++	u8 frev, crev;
++
++	/* get any igp specific overrides */
++	if (amdgpu_atom_parse_data_header(mode_info->atom_context, index, &size,
++				   &frev, &crev, &data_offset)) {
++		igp_info = (union igp_info *)
++			(mode_info->atom_context->bios + data_offset);
++		switch (crev) {
++		case 8:
++		case 9:
++			return igp_info->info_8.ucUMAChannelNumber * 64;
++		default:
++			return 0;
++		}
++	}
++
++	return 0;
++}
++
+ static void amdgpu_atombios_get_igp_ss_overrides(struct amdgpu_device *adev,
+ 						 struct amdgpu_atom_ss *ss,
+ 						 int id)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.h
+index 4e0f488..38d0fe3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.h
+@@ -148,6 +148,8 @@ int amdgpu_atombios_get_clock_info(struct amdgpu_device *adev);
+ 
+ int amdgpu_atombios_get_gfx_info(struct amdgpu_device *adev);
+ 
++int amdgpu_atombios_get_vram_width(struct amdgpu_device *adev);
++
+ bool amdgpu_atombios_get_asic_ss_info(struct amdgpu_device *adev,
+ 				      struct amdgpu_atom_ss *ss,
+ 				      int id, u32 clock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index 0c0a601..78643a1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -37,6 +37,8 @@
+ #include "oss/oss_2_0_d.h"
+ #include "oss/oss_2_0_sh_mask.h"
+ 
++#include "amdgpu_atombios.h"
++
+ static void gmc_v7_0_set_gart_funcs(struct amdgpu_device *adev);
+ static void gmc_v7_0_set_irq_funcs(struct amdgpu_device *adev);
+ static int gmc_v7_0_wait_for_idle(void *handle);
+@@ -325,48 +327,51 @@ static void gmc_v7_0_mc_program(struct amdgpu_device *adev)
+  */
+ static int gmc_v7_0_mc_init(struct amdgpu_device *adev)
+ {
+-	u32 tmp;
+-	int chansize, numchan;
+-
+-	/* Get VRAM informations */
+-	tmp = RREG32(mmMC_ARB_RAMCFG);
+-	if (REG_GET_FIELD(tmp, MC_ARB_RAMCFG, CHANSIZE)) {
+-		chansize = 64;
+-	} else {
+-		chansize = 32;
+-	}
+-	tmp = RREG32(mmMC_SHARED_CHMAP);
+-	switch (REG_GET_FIELD(tmp, MC_SHARED_CHMAP, NOOFCHAN)) {
+-	case 0:
+-	default:
+-		numchan = 1;
+-		break;
+-	case 1:
+-		numchan = 2;
+-		break;
+-	case 2:
+-		numchan = 4;
+-		break;
+-	case 3:
+-		numchan = 8;
+-		break;
+-	case 4:
+-		numchan = 3;
+-		break;
+-	case 5:
+-		numchan = 6;
+-		break;
+-	case 6:
+-		numchan = 10;
+-		break;
+-	case 7:
+-		numchan = 12;
+-		break;
+-	case 8:
+-		numchan = 16;
+-		break;
++	adev->mc.vram_width = amdgpu_atombios_get_vram_width(adev);
++	if (!adev->mc.vram_width) {
++		u32 tmp;
++		int chansize, numchan;
++
++		/* Get VRAM informations */
++		tmp = RREG32(mmMC_ARB_RAMCFG);
++		if (REG_GET_FIELD(tmp, MC_ARB_RAMCFG, CHANSIZE)) {
++			chansize = 64;
++		} else {
++			chansize = 32;
++		}
++		tmp = RREG32(mmMC_SHARED_CHMAP);
++		switch (REG_GET_FIELD(tmp, MC_SHARED_CHMAP, NOOFCHAN)) {
++		case 0:
++		default:
++			numchan = 1;
++			break;
++		case 1:
++			numchan = 2;
++			break;
++		case 2:
++			numchan = 4;
++			break;
++		case 3:
++			numchan = 8;
++			break;
++		case 4:
++			numchan = 3;
++			break;
++		case 5:
++			numchan = 6;
++			break;
++		case 6:
++			numchan = 10;
++			break;
++		case 7:
++			numchan = 12;
++			break;
++		case 8:
++			numchan = 16;
++			break;
++		}
++		adev->mc.vram_width = numchan * chansize;
+ 	}
+-	adev->mc.vram_width = numchan * chansize;
+ 	/* Could aper size report 0 ? */
+ 	adev->mc.aper_base = pci_resource_start(adev->pdev, 0);
+ 	adev->mc.aper_size = pci_resource_len(adev->pdev, 0);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index d19d1c5..42b2f35 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -38,6 +38,8 @@
+ #include "vid.h"
+ #include "vi.h"
+ 
++#include "amdgpu_atombios.h"
++
+ 
+ static void gmc_v8_0_set_gart_funcs(struct amdgpu_device *adev);
+ static void gmc_v8_0_set_irq_funcs(struct amdgpu_device *adev);
+@@ -487,48 +489,51 @@ static void gmc_v8_0_mc_program(struct amdgpu_device *adev)
+  */
+ static int gmc_v8_0_mc_init(struct amdgpu_device *adev)
+ {
+-	u32 tmp;
+-	int chansize, numchan;
+-
+-	/* Get VRAM informations */
+-	tmp = RREG32(mmMC_ARB_RAMCFG);
+-	if (REG_GET_FIELD(tmp, MC_ARB_RAMCFG, CHANSIZE)) {
+-		chansize = 64;
+-	} else {
+-		chansize = 32;
+-	}
+-	tmp = RREG32(mmMC_SHARED_CHMAP);
+-	switch (REG_GET_FIELD(tmp, MC_SHARED_CHMAP, NOOFCHAN)) {
+-	case 0:
+-	default:
+-		numchan = 1;
+-		break;
+-	case 1:
+-		numchan = 2;
+-		break;
+-	case 2:
+-		numchan = 4;
+-		break;
+-	case 3:
+-		numchan = 8;
+-		break;
+-	case 4:
+-		numchan = 3;
+-		break;
+-	case 5:
+-		numchan = 6;
+-		break;
+-	case 6:
+-		numchan = 10;
+-		break;
+-	case 7:
+-		numchan = 12;
+-		break;
+-	case 8:
+-		numchan = 16;
+-		break;
++	adev->mc.vram_width = amdgpu_atombios_get_vram_width(adev);
++	if (!adev->mc.vram_width) {
++		u32 tmp;
++		int chansize, numchan;
++
++		/* Get VRAM informations */
++		tmp = RREG32(mmMC_ARB_RAMCFG);
++		if (REG_GET_FIELD(tmp, MC_ARB_RAMCFG, CHANSIZE)) {
++			chansize = 64;
++		} else {
++			chansize = 32;
++		}
++		tmp = RREG32(mmMC_SHARED_CHMAP);
++		switch (REG_GET_FIELD(tmp, MC_SHARED_CHMAP, NOOFCHAN)) {
++		case 0:
++		default:
++			numchan = 1;
++			break;
++		case 1:
++			numchan = 2;
++			break;
++		case 2:
++			numchan = 4;
++			break;
++		case 3:
++			numchan = 8;
++			break;
++		case 4:
++			numchan = 3;
++			break;
++		case 5:
++			numchan = 6;
++			break;
++		case 6:
++			numchan = 10;
++			break;
++		case 7:
++			numchan = 12;
++			break;
++		case 8:
++			numchan = 16;
++			break;
++		}
++		adev->mc.vram_width = numchan * chansize;
+ 	}
+-	adev->mc.vram_width = numchan * chansize;
+ 	/* Could aper size report 0 ? */
+ 	adev->mc.aper_base = pci_resource_start(adev->pdev, 0);
+ 	adev->mc.aper_size = pci_resource_len(adev->pdev, 0);
+-- 
+2.7.4
+

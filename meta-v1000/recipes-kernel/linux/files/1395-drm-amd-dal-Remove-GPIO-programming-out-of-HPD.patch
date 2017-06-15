@@ -1,0 +1,216 @@
+From 59c9c27adcf5c6d16dc39c74e060ec4995f7b97f Mon Sep 17 00:00:00 2001
+From: Harry Wentland <harry.wentland@amd.com>
+Date: Wed, 19 Oct 2016 20:00:14 -0400
+Subject: [PATCH 1395/1722] drm/amd/dal: Remove GPIO programming out of HPD
+
+Change-Id: Id45898eeadc7c2e543ea0bab8492f72d84a451a4
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Kalyan Alle <kalyan.alle@amd.com>
+---
+ drivers/gpu/drm/amd/dal/dc/gpio/hw_gpio.c | 80 ++++++++++---------------------
+ drivers/gpu/drm/amd/dal/dc/gpio/hw_gpio.h |  7 ---
+ drivers/gpu/drm/amd/dal/dc/gpio/hw_hpd.c  | 29 -----------
+ 3 files changed, 26 insertions(+), 90 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/dal/dc/gpio/hw_gpio.c b/drivers/gpu/drm/amd/dal/dc/gpio/hw_gpio.c
+index 98c162f..1af5cb8 100644
+--- a/drivers/gpu/drm/amd/dal/dc/gpio/hw_gpio.c
++++ b/drivers/gpu/drm/amd/dal/dc/gpio/hw_gpio.c
+@@ -69,7 +69,7 @@ bool dal_hw_gpio_open(
+ 
+ 	store_registers(pin);
+ 
+-	ptr->opened = (pin->funcs->config_mode(pin, mode) == GPIO_RESULT_OK);
++	ptr->opened = (dal_hw_gpio_config_mode(pin, mode) == GPIO_RESULT_OK);
+ 
+ 	return ptr->opened;
+ }
+@@ -128,7 +128,7 @@ enum gpio_result dal_hw_gpio_change_mode(
+ {
+ 	struct hw_gpio *pin = FROM_HW_GPIO_PIN(ptr);
+ 
+-	return pin->funcs->config_mode(pin, mode);
++	return dal_hw_gpio_config_mode(pin, mode);
+ }
+ 
+ void dal_hw_gpio_close(
+@@ -142,70 +142,44 @@ void dal_hw_gpio_close(
+ 	ptr->opened = false;
+ }
+ 
+-static enum gpio_result config_mode_input(
+-	struct hw_gpio *gpio)
+-{
+-	/* turn off output enable, act as input pin;
+-	 * program the pin as GPIO, mask out signal driven by HW */
+-	REG_UPDATE(EN_reg, EN, 0);
+-	REG_UPDATE(MASK_reg, MASK, 1);
+-	return GPIO_RESULT_OK;
+-}
+-
+-static enum gpio_result config_mode_output(
+-	struct hw_gpio *gpio)
+-{
+-	/* turn on output enable, act as output pin;
+-	 * program the pin as GPIO, mask out signal driven by HW */
+-	REG_UPDATE(EN_reg, EN, 1);
+-	REG_UPDATE(MASK_reg, MASK, 1);
+-	return GPIO_RESULT_OK;
+-}
+-
+-static enum gpio_result config_mode_fast_output(
+-	struct hw_gpio *gpio)
+-{
+-	/* grounding the A register then use the EN register bit
+-	 * will have faster effect on the rise time */
+-	REG_UPDATE(A_reg, A, 0);
+-	REG_UPDATE(MASK_reg, MASK, 1);
+-	return GPIO_RESULT_OK;
+-}
+-
+-static enum gpio_result config_mode_hardware(
+-	struct hw_gpio *gpio)
+-{
+-	/* program the pin as tri-state, pin is driven by HW */
+-
+-	REG_UPDATE(MASK_reg, MASK, 0);
+-
+-	return GPIO_RESULT_OK;
+-}
+-
+ enum gpio_result dal_hw_gpio_config_mode(
+-	struct hw_gpio *pin,
++	struct hw_gpio *gpio,
+ 	enum gpio_mode mode)
+ {
+-	pin->base.mode = mode;
++	gpio->base.mode = mode;
+ 
+ 	switch (mode) {
+ 	case GPIO_MODE_INPUT:
+-		return config_mode_input(pin);
++		/* turn off output enable, act as input pin;
++		 * program the pin as GPIO, mask out signal driven by HW */
++		REG_UPDATE(EN_reg, EN, 0);
++		REG_UPDATE(MASK_reg, MASK, 1);
++		return GPIO_RESULT_OK;
+ 	case GPIO_MODE_OUTPUT:
+-		return config_mode_output(pin);
++		/* turn on output enable, act as output pin;
++		 * program the pin as GPIO, mask out signal driven by HW */
++		REG_UPDATE(A_reg, A, 0);
++		REG_UPDATE(MASK_reg, MASK, 1);
++		return GPIO_RESULT_OK;
+ 	case GPIO_MODE_FAST_OUTPUT:
+-		return config_mode_fast_output(pin);
++		/* grounding the A register then use the EN register bit
++		 * will have faster effect on the rise time */
++		REG_UPDATE(A_reg, A, 0);
++		REG_UPDATE(MASK_reg, MASK, 1);
++		return GPIO_RESULT_OK;
+ 	case GPIO_MODE_HARDWARE:
+-		return config_mode_hardware(pin);
++		/* program the pin as tri-state, pin is driven by HW */
++		REG_UPDATE(MASK_reg, MASK, 0);
++		return GPIO_RESULT_OK;
++	case GPIO_MODE_INTERRUPT:
++		/* Interrupt mode supported only by HPD (IrqGpio) pins. */
++		REG_UPDATE(MASK_reg, MASK, 0);
++		return GPIO_RESULT_OK;
+ 	default:
+ 		return GPIO_RESULT_NON_SPECIFIC_ERROR;
+ 	}
+ }
+ 
+-const struct hw_gpio_funcs func = {
+-	.config_mode = dal_hw_gpio_config_mode,
+-};
+-
+ bool dal_hw_gpio_construct(
+ 	struct hw_gpio *pin,
+ 	enum gpio_id id,
+@@ -218,8 +192,6 @@ bool dal_hw_gpio_construct(
+ 	pin->base.mode = GPIO_MODE_UNKNOWN;
+ 	pin->base.opened = false;
+ 
+-	pin->funcs = &func;
+-
+ 	pin->store.mask = 0;
+ 	pin->store.a = 0;
+ 	pin->store.en = 0;
+diff --git a/drivers/gpu/drm/amd/dal/dc/gpio/hw_gpio.h b/drivers/gpu/drm/amd/dal/dc/gpio/hw_gpio.h
+index 4f7445d..70e1561 100644
+--- a/drivers/gpu/drm/amd/dal/dc/gpio/hw_gpio.h
++++ b/drivers/gpu/drm/amd/dal/dc/gpio/hw_gpio.h
+@@ -68,12 +68,6 @@ struct hw_gpio_pin_funcs {
+ 
+ struct hw_gpio;
+ 
+-struct hw_gpio_funcs {
+-	enum gpio_result (*config_mode)(
+-		struct hw_gpio *pin,
+-		enum gpio_mode mode);
+-};
+-
+ /* Register indices are represented by member variables
+  * and are to be filled in by constructors of derived classes.
+  * These members permit the use of common code
+@@ -96,7 +90,6 @@ struct hw_gpio_mux_reg {
+ 
+ struct hw_gpio {
+ 	struct hw_gpio_pin base;
+-	const struct hw_gpio_funcs *funcs;
+ 
+ 	/* variables to save register value */
+ 	struct {
+diff --git a/drivers/gpu/drm/amd/dal/dc/gpio/hw_hpd.c b/drivers/gpu/drm/amd/dal/dc/gpio/hw_hpd.c
+index 77d2734..ed0f076 100644
+--- a/drivers/gpu/drm/amd/dal/dc/gpio/hw_hpd.c
++++ b/drivers/gpu/drm/amd/dal/dc/gpio/hw_hpd.c
+@@ -32,34 +32,6 @@
+ #include "reg_helper.h"
+ #include "gpio_regs.h"
+ 
+-#undef FN
+-#define FN(reg_name, field_name) \
+-	gpio->regs->field_name ## _shift, gpio->regs->field_name ## _mask
+-
+-#define CTX \
+-	gpio->base.ctx
+-#define REG(reg)\
+-	(gpio->regs->reg)
+-
+-static enum gpio_result config_mode(
+-	struct hw_gpio *gpio,
+-	enum gpio_mode mode)
+-{
+-	if (mode == GPIO_MODE_INTERRUPT) {
+-		/* Interrupt mode supported only by HPD (IrqGpio) pins. */
+-		gpio->base.mode = mode;
+-		REG_UPDATE(MASK_reg, MASK, 0);
+-		return GPIO_RESULT_OK;
+-	} else
+-		/* For any mode other than Interrupt,
+-		 * act as normal GPIO. */
+-		return dal_hw_gpio_config_mode(gpio, mode);
+-}
+-
+-const struct hw_gpio_funcs hw_hpd_func = {
+-	.config_mode = config_mode,
+-};
+-
+ bool dal_hw_hpd_construct(
+ 	struct hw_hpd *pin,
+ 	enum gpio_id id,
+@@ -68,7 +40,6 @@ bool dal_hw_hpd_construct(
+ {
+ 	if (!dal_hw_gpio_construct(&pin->base, id, en, ctx))
+ 		return false;
+-	pin->base.funcs = &hw_hpd_func;
+ 	return true;
+ }
+ 
+-- 
+2.7.4
+

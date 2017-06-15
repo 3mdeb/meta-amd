@@ -1,0 +1,114 @@
+From 297e6104f81dee4455d15c38ca720a234ce58bef Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 29 Mar 2017 13:41:57 +0200
+Subject: [PATCH 2654/3082] drm/amdgpu: use TTM_PL_FLAG_CONTIGUOUS v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implement AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS using TTM_PL_FLAG_CONTIGUOUS
+instead of a placement limit. That allows us to better handle CPU
+accessible placements.
+
+v2: prevent virtual BO start address from overflowing
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Michel Dänzer <michel.daenzer@amd.com>
+Reviewed-by: Nicolai Hähnle <nicolai.haehnle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c   | 11 +++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c | 17 +++++++++++++----
+ 2 files changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index d6b2de9..387d190 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -122,20 +122,19 @@ static void amdgpu_ttm_placement_init(struct amdgpu_device *adev,
+ 
+ 	if (domain & AMDGPU_GEM_DOMAIN_VRAM) {
+ 		unsigned visible_pfn = adev->mc.visible_vram_size >> PAGE_SHIFT;
+-		unsigned lpfn = 0;
+-
+-		/* This forces a reallocation if the flag wasn't set before */
+-		if (flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS)
+-			lpfn = adev->mc.real_vram_size >> PAGE_SHIFT;
+ 
+ 		places[c].fpfn = 0;
+-		places[c].lpfn = lpfn;
++		places[c].lpfn = 0;
+ 		places[c].flags = TTM_PL_FLAG_WC | TTM_PL_FLAG_UNCACHED |
+ 			TTM_PL_FLAG_VRAM;
++
+ 		if (flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)
+ 			places[c].lpfn = visible_pfn;
+ 		else
+ 			places[c].flags |= TTM_PL_FLAG_TOPDOWN;
++
++		if (flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS)
++			places[c].flags |= TTM_PL_FLAG_CONTIGUOUS;
+ 		c++;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
+index d710226..977195f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
+@@ -93,7 +93,6 @@ static int amdgpu_vram_mgr_new(struct ttm_mem_type_manager *man,
+ 			       const struct ttm_place *place,
+ 			       struct ttm_mem_reg *mem)
+ {
+-	struct amdgpu_bo *bo = container_of(tbo, struct amdgpu_bo, tbo);
+ 	struct amdgpu_vram_mgr *mgr = man->priv;
+ 	struct drm_mm *mm = &mgr->mm;
+ 	struct drm_mm_node *nodes;
+@@ -107,8 +106,8 @@ static int amdgpu_vram_mgr_new(struct ttm_mem_type_manager *man,
+ 	if (!lpfn)
+ 		lpfn = man->size;
+ 
+-	if (bo->flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS ||
+-	    place->lpfn || amdgpu_vram_page_split == -1) {
++	if (place->flags & TTM_PL_FLAG_CONTIGUOUS ||
++	    amdgpu_vram_page_split == -1) {
+ 		pages_per_node = ~0ul;
+ 		num_nodes = 1;
+ 	} else {
+@@ -126,12 +125,14 @@ static int amdgpu_vram_mgr_new(struct ttm_mem_type_manager *man,
+ 		aflags = DRM_MM_CREATE_TOP;
+ 	}
+ 
++	mem->start = 0;
+ 	pages_left = mem->num_pages;
+ 
+ 	spin_lock(&mgr->lock);
+ 	for (i = 0; i < num_nodes; ++i) {
+ 		unsigned long pages = min(pages_left, pages_per_node);
+ 		uint32_t alignment = mem->page_alignment;
++		unsigned long start;
+ 
+ 		if (pages == pages_per_node)
+ 			alignment = pages_per_node;
+@@ -145,11 +146,19 @@ static int amdgpu_vram_mgr_new(struct ttm_mem_type_manager *man,
+ 		if (unlikely(r))
+ 			goto error;
+ 
++		/* Calculate a virtual BO start address to easily check if
++		 * everything is CPU accessible.
++		 */
++		start = nodes[i].start + nodes[i].size;
++		if (start > mem->num_pages)
++			start -= mem->num_pages;
++		else
++			start = 0;
++		mem->start = max(mem->start, start);
+ 		pages_left -= pages;
+ 	}
+ 	spin_unlock(&mgr->lock);
+ 
+-	mem->start = num_nodes == 1 ? nodes[0].start : AMDGPU_BO_INVALID_OFFSET;
+ 	mem->mm_node = nodes;
+ 
+ 	return 0;
+-- 
+2.7.4
+
