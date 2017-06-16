@@ -1,11 +1,9 @@
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
-SRCREV_amd = "09460b8cf7ddac4abb46eb6439314b29954c76a6"
-LIC_FILES_CHKSUM_amd = "file://docs/license.html;md5=899fbe7e42d494c7c8c159c7001693d5"
-PV_amd = "12.0.3+git${SRCPV}"
+
 DEPENDS_append_amd = " libvdpau libomxil"
 
 PACKAGECONFIG[va] = "--enable-va,--disable-va,libva"
-PACKAGECONFIG_append_amd = " xvmc gallium r600 gallium-llvm xa"
+PACKAGECONFIG_append_amd = " xvmc gallium r600 gallium-llvm xa osmesa"
 PACKAGECONFIG_append_radeon = " va"
 PACKAGECONFIG_append_amdgpu = " va"
 PACKAGECONFIG_remove_amd = "dri3"
@@ -19,21 +17,14 @@ RDEPENDS_mesa-megadriver += "${@bb.utils.contains('PACKAGECONFIG', 'va', '${LIBV
 
 MESA_LLVM_RELEASE_amd = "3.9"
 
-SRC_URI_amd = "\
-			git://anongit.freedesktop.org/git/mesa/mesa;branch=12.0 \
+SRC_URI_append_amd = "\
 			file://0001-fix-building-with-flex-2.6.2.patch \
-			file://0001-reverse-the-patch-radeonsi-rework-clear_buffer-flags.patch \
-			file://0002-radeonsi-silence-runtime-warnings-with-LLVM-3.9.patch \
-			file://0003-st-mesa-Revert-patches-solves-perf-issues-with-mesa-.patch \
-			file://0004-st-mesa-fix-swizzle-issue-in-st_create_sampler_view_.patch \
-			file://0005-Revert-winsys-amdgpu-add-back-multithreaded-command-.patch \
 "
 
 EXTRA_OECONF_remove_amd = "--with-llvm-prefix=${STAGING_BINDIR_NATIVE}"
 
 EXTRA_OECONF_append_amd = " \
 		 --enable-vdpau \
-		 --enable-osmesa \
 		 --enable-glx \
 		 --enable-omx \
 		 --with-omx-libdir=${libdir}/bellagio \
@@ -72,8 +63,3 @@ python () {
     d.setVar("DRIDRIVERS", "swrast,radeon")
     d.setVar("GALLIUMDRIVERS", "swrast,r300,r600,radeonsi")
 }
-
-# We're using components like vdpau which depend
-# on nettle so lets just use it as the default for
-# crypto as well.
-MESA_CRYPTO ?= "nettle"
