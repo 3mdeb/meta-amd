@@ -46,7 +46,6 @@ SRC_URI = " \
      file://0020-WebServer-fix-misleading-cleanup-under-RemoveHandler.patch \
      file://0021-AMDTPowerProfileApi-fix-build-issues.patch \
      file://0022-GpuProfiling-disable-ignored-attributes-checks.patch \
-     file://0023-output-versioned-libs.patch \
      file://amdtPwrProf_mknod.sh \
      file://amdtPwrProf.rules \
      file://codexl_remote_agent.sh \
@@ -120,9 +119,6 @@ do_compile() {
     cd ${CWD}
 }
 
-SOLIB = ".so"
-SOLIBVER = "${SOLIB}.*"
-
 do_install() {
     install -d ${D}/home/root/.CodeXL/CodeXL
 
@@ -134,21 +130,21 @@ do_install() {
     install -m 755 ${S}/${OUTPUT_PREFIX}/CXLGraphicsServer ${D}${INSTALL_PREFIX}/
     install -m 755 ${S}/${OUTPUT_PREFIX}/CXLRemoteDebuggingServer ${D}${INSTALL_PREFIX}/
     install -m 755 ${S}/${OUTPUT_PREFIX}/CXLGraphicsServerPlayer ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libAMDOpenCLDebugAPI64*${SOLIB} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLAPIClasses${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLApiFunctions${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLBaseTools${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLGpuProfilerCLOccupancyAgent${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLGpuProfilerCLProfileAgent${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLGpuProfilerCLTraceAgent${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLGpuProfilerPreloadXInitThreads${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLOSAPIWrappers${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLOSWrappers${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLPowerProfileAPI${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLProcessDebugger${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLRemoteClient${SOLIBVER} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libGPUPerfAPICL${SOLIB} ${D}${INSTALL_PREFIX}/
-    install -m 755 ${S}/${OUTPUT_PREFIX}/libGPUPerfAPICounters${SOLIB} ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libAMDOpenCLDebugAPI64*.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLAPIClasses.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLApiFunctions.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLBaseTools.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLGpuProfilerCLOccupancyAgent.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLGpuProfilerCLProfileAgent.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLGpuProfilerCLTraceAgent.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLGpuProfilerPreloadXInitThreads.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLOSAPIWrappers.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLOSWrappers.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLPowerProfileAPI.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLProcessDebugger.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libCXLRemoteClient.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libGPUPerfAPICL.so ${D}${INSTALL_PREFIX}/
+    install -m 755 ${S}/${OUTPUT_PREFIX}/libGPUPerfAPICounters.so ${D}${INSTALL_PREFIX}/
     install -m 644 ${S}/${OUTPUT_PREFIX}/CodeXLRemoteAgentConfig.xml ${D}${INSTALL_PREFIX}/
     install -m 644 ${S}/${OUTPUT_PREFIX}/amdtPwrProf-5.10/amdtPwrProf.ko ${D}${INSTALL_PREFIX}/
 
@@ -170,13 +166,13 @@ do_install() {
     find ${S}${OUTPUT_PREFIX}/CXLActivityLogger/include/ -type f -exec install -m 644 {} ${D}${INSTALL_PREFIX}/CXLActivityLogger/include/ \;
 
     install -d ${D}${INSTALL_PREFIX}/CXLActivityLogger/bin/x86
-    find ${S}${OUTPUT_PREFIX}/CXLActivityLogger/bin/x86/ -type f -name *${SOLIBVER} -exec install -m 755 {} ${D}${INSTALL_PREFIX}/CXLActivityLogger/bin/x86/ \;
+    find ${S}${OUTPUT_PREFIX}/CXLActivityLogger/bin/x86/ -type f -exec install -m 755 {} ${D}${INSTALL_PREFIX}/CXLActivityLogger/bin/x86/ \;
 
     install -d ${D}${INSTALL_PREFIX}/CXLActivityLogger/bin/x86_64
-    find ${S}${OUTPUT_PREFIX}/CXLActivityLogger/bin/x86_64/ -type f -name *${SOLIBVER} -exec install -m 755 {} ${D}${INSTALL_PREFIX}/CXLActivityLogger/bin/x86_64/ \;
+    find ${S}${OUTPUT_PREFIX}/CXLActivityLogger/bin/x86_64/ -type f -exec install -m 755 {} ${D}${INSTALL_PREFIX}/CXLActivityLogger/bin/x86_64/ \;
 
     install -d ${D}${INSTALL_PREFIX}/Plugins
-    find ${S}${OUTPUT_PREFIX}/Plugins/ -type f -name *${SOLIBVER} -exec install -m 755 {} ${D}${INSTALL_PREFIX}/Plugins/ \;
+    find ${S}${OUTPUT_PREFIX}/Plugins/ -type f -name *.so -exec install -m 755 {} ${D}${INSTALL_PREFIX}/Plugins/ \;
     find ${S}${OUTPUT_PREFIX}/Plugins/ -type f -name *.json -exec install -m 755 {} ${D}${INSTALL_PREFIX}/Plugins/ \;
 
     install -d ${D}${INSTALL_PREFIX}/Legal/Public
@@ -214,21 +210,21 @@ FILES_${PN} += " \
     ${INSTALL_PREFIX}/CXLGraphicsServer \
     ${INSTALL_PREFIX}/CXLRemoteDebuggingServer \
     ${INSTALL_PREFIX}/CXLGraphicsServerPlayer \
-    ${INSTALL_PREFIX}/libAMDOpenCLDebugAPI64*${SOLIB} \
-    ${INSTALL_PREFIX}/libCXLAPIClasses${SOLIBVER} \
-    ${INSTALL_PREFIX}/libCXLApiFunctions${SOLIBVER} \
-    ${INSTALL_PREFIX}/libCXLBaseTools${SOLIBVER} \
-    ${INSTALL_PREFIX}/libCXLGpuProfilerCLOccupancyAgent${SOLIBVER} \
-    ${INSTALL_PREFIX}/libCXLGpuProfilerCLProfileAgent${SOLIBVER} \
-    ${INSTALL_PREFIX}/libCXLGpuProfilerCLTraceAgent${SOLIBVER} \
-    ${INSTALL_PREFIX}/libCXLGpuProfilerPreloadXInitThreads${SOLIBVER} \
-    ${INSTALL_PREFIX}/libCXLOSAPIWrappers${SOLIBVER} \
-    ${INSTALL_PREFIX}/libCXLOSWrappers${SOLIBVER} \
-    ${INSTALL_PREFIX}/libCXLPowerProfileAPI${SOLIBVER} \
-    ${INSTALL_PREFIX}/libCXLProcessDebugger${SOLIBVER} \
-    ${INSTALL_PREFIX}/libCXLRemoteClient${SOLIBVER} \
-    ${INSTALL_PREFIX}/libGPUPerfAPICL${SOLIB} \
-    ${INSTALL_PREFIX}/libGPUPerfAPICounters${SOLIB} \
+    ${INSTALL_PREFIX}/libAMDOpenCLDebugAPI64*.so \
+    ${INSTALL_PREFIX}/libCXLAPIClasses.so \
+    ${INSTALL_PREFIX}/libCXLApiFunctions.so \
+    ${INSTALL_PREFIX}/libCXLBaseTools.so \
+    ${INSTALL_PREFIX}/libCXLGpuProfilerCLOccupancyAgent.so \
+    ${INSTALL_PREFIX}/libCXLGpuProfilerCLProfileAgent.so \
+    ${INSTALL_PREFIX}/libCXLGpuProfilerCLTraceAgent.so \
+    ${INSTALL_PREFIX}/libCXLGpuProfilerPreloadXInitThreads.so \
+    ${INSTALL_PREFIX}/libCXLOSAPIWrappers.so \
+    ${INSTALL_PREFIX}/libCXLOSWrappers.so \
+    ${INSTALL_PREFIX}/libCXLPowerProfileAPI.so \
+    ${INSTALL_PREFIX}/libCXLProcessDebugger.so \
+    ${INSTALL_PREFIX}/libCXLRemoteClient.so \
+    ${INSTALL_PREFIX}/libGPUPerfAPICL.so \
+    ${INSTALL_PREFIX}/libGPUPerfAPICounters.so \
     ${INSTALL_PREFIX}/amdtPwrProf.ko \
     ${INSTALL_PREFIX}/amdtPwrProf_mknod.sh \
     ${sysconfdir}/udev/rules.d/amdtPwrProf.rules \
