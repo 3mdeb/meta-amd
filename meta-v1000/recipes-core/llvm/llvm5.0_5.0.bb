@@ -20,9 +20,10 @@ SRCREV = "24aaeeb480bf8d17697922f4e4b7648f26e80bae"
 PV = "5.0"
 PATCH_VERSION = "0"
 SRC_URI = "git://llvm.org/git/llvm.git;branch=master;protocol=http \
-	   file://0001-CrossCompile.cmake-adjust-build-for-OE.patch \
-	   file://0002-CrossCompile.cmake-use-target-BuildVariables-include.patch \
+           file://0001-CrossCompile.cmake-adjust-build-for-OE.patch \
+           file://0002-CrossCompile.cmake-use-target-BuildVariables-include.patch \
            file://0003-CMakeLists-don-t-use-a-version-suffix.patch \
+           file://0004-CrossCompile.cmake-strip-sysroot-info-from-build-var.patch \
 "
 S = "${WORKDIR}/git"
 
