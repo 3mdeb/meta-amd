@@ -1,0 +1,135 @@
+From 7e585eaeb9aa11174bd28b891729d87b1cfaa176 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <David1.Zhou@amd.com>
+Date: Thu, 11 May 2017 14:52:48 -0400
+Subject: [PATCH 1546/2094] drm/amdgpu: make pipeline sync be in same place v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+v2: directly return for 'if' case.
+
+Signed-off-by: Chunming Zhou <David1.Zhou@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c  |  6 +++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c |  1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c  | 32 +++++++++++++++++++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h  |  2 ++
+ 5 files changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 34cab88..0ac07b2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1140,7 +1140,6 @@ struct amdgpu_job {
+ 	void			*owner;
+ 	uint64_t		fence_ctx; /* the fence_context this job uses */
+ 	bool                    vm_needs_flush;
+-	bool			need_pipeline_sync;
+ 	unsigned		vm_id;
+ 	uint64_t		vm_pd_addr;
+ 	uint32_t		gds_base, gds_size;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 5938c20..025e03b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -121,7 +121,7 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	struct amdgpu_ib *ib = &ibs[0];
+-	struct fence *tmp;
++	struct fence *tmp = NULL;
+ 	bool skip_preamble, need_ctx_switch;
+ 	unsigned patch_offset = ~0;
+ 	struct amdgpu_vm *vm;
+@@ -163,8 +163,8 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 	}
+ 
+ 	if (ring->funcs->emit_pipeline_sync && job &&
+-	    (tmp = amdgpu_sync_get_fence(&job->sched_sync))) {
+-		job->need_pipeline_sync = true;
++	    ((tmp = amdgpu_sync_get_fence(&job->sched_sync)) ||
++	     amdgpu_vm_need_pipeline_sync(ring, job))) {
+ 		amdgpu_ring_emit_pipeline_sync(ring);
+ 		fence_put(tmp);
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index ee7c9de..4a5ffa5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -57,7 +57,6 @@ int amdgpu_job_alloc(struct amdgpu_device *adev, unsigned num_ibs,
+ 	(*job)->vm = vm;
+ 	(*job)->ibs = (void *)&(*job)[1];
+ 	(*job)->num_ibs = num_ibs;
+-	(*job)->need_pipeline_sync = false;
+ 
+ 	amdgpu_sync_create(&(*job)->sync);
+ 	amdgpu_sync_create(&(*job)->sched_sync);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 27b8e15..253dfa4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -694,6 +694,35 @@ static u64 amdgpu_vm_adjust_mc_addr(struct amdgpu_device *adev, u64 mc_addr)
+ 	return addr;
+ }
+ 
++bool amdgpu_vm_need_pipeline_sync(struct amdgpu_ring *ring,
++				  struct amdgpu_job *job)
++{
++	struct amdgpu_device *adev = ring->adev;
++	unsigned vmhub = ring->funcs->vmhub;
++	struct amdgpu_vm_id_manager *id_mgr = &adev->vm_manager.id_mgr[vmhub];
++	struct amdgpu_vm_id *id;
++	bool gds_switch_needed;
++	bool vm_flush_needed = job->vm_needs_flush ||
++		amdgpu_vm_ring_has_compute_vm_bug(ring);
++
++	if (job->vm_id == 0)
++		return false;
++	id = &id_mgr->ids[job->vm_id];
++	gds_switch_needed = ring->funcs->emit_gds_switch && (
++		id->gds_base != job->gds_base ||
++		id->gds_size != job->gds_size ||
++		id->gws_base != job->gws_base ||
++		id->gws_size != job->gws_size ||
++		id->oa_base != job->oa_base ||
++		id->oa_size != job->oa_size);
++
++	if (amdgpu_vm_had_gpu_reset(adev, id))
++		return true;
++	if (!vm_flush_needed && !gds_switch_needed)
++		return false;
++	return true;
++}
++
+ /**
+  * amdgpu_vm_flush - hardware flush the vm
+  *
+@@ -732,9 +761,6 @@ int amdgpu_vm_flush(struct amdgpu_ring *ring, struct amdgpu_job *job)
+ 	if (ring->funcs->init_cond_exec)
+ 		patch_offset = amdgpu_ring_init_cond_exec(ring);
+ 
+-	if (ring->funcs->emit_pipeline_sync && !job->need_pipeline_sync)
+-		amdgpu_ring_emit_pipeline_sync(ring);
+-
+ 	if (ring->funcs->emit_vm_flush && vm_flush_needed) {
+ 		u64 pd_addr = amdgpu_vm_adjust_mc_addr(adev, job->vm_pd_addr);
+ 		struct fence *fence;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index abc0bab..673d05c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -244,5 +244,7 @@ void amdgpu_vm_bo_rmv(struct amdgpu_device *adev,
+ 		      struct amdgpu_bo_va *bo_va);
+ void amdgpu_vm_adjust_size(struct amdgpu_device *adev, uint64_t vm_size);
+ int amdgpu_vm_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
++bool amdgpu_vm_need_pipeline_sync(struct amdgpu_ring *ring,
++				  struct amdgpu_job *job);
+ 
+ #endif
+-- 
+2.7.4
+

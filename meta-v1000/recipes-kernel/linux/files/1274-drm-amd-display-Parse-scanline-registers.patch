@@ -1,0 +1,329 @@
+From ca2547c5dc0fbe071694cf1140fb1c494030d47a Mon Sep 17 00:00:00 2001
+From: Sylvia Tsai <sylvia.tsai@amd.com>
+Date: Tue, 11 Apr 2017 15:15:28 -0400
+Subject: [PATCH 1274/2094] drm/amd/display: Parse scanline registers
+
+They could differ between ASIC generations
+
+Change-Id: Ia352ae206273fe3a025579554cae4e3711a26fcc
+Signed-off-by: Sylvia Tsai <sylvia.tsai@amd.com>
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c  | 15 +++++-
+ drivers/gpu/drm/amd/display/dc/core/dc_stream.c    | 21 ++++++---
+ drivers/gpu/drm/amd/display/dc/dc.h                |  7 ++-
+ .../display/dc/dce110/dce110_timing_generator.c    | 54 ++++++++++------------
+ .../display/dc/dce110/dce110_timing_generator.h    |  8 ++--
+ .../display/dc/dce120/dce120_timing_generator.c    | 42 ++++++++---------
+ .../drm/amd/display/dc/inc/hw/timing_generator.h   |  8 ++--
+ 7 files changed, 89 insertions(+), 66 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 222c3dc..acd4c67 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -109,6 +109,8 @@ static u32 dm_vblank_get_counter(struct amdgpu_device *adev, int crtc)
+ static int dm_crtc_get_scanoutpos(struct amdgpu_device *adev, int crtc,
+ 					u32 *vbl, u32 *position)
+ {
++	uint32_t v_blank_start, v_blank_end, h_position, v_position;
++
+ 	if ((crtc < 0) || (crtc >= adev->mode_info.num_crtc))
+ 		return -EINVAL;
+ 	else {
+@@ -119,7 +121,18 @@ static int dm_crtc_get_scanoutpos(struct amdgpu_device *adev, int crtc,
+ 			return 0;
+ 		}
+ 
+-		return dc_stream_get_scanoutpos(acrtc->stream, vbl, position);
++		/*
++		 * TODO rework base driver to use values directly.
++		 * for now parse it back into reg-format
++		 */
++		dc_stream_get_scanoutpos(acrtc->stream,
++					 &v_blank_start,
++					 &v_blank_end,
++					 &h_position,
++					 &v_position);
++
++		*position = (v_position) || (h_position << 16);
++		*vbl = (v_blank_start) || (v_blank_end << 16);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+index bf209f7..3dbd6c0 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+@@ -282,12 +282,14 @@ uint32_t dc_stream_get_vblank_counter(const struct dc_stream *dc_stream)
+ 	return 0;
+ }
+ 
+-uint32_t dc_stream_get_scanoutpos(
+-		const struct dc_stream *dc_stream,
+-		uint32_t *vbl,
+-		uint32_t *position)
++bool dc_stream_get_scanoutpos(const struct dc_stream *dc_stream,
++				  uint32_t *v_blank_start,
++				  uint32_t *v_blank_end,
++				  uint32_t *h_position,
++				  uint32_t *v_position)
+ {
+ 	uint8_t i;
++	bool ret = false;
+ 	struct core_stream *stream = DC_STREAM_TO_CORE(dc_stream);
+ 	struct core_dc *core_dc = DC_TO_CORE(stream->ctx->dc);
+ 	struct resource_context *res_ctx =
+@@ -299,10 +301,17 @@ uint32_t dc_stream_get_scanoutpos(
+ 		if (res_ctx->pipe_ctx[i].stream != stream)
+ 			continue;
+ 
+-		return tg->funcs->get_scanoutpos(tg, vbl, position);
++		tg->funcs->get_scanoutpos(tg,
++					  v_blank_start,
++					  v_blank_end,
++					  h_position,
++					  v_position);
++
++		ret = true;
++		break;
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 97af8f6..7d548b4 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -484,8 +484,11 @@ uint32_t dc_stream_get_vblank_counter(const struct dc_stream *stream);
+  * This has a dependency on the caller (amdgpu_get_crtc_scanoutpos)
+  * being refactored properly to be dce-specific
+  */
+-uint32_t dc_stream_get_scanoutpos(
+-		const struct dc_stream *stream, uint32_t *vbl, uint32_t *position);
++bool dc_stream_get_scanoutpos(const struct dc_stream *stream,
++				  uint32_t *v_blank_start,
++				  uint32_t *v_blank_end,
++				  uint32_t *h_position,
++				  uint32_t *v_position);
+ 
+ /*
+  * Structure to store surface/stream associations for validation
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
+index 006412b..7070aaf 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
+@@ -574,29 +574,26 @@ void dce110_timing_generator_get_crtc_positions(
+  *  @param [out] vpos, hpos
+  *****************************************************************************
+  */
+-uint32_t dce110_timing_generator_get_crtc_scanoutpos(
++void dce110_timing_generator_get_crtc_scanoutpos(
+ 	struct timing_generator *tg,
+-	uint32_t *vbl,
+-	uint32_t *position)
++	uint32_t *v_blank_start,
++	uint32_t *v_blank_end,
++	uint32_t *h_position,
++	uint32_t *v_position)
+ {
+ 	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+-	/* TODO 1: Update the implementation once caller is updated
+-	 * WARNING!! This function is returning the whole register value
+-	 * because the caller is expecting it instead of proper vertical and
+-	 * horizontal position. This should be a temporary implementation
+-	 * until the caller is updated. */
+ 
+-	/* TODO 2: re-use dce110_timing_generator_get_crtc_positions() */
+-
+-	*vbl = dm_read_reg(tg->ctx,
++	uint32_t v_blank_start_end  = dm_read_reg(tg->ctx,
+ 			CRTC_REG(mmCRTC_V_BLANK_START_END));
+ 
+-	*position = dm_read_reg(tg->ctx,
+-			CRTC_REG(mmCRTC_STATUS_POSITION));
++	*v_blank_start = get_reg_field_value(v_blank_start_end,
++					     CRTC_V_BLANK_START_END,
++					     CRTC_V_BLANK_START);
++	*v_blank_end = get_reg_field_value(v_blank_start_end,
++					   CRTC_V_BLANK_START_END,
++					   CRTC_V_BLANK_END);
+ 
+-	/* @TODO: return value should indicate if current
+-	 * crtc is inside vblank*/
+-	return 0;
++	dce110_timing_generator_get_crtc_positions(tg, h_position, v_position);
+ }
+ 
+ /* TODO: is it safe to assume that mask/shift of Primary and Underlay
+@@ -1875,34 +1872,31 @@ void dce110_tg_set_colors(struct timing_generator *tg,
+ bool dce110_arm_vert_intr(struct timing_generator *tg, uint8_t width)
+ {
+ 	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+-	uint32_t vbl = 0;
++	uint32_t v_blank_start = 0;
++	uint32_t v_blank_end = 0;
+ 	uint32_t val = 0;
+-	uint32_t position, vbl_start;
++	uint32_t h_position, v_position;
+ 
+ 	tg->funcs->get_scanoutpos(
+ 			tg,
+-			&vbl,
+-			&position);
++			&v_blank_start,
++			&v_blank_end,
++			&h_position,
++			&v_position);
+ 
+-	if (vbl == 0)
++	if (v_blank_start == 0 || v_blank_end == 0)
+ 		return false;
+ 
+-	vbl_start =
+-		get_reg_field_value(
+-		vbl,
+-		CRTC_V_BLANK_START_END,
+-		CRTC_V_BLANK_START);
+-
+ 	set_reg_field_value(
+ 		val,
+-		vbl_start,
++		v_blank_start,
+ 		CRTC_VERTICAL_INTERRUPT0_POSITION,
+ 		CRTC_VERTICAL_INTERRUPT0_LINE_START);
+ 
+-	/* Set interaval width for interrupt to fire to 1 scanline */
++	/* Set interval width for interrupt to fire to 1 scanline */
+ 	set_reg_field_value(
+ 		val,
+-		vbl_start + width,
++		v_blank_start + width,
+ 		CRTC_VERTICAL_INTERRUPT0_POSITION,
+ 		CRTC_VERTICAL_INTERRUPT0_LINE_END);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h
+index ca387b4..f14a4d9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h
+@@ -230,10 +230,12 @@ void dce110_timing_generator_set_static_screen_control(
+ 	struct timing_generator *tg,
+ 	uint32_t value);
+ 
+-uint32_t dce110_timing_generator_get_crtc_scanoutpos(
++void dce110_timing_generator_get_crtc_scanoutpos(
+ 	struct timing_generator *tg,
+-	uint32_t *vbl,
+-	uint32_t *position);
++	uint32_t *v_blank_start,
++	uint32_t *v_blank_end,
++	uint32_t *h_position,
++	uint32_t *v_position);
+ 
+ void dce110_timing_generator_enable_advanced_request(
+ 	struct timing_generator *tg,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c b/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c
+index 95cb176..1318df7 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c
++++ b/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c
+@@ -576,24 +576,28 @@ void dce120_timing_generator_set_drr(
+ 	}
+ }
+ 
+-uint32_t dce120_timing_generator_get_crtc_scanoutpos(
++void dce120_timing_generator_get_crtc_scanoutpos(
+ 	struct timing_generator *tg,
+-	uint32_t *vbl,
+-	uint32_t *position)
++	uint32_t *v_blank_start,
++	uint32_t *v_blank_end,
++	uint32_t *h_position,
++	uint32_t *v_position)
+ {
+ 	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+-	*vbl = dm_read_reg_soc15(
++	uint32_t v_blank_start_end = dm_read_reg_soc15(
+ 			tg->ctx,
+ 			mmCRTC0_CRTC_V_BLANK_START_END,
+ 			tg110->offsets.crtc);
+ 
+-	*position = dm_read_reg_soc15(
+-				tg->ctx,
+-				mmCRTC0_CRTC_STATUS_POSITION,
+-				tg110->offsets.crtc);
++	*v_blank_start = get_reg_field_value(v_blank_start_end,
++					     CRTC0_CRTC_V_BLANK_START_END,
++					     CRTC_V_BLANK_START);
++	*v_blank_end = get_reg_field_value(v_blank_start_end,
++					   CRTC0_CRTC_V_BLANK_START_END,
++					   CRTC_V_BLANK_END);
+ 
+-	return 0;
++	dce120_timing_generator_get_crtc_positions(tg, h_position, v_position);
+ }
+ 
+ void dce120_timing_generator_enable_advanced_request(
+@@ -1044,26 +1048,22 @@ static bool dce120_arm_vert_intr(
+ 		uint8_t width)
+ {
+ 	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+-	uint32_t vbl, position, vbl_start;
++	uint32_t v_blank_start, v_blank_end, h_position, v_position;
+ 
+ 	tg->funcs->get_scanoutpos(
+ 				tg,
+-				&vbl,
+-				&position);
++				&v_blank_start,
++				&v_blank_end,
++				&h_position,
++				&v_position);
+ 
+-	if (vbl == 0)
++	if (v_blank_start == 0 || v_blank_end == 0)
+ 		return false;
+ 
+-	vbl_start =
+-		get_reg_field_value(
+-		vbl,
+-		CRTC0_CRTC_V_BLANK_START_END,
+-		CRTC_V_BLANK_START);
+-
+ 	CRTC_REG_SET_2(
+ 			CRTC0_CRTC_VERTICAL_INTERRUPT0_POSITION,
+-			CRTC_VERTICAL_INTERRUPT0_LINE_START, vbl_start,
+-			CRTC_VERTICAL_INTERRUPT0_LINE_END, vbl_start + width);
++			CRTC_VERTICAL_INTERRUPT0_LINE_START, v_blank_start,
++			CRTC_VERTICAL_INTERRUPT0_LINE_END, v_blank_start + width);
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+index 51902a4..b3deaf2 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+@@ -120,10 +120,12 @@ struct timing_generator_funcs {
+ 								int32_t *h_position,
+ 								int32_t *v_position);
+ 	uint32_t (*get_frame_count)(struct timing_generator *tg);
+-	uint32_t (*get_scanoutpos)(
++	void (*get_scanoutpos)(
+ 		struct timing_generator *tg,
+-		uint32_t *vbl,
+-		uint32_t *position);
++		uint32_t *v_blank_start,
++		uint32_t *v_blank_end,
++		uint32_t *h_position,
++		uint32_t *v_position);
+ 	void (*set_early_control)(struct timing_generator *tg,
+ 							   uint32_t early_cntl);
+ 	void (*wait_for_state)(struct timing_generator *tg,
+-- 
+2.7.4
+

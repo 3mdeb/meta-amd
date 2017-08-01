@@ -1,0 +1,109 @@
+From c9b7b0f7f0678990e4ce07b8025e46b7a78eb3bb Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Wed, 25 Jan 2017 15:07:40 +0800
+Subject: [PATCH 0563/2094] drm/amdgpu:impl RREG32 no kiq version
+
+some registers are PF & VF copy, and we can safely use
+mmio method to access them.
+
+and sometime we are forbid to use kiq to access registers
+for example in INTR context.
+
+we need a MACRO that always disable KIQ for regs accessing
+
+Change-Id: Ie6dc323dc86829a4a6ceb7073c269b106b534c4a
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Xiangliang Yu <Xiangliang.Yu@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        | 21 ++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 12 ++++++------
+ 2 files changed, 20 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 402a895..74bffca8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1510,9 +1510,9 @@ void amdgpu_device_fini(struct amdgpu_device *adev);
+ int amdgpu_gpu_wait_for_idle(struct amdgpu_device *adev);
+ 
+ uint32_t amdgpu_mm_rreg(struct amdgpu_device *adev, uint32_t reg,
+-			bool always_indirect);
++			uint32_t acc_flags);
+ void amdgpu_mm_wreg(struct amdgpu_device *adev, uint32_t reg, uint32_t v,
+-		    bool always_indirect);
++		    uint32_t acc_flags);
+ u32 amdgpu_io_rreg(struct amdgpu_device *adev, u32 reg);
+ void amdgpu_io_wreg(struct amdgpu_device *adev, u32 reg, u32 v);
+ 
+@@ -1523,11 +1523,18 @@ bool amdgpu_device_has_dc_support(struct amdgpu_device *adev);
+ /*
+  * Registers read & write functions.
+  */
+-#define RREG32(reg) amdgpu_mm_rreg(adev, (reg), false)
+-#define RREG32_IDX(reg) amdgpu_mm_rreg(adev, (reg), true)
+-#define DREG32(reg) printk(KERN_INFO "REGISTER: " #reg " : 0x%08X\n", amdgpu_mm_rreg(adev, (reg), false))
+-#define WREG32(reg, v) amdgpu_mm_wreg(adev, (reg), (v), false)
+-#define WREG32_IDX(reg, v) amdgpu_mm_wreg(adev, (reg), (v), true)
++
++#define AMDGPU_REGS_IDX       (1<<0)
++#define AMDGPU_REGS_NO_KIQ    (1<<1)
++
++#define RREG32_NO_KIQ(reg) amdgpu_mm_rreg(adev, (reg), AMDGPU_REGS_NO_KIQ)
++#define WREG32_NO_KIQ(reg, v) amdgpu_mm_wreg(adev, (reg), (v), AMDGPU_REGS_NO_KIQ)
++
++#define RREG32(reg) amdgpu_mm_rreg(adev, (reg), 0)
++#define RREG32_IDX(reg) amdgpu_mm_rreg(adev, (reg), AMDGPU_REGS_IDX)
++#define DREG32(reg) printk(KERN_INFO "REGISTER: " #reg " : 0x%08X\n", amdgpu_mm_rreg(adev, (reg), 0))
++#define WREG32(reg, v) amdgpu_mm_wreg(adev, (reg), (v), 0)
++#define WREG32_IDX(reg, v) amdgpu_mm_wreg(adev, (reg), (v), AMDGPU_REGS_IDX)
+ #define REG_SET(FIELD, v) (((v) << FIELD##_SHIFT) & FIELD##_MASK)
+ #define REG_GET(FIELD, v) (((v) << FIELD##_SHIFT) & FIELD##_MASK)
+ #define RREG32_PCIE(reg) adev->pcie_rreg(adev, (reg))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 3534089..5215fc5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -91,16 +91,16 @@ bool amdgpu_device_is_px(struct drm_device *dev)
+  * MMIO register access helper functions.
+  */
+ uint32_t amdgpu_mm_rreg(struct amdgpu_device *adev, uint32_t reg,
+-			bool always_indirect)
++			uint32_t acc_flags)
+ {
+ 	uint32_t ret;
+ 
+-	if (amdgpu_sriov_runtime(adev)) {
++	if (!(acc_flags & AMDGPU_REGS_NO_KIQ) && amdgpu_sriov_runtime(adev)) {
+ 		BUG_ON(in_interrupt());
+ 		return amdgpu_virt_kiq_rreg(adev, reg);
+ 	}
+ 
+-	if ((reg * 4) < adev->rmmio_size && !always_indirect)
++	if ((reg * 4) < adev->rmmio_size && !(acc_flags & AMDGPU_REGS_IDX))
+ 		ret = readl(((void __iomem *)adev->rmmio) + (reg * 4));
+ 	else {
+ 		unsigned long flags;
+@@ -115,16 +115,16 @@ uint32_t amdgpu_mm_rreg(struct amdgpu_device *adev, uint32_t reg,
+ }
+ 
+ void amdgpu_mm_wreg(struct amdgpu_device *adev, uint32_t reg, uint32_t v,
+-		    bool always_indirect)
++		    uint32_t acc_flags)
+ {
+ 	trace_amdgpu_mm_wreg(adev->pdev->device, reg, v);
+ 
+-	if (amdgpu_sriov_runtime(adev)) {
++	if (!(acc_flags & AMDGPU_REGS_NO_KIQ) && amdgpu_sriov_runtime(adev)) {
+ 		BUG_ON(in_interrupt());
+ 		return amdgpu_virt_kiq_wreg(adev, reg, v);
+ 	}
+ 
+-	if ((reg * 4) < adev->rmmio_size && !always_indirect)
++	if ((reg * 4) < adev->rmmio_size && !(acc_flags & AMDGPU_REGS_IDX))
+ 		writel(v, ((void __iomem *)adev->rmmio) + (reg * 4));
+ 	else {
+ 		unsigned long flags;
+-- 
+2.7.4
+

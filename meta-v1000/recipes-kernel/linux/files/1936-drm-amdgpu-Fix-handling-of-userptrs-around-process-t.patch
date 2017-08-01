@@ -1,0 +1,326 @@
+From 31971789060e39d478c938b2c06b6778755b35ac Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Tue, 24 Jan 2017 20:41:45 -0500
+Subject: [PATCH 1936/2094] drm/amdgpu: Fix handling of userptrs around process
+ termination
+
+Delayed workers can update userptr BOs during or shortly after
+process termination. That means task_structs and mm_struct may
+be invalid when amdgpu_ttm_tt_get_user_pages is called.
+
+Instead of a task_struct pointer, store a struct pid reference and
+use it to get a safe task reference (or NULL if the process has
+already terminated). Return -ESRCH to indicate to the caller when
+process termination is detected.
+
+Increment the reference counter of the mm_struct while the restore
+delayed work is queued to ensure the mm_struct reference is valid
+until the worker is finished.
+
+Change-Id: I7c4c7745bc9da281f30ad02355f5c70de0a52823
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c       | 87 ++++++++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h       |  3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c |  6 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c           |  3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c          | 36 +++++++---
+ 5 files changed, 98 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index b177487..6d5b824 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -152,6 +152,43 @@ int amdgpu_amdkfd_resume(struct amdgpu_device *rdev)
+ 	return r;
+ }
+ 
++/* Cancel any scheduled restore work or wait for it to finish. Must be
++ * called with the mem->lock held. First drop the mm reference. If the
++ * worker has already started, it will detect that mm was dropped and
++ * cancel itself.
++ *
++ * If the worker has already started, it needs to take the
++ * mem->lock. To prevent deadlocks, we need to briefly drop the lock
++ * while waiting. During that time someone else may schedule another
++ * restore. So repeat the process if necessary.
++ *
++ * mmput needs to be called without holding the lock to prevent
++ * circular lock dependencies.
++ */
++static void cancel_restore_locked(struct kgd_mem *mem)
++{
++	struct mm_struct *mm;
++
++	while (mem->mm) {
++		mm = mem->mm;
++		mem->mm = NULL;
++
++		mutex_unlock(&mem->lock);
++
++		mmput(mm);
++		cancel_delayed_work_sync(&mem->work);
++
++		mutex_lock(&mem->lock);
++	}
++}
++
++void amdgpu_amdkfd_cancel_restore_mem(struct kgd_mem *mem)
++{
++	mutex_lock(&mem->lock);
++	cancel_restore_locked(mem);
++	mutex_unlock(&mem->lock);
++}
++
+ int amdgpu_amdkfd_evict_mem(struct amdgpu_device *adev, struct kgd_mem *mem,
+ 			    struct mm_struct *mm)
+ {
+@@ -162,11 +199,12 @@ int amdgpu_amdkfd_evict_mem(struct amdgpu_device *adev, struct kgd_mem *mem,
+ 
+ 	mutex_lock(&mem->lock);
+ 
+-	if (mem->evicted == 1 && delayed_work_pending(&mem->work))
+-		/* Cancelling a scheduled restoration */
+-		cancel_delayed_work(&mem->work);
+-
+ 	if (++mem->evicted > 1) {
++		/* Memory was already evicted. It may have been
++		 * scheduled for restoration, but that restoration
++		 * hasn't happened yet. When the worker starts it will
++		 * know and abort.
++		 */
+ 		mutex_unlock(&mem->lock);
+ 		return 0;
+ 	}
+@@ -199,14 +237,25 @@ static void amdgdu_amdkfd_restore_mem_worker(struct work_struct *work)
+ 	adev = amdgpu_ttm_adev(mem->bo->tbo.bdev);
+ 	mm = mem->mm;
+ 
+-	/* Restoration may have been canceled by another eviction or
+-	 * could already be done by a restore scheduled earlier */
++	/* Check if restore was canceled */
++	if (!mm) {
++		mutex_unlock(&mem->lock);
++		return;
++	}
++
++	/* Only restore if no other eviction happened since restore
++	 * was scheduled.
++	 */
+ 	if (mem->evicted == 1) {
+ 		amdgpu_amdkfd_gpuvm_restore_mem(mem, mm);
+ 		mem->evicted = 0;
+ 	}
+ 
++	mem->mm = NULL;
++
+ 	mutex_unlock(&mem->lock);
++
++	mmput(mm);
+ }
+ 
+ int amdgpu_amdkfd_schedule_restore_mem(struct amdgpu_device *adev,
+@@ -232,27 +281,23 @@ int amdgpu_amdkfd_schedule_restore_mem(struct amdgpu_device *adev,
+ 		return 0;
+ 	}
+ 
+-	/* mem->evicted is 1 after decrememting. Schedule
+-	 * restoration. */
+-	if (delayed_work_pending(&mem->work))
+-		cancel_delayed_work(&mem->work);
+-	mem->mm = mm;
+-	INIT_DELAYED_WORK(&mem->work,
+-			  amdgdu_amdkfd_restore_mem_worker);
+-	schedule_delayed_work(&mem->work, delay);
++	/* mem->evicted is 1 after decrementing. If a restoration was
++	 * already scheduled, just let it do its job. Otherwise
++	 * schedule another one.
++	 */
++	if (!mem->mm) {
++		mem->mm = mm;
++		atomic_inc(&mm->mm_users);
++		INIT_DELAYED_WORK(&mem->work,
++				  amdgdu_amdkfd_restore_mem_worker);
++		schedule_delayed_work(&mem->work, delay);
++	}
+ 
+ 	mutex_unlock(&mem->lock);
+ 
+ 	return r;
+ }
+ 
+-void amdgpu_amdkfd_cancel_restore_mem(struct amdgpu_device *adev,
+-				      struct kgd_mem *mem)
+-{
+-	if (delayed_work_pending(&mem->work))
+-		cancel_delayed_work_sync(&mem->work);
+-}
+-
+ int amdgpu_amdkfd_submit_ib(struct kgd_dev *kgd, enum kgd_engine_type engine,
+ 				uint32_t vmid, uint64_t gpu_addr,
+ 				uint32_t *ib_cmd, uint32_t ib_len)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index ac389fd..23c7fc7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -125,8 +125,7 @@ int amdgpu_amdkfd_schedule_restore_mem(struct amdgpu_device *adev,
+ 				       struct kgd_mem *mem,
+ 				       struct mm_struct *mm,
+ 				       unsigned long delay);
+-void amdgpu_amdkfd_cancel_restore_mem(struct amdgpu_device *adev,
+-				      struct kgd_mem *mem);
++void amdgpu_amdkfd_cancel_restore_mem(struct kgd_mem *mem);
+ int amdgpu_amdkfd_submit_ib(struct kgd_dev *kgd, enum kgd_engine_type engine,
+ 				uint32_t vmid, uint64_t gpu_addr,
+ 				uint32_t *ib_cmd, uint32_t ib_len);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 034bf91..370daae 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1111,8 +1111,7 @@ int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
+ 	 * be freed anyway */
+ 
+ 	amdgpu_mn_unregister(mem->bo);
+-	if (mem->work.work.func)
+-		cancel_delayed_work_sync(&mem->work);
++	amdgpu_amdkfd_cancel_restore_mem(mem);
+ 
+ 	ret = reserve_bo_and_cond_vms(mem, NULL, VA_DO_NOT_CARE, &ctx);
+ 	if (unlikely(ret != 0))
+@@ -1923,6 +1922,9 @@ int amdgpu_amdkfd_gpuvm_restore_mem(struct kgd_mem *mem, struct mm_struct *mm)
+ 		have_pages = !ret;
+ 		if (!have_pages) {
+ 			unreserve_bo_and_vms(&ctx, false);
++			if (ret == -ESRCH)
++				/* process terminating, fail quiet and fast */
++				return ret;
+ 			pr_err("get_user_pages failed. Probably userptr is freed. %d\n",
+ 			       ret);
+ 		}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+index c2ee4a1..61ce27a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+@@ -89,8 +89,7 @@ static void amdgpu_mn_destroy(struct work_struct *work)
+ 			bo->mn = NULL;
+ 			list_del_init(&bo->mn_list);
+ 			if (rmn->type == AMDGPU_MN_TYPE_HSA)
+-				amdgpu_amdkfd_cancel_restore_mem(
+-					adev, bo->kfd_bo);
++				amdgpu_amdkfd_cancel_restore_mem(bo->kfd_bo);
+ 		}
+ 		kfree(node);
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 53b8d74..220ec28 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -667,7 +667,8 @@ struct amdgpu_ttm_tt {
+ 	struct amdgpu_device	*adev;
+ 	u64			offset;
+ 	uint64_t		userptr;
+-	struct task_struct	*usertask;
++	struct mm_struct	*usermm;
++	struct pid		*userpid;
+ 	uint32_t		userflags;
+ 	spinlock_t              guptasklock;
+ 	struct list_head        guptasks;
+@@ -680,6 +681,7 @@ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages)
+ 	struct amdgpu_ttm_tt *gtt = (void *)ttm;
+ 	unsigned int flags = 0;
+ 	unsigned pinned = 0;
++	struct task_struct *usertask;
+ 	int r;
+ 
+ 	if (!(gtt->userflags & AMDGPU_GEM_USERPTR_READONLY))
+@@ -691,11 +693,22 @@ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages)
+ 		unsigned long end = gtt->userptr + ttm->num_pages * PAGE_SIZE;
+ 		struct vm_area_struct *vma;
+ 
+-		vma = find_vma(gtt->usertask->mm, gtt->userptr);
++		vma = find_vma(gtt->usermm, gtt->userptr);
+ 		if (!vma || vma->vm_file || vma->vm_end < end)
+ 			return -EPERM;
+ 	}
+ 
++	if (!gtt->userpid)
++		return -EINVAL;
++	usertask = get_pid_task(gtt->userpid, PIDTYPE_PID);
++	if (!usertask)
++		return -ESRCH;
++	if (usertask->mm != gtt->usermm) {
++		/* Happens during process shutdown */
++		put_task_struct(usertask);
++		return -ESRCH;
++	}
++
+ 	do {
+ 		unsigned num_pages = ttm->num_pages - pinned;
+ 		uint64_t userptr = gtt->userptr + pinned * PAGE_SIZE;
+@@ -707,11 +720,11 @@ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages)
+ 		list_add(&guptask.list, &gtt->guptasks);
+ 		spin_unlock(&gtt->guptasklock);
+ 
+-		if (gtt->usertask->mm == current->mm)
++		if (gtt->usermm == current->mm)
+ 			r = get_user_pages(userptr, num_pages, flags, p, NULL);
+ 		else
+-			r = get_user_pages_remote(gtt->usertask,
+-					gtt->usertask->mm, userptr, num_pages,
++			r = get_user_pages_remote(usertask,
++					gtt->usermm, userptr, num_pages,
+ 					flags, p, NULL);
+ 
+ 		spin_lock(&gtt->guptasklock);
+@@ -725,10 +738,12 @@ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages)
+ 
+ 	} while (pinned < ttm->num_pages);
+ 
++	put_task_struct(usertask);
+ 	return 0;
+ 
+ release_pages:
+ 	release_pages(pages, pinned, 0);
++	put_task_struct(usertask);
+ 	return r;
+ }
+ 
+@@ -916,6 +931,9 @@ static void amdgpu_ttm_backend_destroy(struct ttm_tt *ttm)
+ {
+ 	struct amdgpu_ttm_tt *gtt = (void *)ttm;
+ 
++	if (gtt->userpid)
++		put_pid(gtt->userpid);
++
+ 	ttm_dma_tt_fini(&gtt->ttm);
+ 	kfree(gtt);
+ }
+@@ -1038,7 +1056,8 @@ int amdgpu_ttm_tt_set_userptr(struct ttm_tt *ttm, uint64_t addr,
+ 		return -EINVAL;
+ 
+ 	gtt->userptr = addr;
+-	gtt->usertask = current->group_leader;
++	gtt->usermm = current->mm;
++	gtt->userpid = get_task_pid(current->group_leader, PIDTYPE_PID);
+ 	gtt->userflags = flags;
+ 	spin_lock_init(&gtt->guptasklock);
+ 	INIT_LIST_HEAD(&gtt->guptasks);
+@@ -1054,10 +1073,7 @@ struct mm_struct *amdgpu_ttm_tt_get_usermm(struct ttm_tt *ttm)
+ 	if (gtt == NULL)
+ 		return NULL;
+ 
+-	if (gtt->usertask == NULL)
+-		return NULL;
+-
+-	return gtt->usertask->mm;
++	return gtt->usermm;
+ }
+ 
+ bool amdgpu_ttm_tt_affect_userptr(struct ttm_tt *ttm, unsigned long start,
+-- 
+2.7.4
+

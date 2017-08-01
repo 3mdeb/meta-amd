@@ -1,0 +1,188 @@
+From b92d72caa536999b683b777ca85c82256e55f3ba Mon Sep 17 00:00:00 2001
+From: Charlene Liu <charlene.liu@amd.com>
+Date: Wed, 22 Feb 2017 13:46:29 -0500
+Subject: [PATCH 0684/2094] drm/amd/display: HDMI deep color mode audio issue
+
+Change-Id: Ie6abd89247bc2248063a57003d9841898e710502
+Signed-off-by: Charlene Liu <charlene.liu@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Reviewed-by: Charlene Liu <Charlene.Liu@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c  |  9 ++++++--
+ drivers/gpu/drm/amd/display/dc/core/dc_stream.c    | 11 +++++----
+ drivers/gpu/drm/amd/display/dc/dce/dce_audio.c     |  9 ++++++++
+ .../gpu/drm/amd/display/dc/dce/dce_clock_source.c  |  1 -
+ .../drm/amd/display/dc/dce/dce_stream_encoder.c    | 26 +++++-----------------
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    | 18 ---------------
+ 6 files changed, 28 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 4d556b3..407ce60 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -1101,9 +1101,14 @@ enum dc_status resource_map_pool_resources(
+ 	for (i = 0; i < context->stream_count; i++) {
+ 		struct core_stream *stream = context->streams[i];
+ 
+-		if (!resource_is_stream_unchanged(dc->current_context, stream))
++		if (!resource_is_stream_unchanged(dc->current_context, stream)) {
++			if (stream != NULL && dc->current_context->streams[i] != NULL) {
++				stream->bit_depth_params =
++						dc->current_context->streams[i]->bit_depth_params;
++				stream->clamping = dc->current_context->streams[i]->clamping;
+ 			continue;
+-
++		}
++	}
+ 		/* mark resources used for stream that is already active */
+ 		for (j = 0; j < MAX_PIPES; j++) {
+ 			struct pipe_ctx *pipe_ctx =
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+index e1f579b..4e1a933 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+@@ -305,7 +305,7 @@ void dc_stream_log(
+ 
+ 	dm_logger_write(dm_logger,
+ 			log_type,
+-			"core_stream 0x%x: src: %d, %d, %d, %d; dst: %d, %d, %d, %d;\n",
++			"core_stream 0x%x: src: %d, %d, %d, %d; dst: %d, %d, %d, %d, colorSpace:%d\n",
+ 			core_stream,
+ 			core_stream->public.src.x,
+ 			core_stream->public.src.y,
+@@ -314,13 +314,16 @@ void dc_stream_log(
+ 			core_stream->public.dst.x,
+ 			core_stream->public.dst.y,
+ 			core_stream->public.dst.width,
+-			core_stream->public.dst.height);
++			core_stream->public.dst.height,
++			core_stream->public.output_color_space);
+ 	dm_logger_write(dm_logger,
+ 			log_type,
+-			"\tpix_clk_khz: %d, h_total: %d, v_total: %d\n",
++			"\tpix_clk_khz: %d, h_total: %d, v_total: %d, pixelencoder:%d, displaycolorDepth:%d\n",
+ 			core_stream->public.timing.pix_clk_khz,
+ 			core_stream->public.timing.h_total,
+-			core_stream->public.timing.v_total);
++			core_stream->public.timing.v_total,
++			core_stream->public.timing.pixel_encoding,
++			core_stream->public.timing.display_color_depth);
+ 	dm_logger_write(dm_logger,
+ 			log_type,
+ 			"\tsink name: %s, serial: %d\n",
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_audio.c b/drivers/gpu/drm/amd/display/dc/dce/dce_audio.c
+index 596e039..7f52e39 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_audio.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_audio.c
+@@ -773,6 +773,15 @@ void dce_aud_wall_dto_setup(
+ 			crtc_info->calculated_pixel_clock,
+ 			&clock_info);
+ 
++		dm_logger_write(audio->ctx->logger, LOG_HW_SET_MODE,\
++				"\n************************%s:Input::requested_pixel_clock = %d"\
++				"calculated_pixel_clock =%d\n"\
++				"audio_dto_module = %d audio_dto_phase =%d \n\n", __func__,\
++				crtc_info->requested_pixel_clock,\
++				crtc_info->calculated_pixel_clock,\
++				clock_info.audio_dto_module,\
++				clock_info.audio_dto_phase);
++
+ 		/* On TN/SI, Program DTO source select and DTO select before
+ 		programming DTO modulo and DTO phase. These bits must be
+ 		programmed first, otherwise there will be no HDMI audio at boot
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c b/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c
+index 26742e0..a2a2ecf 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c
+@@ -874,7 +874,6 @@ static bool dce110_program_pix_clk(
+ 			bp_pc_params.flags.SET_XTALIN_REF_SRC =
+ 							!pll_settings->use_external_clk;
+ 			if (pix_clk_params->flags.SUPPORT_YCBCR420) {
+-				bp_pc_params.target_pixel_clock = pll_settings->actual_pix_clk / 2;
+ 				bp_pc_params.flags.SUPPORT_YUV_420 = 1;
+ 			}
+ 		}
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_stream_encoder.c b/drivers/gpu/drm/amd/display/dc/dce/dce_stream_encoder.c
+index e4092fd..d6662fa 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_stream_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_stream_encoder.c
+@@ -873,22 +873,6 @@ static const struct audio_clock_info audio_clock_info_table[16] = {
+ 	{59400, 3072, 445500, 9408, 990000, 6144, 594000}
+ };
+ 
+-static const struct audio_clock_info audio_clock_info_table_30bpc[14] = {
+-	{2517, 9152, 70312, 14014, 78125, 9152, 46875},
+-	{2518, 9152, 70312, 14014, 78125, 9152, 46875},
+-	{2520, 4096, 31500, 6272, 35000, 6144, 31500},
+-	{2700, 4096, 33750, 6272, 37500, 6144, 33750},
+-	{2702, 8192, 67567, 12544, 75075, 8192, 45045},
+-	{2703, 8192, 67567, 12544, 75075, 8192, 45045},
+-	{5400, 4096, 67500, 6272, 75000, 6144, 67500},
+-	{5405, 8192, 135135, 6272, 75075, 8192, 90090},
+-	{7417, 11648, 263672, 17836, 292969, 11648, 175181},
+-	{7425, 8192, 185625,  6272, 103125, 12288, 185625},
+-	{14835, 11648, 527344, 17836, 585938, 11648, 351563},
+-	{14850, 4096, 185625, 6272, 206250, 6144, 185625},
+-	{29670, 11648, 527344, 17836, 585938, 11648, 703125},
+-	{29700, 6144, 556875, 4704, 309375, 5120, 309375}
+-};
+ static const struct audio_clock_info audio_clock_info_table_36bpc[14] = {
+ 	{2517,  9152,  84375,  7007,  48875,  9152,  56250},
+ 	{2518,  9152,  84375,  7007,  48875,  9152,  56250},
+@@ -1005,11 +989,6 @@ bool get_audio_clock_info(
+ 		audio_array_size = ARRAY_SIZE(
+ 				audio_clock_info_table_36bpc);
+ 		break;
+-	case COLOR_DEPTH_101010:
+-		clock_info = audio_clock_info_table_30bpc;
+-		audio_array_size = ARRAY_SIZE(
+-				audio_clock_info_table_30bpc);
+-		break;
+ 	default:
+ 		clock_info = audio_clock_info_table;
+ 		audio_array_size = ARRAY_SIZE(
+@@ -1114,6 +1093,11 @@ static void dce110_se_setup_hdmi_audio(
+ 		crtc_info->requested_pixel_clock,
+ 		crtc_info->calculated_pixel_clock,
+ 		&audio_clock_info)) {
++		dm_logger_write(enc->ctx->logger, LOG_HW_SET_MODE,
++				"\n*********************%s:Input::requested_pixel_clock = %d"\
++				"calculated_pixel_clock = %d \n", __func__,\
++				crtc_info->requested_pixel_clock,\
++				crtc_info->calculated_pixel_clock);
+ 
+ 		/* HDMI_ACR_32_0__HDMI_ACR_CTS_32_MASK */
+ 		REG_UPDATE(HDMI_ACR_32_0, HDMI_ACR_CTS_32, audio_clock_info.cts_32khz);
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 6915cc4..2f68bf2 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -873,25 +873,7 @@ static void build_audio_output(
+ 					audio_output->crtc_info.requested_pixel_clock/2;
+ 			audio_output->crtc_info.calculated_pixel_clock =
+ 					pipe_ctx->pix_clk_params.requested_pix_clk/2;
+-		}
+ 
+-		if (pipe_ctx->pix_clk_params.pixel_encoding != PIXEL_ENCODING_YCBCR422) {
+-			switch (pipe_ctx->pix_clk_params.color_depth) {
+-			case COLOR_DEPTH_888:
+-				break;
+-			case COLOR_DEPTH_101010:
+-				audio_output->crtc_info.calculated_pixel_clock = (audio_output->crtc_info.calculated_pixel_clock * 30) / 24;
+-			break;
+-			case COLOR_DEPTH_121212:
+-				audio_output->crtc_info.calculated_pixel_clock = (audio_output->crtc_info.calculated_pixel_clock * 36) / 24;
+-			break;
+-			case COLOR_DEPTH_161616:
+-				audio_output->crtc_info.calculated_pixel_clock = (audio_output->crtc_info.calculated_pixel_clock * 48) / 24;
+-			break;
+-			default:
+-				ASSERT(0);
+-			break;
+-			}
+ 		}
+ 	}
+ 
+-- 
+2.7.4
+

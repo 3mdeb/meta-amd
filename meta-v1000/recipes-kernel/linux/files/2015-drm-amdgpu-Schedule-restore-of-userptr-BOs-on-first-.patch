@@ -1,0 +1,150 @@
+From c556a918863450fbc65c0d234f192c8fe9448fa7 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Wed, 5 Apr 2017 19:41:01 -0400
+Subject: [PATCH 2015/2094] drm/amdgpu: Schedule restore of userptr BOs on
+ first eviction
+
+Scheduling retore in another MMU notifier can result in queues being
+stalled indefinitely if the last userptr BO is freed in the mean time.
+Instead schedule restore when the first eviction happens.
+
+Bug: SWDEV-117996
+Change-Id: Idabadebf2a7e40609288d62170a0840d3b6f1d9b
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h       |  2 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c | 18 +-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c           | 52 +-----------------------
+ 3 files changed, 2 insertions(+), 70 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 75c15ec..e698b08 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -137,8 +137,6 @@ void amdgpu_amdkfd_device_init(struct amdgpu_device *rdev);
+ void amdgpu_amdkfd_device_fini(struct amdgpu_device *rdev);
+ 
+ int amdgpu_amdkfd_evict_userptr(struct kgd_mem *mem, struct mm_struct *mm);
+-int amdgpu_amdkfd_schedule_restore_userptr(struct kgd_mem *mem,
+-					   unsigned long delay);
+ int amdgpu_amdkfd_submit_ib(struct kgd_dev *kgd, enum kgd_engine_type engine,
+ 				uint32_t vmid, uint64_t gpu_addr,
+ 				uint32_t *ib_cmd, uint32_t ib_len);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 2656add..e368814 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1915,6 +1915,7 @@ int amdgpu_amdkfd_evict_userptr(struct kgd_mem *mem,
+ 		r = kgd2kfd->quiesce_mm(NULL, mm);
+ 		if (r != 0)
+ 			pr_err("Failed to quiesce KFD\n");
++		schedule_delayed_work(&process_info->work, 1);
+ 	}
+ 
+ 	return r;
+@@ -2190,23 +2191,6 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 		schedule_delayed_work(&process_info->work, 1);
+ }
+ 
+-/* Schedule delayed restoring of userptr BOs
+- *
+- * This runs in an MMU notifier. See limitations above. The scheduled
+- * worker is free of those limitations. Delaying the restore allows
+- * multiple MMU notifiers to happen in rapid succession, for example
+- * when fork COWs many BOs at once.
+- */
+-int amdgpu_amdkfd_schedule_restore_userptr(struct kgd_mem *mem,
+-					   unsigned long delay)
+-{
+-	struct amdkfd_process_info *process_info = mem->process_info;
+-
+-	schedule_delayed_work(&process_info->work, delay);
+-
+-	return 0;
+-}
+-
+ /** amdgpu_amdkfd_gpuvm_restore_process_bos - Restore all BOs for the given
+  *   KFD process identified by process_info
+  *
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+index e217dea..4efa325 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+@@ -265,53 +265,6 @@ static void amdgpu_mn_invalidate_range_start_hsa(struct mmu_notifier *mn,
+ 	mutex_unlock(&rmn->lock);
+ }
+ 
+-/**
+- * amdgpu_mn_invalidate_range_end_hsa - callback to notify about mm change
+- *
+- * @mn: our notifier
+- * @mn: the mm this callback is about
+- * @start: start of updated range
+- * @end: end of updated range
+- *
+- * Restore BOs between start and end. Once the last BO is restored,
+- * the queues can be reenabled. Restoring a BO can itself trigger
+- * another recursive MMU notifier. Therefore this needs to be
+- * scheduled in a worker thread. Adding a slight delay (1 jiffy)
+- * avoids excessive repeated evictions.
+- */
+-static void amdgpu_mn_invalidate_range_end_hsa(struct mmu_notifier *mn,
+-		struct mm_struct *mm,
+-		unsigned long start,
+-		unsigned long end)
+-{
+-	struct amdgpu_mn *rmn = container_of(mn, struct amdgpu_mn, mn);
+-	struct interval_tree_node *it;
+-
+-	/* notification is exclusive, but interval is inclusive */
+-	end -= 1;
+-
+-	mutex_lock(&rmn->lock);
+-
+-	it = interval_tree_iter_first(&rmn->objects, start, end);
+-	while (it) {
+-		struct amdgpu_mn_node *node;
+-		struct amdgpu_bo *bo;
+-
+-		node = container_of(it, struct amdgpu_mn_node, it);
+-		it = interval_tree_iter_next(it, start, end);
+-
+-		list_for_each_entry(bo, &node->bos, mn_list) {
+-			struct kgd_mem *mem = bo->kfd_bo;
+-
+-			if (amdgpu_ttm_tt_affect_userptr(bo->tbo.ttm,
+-							 start, end))
+-				amdgpu_amdkfd_schedule_restore_userptr(mem, 1);
+-		}
+-	}
+-
+-	mutex_unlock(&rmn->lock);
+-}
+-
+ static void amdgpu_mn_invalidate_page_hsa(struct mmu_notifier *mn,
+ 					  struct mm_struct *mm,
+ 					  unsigned long address)
+@@ -332,10 +285,8 @@ static void amdgpu_mn_invalidate_page_hsa(struct mmu_notifier *mn,
+ 			struct kgd_mem *mem = bo->kfd_bo;
+ 
+ 			if (amdgpu_ttm_tt_affect_userptr(bo->tbo.ttm,
+-							 address, address)) {
++							 address, address))
+ 				amdgpu_amdkfd_evict_userptr(mem, mm);
+-				amdgpu_amdkfd_schedule_restore_userptr(mem, 1);
+-			}
+ 		}
+ 	}
+ 
+@@ -352,7 +303,6 @@ static const struct mmu_notifier_ops amdgpu_mn_ops[] = {
+ 		.release = amdgpu_mn_release,
+ 		.invalidate_page = amdgpu_mn_invalidate_page_hsa,
+ 		.invalidate_range_start = amdgpu_mn_invalidate_range_start_hsa,
+-		.invalidate_range_end = amdgpu_mn_invalidate_range_end_hsa,
+ 	},
+ };
+ 
+-- 
+2.7.4
+

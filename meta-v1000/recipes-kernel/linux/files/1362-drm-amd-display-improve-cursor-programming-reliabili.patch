@@ -1,0 +1,225 @@
+From cea86a6400a7bafaddc3f4fa21ce1c2ed039fb5d Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Fri, 21 Apr 2017 09:34:09 -0400
+Subject: [PATCH 1362/2094] drm/amd/display: improve cursor programming
+ reliability
+
+This change will cache cursor attributes and reprogram them
+when enabling cursor after power gating if the attributes were not
+yet reprogrammed
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_stream.c    | 55 ++++++++++------------
+ drivers/gpu/drm/amd/display/dc/dc.h                |  2 +-
+ drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp.h |  2 +-
+ .../drm/amd/display/dc/dce110/dce110_ipp_cursor.c  |  4 +-
+ drivers/gpu/drm/amd/display/dc/dce120/dce120_ipp.h |  2 +-
+ .../drm/amd/display/dc/dce120/dce120_ipp_cursor.c  |  4 +-
+ drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h        |  4 +-
+ 7 files changed, 32 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+index 3dbd6c0..23627b1 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+@@ -182,7 +182,6 @@ bool dc_stream_set_cursor_attributes(
+ 	struct core_stream *stream;
+ 	struct core_dc *core_dc;
+ 	struct resource_context *res_ctx;
+-	bool ret = false;
+ 
+ 	if (NULL == dc_stream) {
+ 		dm_error("DC: dc_stream is NULL!\n");
+@@ -200,28 +199,26 @@ bool dc_stream_set_cursor_attributes(
+ 	for (i = 0; i < MAX_PIPES; i++) {
+ 		struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[i];
+ 
+-		if ((pipe_ctx->stream == stream) &&
+-			(pipe_ctx->ipp != NULL)) {
+-			struct input_pixel_processor *ipp = pipe_ctx->ipp;
++		if (pipe_ctx->stream != stream || !pipe_ctx->ipp)
++			continue;
++		if (pipe_ctx->top_pipe && pipe_ctx->surface != pipe_ctx->top_pipe->surface)
++			continue;
+ 
+-			if (ipp->funcs->ipp_cursor_set_attributes(
+-				ipp, attributes))
+-				ret = true;
+-		}
++		pipe_ctx->ipp->funcs->ipp_cursor_set_attributes(
++				pipe_ctx->ipp, attributes);
+ 	}
+ 
+-	return ret;
++	return true;
+ }
+ 
+ bool dc_stream_set_cursor_position(
+ 	const struct dc_stream *dc_stream,
+-	struct dc_cursor_position *position)
++	const struct dc_cursor_position *position)
+ {
+ 	int i;
+ 	struct core_stream *stream;
+ 	struct core_dc *core_dc;
+ 	struct resource_context *res_ctx;
+-	bool ret = false;
+ 
+ 	if (NULL == dc_stream) {
+ 		dm_error("DC: dc_stream is NULL!\n");
+@@ -239,27 +236,27 @@ bool dc_stream_set_cursor_position(
+ 
+ 	for (i = 0; i < MAX_PIPES; i++) {
+ 		struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[i];
++		struct input_pixel_processor *ipp = pipe_ctx->ipp;
++		struct dc_cursor_position pos_cpy = *position;
++		struct dc_cursor_mi_param param = {
++			.pixel_clk_khz = dc_stream->timing.pix_clk_khz,
++			.ref_clk_khz = res_ctx->pool->ref_clock_inKhz,
++			.viewport_x_start = pipe_ctx->scl_data.viewport.x,
++			.viewport_width = pipe_ctx->scl_data.viewport.width,
++			.h_scale_ratio = pipe_ctx->scl_data.ratios.horz
++		};
++
++		if (pipe_ctx->stream != stream ||
++				!pipe_ctx->ipp || !pipe_ctx->surface)
++			continue;
+ 
+-		if (pipe_ctx->stream == stream &&
+-				pipe_ctx->ipp && pipe_ctx->surface) {
+-			struct input_pixel_processor *ipp = pipe_ctx->ipp;
+-			struct dc_cursor_mi_param param = {
+-				.pixel_clk_khz = dc_stream->timing.pix_clk_khz,
+-				.ref_clk_khz = res_ctx->pool->ref_clock_inKhz,
+-				.viewport_x_start = pipe_ctx->scl_data.viewport.x,
+-				.viewport_width = pipe_ctx->scl_data.viewport.width,
+-				.h_scale_ratio = pipe_ctx->scl_data.ratios.horz,
+-			};
+-
+-			if (pipe_ctx->top_pipe && pipe_ctx->surface != pipe_ctx->top_pipe->surface)
+-				position->enable = false;
+-
+-			ipp->funcs->ipp_cursor_set_position(ipp, position, &param);
+-			ret = true;
+-		}
++		if (pipe_ctx->top_pipe && pipe_ctx->surface != pipe_ctx->top_pipe->surface)
++			pos_cpy.enable = false;
++
++		ipp->funcs->ipp_cursor_set_position(ipp, &pos_cpy, &param);
+ 	}
+ 
+-	return ret;
++	return true;
+ }
+ 
+ uint32_t dc_stream_get_vblank_counter(const struct dc_stream *dc_stream)
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index d35fa01..5629e3c 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -764,7 +764,7 @@ bool dc_stream_set_cursor_attributes(
+ 
+ bool dc_stream_set_cursor_position(
+ 	const struct dc_stream *stream,
+-	struct dc_cursor_position *position);
++	const struct dc_cursor_position *position);
+ 
+ /* Newer interfaces  */
+ struct dc_cursor {
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp.h b/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp.h
+index a374ef2..434fe2f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp.h
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp.h
+@@ -54,7 +54,7 @@ void dce110_ipp_cursor_set_position(
+ 	const struct dc_cursor_position *position,
+ 	const struct dc_cursor_mi_param *param);
+ 
+-bool dce110_ipp_cursor_set_attributes(
++void dce110_ipp_cursor_set_attributes(
+ 	struct input_pixel_processor *ipp,
+ 	const struct dc_cursor_attributes *attributes);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp_cursor.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp_cursor.c
+index 5b230b1..f712916 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp_cursor.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp_cursor.c
+@@ -95,7 +95,7 @@ void dce110_ipp_cursor_set_position(
+ 	lock(ipp110, false);
+ }
+ 
+-bool dce110_ipp_cursor_set_attributes(
++void dce110_ipp_cursor_set_attributes(
+ 	struct input_pixel_processor *ipp,
+ 	const struct dc_cursor_attributes *attributes)
+ {
+@@ -122,8 +122,6 @@ bool dce110_ipp_cursor_set_attributes(
+ 
+ 	/* Unlock Cursor registers. */
+ 	lock(ipp110, false);
+-
+-	return true;
+ }
+ 
+ static void enable(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce120/dce120_ipp.h b/drivers/gpu/drm/amd/display/dc/dce120/dce120_ipp.h
+index 4b326bc..7f645fd 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce120/dce120_ipp.h
++++ b/drivers/gpu/drm/amd/display/dc/dce120/dce120_ipp.h
+@@ -42,7 +42,7 @@ void dce120_ipp_cursor_set_position(
+ 	const struct dc_cursor_position *position,
+ 	const struct dc_cursor_mi_param *param);
+ 
+-bool dce120_ipp_cursor_set_attributes(
++void dce120_ipp_cursor_set_attributes(
+ 	struct input_pixel_processor *ipp,
+ 	const struct dc_cursor_attributes *attributes);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce120/dce120_ipp_cursor.c b/drivers/gpu/drm/amd/display/dc/dce120/dce120_ipp_cursor.c
+index 15671fd..dc81d32 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce120/dce120_ipp_cursor.c
++++ b/drivers/gpu/drm/amd/display/dc/dce120/dce120_ipp_cursor.c
+@@ -160,7 +160,7 @@ void dce120_ipp_cursor_set_position(
+ 	lock(ipp110, false);
+ }
+ 
+-bool dce120_ipp_cursor_set_attributes(
++void dce120_ipp_cursor_set_attributes(
+ 	struct input_pixel_processor *ipp,
+ 	const struct dc_cursor_attributes *attributes)
+ {
+@@ -189,7 +189,5 @@ bool dce120_ipp_cursor_set_attributes(
+ 
+ 	/* Unlock Cursor registers. */
+ 	lock(ipp110, false);
+-
+-	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
+index 0457bc7..7928e23 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
+@@ -37,8 +37,6 @@ struct input_pixel_processor {
+ 	struct  dc_context *ctx;
+ 	unsigned int inst;
+ 	const struct ipp_funcs *funcs;
+-
+-	unsigned int cusor_width;
+ };
+ 
+ enum ipp_prescale_mode {
+@@ -88,7 +86,7 @@ struct ipp_funcs {
+ 		const struct dc_cursor_position *position,
+ 		const struct dc_cursor_mi_param *param);
+ 
+-	bool (*ipp_cursor_set_attributes)(
++	void (*ipp_cursor_set_attributes)(
+ 		struct input_pixel_processor *ipp,
+ 		const struct dc_cursor_attributes *attributes);
+ 
+-- 
+2.7.4
+

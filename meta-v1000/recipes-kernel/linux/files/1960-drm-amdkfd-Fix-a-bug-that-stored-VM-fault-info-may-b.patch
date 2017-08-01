@@ -1,0 +1,120 @@
+From 31d3b8be9986bb6fb4647a247cd0f88a86b494de Mon Sep 17 00:00:00 2001
+From: Yong Zhao <yong.zhao@amd.com>
+Date: Fri, 13 Jan 2017 17:31:56 -0500
+Subject: [PATCH 1960/2094] drm/amdkfd: Fix a bug that stored VM fault info may
+ be wrong
+
+We should only store the VM fault info when it is from KFD.
+
+Change-Id: Ie1a84c2455d279a81a039172b8bdb8d565825b48
+Signed-off-by: Yong Zhao <yong.zhao@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c | 15 ++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h |  3 +++
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c      |  5 ++++-
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c      |  7 +++++--
+ 4 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index a819db0..3c8791c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -35,6 +35,8 @@ const struct kfd2kgd_calls *kfd2kgd;
+ const struct kgd2kfd_calls *kgd2kfd;
+ bool (*kgd2kfd_init_p)(unsigned, const struct kgd2kfd_calls**);
+ 
++unsigned int global_compute_vmid_bitmap = 0xFF00;
++
+ int amdgpu_amdkfd_init(void)
+ {
+ 	int ret;
+@@ -105,7 +107,7 @@ void amdgpu_amdkfd_device_init(struct amdgpu_device *rdev)
+ {
+ 	if (rdev->kfd) {
+ 		struct kgd2kfd_shared_resources gpu_resources = {
+-			.compute_vmid_bitmap = 0xFF00,
++			.compute_vmid_bitmap = global_compute_vmid_bitmap,
+ 
+ 			.first_compute_pipe = 1,
+ 			.compute_pipe_count = 4 - 1,
+@@ -606,3 +608,14 @@ bool read_user_wptr(struct mm_struct *mm, uint32_t __user *wptr,
+ 
+ 	return wptr_valid;
+ }
++
++bool amdgpu_amdkfd_is_kfd_vmid(struct amdgpu_device *adev,
++			u32 vmid)
++{
++	if (adev->kfd) {
++		if ((1 << vmid) & global_compute_vmid_bitmap)
++			return true;
++	}
++
++	return false;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index ec0efdb..6718c77 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -141,6 +141,9 @@ int amdgpu_amdkfd_copy_mem_to_mem(struct kgd_dev *kgd, struct kgd_mem *src_mem,
+ 		uint64_t dest_offset, uint64_t size, struct fence **f,
+ 		uint64_t *actual_size);
+ 
++bool amdgpu_amdkfd_is_kfd_vmid(struct amdgpu_device *adev,
++			u32 vmid);
++
+ /* Shared API */
+ int map_bo(struct amdgpu_device *rdev, uint64_t va, void *vm,
+ 		struct amdgpu_bo *bo, struct amdgpu_bo_va **bo_va);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index 1f21616..3665ac3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -808,6 +808,8 @@ static void gmc_v7_0_vm_fini(struct amdgpu_device *adev)
+  * @adev: amdgpu_device pointer
+  * @status: VM_CONTEXT1_PROTECTION_FAULT_STATUS register value
+  * @addr: VM_CONTEXT1_PROTECTION_FAULT_ADDR register value
++ * @mc_client: VM_CONTEXT1_PROTECTION_FAULT_MCCLIENT register value
++ * @src_id: interrupt source id
+  *
+  * Print human readable fault information (CIK).
+  */
+@@ -831,7 +833,8 @@ static void gmc_v7_0_vm_decode_fault(struct amdgpu_device *adev,
+ 			     MEMORY_CLIENT_RW) ?
+ 	       "write" : "read", block, mc_client, mc_id);
+ 
+-	if (!atomic_read(&adev->mc.vm_fault_info_updated)) {
++	if (amdgpu_amdkfd_is_kfd_vmid(adev, vmid)
++		&& !atomic_read(&adev->mc.vm_fault_info_updated)) {
+ 		info->vmid = vmid;
+ 		info->mc_id = mc_id;
+ 		info->page_addr = addr;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index 80053a3..4af6782 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -1015,8 +1015,10 @@ static void gmc_v8_0_vm_fini(struct amdgpu_device *adev)
+  * @adev: amdgpu_device pointer
+  * @status: VM_CONTEXT1_PROTECTION_FAULT_STATUS register value
+  * @addr: VM_CONTEXT1_PROTECTION_FAULT_ADDR register value
++ * @mc_client: VM_CONTEXT1_PROTECTION_FAULT_MCCLIENT register value
++ * @src_id: interrupt source id
+  *
+- * Print human readable fault information (CIK).
++ * Print human readable fault information (VI).
+  */
+ static void gmc_v8_0_vm_decode_fault(struct amdgpu_device *adev,
+ 				     u32 status, u32 addr, u32 mc_client)
+@@ -1038,7 +1040,8 @@ static void gmc_v8_0_vm_decode_fault(struct amdgpu_device *adev,
+ 			     MEMORY_CLIENT_RW) ?
+ 	       "write" : "read", block, mc_client, mc_id);
+ 
+-	if (!atomic_read(&adev->mc.vm_fault_info_updated)) {
++	if (amdgpu_amdkfd_is_kfd_vmid(adev, vmid)
++		&& !atomic_read(&adev->mc.vm_fault_info_updated)) {
+ 		info->vmid = vmid;
+ 		info->mc_id = mc_id;
+ 		info->page_addr = addr;
+-- 
+2.7.4
+

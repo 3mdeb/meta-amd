@@ -1,0 +1,328 @@
+From 290e8d9ebd5aa5130f410cf313177660d896e122 Mon Sep 17 00:00:00 2001
+From: Huang Rui <ray.huang@amd.com>
+Date: Tue, 1 Nov 2016 15:35:38 +0800
+Subject: [PATCH 0807/2094] drm/amdgpu: use new flag to handle different
+ firmware loading method
+
+This patch introduces a new flag named "amdgpu_firmware_load_type" to
+handle different firmware loading method. Since Vega10, there are
+three ways to load firmware. It would be better to use a flag and a
+fw_load_type kernel parameter to configure it.
+
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           | 10 +++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c       |  6 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c |  4 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c     | 67 +++++++++++++++++++++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h     |  3 ++
+ drivers/gpu/drm/amd/amdgpu/cik.c              |  2 +
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c         |  6 +--
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c        |  4 +-
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c        |  4 +-
+ drivers/gpu/drm/amd/amdgpu/vi.c               |  4 +-
+ 10 files changed, 90 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index b713f37..4d06de8b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -82,7 +82,7 @@ extern int amdgpu_pcie_gen2;
+ extern int amdgpu_msi;
+ extern int amdgpu_lockup_timeout;
+ extern int amdgpu_dpm;
+-extern int amdgpu_smc_load_fw;
++extern int amdgpu_fw_load_type;
+ extern int amdgpu_aspm;
+ extern int amdgpu_runtime_pm;
+ extern unsigned amdgpu_ip_block_mask;
+@@ -1065,9 +1065,15 @@ struct amdgpu_sdma {
+ /*
+  * Firmware
+  */
++enum amdgpu_firmware_load_type {
++	AMDGPU_FW_LOAD_DIRECT = 0,
++	AMDGPU_FW_LOAD_SMU,
++	AMDGPU_FW_LOAD_PSP,
++};
++
+ struct amdgpu_firmware {
+ 	struct amdgpu_firmware_info ucode[AMDGPU_UCODE_ID_MAXIMUM];
+-	bool smu_load;
++	enum amdgpu_firmware_load_type load_type;
+ 	struct amdgpu_bo *fw_buf;
+ 	unsigned int fw_size;
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 296dcb7..3d0e8b1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -79,7 +79,7 @@ int amdgpu_pcie_gen2 = -1;
+ int amdgpu_msi = -1;
+ int amdgpu_lockup_timeout = 0;
+ int amdgpu_dpm = -1;
+-int amdgpu_smc_load_fw = 1;
++int amdgpu_fw_load_type = -1;
+ int amdgpu_aspm = -1;
+ int amdgpu_runtime_pm = -1;
+ unsigned amdgpu_ip_block_mask = 0xffffffff;
+@@ -140,8 +140,8 @@ module_param_named(lockup_timeout, amdgpu_lockup_timeout, int, 0444);
+ MODULE_PARM_DESC(dpm, "DPM support (1 = enable, 0 = disable, -1 = auto)");
+ module_param_named(dpm, amdgpu_dpm, int, 0444);
+ 
+-MODULE_PARM_DESC(smc_load_fw, "SMC firmware loading(1 = enable, 0 = disable)");
+-module_param_named(smc_load_fw, amdgpu_smc_load_fw, int, 0444);
++MODULE_PARM_DESC(fw_load_type, "firmware loading type (0 = direct, 1 = SMU, 2 = PSP, -1 = auto)");
++module_param_named(fw_load_type, amdgpu_fw_load_type, int, 0444);
+ 
+ MODULE_PARM_DESC(aspm, "ASPM support (1 = enable, 0 = disable, -1 = auto)");
+ module_param_named(aspm, amdgpu_aspm, int, 0444);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
+index d56d200..96a5113 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
+@@ -163,7 +163,7 @@ static int amdgpu_pp_hw_init(void *handle)
+ 	int ret = 0;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (adev->pp_enabled && adev->firmware.smu_load)
++	if (adev->pp_enabled && adev->firmware.load_type == AMDGPU_FW_LOAD_SMU)
+ 		amdgpu_ucode_init_bo(adev);
+ 
+ 	if (adev->powerplay.ip_funcs->hw_init)
+@@ -190,7 +190,7 @@ static int amdgpu_pp_hw_fini(void *handle)
+ 		ret = adev->powerplay.ip_funcs->hw_fini(
+ 					adev->powerplay.pp_handle);
+ 
+-	if (adev->pp_enabled && adev->firmware.smu_load)
++	if (adev->pp_enabled && adev->firmware.load_type == AMDGPU_FW_LOAD_SMU)
+ 		amdgpu_ucode_fini_bo(adev);
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c
+index be16377..73c3e66 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c
+@@ -217,6 +217,49 @@ bool amdgpu_ucode_hdr_version(union amdgpu_firmware_header *hdr,
+ 	return true;
+ }
+ 
++enum amdgpu_firmware_load_type
++amdgpu_ucode_get_load_type(struct amdgpu_device *adev, int load_type)
++{
++	switch (adev->asic_type) {
++#ifdef CONFIG_DRM_AMDGPU_SI
++	case CHIP_TAHITI:
++	case CHIP_PITCAIRN:
++	case CHIP_VERDE:
++	case CHIP_OLAND:
++		return AMDGPU_FW_LOAD_DIRECT;
++#endif
++#ifdef CONFIG_DRM_AMDGPU_CIK
++	case CHIP_BONAIRE:
++	case CHIP_KAVERI:
++	case CHIP_KABINI:
++	case CHIP_HAWAII:
++	case CHIP_MULLINS:
++		return AMDGPU_FW_LOAD_DIRECT;
++#endif
++	case CHIP_TOPAZ:
++	case CHIP_TONGA:
++	case CHIP_FIJI:
++	case CHIP_CARRIZO:
++	case CHIP_STONEY:
++	case CHIP_POLARIS10:
++	case CHIP_POLARIS11:
++	case CHIP_POLARIS12:
++		if (!load_type)
++			return AMDGPU_FW_LOAD_DIRECT;
++		else
++			return AMDGPU_FW_LOAD_SMU;
++	case CHIP_VEGA10:
++		if (!load_type)
++			return AMDGPU_FW_LOAD_DIRECT;
++		else
++			return AMDGPU_FW_LOAD_PSP;
++	default:
++		DRM_ERROR("Unknow firmware load type\n");
++	}
++
++	return AMDGPU_FW_LOAD_DIRECT;
++}
++
+ static int amdgpu_ucode_init_single_fw(struct amdgpu_firmware_info *ucode,
+ 				uint64_t mc_addr, void *kptr)
+ {
+@@ -273,7 +316,7 @@ int amdgpu_ucode_init_bo(struct amdgpu_device *adev)
+ 	uint64_t fw_mc_addr;
+ 	void *fw_buf_ptr = NULL;
+ 	uint64_t fw_offset = 0;
+-	int i, err;
++	int i, err, max;
+ 	struct amdgpu_firmware_info *ucode = NULL;
+ 	const struct common_firmware_header *header = NULL;
+ 
+@@ -306,7 +349,16 @@ int amdgpu_ucode_init_bo(struct amdgpu_device *adev)
+ 
+ 	amdgpu_bo_unreserve(*bo);
+ 
+-	for (i = 0; i < AMDGPU_UCODE_ID_MAXIMUM; i++) {
++	/*
++	 * if SMU loaded firmware, it needn't add SMC, UVD, and VCE
++	 * ucode info here
++	 */
++	if (adev->firmware.load_type != AMDGPU_FW_LOAD_PSP)
++		max = AMDGPU_UCODE_ID_MAXIMUM - 3;
++	else
++		max = AMDGPU_UCODE_ID_MAXIMUM;
++
++	for (i = 0; i < max; i++) {
+ 		ucode = &adev->firmware.ucode[i];
+ 		if (ucode->fw) {
+ 			header = (const struct common_firmware_header *)ucode->fw->data;
+@@ -331,7 +383,8 @@ int amdgpu_ucode_init_bo(struct amdgpu_device *adev)
+ failed_reserve:
+ 	amdgpu_bo_unref(bo);
+ failed:
+-	adev->firmware.smu_load = false;
++	if (err)
++		adev->firmware.load_type = AMDGPU_FW_LOAD_DIRECT;
+ 
+ 	return err;
+ }
+@@ -340,8 +393,14 @@ int amdgpu_ucode_fini_bo(struct amdgpu_device *adev)
+ {
+ 	int i;
+ 	struct amdgpu_firmware_info *ucode = NULL;
++	int max;
++
++	if (adev->firmware.load_type != AMDGPU_FW_LOAD_PSP)
++		max = AMDGPU_UCODE_ID_MAXIMUM - 3;
++	else
++		max = AMDGPU_UCODE_ID_MAXIMUM;
+ 
+-	for (i = 0; i < AMDGPU_UCODE_ID_MAXIMUM; i++) {
++	for (i = 0; i < max; i++) {
+ 		ucode = &adev->firmware.ucode[i];
+ 		if (ucode->fw) {
+ 			ucode->mc_addr = 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h
+index 19a584c..2b212b0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h
+@@ -176,4 +176,7 @@ bool amdgpu_ucode_hdr_version(union amdgpu_firmware_header *hdr,
+ int amdgpu_ucode_init_bo(struct amdgpu_device *adev);
+ int amdgpu_ucode_fini_bo(struct amdgpu_device *adev);
+ 
++enum amdgpu_firmware_load_type
++amdgpu_ucode_get_load_type(struct amdgpu_device *adev, int load_type);
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik.c b/drivers/gpu/drm/amd/amdgpu/cik.c
+index 37b033a..1451594 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik.c
+@@ -1786,6 +1786,8 @@ static int cik_common_early_init(void *handle)
+ 		return -EINVAL;
+ 	}
+ 
++	adev->firmware.load_type = amdgpu_ucode_get_load_type(adev, amdgpu_fw_load_type);
++
+ 	amdgpu_get_pcie_info(adev);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index d0975ac..a53e36c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -1040,7 +1040,7 @@ static int gfx_v8_0_init_microcode(struct amdgpu_device *adev)
+ 		}
+ 	}
+ 
+-	if (adev->firmware.smu_load) {
++	if (adev->firmware.load_type == AMDGPU_FW_LOAD_SMU) {
+ 		info = &adev->firmware.ucode[AMDGPU_UCODE_ID_CP_PFP];
+ 		info->ucode_id = AMDGPU_UCODE_ID_CP_PFP;
+ 		info->fw = adev->gfx.pfp_fw;
+@@ -4246,7 +4246,7 @@ static int gfx_v8_0_rlc_resume(struct amdgpu_device *adev)
+ 	gfx_v8_0_init_pg(adev);
+ 
+ 	if (!adev->pp_enabled) {
+-		if (!adev->firmware.smu_load) {
++		if (adev->firmware.load_type != AMDGPU_FW_LOAD_SMU) {
+ 			/* legacy rlc firmware loading */
+ 			r = gfx_v8_0_rlc_load_microcode(adev);
+ 			if (r)
+@@ -5266,7 +5266,7 @@ static int gfx_v8_0_cp_resume(struct amdgpu_device *adev)
+ 		gfx_v8_0_enable_gui_idle_interrupt(adev, false);
+ 
+ 	if (!adev->pp_enabled) {
+-		if (!adev->firmware.smu_load) {
++		if (adev->firmware.load_type != AMDGPU_FW_LOAD_SMU) {
+ 			/* legacy firmware loading */
+ 			r = gfx_v8_0_cp_gfx_load_microcode(adev);
+ 			if (r)
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index 7fc4854..bcc14ed 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -158,7 +158,7 @@ static int sdma_v2_4_init_microcode(struct amdgpu_device *adev)
+ 		if (adev->sdma.instance[i].feature_version >= 20)
+ 			adev->sdma.instance[i].burst_nop = true;
+ 
+-		if (adev->firmware.smu_load) {
++		if (adev->firmware.load_type == AMDGPU_FW_LOAD_SMU) {
+ 			info = &adev->firmware.ucode[AMDGPU_UCODE_ID_SDMA0 + i];
+ 			info->ucode_id = AMDGPU_UCODE_ID_SDMA0 + i;
+ 			info->fw = adev->sdma.instance[i].fw;
+@@ -562,7 +562,7 @@ static int sdma_v2_4_start(struct amdgpu_device *adev)
+ 	int r;
+ 
+ 	if (!adev->pp_enabled) {
+-		if (!adev->firmware.smu_load) {
++		if (adev->firmware.load_type != AMDGPU_FW_LOAD_SMU) {
+ 			r = sdma_v2_4_load_microcode(adev);
+ 			if (r)
+ 				return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index 27a823a..497c00a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -310,7 +310,7 @@ static int sdma_v3_0_init_microcode(struct amdgpu_device *adev)
+ 		if (adev->sdma.instance[i].feature_version >= 20)
+ 			adev->sdma.instance[i].burst_nop = true;
+ 
+-		if (adev->firmware.smu_load) {
++		if (adev->firmware.load_type == AMDGPU_FW_LOAD_SMU) {
+ 			info = &adev->firmware.ucode[AMDGPU_UCODE_ID_SDMA0 + i];
+ 			info->ucode_id = AMDGPU_UCODE_ID_SDMA0 + i;
+ 			info->fw = adev->sdma.instance[i].fw;
+@@ -771,7 +771,7 @@ static int sdma_v3_0_start(struct amdgpu_device *adev)
+ 	int r, i;
+ 
+ 	if (!adev->pp_enabled) {
+-		if (!adev->firmware.smu_load) {
++		if (adev->firmware.load_type != AMDGPU_FW_LOAD_SMU) {
+ 			r = sdma_v3_0_load_microcode(adev);
+ 			if (r)
+ 				return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/vi.c b/drivers/gpu/drm/amd/amdgpu/vi.c
+index 35d8f36..9d8434e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vi.c
++++ b/drivers/gpu/drm/amd/amdgpu/vi.c
+@@ -1097,8 +1097,8 @@ static int vi_common_early_init(void *handle)
+ 		return -EINVAL;
+ 	}
+ 
+-	if (amdgpu_smc_load_fw && smc_enabled)
+-		adev->firmware.smu_load = true;
++	/* vi use smc load by default */
++	adev->firmware.load_type = amdgpu_ucode_get_load_type(adev, amdgpu_fw_load_type);
+ 
+ 	amdgpu_get_pcie_info(adev);
+ 
+-- 
+2.7.4
+

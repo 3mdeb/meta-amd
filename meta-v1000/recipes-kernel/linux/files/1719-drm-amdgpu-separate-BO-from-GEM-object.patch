@@ -1,0 +1,244 @@
+From d3ae98b8402ce7e350d8e7b011fe979d9edfb6b6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Sun, 6 Dec 2015 16:10:26 +0200
+Subject: [PATCH 1719/2094] drm/amdgpu: separate BO from GEM object
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This allows us to have multiple GEM objects for one BO.
+
+Change-Id: I0cb30db4177ddcb18cb7ff294c220e700c9a26bc
+Signed-off-by: Christian König <christian.koenig@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu.h
+	drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+	drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+	drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        | 12 +++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c    | 43 +++++++++++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c  | 20 +++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    | 19 ++++++++++---
+ 5 files changed, 80 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 6cc30b7..7879adc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -405,6 +405,12 @@ struct amdgpu_bo_va {
+ 
+ #define AMDGPU_GEM_DOMAIN_MAX		0x3
+ 
++struct amdgpu_gem_object {
++	struct drm_gem_object		base;
++	struct list_head		list;
++	struct amdgpu_bo		*bo;
++};
++
+ struct amdgpu_bo {
+ 	/* Protected by tbo.reserved */
+ 	u32				prefered_domains;
+@@ -421,12 +427,14 @@ struct amdgpu_bo {
+ 	void				*metadata;
+ 	u32				metadata_size;
+ 	unsigned			prime_shared_count;
++	/* GEM objects refereing to this BO */
++	struct list_head	gem_objects;
++
+ 	/* list of all virtual address to which this bo
+ 	 * is associated to
+ 	 */
+ 	struct list_head		va;
+ 	/* Constant after initialization */
+-	struct drm_gem_object		gem_base;
+ 	struct amdgpu_bo		*parent;
+ 	struct amdgpu_bo		*shadow;
+ 
+@@ -436,7 +444,7 @@ struct amdgpu_bo {
+ 	struct list_head		shadow_list;
+ 	struct kfd_process_device	*pdd;
+ };
+-#define gem_to_amdgpu_bo(gobj) container_of((gobj), struct amdgpu_bo, gem_base)
++#define gem_to_amdgpu_bo(gobj) container_of((gobj), struct amdgpu_gem_object, base)->bo
+ 
+ void amdgpu_gem_object_free(struct drm_gem_object *obj);
+ int amdgpu_gem_object_open(struct drm_gem_object *obj,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 604c947..3890096 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -33,14 +33,20 @@
+ 
+ void amdgpu_gem_object_free(struct drm_gem_object *gobj)
+ {
+-	struct amdgpu_bo *robj = gem_to_amdgpu_bo(gobj);
++	struct amdgpu_gem_object *aobj;
+ 
+-	if (robj) {
+-		if (robj->gem_base.import_attach)
+-			drm_prime_gem_destroy(&robj->gem_base, robj->tbo.sg);
+-		amdgpu_mn_unregister(robj);
+-		amdgpu_bo_unref(&robj);
+-	}
++	aobj = container_of((gobj), struct amdgpu_gem_object, base);
++	if (aobj->base.import_attach)
++		drm_prime_gem_destroy(&aobj->base, aobj->bo->tbo.sg);
++
++	ww_mutex_lock(&aobj->bo->tbo.resv->lock, NULL);
++	list_del(&aobj->list);
++	ww_mutex_unlock(&aobj->bo->tbo.resv->lock);
++
++	amdgpu_mn_unregister(aobj->bo);
++	amdgpu_bo_unref(&aobj->bo);
++	drm_gem_object_release(&aobj->base);
++	kfree(aobj);
+ }
+ 
+ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
+@@ -49,6 +55,7 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
+ 				struct drm_gem_object **obj)
+ {
+ 	struct amdgpu_bo *robj;
++	struct amdgpu_gem_object *gobj;
+ 	unsigned long max_size;
+ 	int r;
+ 
+@@ -93,7 +100,25 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
+ 		}
+ 		return r;
+ 	}
+-	*obj = &robj->gem_base;
++	robj->pid = task_pid_nr(current);
++
++	gobj = kzalloc(sizeof(struct amdgpu_gem_object), GFP_KERNEL);
++	if (unlikely(!gobj)) {
++		amdgpu_bo_unref(&robj);
++		return -ENOMEM;
++	}
++
++	r = drm_gem_object_init(adev->ddev, &gobj->base, amdgpu_bo_size(robj));
++	if (unlikely(r)) {
++		kfree(gobj);
++		amdgpu_bo_unref(&robj);
++		return r;
++	}
++
++	list_add(&gobj->list, &robj->gem_objects);
++	gobj->bo = amdgpu_bo_ref(robj);
++	*obj = &gobj->base;
++
+ 
+ 	return 0;
+ }
+@@ -848,7 +873,7 @@ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
+ 		struct drm_amdgpu_gem_create_in info;
+ 		void __user *out = (void __user *)(uintptr_t)args->value;
+ 
+-		info.bo_size = robj->gem_base.size;
++		info.bo_size = amdgpu_bo_size(robj);
+ 		info.alignment = robj->tbo.mem.page_alignment << PAGE_SHIFT;
+ 		info.domains = robj->prefered_domains;
+ 		info.domain_flags = robj->flags;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 0b0de11..969087d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -113,7 +113,6 @@ static void amdgpu_ttm_bo_destroy(struct ttm_buffer_object *tbo)
+ 	}
+ 	amdgpu_update_memory_usage(adev, &bo->tbo.mem, NULL);
+ 
+-	drm_gem_object_release(&bo->gem_base);
+ 	amdgpu_bo_unref(&bo->parent);
+ 	if (!list_empty(&bo->shadow_list)) {
+ 		mutex_lock(&adev->shadow_list_lock);
+@@ -389,6 +388,7 @@ int amdgpu_bo_create_restricted(struct amdgpu_device *adev,
+ 	}
+ 	INIT_LIST_HEAD(&bo->shadow_list);
+ 	INIT_LIST_HEAD(&bo->va);
++	INIT_LIST_HEAD(&bo->gem_objects);
+ 	bo->prefered_domains = domain & (AMDGPU_GEM_DOMAIN_VRAM |
+ 					 AMDGPU_GEM_DOMAIN_GTT |
+ 					 AMDGPU_GEM_DOMAIN_CPU |
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+index 6bdc866..b9425ed 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+@@ -65,6 +65,7 @@ amdgpu_gem_prime_import_sg_table(struct drm_device *dev,
+ 	struct reservation_object *resv = attach->dmabuf->resv;
+ 	struct amdgpu_device *adev = dev->dev_private;
+ 	struct amdgpu_bo *bo;
++	struct amdgpu_gem_object *gobj;
+ 	int ret;
+ 
+ 	ww_mutex_lock(&resv->lock, NULL);
+@@ -75,7 +76,24 @@ amdgpu_gem_prime_import_sg_table(struct drm_device *dev,
+ 		return ERR_PTR(ret);
+ 
+ 	bo->prime_shared_count = 1;
+-	return &bo->gem_base;
++
++	gobj = kzalloc(sizeof(struct amdgpu_gem_object), GFP_KERNEL);
++	if (unlikely(!gobj)) {
++		amdgpu_bo_unref(&bo);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	ret = drm_gem_object_init(adev->ddev, &gobj->base, amdgpu_bo_size(bo));
++	if (unlikely(ret)) {
++		kfree(gobj);
++		amdgpu_bo_unref(&bo);
++		return ERR_PTR(ret);
++	}
++
++	list_add(&gobj->list, &bo->gem_objects);
++	gobj->bo = amdgpu_bo_ref(bo);
++
++	return &gobj->base;
+ }
+ 
+ int amdgpu_gem_prime_pin(struct drm_gem_object *obj)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 300f50f..ac7546c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -254,17 +254,30 @@ static void amdgpu_evict_flags(struct ttm_buffer_object *bo,
+ static int amdgpu_verify_access(struct ttm_buffer_object *bo, struct file *filp)
+ {
+ 	struct amdgpu_bo *abo = container_of(bo, struct amdgpu_bo, tbo);
++	struct drm_file *file_priv = filp->private_data;
++	struct amdgpu_gem_object *gobj;
+ 	if (filp == NULL)
+ 		return 0;
+ 
+ 	if (amdgpu_ttm_tt_get_usermm(bo->ttm))
+ 		return -EPERM;
+-	return drm_vma_node_verify_access(&abo->gem_base.vma_node,
+-					  filp->private_data);
++
++	ww_mutex_lock(&abo->tbo.resv->lock, NULL);
++	list_for_each_entry(gobj, &abo->gem_objects, list) {
++		if (gobj->base.dev != file_priv->minor->dev)
++			continue;
++
++		ww_mutex_unlock(&abo->tbo.resv->lock);
++		return drm_vma_node_verify_access(&gobj->base.vma_node,
++					filp->private_data);
++	}
++	ww_mutex_unlock(&abo->tbo.resv->lock);
++
++	return -EPERM;
+ }
+ 
+ static void amdgpu_move_null(struct ttm_buffer_object *bo,
+-			     struct ttm_mem_reg *new_mem)
++			struct ttm_mem_reg *new_mem)
+ {
+ 	struct ttm_mem_reg *old_mem = &bo->mem;
+ 
+-- 
+2.7.4
+

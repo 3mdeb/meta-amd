@@ -1,0 +1,246 @@
+From 93cc6ceeeb1ab76e3d61acb6a8ca24c50afbe07f Mon Sep 17 00:00:00 2001
+From: Junwei Zhang <Jerry.Zhang@amd.com>
+Date: Mon, 16 Jan 2017 13:59:01 +0800
+Subject: [PATCH 0594/2094] drm/amdgpu: IOCTL interface for PRT support v4
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Till GFX8 we can only enable PRT support globally, but with the next hardware
+generation we can do this on a per page basis.
+
+Keep the interface consistent by adding PRT mappings and enable
+support globally on current hardware when the first mapping is made.
+
+v2: disable PRT support delayed and on all error paths
+v3: PRT and other permissions are mutal exclusive,
+    PRT mappings don't need a BO.
+v4: update PRT mappings durign CS as well, make va_flags 64bit
+
+Signed-off-by: Junwei Zhang <Jerry.Zhang@amd.com>
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Nicolai Hähnle <nicolai.haehnle@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  | 16 +++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c | 62 ++++++++++++++++++++-------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c | 10 ++++++
+ include/uapi/drm/amdgpu_drm.h           |  2 ++
+ 5 files changed, 64 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 3b95c67..20a724b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -703,6 +703,7 @@ void amdgpu_ctx_mgr_fini(struct amdgpu_ctx_mgr *mgr);
+ 
+ struct amdgpu_fpriv {
+ 	struct amdgpu_vm	vm;
++	struct amdgpu_bo_va	*prt_va;
+ 	struct mutex		bo_list_lock;
+ 	struct idr		bo_list_handles;
+ 	struct amdgpu_ctx_mgr	ctx_mgr;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 6e948e4..433254b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -758,10 +758,11 @@ static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser, int error, bo
+ 	amdgpu_bo_unref(&parser->uf_entry.robj);
+ }
+ 
+-static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p,
+-				   struct amdgpu_vm *vm)
++static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p)
+ {
+ 	struct amdgpu_device *adev = p->adev;
++	struct amdgpu_fpriv *fpriv = p->filp->driver_priv;
++	struct amdgpu_vm *vm = &fpriv->vm;
+ 	struct amdgpu_bo_va *bo_va;
+ 	struct amdgpu_bo *bo;
+ 	int i, r;
+@@ -778,6 +779,15 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p,
+ 	if (r)
+ 		return r;
+ 
++	r = amdgpu_vm_bo_update(adev, fpriv->prt_va, false);
++	if (r)
++		return r;
++
++	r = amdgpu_sync_fence(adev, &p->job->sync,
++			      fpriv->prt_va->last_pt_update);
++	if (r)
++		return r;
++
+ 	if (amdgpu_sriov_vf(adev)) {
+ 		struct fence *f;
+ 		bo_va = vm->csa_bo_va;
+@@ -854,7 +864,7 @@ static int amdgpu_cs_ib_vm_chunk(struct amdgpu_device *adev,
+ 	if (p->job->vm) {
+ 		p->job->vm_pd_addr = amdgpu_bo_gpu_offset(vm->page_directory);
+ 
+-		r = amdgpu_bo_vm_update_pte(p, vm);
++		r = amdgpu_bo_vm_update_pte(p);
+ 		if (r)
+ 			return r;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 1dc59aa..7f530f2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -540,6 +540,12 @@ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
+ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 			  struct drm_file *filp)
+ {
++	const uint32_t valid_flags = AMDGPU_VM_DELAY_UPDATE |
++		AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE |
++		AMDGPU_VM_PAGE_EXECUTABLE;
++	const uint32_t prt_flags = AMDGPU_VM_DELAY_UPDATE |
++		AMDGPU_VM_PAGE_PRT;
++
+ 	struct drm_amdgpu_gem_va *args = data;
+ 	struct drm_gem_object *gobj;
+ 	struct amdgpu_device *adev = dev->dev_private;
+@@ -550,7 +556,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 	struct ttm_validate_buffer tv;
+ 	struct ww_acquire_ctx ticket;
+ 	struct list_head list;
+-	uint32_t invalid_flags, va_flags = 0;
++	uint64_t va_flags = 0;
+ 	int r = 0;
+ 
+ 	if (!adev->vm_manager.enabled)
+@@ -564,11 +570,9 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 		return -EINVAL;
+ 	}
+ 
+-	invalid_flags = ~(AMDGPU_VM_DELAY_UPDATE | AMDGPU_VM_PAGE_READABLE |
+-			AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
+-	if ((args->flags & invalid_flags)) {
+-		dev_err(&dev->pdev->dev, "invalid flags 0x%08X vs 0x%08X\n",
+-			args->flags, invalid_flags);
++	if ((args->flags & ~valid_flags) && (args->flags & ~prt_flags)) {
++		dev_err(&dev->pdev->dev, "invalid flags combination 0x%08X\n",
++			args->flags);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -582,28 +586,34 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 		return -EINVAL;
+ 	}
+ 
+-	gobj = drm_gem_object_lookup(filp, args->handle);
+-	if (gobj == NULL)
+-		return -ENOENT;
+-	abo = gem_to_amdgpu_bo(gobj);
+ 	INIT_LIST_HEAD(&list);
+-	tv.bo = &abo->tbo;
+-	tv.shared = false;
+-	list_add(&tv.head, &list);
++	if (!(args->flags & AMDGPU_VM_PAGE_PRT)) {
++		gobj = drm_gem_object_lookup(filp, args->handle);
++		if (gobj == NULL)
++			return -ENOENT;
++		abo = gem_to_amdgpu_bo(gobj);
++		tv.bo = &abo->tbo;
++		tv.shared = false;
++		list_add(&tv.head, &list);
++	} else {
++		gobj = NULL;
++		abo = NULL;
++	}
+ 
+ 	amdgpu_vm_get_pd_bo(&fpriv->vm, &list, &vm_pd);
+ 
+ 	r = ttm_eu_reserve_buffers(&ticket, &list, true, NULL);
+-	if (r) {
+-		drm_gem_object_unreference_unlocked(gobj);
+-		return r;
+-	}
++	if (r)
++		goto error_unref;
+ 
+-	bo_va = amdgpu_vm_bo_find(&fpriv->vm, abo);
+-	if (!bo_va) {
+-		ttm_eu_backoff_reservation(&ticket, &list);
+-		drm_gem_object_unreference_unlocked(gobj);
+-		return -ENOENT;
++	if (abo) {
++		bo_va = amdgpu_vm_bo_find(&fpriv->vm, abo);
++		if (!bo_va) {
++			r = -ENOENT;
++			goto error_backoff;
++		}
++	} else {
++		bo_va = fpriv->prt_va;
+ 	}
+ 
+ 	switch (args->operation) {
+@@ -614,6 +624,8 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 			va_flags |= AMDGPU_PTE_WRITEABLE;
+ 		if (args->flags & AMDGPU_VM_PAGE_EXECUTABLE)
+ 			va_flags |= AMDGPU_PTE_EXECUTABLE;
++		if (args->flags & AMDGPU_VM_PAGE_PRT)
++			va_flags |= AMDGPU_PTE_PRT;
+ 		r = amdgpu_vm_bo_map(adev, bo_va, args->va_address,
+ 				     args->offset_in_bo, args->map_size,
+ 				     va_flags);
+@@ -624,11 +636,13 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 	default:
+ 		break;
+ 	}
+-	if (!r && !(args->flags & AMDGPU_VM_DELAY_UPDATE) &&
+-	    !amdgpu_vm_debug)
++	if (!r && !(args->flags & AMDGPU_VM_DELAY_UPDATE) && !amdgpu_vm_debug)
+ 		amdgpu_gem_va_update_vm(adev, bo_va, &list, args->operation);
++
++error_backoff:
+ 	ttm_eu_backoff_reservation(&ticket, &list);
+ 
++error_unref:
+ 	drm_gem_object_unreference_unlocked(gobj);
+ 	return r;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 215f73b..d5f9d6a4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -656,6 +656,14 @@ int amdgpu_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
+ 		goto out_suspend;
+ 	}
+ 
++	fpriv->prt_va = amdgpu_vm_bo_add(adev, &fpriv->vm, NULL);
++	if (!fpriv->prt_va) {
++		r = -ENOMEM;
++		amdgpu_vm_fini(adev, &fpriv->vm);
++		kfree(fpriv);
++		goto out_suspend;
++	}
++
+ 	if (amdgpu_sriov_vf(adev)) {
+ 		r = amdgpu_map_static_csa(adev, &fpriv->vm);
+ 		if (r)
+@@ -700,6 +708,8 @@ void amdgpu_driver_postclose_kms(struct drm_device *dev,
+ 	amdgpu_uvd_free_handles(adev, file_priv);
+ 	amdgpu_vce_free_handles(adev, file_priv);
+ 
++	amdgpu_vm_bo_rmv(adev, fpriv->prt_va);
++
+ 	if (amdgpu_sriov_vf(adev)) {
+ 		/* TODO: how to handle reserve failure */
+ 		BUG_ON(amdgpu_bo_reserve(adev->virt.csa_obj, false));
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 2cf8df8..07e3710 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -363,6 +363,8 @@ struct drm_amdgpu_gem_op {
+ #define AMDGPU_VM_PAGE_WRITEABLE	(1 << 2)
+ /* executable mapping, new for VI */
+ #define AMDGPU_VM_PAGE_EXECUTABLE	(1 << 3)
++/* partially resident texture */
++#define AMDGPU_VM_PAGE_PRT		(1 << 4)
+ 
+ struct drm_amdgpu_gem_va {
+ 	/** GEM object handle */
+-- 
+2.7.4
+

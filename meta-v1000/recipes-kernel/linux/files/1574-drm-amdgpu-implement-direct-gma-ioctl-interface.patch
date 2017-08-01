@@ -1,0 +1,170 @@
+From c4796d7922eaa3bd73780ef28d3a83e1c2f3cf22 Mon Sep 17 00:00:00 2001
+From: Flora Cui <Flora.Cui@amd.com>
+Date: Thu, 11 Aug 2016 14:41:08 +0800
+Subject: [PATCH 1574/2094] drm/amdgpu: implement direct gma ioctl interface
+
+Change-Id: Ibe3d5eca19e84b21dda183010ebd229434cd2f6c
+Signed-off-by: Flora Cui <Flora.Cui@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+
+ Conflicts:
+	include/uapi/drm/amdgpu_drm.h
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  3 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c | 75 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c |  1 +
+ include/uapi/drm/amdgpu_drm.h           | 11 +++++
+ 4 files changed, 90 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 8dbe660..13b657c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1366,6 +1366,9 @@ int amdgpu_gem_metadata_ioctl(struct drm_device *dev, void *data,
+ int amdgpu_freesync_ioctl(struct drm_device *dev, void *data,
+ 			    struct drm_file *filp);
+ 
++int amdgpu_gem_dgma_ioctl(struct drm_device *dev, void *data,
++			  struct drm_file *filp);
++
+ int amdgpu_sem_ioctl(struct drm_device *dev, void *data,
+ 		     struct drm_file *filp);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 710c8a20..79b3a87 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -441,6 +441,81 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
+ 	return r;
+ }
+ 
++int amdgpu_gem_dgma_ioctl(struct drm_device *dev, void *data,
++			   struct drm_file *filp)
++{
++	struct amdgpu_device *adev = dev->dev_private;
++	struct drm_amdgpu_gem_dgma *args = data;
++	struct drm_gem_object *gobj;
++	struct amdgpu_bo *abo;
++	dma_addr_t *dma_addr;
++	uint32_t handle, flags, offset;
++	int i, r = 0;
++
++	switch (args->op) {
++	case AMDGPU_GEM_DGMA_IMPORT:
++		/* create a gem object to contain this object in */
++		r = amdgpu_gem_object_create(adev, args->size, 0,
++					     AMDGPU_GEM_DOMAIN_DGMA_IMPORT, 0,
++					     0, &gobj);
++		if (r)
++			return r;
++
++		abo = gem_to_amdgpu_bo(gobj);
++		r = amdgpu_bo_reserve(abo, true);
++		if (unlikely(r))
++			goto release_object;
++
++		dma_addr = kmalloc_array(abo->tbo.num_pages, sizeof(dma_addr_t), GFP_KERNEL);
++		if (unlikely(dma_addr == NULL)) {
++			amdgpu_bo_unreserve(abo);
++			goto release_object;
++		}
++		for (i = 0; i < abo->tbo.num_pages; i++)
++			dma_addr[i] = args->addr + i * PAGE_SIZE;
++
++		flags = AMDGPU_PTE_VALID | AMDGPU_PTE_READABLE | AMDGPU_PTE_WRITEABLE;
++		if (adev->asic_type >= CHIP_TONGA)
++			flags |= AMDGPU_PTE_EXECUTABLE;
++
++		offset = amdgpu_bo_gpu_offset(abo);
++		offset -= adev->mman.bdev.man[TTM_PL_TT].gpu_offset;
++		r = amdgpu_gart_bind(adev, offset, abo->tbo.num_pages,
++					NULL, dma_addr, flags);
++		kfree(dma_addr);
++		amdgpu_bo_unreserve(abo);
++		if (unlikely(r))
++			goto release_object;
++
++		abo->tbo.mem.bus.base = args->addr;
++		abo->tbo.mem.bus.offset = 0;
++
++		r = drm_gem_handle_create(filp, gobj, &handle);
++		args->handle = handle;
++		break;
++	case AMDGPU_GEM_DGMA_QUERY_PHYS_ADDR:
++		gobj = drm_gem_object_lookup(filp, args->handle);
++		if (gobj == NULL)
++			return -ENOENT;
++
++		abo = gem_to_amdgpu_bo(gobj);
++		if (abo->tbo.mem.mem_type != AMDGPU_PL_DGMA) {
++			r = -EINVAL;
++			goto release_object;
++		}
++		args->addr = amdgpu_bo_gpu_offset(abo);
++		args->addr -= adev->mc.vram_start;
++		args->addr += adev->mc.aper_base;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++release_object:
++	drm_gem_object_unreference_unlocked(gobj);
++	return r;
++}
++
+ int amdgpu_mode_dumb_mmap(struct drm_file *filp,
+ 			  struct drm_device *dev,
+ 			  uint32_t handle, uint64_t *offset_p)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index b8f8fee..bf1592f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -1051,6 +1051,7 @@ const struct drm_ioctl_desc amdgpu_ioctls_kms[] = {
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_OP, amdgpu_gem_op_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_USERPTR, amdgpu_gem_userptr_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_FREESYNC, amdgpu_freesync_ioctl, DRM_MASTER),
++	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_DGMA, amdgpu_gem_dgma_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_FIND_BO, amdgpu_gem_find_bo_by_cpu_mapping_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_SEM, amdgpu_sem_ioctl, DRM_AUTH|DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ };
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 249db46..b2764f3 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -56,6 +56,7 @@ extern "C" {
+ 
+ /* hybrid specific ioctls */
+ #define DRM_AMDGPU_SEM			0x5b
++#define DRM_AMDGPU_GEM_DGMA		0x5c
+ #define DRM_AMDGPU_GEM_FIND_BO		0x5f
+ 
+ #define DRM_IOCTL_AMDGPU_GEM_CREATE	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_CREATE, union drm_amdgpu_gem_create)
+@@ -75,6 +76,7 @@ extern "C" {
+ #define DRM_IOCTL_AMDGPU_FREESYNC	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_FREESYNC, struct drm_amdgpu_freesync)
+ 
+ /* hybrid specific ioctls */
++#define DRM_IOCTL_AMDGPU_GEM_DGMA      DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_DGMA, struct drm_amdgpu_gem_dgma)
+ #define DRM_IOCTL_AMDGPU_GEM_FIND_BO	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_FIND_BO, struct drm_amdgpu_gem_find_bo)
+ #define DRM_IOCTL_AMDGPU_SEM		DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_SEM, union drm_amdgpu_sem)
+ 
+@@ -286,6 +288,15 @@ struct drm_amdgpu_gem_find_bo {
+ 	uint64_t		offset;
+ };
+ 
++#define AMDGPU_GEM_DGMA_IMPORT			0
++#define AMDGPU_GEM_DGMA_QUERY_PHYS_ADDR			1
++struct drm_amdgpu_gem_dgma {
++	__u64           addr;
++	__u64           size;
++	__u32           op;
++	__u32           handle;
++};
++
+ /* SI-CI-VI: */
+ /* same meaning as the GB_TILE_MODE and GL_MACRO_TILE_MODE fields */
+ #define AMDGPU_TILING_ARRAY_MODE_SHIFT			0
+-- 
+2.7.4
+

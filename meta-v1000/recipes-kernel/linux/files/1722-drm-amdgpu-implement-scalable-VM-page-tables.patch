@@ -1,0 +1,175 @@
+From 1938c92b250c7888b3e02f354b0d6f38bd07b4fd Mon Sep 17 00:00:00 2001
+From: David Ogbeide <Davidboyowa.Ogbeide@amd.com>
+Date: Mon, 7 Mar 2016 13:37:51 -0500
+Subject: [PATCH 1722/2094] drm/amdgpu: implement scalable VM page tables
+
+GPUVM table and GART sizes are currently
+initialized to default fixed constants.
+
+Sizes should be determined by the amount of physical
+RAM to optimize memory usage on smaller systems and
+prevent mapping constraints on larger systems.
+
+BUG: KFD-224
+
+Signed-off-by: David Ogbeide <davidboyowa.ogbeide@amd.com>
+Change-Id: Ia33d5234c3e1186a0ca0711a173dad308e0c6a30
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+	drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 24 +++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c      | 34 ++++++++++++++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c      | 34 ++++++++++++++++++++++++------
+ 3 files changed, 80 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 612f0ba..c252054 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1109,6 +1109,9 @@ static void amdgpu_check_vm_size(struct amdgpu_device *adev)
+  */
+ static void amdgpu_check_arguments(struct amdgpu_device *adev)
+ {
++	struct sysinfo si;
++	int phys_ram_gb, amdgpu_vm_size_aligned;
++
+ 	if (amdgpu_sched_jobs < 4) {
+ 		dev_warn(adev->dev, "sched jobs (%d) must be at least 4\n",
+ 			 amdgpu_sched_jobs);
+@@ -1128,6 +1131,27 @@ static void amdgpu_check_arguments(struct amdgpu_device *adev)
+ 		}
+ 	}
+ 
++	/* Compute the GPU VM space only if the user
++	 * hasn't changed it from the default.
++	 */
++	if (amdgpu_vm_size == -1) {
++		/* Computation depends on the amount of physical RAM available.
++		 * Cannot exceed 1TB.
++		 */
++		si_meminfo(&si);
++		phys_ram_gb = ((uint64_t)si.totalram * si.mem_unit) >> 30;
++		amdgpu_vm_size = min(phys_ram_gb * 3 + 16, 1024);
++
++		/* GPUVM sizes are almost never perfect powers of two.
++		 * Round up to nearest power of two starting from
++		 * the minimum allowed but aligned size of 32GB */
++		amdgpu_vm_size_aligned = 32;
++		while (amdgpu_vm_size > amdgpu_vm_size_aligned)
++			amdgpu_vm_size_aligned *= 2;
++
++		amdgpu_vm_size = amdgpu_vm_size_aligned;
++	}
++
+ 	amdgpu_check_vm_size(adev);
+ 
+ 	amdgpu_check_block_size(adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index 2750e5c..d629a4b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -327,6 +327,9 @@ static void gmc_v7_0_mc_program(struct amdgpu_device *adev)
+  */
+ static int gmc_v7_0_mc_init(struct amdgpu_device *adev)
+ {
++	uint64_t gart_size_aligned;
++	struct sysinfo si;
++	
+ 	adev->mc.vram_width = amdgpu_atombios_get_vram_width(adev);
+ 	if (!adev->mc.vram_width) {
+ 		u32 tmp;
+@@ -391,12 +394,31 @@ static int gmc_v7_0_mc_init(struct amdgpu_device *adev)
+ 	if (adev->mc.visible_vram_size > adev->mc.real_vram_size)
+ 		adev->mc.visible_vram_size = adev->mc.real_vram_size;
+ 
+-	/* unless the user had overridden it, set the gart
+-	 * size equal to the 1024 or vram, whichever is larger.
+-	 */
+-	if (amdgpu_gart_size == -1)
+-		adev->mc.gtt_size = max((AMDGPU_DEFAULT_GTT_SIZE_MB << 20),
+-					adev->mc.mc_vram_size);
++	/* Unless the user has overridden it, compute the GART size */
++	if (amdgpu_gart_size == -1) {
++		si_meminfo(&si);
++		/* Set the GART to map the largest size between either
++		 * VRAM capacity or double the available physical RAM,
++		 * but no larger than 512GB.
++		 */
++		adev->mc.gtt_size = min(
++			max(
++				((uint64_t)si.totalram * si.mem_unit * 2),
++				adev->mc.mc_vram_size
++			),
++			1024ULL << 29
++		);
++
++		/* GART sizes computed from physical RAM capacity
++		 * may not always be perfect powers of two.
++		 * Round up starting from the minimum size of 1GB.
++		 */
++		gart_size_aligned = 1024ULL << 20;
++		while (adev->mc.gtt_size > gart_size_aligned)
++			gart_size_aligned <<= 1;
++
++		adev->mc.gtt_size = gart_size_aligned;
++	}
+ 	else
+ 		adev->mc.gtt_size = (uint64_t)amdgpu_gart_size << 20;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index a83d32d..feaeb99 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -489,6 +489,9 @@ static void gmc_v8_0_mc_program(struct amdgpu_device *adev)
+  */
+ static int gmc_v8_0_mc_init(struct amdgpu_device *adev)
+ {
++	uint64_t gart_size_aligned;
++	struct sysinfo si;
++
+ 	adev->mc.vram_width = amdgpu_atombios_get_vram_width(adev);
+ 	if (!adev->mc.vram_width) {
+ 		u32 tmp;
+@@ -553,12 +556,31 @@ static int gmc_v8_0_mc_init(struct amdgpu_device *adev)
+ 	if (adev->mc.visible_vram_size > adev->mc.real_vram_size)
+ 		adev->mc.visible_vram_size = adev->mc.real_vram_size;
+ 
+-	/* unless the user had overridden it, set the gart
+-	 * size equal to the 1024 or vram, whichever is larger.
+-	 */
+-	if (amdgpu_gart_size == -1)
+-		adev->mc.gtt_size = max((AMDGPU_DEFAULT_GTT_SIZE_MB << 20),
+-					adev->mc.mc_vram_size);
++	/* Unless the user has overridden it, compute the GART size */
++	if (amdgpu_gart_size == -1) {
++		si_meminfo(&si);
++		/* Set the GART to map the largest size between either
++		 * VRAM capacity or double the available physical RAM,
++		 * but no larger than 512GB.
++		 */
++		adev->mc.gtt_size = min(
++			max(
++				((uint64_t)si.totalram * si.mem_unit * 2),
++				adev->mc.mc_vram_size
++			),
++			1024ULL << 29
++		);
++
++		/* GART sizes computed from physical RAM capacity
++		 * may not always be perfect powers of two.
++		 * Round up starting from the minimum size of 1GB.
++		 */
++		gart_size_aligned = 1024ULL << 20;
++		while (adev->mc.gtt_size > gart_size_aligned)
++			gart_size_aligned <<= 1;
++
++		adev->mc.gtt_size = gart_size_aligned;
++	}
+ 	else
+ 		adev->mc.gtt_size = (uint64_t)amdgpu_gart_size << 20;
+ 
+-- 
+2.7.4
+

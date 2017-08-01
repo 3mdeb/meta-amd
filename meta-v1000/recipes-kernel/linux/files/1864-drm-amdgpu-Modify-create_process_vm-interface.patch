@@ -1,0 +1,137 @@
+From b73e19268d26a08ae1e4999adbc42338bf92c4ef Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Date: Mon, 27 Jun 2016 15:30:45 -0400
+Subject: [PATCH 1864/2094] drm/amdgpu: Modify create_process_vm interface
+
+Modify create_process_vm to accommodate master VM. KFD process chooses
+the VM of the first device detected to be the master VM. This
+information is passed on to KGD via create_process_interface.
+
+Change-Id: I8b5fd102f1f598673af0c936b718b1d7d8d235a3
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h       |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c | 12 +++++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h            |  2 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c         |  5 ++++-
+ drivers/gpu/drm/amd/include/kgd_kfd_interface.h  |  3 ++-
+ drivers/gpu/drm/radeon/radeon_kfd.c              |  4 ++--
+ 6 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 28285c5..48eaf5f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -156,7 +156,8 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ int amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
+ 		struct kgd_dev *kgd, struct kgd_mem *mem, void *vm);
+ 
+-int amdgpu_amdkfd_gpuvm_create_process_vm(struct kgd_dev *kgd, void **vm);
++int amdgpu_amdkfd_gpuvm_create_process_vm(struct kgd_dev *kgd, void **vm,
++					  void *master_vm);
+ void amdgpu_amdkfd_gpuvm_destroy_process_vm(struct kgd_dev *kgd, void *vm);
+ 
+ uint32_t amdgpu_amdkfd_gpuvm_get_process_page_dir(void *vm);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 123adfb..54ff3de 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1034,7 +1034,8 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ 	return ret;
+ }
+ 
+-int amdgpu_amdkfd_gpuvm_create_process_vm(struct kgd_dev *kgd, void **vm)
++int amdgpu_amdkfd_gpuvm_create_process_vm(struct kgd_dev *kgd, void **vm,
++					  void *master_vm)
+ {
+ 	int ret;
+ 	struct amdkfd_vm *new_vm;
+@@ -1061,6 +1062,15 @@ int amdgpu_amdkfd_gpuvm_create_process_vm(struct kgd_dev *kgd, void **vm)
+ 	mutex_init(&new_vm->lock);
+ 	INIT_LIST_HEAD(&new_vm->kfd_bo_list);
+ 	INIT_LIST_HEAD(&new_vm->kfd_vm_list);
++
++	if (master_vm == NULL)
++		new_vm->master = new_vm;
++	else {
++		new_vm->master = master_vm;
++		list_add_tail(&new_vm->kfd_vm_list,
++			      &((struct amdkfd_vm *)master_vm)->kfd_vm_list);
++	}
++	new_vm->master->n_vms++;
+ 	*vm = (void *) new_vm;
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index cabf0fe..887d6c3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -669,6 +669,8 @@ struct kfd_process {
+ 	size_t debug_event_count;
+ 
+ 	struct rb_root bo_interval_tree;
++
++	void *master_vm;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 530ba7d..f38cca8 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -731,12 +731,15 @@ struct kfd_process_device *kfd_create_process_device_data(struct kfd_dev *dev,
+ 		idr_init(&pdd->alloc_idr);
+ 
+ 		/* Create the GPUVM context for this specific device */
+-		if (dev->kfd2kgd->create_process_vm(dev->kgd, &pdd->vm)) {
++		if (dev->kfd2kgd->create_process_vm(dev->kgd, &pdd->vm,
++						    p->master_vm)) {
+ 			pr_err("Failed to create process VM object\n");
+ 			list_del(&pdd->per_device_list);
+ 			kfree(pdd);
+ 			pdd = NULL;
+ 		}
++		if (p->master_vm == NULL)
++			p->master_vm = pdd->vm;
+ 	}
+ 
+ 	return pdd;
+diff --git a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+index 1c1ed35..1d5935e 100644
+--- a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+@@ -234,7 +234,8 @@ struct kfd2kgd_calls {
+ 
+ 	uint32_t (*get_max_engine_clock_in_mhz)(struct kgd_dev *kgd);
+ 
+-	int (*create_process_vm)(struct kgd_dev *kgd, void **vm);
++	int (*create_process_vm)(struct kgd_dev *kgd, void **vm,
++				 void *master_vm);
+ 	void (*destroy_process_vm)(struct kgd_dev *kgd, void *vm);
+ 
+ 	int (*create_process_gpumem)(struct kgd_dev *kgd, uint64_t va, size_t size, void *vm, struct kgd_mem **mem);
+diff --git a/drivers/gpu/drm/radeon/radeon_kfd.c b/drivers/gpu/drm/radeon/radeon_kfd.c
+index 869aa0a..7e816c5 100644
+--- a/drivers/gpu/drm/radeon/radeon_kfd.c
++++ b/drivers/gpu/drm/radeon/radeon_kfd.c
+@@ -79,7 +79,7 @@ static uint64_t get_gpu_clock_counter(struct kgd_dev *kgd);
+ 
+ static uint32_t get_max_engine_clock_in_mhz(struct kgd_dev *kgd);
+ 
+-static int create_process_vm(struct kgd_dev *kgd, void **vm);
++static int create_process_vm(struct kgd_dev *kgd, void **vm, void *master_vm);
+ static void destroy_process_vm(struct kgd_dev *kgd, void *vm);
+ 
+ static uint32_t get_process_page_dir(void *vm);
+@@ -424,7 +424,7 @@ static uint32_t get_max_engine_clock_in_mhz(struct kgd_dev *kgd)
+ /*
+  * Creates a VM context for HSA process
+  */
+-static int create_process_vm(struct kgd_dev *kgd, void **vm)
++static int create_process_vm(struct kgd_dev *kgd, void **vm, void *master_vm)
+ {
+ 	int ret;
+ 	struct radeon_vm *new_vm;
+-- 
+2.7.4
+

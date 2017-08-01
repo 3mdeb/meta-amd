@@ -1,0 +1,149 @@
+From 824b3cb20a9b74c9cba2c79492c9954764659f2c Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Fri, 3 Mar 2017 15:39:51 -0500
+Subject: [PATCH 0815/2094] drm/amdgpu: add NGG parameters
+
+NGG (Next Generation Graphics) is a new feature in GFX9.0.  This
+adds the relevant parameters.
+
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     | 29 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c | 21 +++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c |  7 +++++++
+ include/uapi/drm/amdgpu_drm.h           |  8 ++++++++
+ 4 files changed, 65 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index f605219..ad0e224 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -105,6 +105,11 @@ extern char *amdgpu_disable_cu;
+ extern char *amdgpu_virtual_display;
+ extern unsigned amdgpu_pp_feature_mask;
+ extern int amdgpu_vram_page_split;
++extern int amdgpu_ngg;
++extern int amdgpu_prim_buf_per_se;
++extern int amdgpu_pos_buf_per_se;
++extern int amdgpu_cntl_sb_buf_per_se;
++extern int amdgpu_param_buf_per_se;
+ 
+ #define AMDGPU_WAIT_IDLE_TIMEOUT_IN_MS	        3000
+ #define AMDGPU_MAX_USEC_TIMEOUT			100000	/* 100 ms */
+@@ -959,6 +964,28 @@ struct amdgpu_gfx_funcs {
+ 	void (*read_wave_sgprs)(struct amdgpu_device *adev, uint32_t simd, uint32_t wave, uint32_t start, uint32_t size, uint32_t *dst);
+ };
+ 
++struct amdgpu_ngg_buf {
++	struct amdgpu_bo	*bo;
++	uint64_t		gpu_addr;
++	uint32_t		size;
++	uint32_t		bo_size;
++};
++
++enum {
++	PRIM = 0,
++	POS,
++	CNTL,
++	PARAM,
++	NGG_BUF_MAX
++};
++
++struct amdgpu_ngg {
++	struct amdgpu_ngg_buf	buf[NGG_BUF_MAX];
++	uint32_t		gds_reserve_addr;
++	uint32_t		gds_reserve_size;
++	bool			init;
++};
++
+ struct amdgpu_gfx {
+ 	struct mutex			gpu_clock_mutex;
+ 	struct amdgpu_gfx_config	config;
+@@ -1002,6 +1029,8 @@ struct amdgpu_gfx {
+ 	uint32_t                        grbm_soft_reset;
+ 	uint32_t                        srbm_soft_reset;
+ 	bool                            in_reset;
++	/* NGG */
++	struct amdgpu_ngg		ngg;
+ };
+ 
+ int amdgpu_ib_get(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 3d0e8b1..ef3ed11 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -103,6 +103,11 @@ unsigned amdgpu_pg_mask = 0xffffffff;
+ char *amdgpu_disable_cu = NULL;
+ char *amdgpu_virtual_display = NULL;
+ unsigned amdgpu_pp_feature_mask = 0xffffffff;
++int amdgpu_ngg = 0;
++int amdgpu_prim_buf_per_se = 0;
++int amdgpu_pos_buf_per_se = 0;
++int amdgpu_cntl_sb_buf_per_se = 0;
++int amdgpu_param_buf_per_se = 0;
+ 
+ MODULE_PARM_DESC(vramlimit, "Restrict VRAM for testing, in megabytes");
+ module_param_named(vramlimit, amdgpu_vram_limit, int, 0600);
+@@ -213,6 +218,22 @@ MODULE_PARM_DESC(virtual_display,
+ 		 "Enable virtual display feature (the virtual_display will be set like xxxx:xx:xx.x,x;xxxx:xx:xx.x,x)");
+ module_param_named(virtual_display, amdgpu_virtual_display, charp, 0444);
+ 
++MODULE_PARM_DESC(ngg, "Next Generation Graphics (1 = enable, 0 = disable(default depending on gfx))");
++module_param_named(ngg, amdgpu_ngg, int, 0444);
++
++MODULE_PARM_DESC(prim_buf_per_se, "the size of Primitive Buffer per Shader Engine (default depending on gfx)");
++module_param_named(prim_buf_per_se, amdgpu_prim_buf_per_se, int, 0444);
++
++MODULE_PARM_DESC(pos_buf_per_se, "the size of Position Buffer per Shader Engine (default depending on gfx)");
++module_param_named(pos_buf_per_se, amdgpu_pos_buf_per_se, int, 0444);
++
++MODULE_PARM_DESC(cntl_sb_buf_per_se, "the size of Control Sideband per Shader Engine (default depending on gfx)");
++module_param_named(cntl_sb_buf_per_se, amdgpu_cntl_sb_buf_per_se, int, 0444);
++
++MODULE_PARM_DESC(param_buf_per_se, "the size of Off-Chip Pramater Cache per Shader Engine (default depending on gfx)");
++module_param_named(param_buf_per_se, amdgpu_param_buf_per_se, int, 0444);
++
++
+ static const struct pci_device_id pciidlist[] = {
+ #ifdef  CONFIG_DRM_AMDGPU_SI
+ 	{0x1002, 0x6780, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_TAHITI},
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 6906322..de0c776 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -542,6 +542,13 @@ static int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file
+ 		dev_info.gc_double_offchip_lds_buf =
+ 			adev->gfx.config.double_offchip_lds_buf;
+ 
++		if (amdgpu_ngg) {
++			dev_info.prim_buf_gpu_addr = adev->gfx.ngg.buf[PRIM].gpu_addr;
++			dev_info.pos_buf_gpu_addr = adev->gfx.ngg.buf[POS].gpu_addr;
++			dev_info.cntl_sb_buf_gpu_addr = adev->gfx.ngg.buf[CNTL].gpu_addr;
++			dev_info.param_buf_gpu_addr = adev->gfx.ngg.buf[PARAM].gpu_addr;
++		}
++
+ 		return copy_to_user(out, &dev_info,
+ 				    min((size_t)size, sizeof(dev_info))) ? -EFAULT : 0;
+ 	}
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index d4ad2a1..1bf6b29 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -746,6 +746,14 @@ struct drm_amdgpu_info_device {
+ 	__u32 vce_harvest_config;
+ 	/* gfx double offchip LDS buffers */
+ 	__u32 gc_double_offchip_lds_buf;
++	/* NGG Primitive Buffer */
++	__u64 prim_buf_gpu_addr;
++	/* NGG Position Buffer */
++	__u64 pos_buf_gpu_addr;
++	/* NGG Control Sideband */
++	__u64 cntl_sb_buf_gpu_addr;
++	/* NGG Parameter Cache */
++	__u64 param_buf_gpu_addr;
+ };
+ 
+ struct drm_amdgpu_info_hw_ip {
+-- 
+2.7.4
+

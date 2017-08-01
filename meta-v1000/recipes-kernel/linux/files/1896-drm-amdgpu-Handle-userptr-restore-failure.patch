@@ -1,0 +1,100 @@
+From d1f8ad75949657d46a4b3dd8470f74b15d11f05c Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Date: Mon, 17 Oct 2016 17:51:45 -0400
+Subject: [PATCH 1896/2094] drm/amdgpu: Handle userptr restore failure
+
+OpenCL test app frees the userptr before unmapping it. This triggers an
+evict just before the BO is unmapped. Occasionally, the restore BO
+happens before the unmap. In this case, the restore fails as
+get_user_pages() fail as the buffer is already freed.
+
+Handle this situation more gracefully by marking the BO unmapped and not
+evicted. In this way subsequent unmap will fail since the BO is already
+unmapped. However, if the user space tries to access the BO as expected
+a VM_FAULT will be triggered.
+
+BUG: SWDEV-104242
+
+Change-Id: I63f56505ac52a03b909785c3915c087fb0deb1ad
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h       |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c | 20 +++++++++++++++-----
+ 2 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 1d8ef37..5497494 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -39,6 +39,7 @@ struct kfd_bo_va_list {
+ 	struct amdgpu_bo_va *bo_va;
+ 	void *kgd_dev;
+ 	bool is_mapped;
++	bool map_fail;
+ };
+ 
+ struct kgd_mem {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 057a47b..5b6fd44 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -203,7 +203,6 @@ static int add_bo_to_vm(struct amdgpu_device *adev, struct kgd_mem *mem,
+ 	}
+ 
+ 	bo_va_entry->kgd_dev = (void *)adev;
+-	bo_va_entry->is_mapped = false;
+ 	list_add(&bo_va_entry->bo_list, list_bo_va);
+ 
+ 	if (p_bo_va_entry)
+@@ -1790,14 +1789,16 @@ int amdgpu_amdkfd_gpuvm_restore_mem(struct kgd_mem *mem, struct mm_struct *mm)
+ 		adev = (struct amdgpu_device *)entry->kgd_dev;
+ 
+ 		if (unlikely(!have_pages)) {
+-			entry->is_mapped = false;
++			pr_err("get_user_pages failed. Probably userptr is freed. %d\n",
++				ret);
++			entry->map_fail = true;
+ 			continue;
+ 		}
+ 
+ 		r = amdgpu_amdkfd_bo_validate(mem->bo, domain, true);
+ 		if (unlikely(r != 0)) {
+ 			pr_err("Failed to validate BO\n");
+-			entry->is_mapped = false;
++			entry->map_fail = true;
+ 			if (ret == 0)
+ 				ret = r;
+ 			continue;
+@@ -1807,7 +1808,7 @@ int amdgpu_amdkfd_gpuvm_restore_mem(struct kgd_mem *mem, struct mm_struct *mm)
+ 				    &ctx.sync);
+ 		if (unlikely(r != 0)) {
+ 			pr_err("Failed to map BO to gpuvm\n");
+-			entry->is_mapped = false;
++			entry->map_fail = true;
+ 			if (ret == 0)
+ 				ret = r;
+ 		}
+@@ -1826,10 +1827,19 @@ int amdgpu_amdkfd_gpuvm_restore_mem(struct kgd_mem *mem, struct mm_struct *mm)
+ 		if (!entry->is_mapped)
+ 			continue;
+ 
++		/* Mapping failed. To be in a consistent state, mark the
++		 * buffer as unmapped, but state of the buffer will be
++		 * not evicted. A vm fault will generated if user space tries
++		 * to access this buffer.
++		 */
++		if (entry->map_fail) {
++			entry->is_mapped = false;
++			mem->mapped_to_gpu_memory--;
++		}
+ 		adev = (struct amdgpu_device *)entry->kgd_dev;
+ 
+ 		r = kgd2kfd->resume_mm(adev->kfd, mm);
+-		if (ret != 0) {
++		if (r != 0) {
+ 			pr_err("Failed to resume KFD\n");
+ 			if (ret == 0)
+ 				ret = r;
+-- 
+2.7.4
+

@@ -1,0 +1,284 @@
+From 14bd0e02d8250f0ea458b06399a9d43a05080e49 Mon Sep 17 00:00:00 2001
+From: Shaoyun Liu <Shaoyun.Liu@amd.com>
+Date: Mon, 24 Apr 2017 10:57:54 -0400
+Subject: [PATCH 2064/2094] drm/amdgpu: Implement new invalidate tlb in amdgpu
+
+1. Add invalidate tlb interface in kfd2kgd.
+2. Switch to use command package for tlb invalidation on asic newer than v8
+   when kiq is enabled.
+
+Change-Id: Ia6c04ca7a3a57423cc1ab95c42d0787705957151
+Signed-off-by: Shaoyun Liu <Shaoyun.Liu@amd.com>
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c | 23 ++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c | 52 ++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c | 51 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/soc15d.h               |  3 ++
+ drivers/gpu/drm/amd/amdgpu/vid.h                  |  6 ++-
+ drivers/gpu/drm/amd/include/kgd_kfd_interface.h   |  3 ++
+ 6 files changed, 136 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+index ce9b9f4..464930c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+@@ -145,6 +145,7 @@ static bool get_atc_vmid_pasid_mapping_valid(struct kgd_dev *kgd, uint8_t vmid);
+ static uint16_t get_atc_vmid_pasid_mapping_pasid(struct kgd_dev *kgd,
+ 							uint8_t vmid);
+ static void write_vmid_invalidate_request(struct kgd_dev *kgd, uint8_t vmid);
++static int invalidate_tlbs(struct kgd_dev *kgd, uint16_t pasid);
+ static void set_num_of_requests(struct kgd_dev *dev, uint8_t num_of_req);
+ static int alloc_memory_of_scratch(struct kgd_dev *kgd,
+ 					 uint64_t va, uint32_t vmid);
+@@ -212,6 +213,7 @@ static const struct kfd2kgd_calls kfd2kgd = {
+ 			get_atc_vmid_pasid_mapping_valid,
+ 	.read_vmid_from_vmfault_reg = read_vmid_from_vmfault_reg,
+ 	.write_vmid_invalidate_request = write_vmid_invalidate_request,
++	.invalidate_tlbs = invalidate_tlbs,
+ 	.alloc_memory_of_gpu = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu,
+ 	.free_memory_of_gpu = amdgpu_amdkfd_gpuvm_free_memory_of_gpu,
+ 	.map_memory_to_gpu = amdgpu_amdkfd_gpuvm_map_memory_to_gpu,
+@@ -830,6 +832,27 @@ static void write_vmid_invalidate_request(struct kgd_dev *kgd, uint8_t vmid)
+ 	WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);
+ }
+ 
++static int invalidate_tlbs(struct kgd_dev *kgd, uint16_t pasid)
++{
++	struct amdgpu_device *adev = (struct amdgpu_device *) kgd;
++	int vmid;
++
++	for (vmid = 0; vmid < 16; vmid++) {
++		if (!amdgpu_amdkfd_is_kfd_vmid(adev, vmid))
++			continue;
++		if (RREG32(mmATC_VMID0_PASID_MAPPING + vmid) &
++			ATC_VMID0_PASID_MAPPING__VALID_MASK) {
++			if ((RREG32(mmATC_VMID0_PASID_MAPPING + vmid) &
++				ATC_VMID0_PASID_MAPPING__PASID_MASK) == pasid) {
++				WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);
++				break;
++			}
++		}
++	}
++
++	return 0;
++}
++
+ static int write_config_static_mem(struct kgd_dev *kgd, bool swizzle_enable,
+ 		uint8_t element_size, uint8_t index_stride, uint8_t mtype)
+ {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+index 8bc12a6..637f7c9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+@@ -105,7 +105,6 @@ static int kgd_hqd_destroy(struct kgd_dev *kgd,
+ 				uint32_t queue_id);
+ static int kgd_hqd_sdma_destroy(struct kgd_dev *kgd, void *mqd,
+ 				unsigned int utimeout);
+-static void write_vmid_invalidate_request(struct kgd_dev *kgd, uint8_t vmid);
+ static int kgd_address_watch_disable(struct kgd_dev *kgd);
+ static int kgd_address_watch_execute(struct kgd_dev *kgd,
+ 					unsigned int watch_point_id,
+@@ -132,6 +131,7 @@ static int write_config_static_mem(struct kgd_dev *kgd, bool swizzle_enable,
+ 		uint8_t element_size, uint8_t index_stride, uint8_t mtype);
+ static void set_vm_context_page_table_base(struct kgd_dev *kgd, uint32_t vmid,
+ 		uint32_t page_table_base);
++static int invalidate_tlbs(struct kgd_dev *kgd, uint16_t pasid);
+ 
+ /* Because of REG_GET_FIELD() being used, we put this function in the
+  * asic specific file.
+@@ -191,6 +191,7 @@ static const struct kfd2kgd_calls kfd2kgd = {
+ 	.get_atc_vmid_pasid_mapping_valid =
+ 			get_atc_vmid_pasid_mapping_valid,
+ 	.write_vmid_invalidate_request = write_vmid_invalidate_request,
++	.invalidate_tlbs = invalidate_tlbs,
+ 	.alloc_memory_of_gpu = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu,
+ 	.free_memory_of_gpu = amdgpu_amdkfd_gpuvm_free_memory_of_gpu,
+ 	.map_memory_to_gpu = amdgpu_amdkfd_gpuvm_map_memory_to_gpu,
+@@ -763,6 +764,55 @@ static void write_vmid_invalidate_request(struct kgd_dev *kgd, uint8_t vmid)
+ 	WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);
+ }
+ 
++static int invalidate_tlbs_with_kiq(struct amdgpu_device *adev, uint16_t pasid)
++{
++	signed long r;
++	struct fence *f;
++	struct amdgpu_ring *ring = &adev->gfx.kiq.ring;
++
++	mutex_lock(&adev->virt.lock_kiq);
++	amdgpu_ring_alloc(ring, 12); /* fence + invalidate_tlbs package*/
++	amdgpu_ring_write(ring, PACKET3(PACKET3_INVALIDATE_TLBS, 0));
++	amdgpu_ring_write(ring,
++			PACKET3_INVALIDATE_TLBS_DST_SEL(1) |
++			PACKET3_INVALIDATE_TLBS_PASID(pasid));
++	amdgpu_fence_emit(ring, &f);
++	amdgpu_ring_commit(ring);
++	mutex_unlock(&adev->virt.lock_kiq);
++
++	r = fence_wait(f, false);
++	if (r)
++		DRM_ERROR("wait for kiq fence error: %ld.\n", r);
++	fence_put(f);
++
++	return r;
++}
++
++static int invalidate_tlbs(struct kgd_dev *kgd, uint16_t pasid)
++{
++	struct amdgpu_device *adev = (struct amdgpu_device *) kgd;
++	int vmid;
++	struct amdgpu_ring *ring = &adev->gfx.kiq.ring;
++
++	if (ring->ready)
++		return invalidate_tlbs_with_kiq(adev, pasid);
++
++	for (vmid = 0; vmid < 16; vmid++) {
++		if (!amdgpu_amdkfd_is_kfd_vmid(adev, vmid))
++			continue;
++		if (RREG32(mmATC_VMID0_PASID_MAPPING + vmid) &
++			ATC_VMID0_PASID_MAPPING__VALID_MASK) {
++			if ((RREG32(mmATC_VMID0_PASID_MAPPING + vmid) &
++				ATC_VMID0_PASID_MAPPING__PASID_MASK) == pasid) {
++				WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);
++				break;
++			}
++		}
++	}
++
++	return 0;
++}
++
+ static int kgd_address_watch_disable(struct kgd_dev *kgd)
+ {
+ 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
+index 5876377..340f0524 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
+@@ -46,6 +46,7 @@
+ #include "soc15_common.h"
+ #include "v9_structs.h"
+ #include "soc15.h"
++#include "soc15d.h"
+ 
+ /* HACK: MMHUB and GC both have VM-related register with the same
+  * names but different offsets. Define the MMHUB register we need here
+@@ -168,6 +169,7 @@ static int write_config_static_mem(struct kgd_dev *kgd, bool swizzle_enable,
+ 		uint8_t element_size, uint8_t index_stride, uint8_t mtype);
+ static void set_vm_context_page_table_base(struct kgd_dev *kgd, uint32_t vmid,
+ 		uint32_t page_table_base);
++static int invalidate_tlbs(struct kgd_dev *kgd, uint16_t pasid);
+ 
+ /* Because of REG_GET_FIELD() being used, we put this function in the
+  * asic specific file.
+@@ -234,6 +236,7 @@ static const struct kfd2kgd_calls kfd2kgd = {
+ 	.get_atc_vmid_pasid_mapping_valid =
+ 			get_atc_vmid_pasid_mapping_valid,
+ 	.write_vmid_invalidate_request = write_vmid_invalidate_request,
++	.invalidate_tlbs = invalidate_tlbs,
+ 	.alloc_memory_of_gpu = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu,
+ 	.free_memory_of_gpu = amdgpu_amdkfd_gpuvm_free_memory_of_gpu,
+ 	.map_memory_to_gpu = amdgpu_amdkfd_gpuvm_map_memory_to_gpu,
+@@ -943,6 +946,54 @@ static void write_vmid_invalidate_request(struct kgd_dev *kgd, uint8_t vmid)
+ 		cpu_relax();
+ }
+ 
++static int invalidate_tlbs_with_kiq(struct amdgpu_device *adev, uint16_t pasid)
++{
++	signed long r;
++	struct fence *f;
++	struct amdgpu_ring *ring = &adev->gfx.kiq.ring;
++
++	mutex_lock(&adev->virt.lock_kiq);
++	amdgpu_ring_alloc(ring, 12); /* fence + invalidate_tlbs package*/
++	amdgpu_ring_write(ring, PACKET3(PACKET3_INVALIDATE_TLBS, 0));
++	amdgpu_ring_write(ring,
++			PACKET3_INVALIDATE_TLBS_DST_SEL(1) |
++			PACKET3_INVALIDATE_TLBS_PASID(pasid));
++	amdgpu_fence_emit(ring, &f);
++	amdgpu_ring_commit(ring);
++	mutex_unlock(&adev->virt.lock_kiq);
++
++	r = fence_wait(f, false);
++	if (r)
++		DRM_ERROR("wait for kiq fence error: %ld.\n", r);
++	fence_put(f);
++
++	return r;
++}
++
++static int invalidate_tlbs(struct kgd_dev *kgd, uint16_t pasid)
++{
++	struct amdgpu_device *adev = (struct amdgpu_device *) kgd;
++	int vmid;
++	struct amdgpu_ring *ring = &adev->gfx.kiq.ring;
++
++	if (ring->ready)
++		return invalidate_tlbs_with_kiq(adev, pasid);
++
++	for (vmid = 0; vmid < 16; vmid++) {
++		if (!amdgpu_amdkfd_is_kfd_vmid(adev, vmid))
++			continue;
++		if (get_atc_vmid_pasid_mapping_valid(kgd, vmid)) {
++			if (get_atc_vmid_pasid_mapping_pasid(kgd, vmid)
++				== pasid) {
++				write_vmid_invalidate_request(kgd, vmid);
++				break;
++			}
++		}
++	}
++
++	return 0;
++}
++
+ static int kgd_address_watch_disable(struct kgd_dev *kgd)
+ {
+ 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
+diff --git a/drivers/gpu/drm/amd/amdgpu/soc15d.h b/drivers/gpu/drm/amd/amdgpu/soc15d.h
+index e79befd..11a3a01 100644
+--- a/drivers/gpu/drm/amd/amdgpu/soc15d.h
++++ b/drivers/gpu/drm/amd/amdgpu/soc15d.h
+@@ -260,6 +260,9 @@
+ #define	PACKET3_WAIT_ON_CE_COUNTER			0x86
+ #define	PACKET3_WAIT_ON_DE_COUNTER_DIFF			0x88
+ #define	PACKET3_SWITCH_BUFFER				0x8B
++#define	PACKET3_INVALIDATE_TLBS				0x98
++#define	PACKET3_INVALIDATE_TLBS_DST_SEL(x)		((x) << 0)
++#define	PACKET3_INVALIDATE_TLBS_PASID(x)		((x) << 5)
+ #define PACKET3_FRAME_CONTROL				0x90
+ #			define FRAME_CMD(x) ((x) << 28)
+ 			/*
+diff --git a/drivers/gpu/drm/amd/amdgpu/vid.h b/drivers/gpu/drm/amd/amdgpu/vid.h
+index 9806900..61f1420 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vid.h
++++ b/drivers/gpu/drm/amd/amdgpu/vid.h
+@@ -363,7 +363,11 @@
+ #define	PACKET3_WAIT_ON_CE_COUNTER			0x86
+ #define	PACKET3_WAIT_ON_DE_COUNTER_DIFF			0x88
+ #define	PACKET3_SWITCH_BUFFER				0x8B
+-#define PACKET3_FRAME_CONTROL				0x90
++#define	PACKET3_INVALIDATE_TLBS				0x98
++#define	PACKET3_INVALIDATE_TLBS_DST_SEL(x)		((x) << 0)
++#define	PACKET3_INVALIDATE_TLBS_PASID(x)		((x) << 5)
++
++#define	PACKET3_FRAME_CONTROL				0x90
+ #			define FRAME_CMD(x) ((x) << 28)
+ 			/*
+ 			 * x=0: tmz_begin
+diff --git a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+index 83cdd80..454d199 100644
+--- a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+@@ -331,6 +331,9 @@ struct kfd2kgd_calls {
+ 	uint32_t (*read_vmid_from_vmfault_reg)(struct kgd_dev *kgd);
+ 	void (*write_vmid_invalidate_request)(struct kgd_dev *kgd,
+ 					uint8_t vmid);
++
++	int (*invalidate_tlbs)(struct kgd_dev *kgd, uint16_t pasid);
++
+ 	int (*alloc_memory_of_gpu)(struct kgd_dev *kgd, uint64_t va,
+ 			uint64_t size, void *vm,
+ 			struct kgd_mem **mem, uint64_t *offset,
+-- 
+2.7.4
+

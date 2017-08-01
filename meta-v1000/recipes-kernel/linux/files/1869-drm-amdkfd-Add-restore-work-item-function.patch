@@ -1,0 +1,164 @@
+From 196289c7aee5c8df6799fa86fc5e957524595753 Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Date: Tue, 5 Jul 2016 17:32:48 -0400
+Subject: [PATCH 1869/2094] drm/amdkfd: Add restore work item function
+
+If any BO from a process is evicted, then a restore work queue is
+scheduled to start after a TIMEOUT. This thread will restore all the BOs
+and the user queues.
+
+Change-Id: I5591e2665bd8e7617243ad1772d0b057c0ce9f5e
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c  | 82 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    | 12 +++++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c |  3 ++
+ 3 files changed, 97 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index a47d7f1..0ce9572 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -745,6 +745,88 @@ int kgd2kfd_resume_mm(struct kfd_dev *kfd, struct mm_struct *mm)
+ 	return r;
+ }
+ 
++/* resume_process_mm -
++ *  Resume all user queues that belongs to given process p. The caller must
++ *  ensure that process p context is valid.
++ */
++static int resume_process_mm(struct kfd_process *p)
++{
++	struct kfd_process_device *pdd;
++	struct mm_struct *mm = (struct mm_struct *)p->mm;
++	int r, ret = 0;
++
++	list_for_each_entry(pdd, &p->per_device_data, per_device_list) {
++		if (pdd->dev->dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
++			down_read(&mm->mmap_sem);
++
++		r = process_restore_queues(pdd->dev->dqm, &pdd->qpd);
++		if (r != 0) {
++			pr_err("Failed to restore process queues\n");
++			if (ret == 0)
++				ret = r;
++		}
++
++		if (pdd->dev->dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
++			up_read(&mm->mmap_sem);
++	}
++
++	return ret;
++}
++
++/** kfd_schedule_restore_bos_and_queues - Schedules work queue that will
++ *   restore all BOs that belong to given process and then restore its queues
++ *
++ * @mm: mm_struct that identifies the KFD process
++ *
++ */
++static int kfd_schedule_restore_bos_and_queues(struct kfd_process *p)
++{
++	if (delayed_work_pending(&p->restore_work)) {
++		WARN(1, "Trying to evict an unrestored process\n");
++		cancel_delayed_work_sync(&p->restore_work);
++	}
++
++	/* During process initialization restore_work is initialized
++	 * to kfd_restore_bo_worker
++	 */
++	schedule_delayed_work(&p->restore_work, PROCESS_RESTORE_TIME_MS);
++	return 0;
++}
++
++void kfd_restore_bo_worker(struct work_struct *work)
++{
++	struct delayed_work *dwork;
++	struct kfd_process *p;
++	struct kfd_process_device *pdd;
++	int ret = 0;
++
++	dwork = to_delayed_work(work);
++
++	/* Process termination destroys this worker thread. So during the
++	 * lifetime of this thread, kfd_process p will be valid
++	 */
++	p = container_of(dwork, struct kfd_process, restore_work);
++
++	/* Call restore_process_bos on the first KGD device. This function
++	 * takes care of restoring the whole process including other devices.
++	 * Restore can fail if enough memory is not available. If so,
++	 * reschedule again.
++	 */
++	pdd = list_first_entry(&p->per_device_data,
++			       struct kfd_process_device,
++			       per_device_list);
++
++	ret = pdd->dev->kfd2kgd->restore_process_bos(p->master_vm);
++	if (ret) {
++		kfd_schedule_restore_bos_and_queues(p);
++		return;
++	}
++
++	ret = resume_process_mm(p);
++	if (ret)
++		pr_err("Failed to resume user queues\n");
++}
++
+ static int kfd_gtt_sa_init(struct kfd_dev *kfd, unsigned int buf_size,
+ 				unsigned int chunk_size)
+ {
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 887d6c3..b3f2665 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -541,6 +541,15 @@ struct qcm_process_device {
+ 	void *ib_kaddr;
+ };
+ 
++/* KFD Memory Eviction */
++/* Appox. wait time before attempting to restore evicted BOs */
++#define PROCESS_RESTORE_TIME_MS 2000
++/* Approx. back off time if restore fails due to lack of memory */
++#define PROCESS_BACK_OFF_TIME_MS 1000
++
++void kfd_restore_bo_worker(struct work_struct *work);
++
++
+ /*8 byte handle containing GPU ID in the most significant 4 bytes and
+  * idr_handle in the least significant 4 bytes*/
+ #define MAKE_HANDLE(gpu_id, idr_handle) (((uint64_t)(gpu_id) << 32) + idr_handle)
+@@ -671,6 +680,9 @@ struct kfd_process {
+ 	struct rb_root bo_interval_tree;
+ 
+ 	void *master_vm;
++
++	/* For restoring BOs after eviction */
++	struct delayed_work restore_work;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 89322d9..a8390ec 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -508,6 +508,8 @@ static void kfd_process_notifier_release(struct mmu_notifier *mn,
+ 	p = container_of(mn, struct kfd_process, mmu_notifier);
+ 	BUG_ON(p->mm != mm);
+ 
++	cancel_delayed_work_sync(&p->restore_work);
++
+ 	mutex_lock(&kfd_processes_mutex);
+ 	hash_del_rcu(&p->kfd_processes);
+ 	mutex_unlock(&kfd_processes_mutex);
+@@ -675,6 +677,7 @@ static struct kfd_process *create_process(const struct task_struct *thread,
+ 	if (err)
+ 		goto err_init_cwsr;
+ 
++	INIT_DELAYED_WORK(&process->restore_work, kfd_restore_bo_worker);
+ 	return process;
+ 
+ err_init_cwsr:
+-- 
+2.7.4
+

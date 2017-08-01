@@ -1,0 +1,151 @@
+From 8b5672db0f5cc7d846ab46ed3d8b49297206d34e Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Thu, 1 Sep 2016 21:11:39 -0400
+Subject: [PATCH 1852/2094] drm/amd: Simplify SDMA HQD loading in kernel
+ threads
+
+Use the use_mm function to temporarily access a user process context
+while running in a kernel thread. This avoids the need to lock the
+mmap_sem, which fixes a circular locking problem observed with user
+pointers while running without the HW scheduler.
+
+Change-Id: I4e74f3b021277e09df55dddf81ae5e070032b599
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c  | 24 ++++++++++++----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c  | 24 ++++++++++++----------
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c            |  9 +-------
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  |  4 ----
+ 4 files changed, 27 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+index 01c1131..b38da17 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+@@ -23,6 +23,7 @@
+ #include <linux/fdtable.h>
+ #include <linux/uaccess.h>
+ #include <linux/firmware.h>
++#include <linux/mmu_context.h>
+ #include <drm/drmP.h>
+ #include "amdgpu.h"
+ #include "amdgpu_amdkfd.h"
+@@ -546,17 +547,18 @@ static int kgd_hqd_sdma_load(struct kgd_dev *kgd, void *mqd,
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_DOORBELL, m->sdma_rlc_doorbell);
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_RPTR, m->sdma_rlc_rb_rptr);
+ 
+-	if (mm && mm == current->mm)
+-		wptr_valid = !get_user(data, wptr);
+-	else if (mm) {
+-		struct vm_area_struct *vma;
+-
+-		vma = find_vma(mm, (unsigned long)wptr);
+-		if (vma && vma->vm_start <= (unsigned long)wptr &&
+-		    vma->vm_ops && vma->vm_ops->access)
+-			wptr_valid = (sizeof(data) == vma->vm_ops->access(
+-					      vma, (unsigned long)wptr,
+-					      &data, sizeof(data), 0));
++	if (mm) {
++		if (mm == current->mm) {
++			/* Running in the correct user process context */
++			wptr_valid = !get_user(data, wptr);
++		} else if (current->mm == NULL) {
++			/* A kernel thread can temporarily use a user
++			 * process context for AIO
++			 */
++			use_mm(mm);
++			wptr_valid = !get_user(data, wptr);
++			unuse_mm(mm);
++		}
+ 	}
+ 	if (wptr_valid)
+ 		WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_WPTR, data);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+index fdaa44c..6da1ec9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+@@ -24,6 +24,7 @@
+ #include <linux/fdtable.h>
+ #include <linux/uaccess.h>
+ #include <linux/firmware.h>
++#include <linux/mmu_context.h>
+ #include <drm/drmP.h>
+ #include "amdgpu.h"
+ #include "amdgpu_amdkfd.h"
+@@ -531,17 +532,18 @@ static int kgd_hqd_sdma_load(struct kgd_dev *kgd, void *mqd,
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_DOORBELL, m->sdmax_rlcx_doorbell);
+ 	WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_RPTR, m->sdmax_rlcx_rb_rptr);
+ 
+-	if (mm && mm == current->mm)
+-		wptr_valid = !get_user(data, wptr);
+-	else if (mm) {
+-		struct vm_area_struct *vma;
+-
+-		vma = find_vma(mm, (unsigned long)wptr);
+-		if (vma && vma->vm_start <= (unsigned long)wptr &&
+-		    vma->vm_ops && vma->vm_ops->access)
+-			wptr_valid = (sizeof(data) == vma->vm_ops->access(
+-					      vma, (unsigned long)wptr,
+-					      &data, sizeof(data), 0));
++	if (mm) {
++		if (mm == current->mm) {
++			/* Running in the correct user process context */
++			wptr_valid = !get_user(data, wptr);
++		} else if (current->mm == NULL) {
++			/* A kernel thread can temporarily use a user
++			 * process context for AIO
++			 */
++			use_mm(mm);
++			wptr_valid = !get_user(data, wptr);
++			unuse_mm(mm);
++		}
+ 	}
+ 	if (wptr_valid)
+ 		WREG32(sdma_base_addr + mmSDMA0_RLC0_RB_WPTR, data);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 69b08a9..a47d7f1 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -738,16 +738,9 @@ int kgd2kfd_resume_mm(struct kfd_dev *kfd, struct mm_struct *mm)
+ 
+ 	r = -ENODEV;
+ 	pdd = kfd_get_process_device_data(kfd, p);
+-	if (pdd) {
+-		if (kfd->dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
+-			down_read(&mm->mmap_sem);
+-
++	if (pdd)
+ 		r = process_restore_queues(kfd->dqm, &pdd->qpd);
+ 
+-		if (kfd->dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
+-			up_read(&mm->mmap_sem);
+-	}
+-
+ 	kfd_unref_process(p);
+ 	return r;
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 03a73b0..61acd04 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -388,8 +388,6 @@ static int update_queue(struct device_queue_manager *dqm, struct queue *q)
+ 
+ 	BUG_ON(!dqm || !q || !q->mqd);
+ 
+-	if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
+-		down_read(&current->mm->mmap_sem);
+ 	mutex_lock(&dqm->lock);
+ 
+ 	pdd = kfd_get_process_device_data(q->device, q->process);
+@@ -445,8 +443,6 @@ static int update_queue(struct device_queue_manager *dqm, struct queue *q)
+ 
+ out_unlock:
+ 	mutex_unlock(&dqm->lock);
+-	if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
+-		up_read(&current->mm->mmap_sem);
+ 
+ 	return retval;
+ }
+-- 
+2.7.4
+
