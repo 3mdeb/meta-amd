@@ -1,0 +1,223 @@
+From 9b1ba4d4fd62a9178538307b9ed6dda2390cac04 Mon Sep 17 00:00:00 2001
+From: Tony Cheng <tony.cheng@amd.com>
+Date: Mon, 19 Dec 2016 12:54:40 -0500
+Subject: [PATCH 0292/2094] drm/amd/display: 4k split black out due to
+ incorrect cursor
+
+- add handling to program both cursor for left and right pipe
+- add guard to disable cursor in case where cursor isn't visible to prevent pipe hang
+
+Change-Id: If8f005b8b8df27f48ba30ffc1b4dcf07100ec517
+Signed-off-by: Tony Cheng <tony.cheng@amd.com>
+Reviewed-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_target.c    | 83 ++++++++++------------
+ drivers/gpu/drm/amd/display/dc/dc_hw_types.h       |  9 +++
+ drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp.h |  3 +-
+ .../drm/amd/display/dc/dce110/dce110_ipp_cursor.c  |  3 +-
+ drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h        |  3 +-
+ 5 files changed, 53 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_target.c b/drivers/gpu/drm/amd/display/dc/core/dc_target.c
+index 48eb7b0..2531df7 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_target.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_target.c
+@@ -148,56 +148,49 @@ bool dc_target_set_cursor_attributes(
+ 	struct dc_target *dc_target,
+ 	const struct dc_cursor_attributes *attributes)
+ {
+-	uint8_t i, j;
+-	struct core_target *target;
+-	struct core_dc *core_dc;
+-	struct resource_context *res_ctx;
++	int i, j;
++	struct core_target *target = DC_TARGET_TO_CORE(dc_target);
++	struct core_dc *core_dc = DC_TO_CORE(target->ctx->dc);
++	struct resource_context *res_ctx = &core_dc->current_context->res_ctx;
++	bool ret = false;
+ 
+ 	if (NULL == dc_target) {
+ 		dm_error("DC: dc_target is NULL!\n");
+ 			return false;
+-
+ 	}
+ 	if (NULL == attributes) {
+ 		dm_error("DC: attributes is NULL!\n");
+ 			return false;
+-
+ 	}
+ 
+-	target = DC_TARGET_TO_CORE(dc_target);
+-	core_dc = DC_TO_CORE(target->ctx->dc);
+-	res_ctx = &core_dc->current_context->res_ctx;
++	for (i = 0; i < dc_target->stream_count; i++) {
++		const struct dc_stream *stream = dc_target->streams[i];
+ 
+-	for (i = 0; i < target->public.stream_count; i++) {
+ 		for (j = 0; j < MAX_PIPES; j++) {
+-			struct input_pixel_processor *ipp =
+-						res_ctx->pipe_ctx[j].ipp;
++			struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[j];
+ 
+-			if (res_ctx->pipe_ctx[j].stream !=
+-				DC_STREAM_TO_CORE(target->public.streams[i]))
+-				continue;
++			if (&pipe_ctx->stream->public == stream) {
++				struct input_pixel_processor *ipp = pipe_ctx->ipp;
+ 
+-			/* As of writing of this code cursor is on the top
+-			 * plane so we only need to set it on first pipe we
+-			 * find. May need to make this code dce specific later.
+-			 */
+-			if (ipp->funcs->ipp_cursor_set_attributes(
+-							ipp, attributes))
+-				return true;
++				if (ipp->funcs->ipp_cursor_set_attributes(
++						ipp, attributes))
++					ret = true;
++			}
+ 		}
+ 	}
+ 
+-	return false;
++	return ret;
+ }
+ 
+ bool dc_target_set_cursor_position(
+ 	struct dc_target *dc_target,
+ 	const struct dc_cursor_position *position)
+ {
+-	uint8_t i, j;
+-	struct core_target *target;
+-	struct core_dc *core_dc;
+-	struct resource_context *res_ctx;
++	int i, j;
++	struct core_target *target = DC_TARGET_TO_CORE(dc_target);
++	struct core_dc *core_dc = DC_TO_CORE(target->ctx->dc);
++	struct resource_context *res_ctx = &core_dc->current_context->res_ctx;
++	bool ret = false;
+ 
+ 	if (NULL == dc_target) {
+ 		dm_error("DC: dc_target is NULL!\n");
+@@ -209,29 +202,29 @@ bool dc_target_set_cursor_position(
+ 		return false;
+ 	}
+ 
+-	target = DC_TARGET_TO_CORE(dc_target);
+-	core_dc = DC_TO_CORE(target->ctx->dc);
+-	res_ctx = &core_dc->current_context->res_ctx;
++	for (i = 0; i < dc_target->stream_count; i++) {
++		const struct dc_stream *stream = dc_target->streams[i];
+ 
+-	for (i = 0; i < target->public.stream_count; i++) {
+ 		for (j = 0; j < MAX_PIPES; j++) {
+-			struct input_pixel_processor *ipp =
+-						res_ctx->pipe_ctx[j].ipp;
+-
+-			if (res_ctx->pipe_ctx[j].stream !=
+-				DC_STREAM_TO_CORE(target->public.streams[i]))
+-				continue;
+-
+-			/* As of writing of this code cursor is on the top
+-			 * plane so we only need to set it on first pipe we
+-			 * find. May need to make this code dce specific later.
+-			 */
+-			ipp->funcs->ipp_cursor_set_position(ipp, position);
+-			return true;
++			struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[j];
++
++			if (&pipe_ctx->stream->public == stream) {
++				struct input_pixel_processor *ipp = pipe_ctx->ipp;
++				struct dc_cursor_mi_param param = {
++					.pixel_clk_khz = stream->timing.pix_clk_khz,
++					.ref_clk_khz = 48000,/*todo refclk*/
++					.viewport_x_start = pipe_ctx->scl_data.viewport.x,
++					.viewport_width = pipe_ctx->scl_data.viewport.width,
++					.h_scale_ratio = pipe_ctx->scl_data.ratios.horz,
++				};
++
++				ipp->funcs->ipp_cursor_set_position(ipp, position, &param);
++				ret = true;
++			}
+ 		}
+ 	}
+ 
+-	return false;
++	return ret;
+ }
+ 
+ uint32_t dc_target_get_vblank_counter(const struct dc_target *dc_target)
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+index 5605a5c..bd60337 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+@@ -27,6 +27,7 @@
+ #define DC_HW_TYPES_H
+ 
+ #include "os_types.h"
++#include "fixed31_32.h"
+ 
+ /******************************************************************************
+  * Data types for Virtual HW Layer of DAL3.
+@@ -359,6 +360,14 @@ struct dc_cursor_position {
+ 	bool hot_spot_enable;
+ };
+ 
++struct dc_cursor_mi_param {
++	unsigned int pixel_clk_khz;
++	unsigned int ref_clk_khz;
++	unsigned int viewport_x_start;
++	unsigned int viewport_width;
++	struct fixed31_32 h_scale_ratio;
++};
++
+ /* IPP related types */
+ 
+ /* Used by both ipp amd opp functions*/
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp.h b/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp.h
+index 60eebde..56fe327 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp.h
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp.h
+@@ -54,7 +54,8 @@ void dce110_ipp_destroy(struct input_pixel_processor **ipp);
+ /* CURSOR RELATED */
+ void dce110_ipp_cursor_set_position(
+ 	struct input_pixel_processor *ipp,
+-	const struct dc_cursor_position *position);
++	const struct dc_cursor_position *position,
++	const struct dc_cursor_mi_param *param);
+ 
+ bool dce110_ipp_cursor_set_attributes(
+ 	struct input_pixel_processor *ipp,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp_cursor.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp_cursor.c
+index 95f6ca3..1cab12b 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp_cursor.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_ipp_cursor.c
+@@ -72,7 +72,8 @@ static void program_address(
+ 
+ void dce110_ipp_cursor_set_position(
+ 	struct input_pixel_processor *ipp,
+-	const struct dc_cursor_position *position)
++	const struct dc_cursor_position *position,
++	const struct dc_cursor_mi_param *param)
+ {
+ 	struct dce110_ipp *ipp110 = TO_DCE110_IPP(ipp);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
+index 7e5f3e0..81de975 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
+@@ -83,7 +83,8 @@ struct ipp_funcs {
+ 	/*** cursor ***/
+ 	void (*ipp_cursor_set_position)(
+ 		struct input_pixel_processor *ipp,
+-		const struct dc_cursor_position *position);
++		const struct dc_cursor_position *position,
++		const struct dc_cursor_mi_param *param);
+ 
+ 	bool (*ipp_cursor_set_attributes)(
+ 		struct input_pixel_processor *ipp,
+-- 
+2.7.4
+

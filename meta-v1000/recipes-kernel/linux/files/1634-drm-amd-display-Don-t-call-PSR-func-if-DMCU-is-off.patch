@@ -1,0 +1,146 @@
+From a37af703eeb6894a7b9cf75c9864fb809d1e35af Mon Sep 17 00:00:00 2001
+From: Harry Wentland <harry.wentland@amd.com>
+Date: Wed, 10 May 2017 15:56:17 -0400
+Subject: [PATCH 1634/2094] drm/amd/display: Don't call PSR func if DMCU is off
+
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c   |  8 --------
+ drivers/gpu/drm/amd/display/dc/dce/dce_abm.c    | 23 +++++++++++++++--------
+ drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c | 11 ++++++++---
+ drivers/gpu/drm/amd/display/dc/inc/hw/abm.h     |  1 +
+ 4 files changed, 24 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index 6f78403..95d042a 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -46,14 +46,6 @@
+ #include "dce/dce_11_0_enum.h"
+ #include "dce/dce_11_0_sh_mask.h"
+ 
+-#ifndef mmDMCU_STATUS__UC_IN_RESET__SHIFT
+-#define mmDMCU_STATUS__UC_IN_RESET__SHIFT 0x0
+-#endif
+-
+-#ifndef mmDMCU_STATUS__UC_IN_RESET_MASK
+-#define mmDMCU_STATUS__UC_IN_RESET_MASK 0x00000001L
+-#endif
+-
+ #define LINK_INFO(...) \
+ 	dm_logger_write(dc_ctx->logger, LOG_HW_HOTPLUG, \
+ 		__VA_ARGS__)
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c b/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c
+index 45a3079..393c435 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c
+@@ -366,6 +366,16 @@ static bool dce_abm_init_backlight(struct abm *abm)
+ 	return true;
+ }
+ 
++static bool is_dmcu_initialized(struct abm *abm)
++{
++	struct dce_abm *abm_dce = TO_DCE_ABM(abm);
++	unsigned int dmcu_uc_reset;
++
++	REG_GET(DMCU_STATUS, UC_IN_RESET, &dmcu_uc_reset);
++
++	return !dmcu_uc_reset;
++}
++
+ static bool dce_abm_set_backlight_level(
+ 		struct abm *abm,
+ 		unsigned int backlight_level,
+@@ -373,23 +383,19 @@ static bool dce_abm_set_backlight_level(
+ 		unsigned int controller_id)
+ {
+ 	struct dce_abm *abm_dce = TO_DCE_ABM(abm);
+-	unsigned int dmcu_uc_reset;
+ 
+ 	dm_logger_write(abm->ctx->logger, LOG_BACKLIGHT,
+ 			"New Backlight level: %d (0x%X)\n",
+ 			backlight_level, backlight_level);
+ 
+-	REG_GET(DMCU_STATUS, UC_IN_RESET, &dmcu_uc_reset);
+-
+ 	/* If DMCU is in reset state, DMCU is uninitialized */
+-	if (dmcu_uc_reset) {
+-		driver_set_backlight_level(abm_dce, backlight_level);
+-	} else {
++	if (is_dmcu_initialized(abm))
+ 		dmcu_set_backlight_level(abm_dce,
+ 				backlight_level,
+ 				frame_ramp,
+ 				controller_id);
+-	}
++	else
++		driver_set_backlight_level(abm_dce, backlight_level);
+ 
+ 	return true;
+ }
+@@ -398,7 +404,8 @@ static const struct abm_funcs dce_funcs = {
+ 	.abm_init = dce_abm_init,
+ 	.set_abm_level = dce_abm_set_level,
+ 	.init_backlight = dce_abm_init_backlight,
+-	.set_backlight_level = dce_abm_set_backlight_level
++	.set_backlight_level = dce_abm_set_backlight_level,
++	.is_dmcu_initialized = is_dmcu_initialized
+ };
+ 
+ static void dce_abm_construct(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c b/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c
+index 6e56d83..8bc0d0f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c
+@@ -29,11 +29,15 @@
+ #include "fixed32_32.h"
+ #include "bios_parser_interface.h"
+ #include "dc.h"
++#include "core_dc.h"
++#include "dce_abm.h"
+ #if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+ #include "dcn_calcs.h"
+ #include "core_dc.h"
+ #endif
+ 
++
++
+ #define TO_DCE_CLOCKS(clocks)\
+ 	container_of(clocks, struct dce_disp_clk, base)
+ 
+@@ -374,6 +378,8 @@ static void dce112_set_clock(
+ 	struct dce_disp_clk *clk_dce = TO_DCE_CLOCKS(clk);
+ 	struct bp_set_dce_clock_parameters dce_clk_params;
+ 	struct dc_bios *bp = clk->ctx->dc_bios;
++	struct core_dc *core_dc = DC_TO_CORE(clk->ctx->dc);
++	struct abm *abm =  core_dc->res_pool->abm;
+ 
+ 	/* Prepare to program display clock*/
+ 	memset(&dce_clk_params, 0, sizeof(dce_clk_params));
+@@ -404,9 +410,8 @@ static void dce112_set_clock(
+ 
+ 	bp->funcs->set_dce_clock(bp, &dce_clk_params);
+ 
+-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+-	dce_psr_wait_loop(clk_dce, requested_clk_khz);
+-#endif
++	if (abm->funcs->is_dmcu_initialized(abm))
++		dce_psr_wait_loop(clk_dce, requested_clk_khz);
+ 
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h b/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
+index 7d07b79..ceabbd3 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
+@@ -40,6 +40,7 @@ struct abm_funcs {
+ 			unsigned int backlight_level,
+ 			unsigned int frame_ramp,
+ 			unsigned int controller_id);
++	bool (*is_dmcu_initialized)(struct abm *abm);
+ };
+ 
+ #endif
+-- 
+2.7.4
+

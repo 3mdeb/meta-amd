@@ -1,0 +1,261 @@
+From 8ac3dad64f7424a72d28bb3b84f59d23ade30feb Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Thu, 11 May 2017 13:36:44 +0800
+Subject: [PATCH 1552/2094] drm/amdgpu/SRIOV:implement guilty job TDR for(V2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1,TDR will kickout guilty job if it hang exceed the threshold
+of the given one from kernel paramter "job_hang_limit", that
+way a bad command stream will not infinitly cause GPU hang.
+
+by default this threshold is 1 so a job will be kicked out
+after it hang.
+
+2,if a job timeout TDR routine will not reset all sched/ring,
+instead if will only reset on the givn one which is indicated
+by @job of amdgpu_sriov_gpu_reset, that way we don't need to
+reset and recover each sched/ring if we already know which job
+cause GPU hang.
+
+3,unblock sriov_gpu_reset for AI family.
+
+V2:
+1:put kickout guilty job after sched parked.
+2:since parking scheduler prior to kickout already occupies a
+while, we can do last check on the in question job before
+doing hw_reset.
+
+TODO:
+1:when a job is considered as guilty, we should mark some flag
+in its fence status flag, and let UMD side aware that this
+fence signaling is not due to job complete but job hang.
+
+2:if gpu reset cause all video memory lost, we need introduce
+a new policy to implement TDR, like drop all jobs not yet
+signaled, and all IOCTL on this device will return ERROR
+DEVICE_LOST.
+this will be implemented later.
+
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c    | 43 +++++++++++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c       |  4 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c     |  6 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h      |  1 +
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 11 ++++++-
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  7 +++++
+ 7 files changed, 63 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 0ac07b2..8dd0bfb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -113,6 +113,7 @@ extern int amdgpu_prim_buf_per_se;
+ extern int amdgpu_pos_buf_per_se;
+ extern int amdgpu_cntl_sb_buf_per_se;
+ extern int amdgpu_param_buf_per_se;
++extern int amdgpu_job_hang_limit;
+ 
+ #define AMDGPU_DEFAULT_GTT_SIZE_MB		3072ULL /* 3GB by default */
+ #define AMDGPU_WAIT_IDLE_TIMEOUT_IN_MS	        3000
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 0ad2633..85929dc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2683,7 +2683,7 @@ static int amdgpu_recover_vram_from_shadow(struct amdgpu_device *adev,
+  */
+ int amdgpu_sriov_gpu_reset(struct amdgpu_device *adev, struct amdgpu_job *job)
+ {
+-	int i, r = 0;
++	int i, j, r = 0;
+ 	int resched;
+ 	struct amdgpu_bo *bo, *tmp;
+ 	struct amdgpu_ring *ring;
+@@ -2696,19 +2696,36 @@ int amdgpu_sriov_gpu_reset(struct amdgpu_device *adev, struct amdgpu_job *job)
+ 	/* block TTM */
+ 	resched = ttm_bo_lock_delayed_workqueue(&adev->mman.bdev);
+ 
+-	/* block scheduler */
+-	for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+-		ring = adev->rings[i];
++	/* we start from the ring trigger GPU hang */
++	j = job ? job->ring->idx : 0;
+ 
++	/* block scheduler */
++	for (i = j; i < j + AMDGPU_MAX_RINGS; ++i) {
++		ring = adev->rings[i % AMDGPU_MAX_RINGS];
+ 		if (!ring || !ring->sched.thread)
+ 			continue;
+ 
+ 		kthread_park(ring->sched.thread);
++
++		if (job && j != i)
++			continue;
++
++		/* here give the last chance to check if fence signaled
++		 * since we already pay some time on kthread_park */
++		if (job && fence_is_signaled(&job->base.s_fence->finished)) {
++			kthread_unpark(ring->sched.thread);
++			goto give_up_reset;
++		}
++
++		if (amd_sched_invalidate_job(&job->base, amdgpu_job_hang_limit))
++			amd_sched_job_kickout(&job->base);
++
++		/* only do job_reset on the hang ring if @job not NULL */
+ 		amd_sched_hw_job_reset(&ring->sched);
+-	}
+ 
+-	/* after all hw jobs are reset, hw fence is meaningless, so force_completion */
+-	amdgpu_fence_driver_force_completion(adev);
++		/* after all hw jobs are reset, hw fence is meaningless, so force_completion */
++		amdgpu_fence_driver_force_completion_ring(ring);
++	}
+ 
+ 	/* request to take full control of GPU before re-initialization  */
+ 	if (job)
+@@ -2761,20 +2778,28 @@ int amdgpu_sriov_gpu_reset(struct amdgpu_device *adev, struct amdgpu_job *job)
+ 	}
+ 	fence_put(fence);
+ 
+-	for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+-		struct amdgpu_ring *ring = adev->rings[i];
++	for (i = j; i < j + AMDGPU_MAX_RINGS; ++i) {
++		ring = adev->rings[i % AMDGPU_MAX_RINGS];
+ 		if (!ring || !ring->sched.thread)
+ 			continue;
+ 
++		if (job && j != i) {
++			kthread_unpark(ring->sched.thread);
++			continue;
++		}
++
+ 		amd_sched_job_recovery(&ring->sched);
+ 		kthread_unpark(ring->sched.thread);
+ 	}
+ 
+ 	drm_helper_resume_force_mode(adev->ddev);
++give_up_reset:
+ 	ttm_bo_unlock_delayed_workqueue(&adev->mman.bdev, resched);
+ 	if (r) {
+ 		/* bad news, how to tell it to userspace ? */
+ 		dev_info(adev->dev, "GPU reset failed\n");
++	} else {
++		dev_info(adev->dev, "GPU reset successed!\n");
+ 	}
+ 
+ 	adev->gfx.in_reset = false;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 82796eda..9adbc2e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -112,6 +112,7 @@ int amdgpu_prim_buf_per_se = 0;
+ int amdgpu_pos_buf_per_se = 0;
+ int amdgpu_cntl_sb_buf_per_se = 0;
+ int amdgpu_param_buf_per_se = 0;
++int amdgpu_job_hang_limit = 0;
+ 
+ MODULE_PARM_DESC(vramlimit, "Restrict VRAM for testing, in megabytes");
+ module_param_named(vramlimit, amdgpu_vram_limit, int, 0600);
+@@ -237,6 +238,9 @@ module_param_named(cntl_sb_buf_per_se, amdgpu_cntl_sb_buf_per_se, int, 0444);
+ MODULE_PARM_DESC(param_buf_per_se, "the size of Off-Chip Pramater Cache per Shader Engine (default depending on gfx)");
+ module_param_named(param_buf_per_se, amdgpu_param_buf_per_se, int, 0444);
+ 
++MODULE_PARM_DESC(job_hang_limit, "how much time allow a job hang and not drop it (default 0)");
++module_param_named(job_hang_limit, amdgpu_job_hang_limit, int ,0444);
++
+ 
+ static const struct pci_device_id pciidlist[] = {
+ #ifdef  CONFIG_DRM_AMDGPU_SI
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index c9a0c12..5b833f6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -541,6 +541,12 @@ void amdgpu_fence_driver_force_completion(struct amdgpu_device *adev)
+ 	}
+ }
+ 
++void amdgpu_fence_driver_force_completion_ring(struct amdgpu_ring *ring)
++{
++	if (ring)
++		amdgpu_fence_write(ring, ring->fence_drv.sync_seq);
++}
++
+ /*
+  * Common fence implementation
+  */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+index 64aa112..85432cc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -78,6 +78,7 @@ struct amdgpu_fence_driver {
+ int amdgpu_fence_driver_init(struct amdgpu_device *adev);
+ void amdgpu_fence_driver_fini(struct amdgpu_device *adev);
+ void amdgpu_fence_driver_force_completion(struct amdgpu_device *adev);
++void amdgpu_fence_driver_force_completion_ring(struct amdgpu_ring *ring);
+ 
+ int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring,
+ 				  unsigned num_hw_submission);
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index b9ca4fb..bb053aa 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -407,9 +407,18 @@ void amd_sched_hw_job_reset(struct amd_gpu_scheduler *sched)
+ 					  &s_job->s_fence->cb)) {
+ 			fence_put(s_job->s_fence->parent);
+ 			s_job->s_fence->parent = NULL;
++			atomic_dec(&sched->hw_rq_count);
+ 		}
+ 	}
+-	atomic_set(&sched->hw_rq_count, 0);
++	spin_unlock(&sched->job_list_lock);
++}
++
++void amd_sched_job_kickout(struct amd_sched_job *s_job)
++{
++	struct amd_gpu_scheduler *sched = s_job->sched;
++
++	spin_lock(&sched->job_list_lock);
++	list_del_init(&s_job->node);
+ 	spin_unlock(&sched->job_list_lock);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index ed5a847..da1b3c1 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -81,6 +81,7 @@ struct amd_sched_job {
+ 	struct list_head		node;
+ 	struct delayed_work		work_tdr;
+ 	uint64_t			id;
++	atomic_t karma;
+ };
+ 
+ extern const struct fence_ops amd_sched_fence_ops_scheduled;
+@@ -96,6 +97,11 @@ static inline struct amd_sched_fence *to_amd_sched_fence(struct fence *f)
+ 	return NULL;
+ }
+ 
++static inline bool amd_sched_invalidate_job(struct amd_sched_job *s_job, int threshold)
++{
++	return (s_job && atomic_inc_return(&s_job->karma) > threshold);
++}
++
+ /**
+  * Define the backend operations called by the scheduler,
+  * these functions should be implemented in driver side
+@@ -160,4 +166,5 @@ void amd_sched_hw_job_reset(struct amd_gpu_scheduler *sched);
+ void amd_sched_job_recovery(struct amd_gpu_scheduler *sched);
+ bool amd_sched_dependency_optimized(struct fence* fence,
+ 				    struct amd_sched_entity *entity);
++void amd_sched_job_kickout(struct amd_sched_job *s_job);
+ #endif
+-- 
+2.7.4
+

@@ -1,0 +1,174 @@
+From b46e26eadedcd09cc53436ae884ef4159fed5d84 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Nicolai=20H=C3=A4hnle?= <nicolai.haehnle@amd.com>
+Date: Fri, 14 Jul 2017 14:33:37 +0200
+Subject: [PATCH 13/14] radeonsi/gfx9: always wrap GS and TCS in an if-block
+
+With merged ESGS shaders, the GS part of a wave may be empty, and the
+hardware gets confused if any GS messages are sent from that wave. Since
+S_SENDMSG is executed even when EXEC = 0, we have to wrap even
+non-monolithic GS shaders in an if-block, so that the entire shader and
+hence the S_SENDMSG instructions are skipped in empty waves.
+
+This change is not required for TCS/HS, but applying it there as well
+simplifies the code a bit.
+
+Fixes GL45-CTS.geometry_shader.rendering.rendering.*
+
+Cc: mesa-stable@lists.freedesktop.org
+---
+ src/gallium/drivers/radeonsi/si_shader.c          | 74 +++++++++++++----------
+ src/gallium/drivers/radeonsi/si_shader_internal.h |  3 +
+ 2 files changed, 45 insertions(+), 32 deletions(-)
+
+diff --git a/src/gallium/drivers/radeonsi/si_shader.c b/src/gallium/drivers/radeonsi/si_shader.c
+index 1d13bec..4224845 100644
+--- a/src/gallium/drivers/radeonsi/si_shader.c
++++ b/src/gallium/drivers/radeonsi/si_shader.c
+@@ -2721,6 +2721,9 @@ static void si_llvm_emit_tcs_epilogue(struct lp_build_tgsi_context *bld_base)
+ 
+ 	si_copy_tcs_inputs(bld_base);
+ 
++	if (ctx->screen->b.chip_class >= GFX9)
++		lp_build_endif(&ctx->merged_wrap_if_state);
++
+ 	rel_patch_id = get_rel_patch_id(ctx);
+ 	invocation_id = unpack_param(ctx, ctx->param_tcs_rel_ids, 8, 5);
+ 	tf_lds_offset = get_tcs_out_current_patch_data_offset(ctx);
+@@ -2954,6 +2957,9 @@ static void si_llvm_emit_gs_epilogue(struct lp_build_tgsi_context *bld_base)
+ 
+ 	ac_build_sendmsg(&ctx->ac, AC_SENDMSG_GS_OP_NOP | AC_SENDMSG_GS_DONE,
+ 			 si_get_gs_wave_id(ctx));
++
++	if (ctx->screen->b.chip_class >= GFX9)
++		lp_build_endif(&ctx->merged_wrap_if_state);
+ }
+ 
+ static void si_llvm_emit_vs_epilogue(struct lp_build_tgsi_context *bld_base)
+@@ -5498,14 +5504,20 @@ static bool si_compile_tgsi_main(struct si_shader_context *ctx,
+ 	preload_ring_buffers(ctx);
+ 
+ 	/* For GFX9 merged shaders:
+-	 * - Set EXEC. If the prolog is present, set EXEC there instead.
++	 * - Set EXEC for the first shader. If the prolog is present, set
++	 *   EXEC there instead.
+ 	 * - Add a barrier before the second shader.
++	 * - In the second shader, reset EXEC to ~0 and wrap the main part in
++	 *   an if-statement. This is required for correctness in geometry
++	 *   shaders, to ensure that empty GS waves do not send GS_EMIT and
++	 *   GS_CUT messages.
+ 	 *
+-	 * The same thing for monolithic shaders is done in
+-	 * si_build_wrapper_function.
++	 * For monolithic merged shaders, the first shader is wrapped in an
++	 * if-block together with its prolog in si_build_wrapper_function.
+ 	 */
+-	if (ctx->screen->b.chip_class >= GFX9 && !is_monolithic) {
+-		if (sel->info.num_instructions > 1 && /* not empty shader */
++	if (ctx->screen->b.chip_class >= GFX9) {
++		if (!is_monolithic &&
++		    sel->info.num_instructions > 1 && /* not empty shader */
+ 		    (shader->key.as_es || shader->key.as_ls) &&
+ 		    (ctx->type == PIPE_SHADER_TESS_EVAL ||
+ 		     (ctx->type == PIPE_SHADER_VERTEX &&
+@@ -5514,9 +5526,19 @@ static bool si_compile_tgsi_main(struct si_shader_context *ctx,
+ 						ctx->param_merged_wave_info, 0);
+ 		} else if (ctx->type == PIPE_SHADER_TESS_CTRL ||
+ 			   ctx->type == PIPE_SHADER_GEOMETRY) {
+-			si_init_exec_from_input(ctx,
+-						ctx->param_merged_wave_info, 8);
++			if (!is_monolithic)
++				si_init_exec_full_mask(ctx);
++
++			/* The barrier must execute for all shaders in a
++			 * threadgroup.
++			 */
+ 			si_llvm_emit_barrier(NULL, bld_base, NULL);
++
++			LLVMValueRef num_threads = unpack_param(ctx, ctx->param_merged_wave_info, 8, 8);
++			LLVMValueRef ena =
++				LLVMBuildICmp(ctx->ac.builder, LLVMIntULT,
++					    ac_get_thread_id(&ctx->ac), num_threads, "");
++			lp_build_if(&ctx->merged_wrap_if_state, &ctx->gallivm, ena);
+ 		}
+ 	}
+ 
+@@ -5980,15 +6002,9 @@ static void si_build_wrapper_function(struct si_shader_context *ctx,
+ 
+ 		/* Merged shaders are executed conditionally depending
+ 		 * on the number of enabled threads passed in the input SGPRs. */
+-		if (is_merged_shader(ctx->shader) &&
+-		    (part == 0 || part == next_shader_first_part)) {
++		if (is_merged_shader(ctx->shader) && part == 0) {
+ 			LLVMValueRef ena, count = initial[3];
+ 
+-			/* The thread count for the 2nd shader is at bit-offset 8. */
+-			if (part == next_shader_first_part) {
+-				count = LLVMBuildLShr(builder, count,
+-						      LLVMConstInt(ctx->i32, 8, 0), "");
+-			}
+ 			count = LLVMBuildAnd(builder, count,
+ 					     LLVMConstInt(ctx->i32, 0x7f, 0), "");
+ 			ena = LLVMBuildICmp(builder, LLVMIntULT,
+@@ -6045,26 +6061,20 @@ static void si_build_wrapper_function(struct si_shader_context *ctx,
+ 		ret = LLVMBuildCall(builder, parts[part], in, num_params, "");
+ 
+ 		if (is_merged_shader(ctx->shader) &&
+-		    (part + 1 == next_shader_first_part ||
+-		     part + 1 == num_parts)) {
++		    part + 1 == next_shader_first_part) {
+ 			lp_build_endif(&if_state);
+ 
+-			if (part + 1 == next_shader_first_part) {
+-				/* A barrier is required between 2 merged shaders. */
+-				si_llvm_emit_barrier(NULL, &ctx->bld_base, NULL);
+-
+-				/* The second half of the merged shader should use
+-				 * the inputs from the toplevel (wrapper) function,
+-				 * not the return value from the last call.
+-				 *
+-				 * That's because the last call was executed condi-
+-				 * tionally, so we can't consume it in the main
+-				 * block.
+-				 */
+-				memcpy(out, initial, sizeof(initial));
+-				num_out = initial_num_out;
+-				num_out_sgpr = initial_num_out_sgpr;
+-			}
++			/* The second half of the merged shader should use
++			 * the inputs from the toplevel (wrapper) function,
++			 * not the return value from the last call.
++			 *
++			 * That's because the last call was executed condi-
++			 * tionally, so we can't consume it in the main
++			 * block.
++			 */
++			memcpy(out, initial, sizeof(initial));
++			num_out = initial_num_out;
++			num_out_sgpr = initial_num_out_sgpr;
+ 			continue;
+ 		}
+ 
+diff --git a/src/gallium/drivers/radeonsi/si_shader_internal.h b/src/gallium/drivers/radeonsi/si_shader_internal.h
+index 5ccde71..4a71199 100644
+--- a/src/gallium/drivers/radeonsi/si_shader_internal.h
++++ b/src/gallium/drivers/radeonsi/si_shader_internal.h
+@@ -25,6 +25,7 @@
+ #define SI_SHADER_PRIVATE_H
+ 
+ #include "si_shader.h"
++#include "gallivm/lp_bld_flow.h"
+ #include "gallivm/lp_bld_init.h"
+ #include "gallivm/lp_bld_tgsi.h"
+ #include "tgsi/tgsi_parse.h"
+@@ -105,6 +106,8 @@ struct si_shader_context {
+ 	unsigned flow_depth;
+ 	unsigned flow_depth_max;
+ 
++	struct lp_build_if_state merged_wrap_if_state;
++
+ 	struct tgsi_array_info *temp_arrays;
+ 	LLVMValueRef *temp_array_allocas;
+ 
+-- 
+2.7.4
+

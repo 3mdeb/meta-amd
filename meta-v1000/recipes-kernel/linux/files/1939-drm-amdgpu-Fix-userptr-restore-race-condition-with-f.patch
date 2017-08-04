@@ -1,0 +1,84 @@
+From 1079537f6c59a44a4330a6d22dd848bfeac26892 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Fri, 3 Feb 2017 17:50:59 -0500
+Subject: [PATCH 1939/2094] drm/amdgpu: Fix userptr restore race condition with
+ free
+
+Update_user_pages needs to drop the lock. This could lead to freeing
+a userptr BO while a restore was in progress. In that case
+cancel_restore_locked and restore_mem_worker would both call mmput
+and lead to corruption of kernel data structures.
+
+Fix this by marking the mem object as busy while dropping the lock
+for user page udpates. When canceling restore, wait for busy mem
+objects. This ensures that a restore that has already started will
+be able complete before the BO gets freed. When the restore completes
+it sets mem->mm to NULL and calls mmput. Thes cancel_restore_locked
+will not call mmput again.
+
+Bug: SWDEV-112697
+Change-Id: I6c76f7559957992303cf69b7a26360886f090990
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c       | 11 +++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h       |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c |  2 ++
+ 3 files changed, 14 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index 6d5b824..39141db 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -170,6 +170,17 @@ static void cancel_restore_locked(struct kgd_mem *mem)
+ 	struct mm_struct *mm;
+ 
+ 	while (mem->mm) {
++		/* update_user_pages needs to drop the lock
++		 * briefly. Therefore holding the lock is no guarantee
++		 * that no restore is in progress
++		 */
++		if (mem->busy) {
++			mutex_unlock(&mem->lock);
++			schedule_timeout_uninterruptible(1);
++			mutex_lock(&mem->lock);
++			continue;
++		}
++
+ 		mm = mem->mm;
+ 		mem->mm = NULL;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 23c7fc7..2fafea5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -61,6 +61,7 @@ struct kgd_mem {
+ 	/* flags bitfield */
+ 	bool no_substitute : 1;
+ 	bool aql_queue     : 1;
++	bool busy          : 1;
+ };
+ 
+ /* KFD Memory Eviction */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index d08d25c6..8d05564 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -826,6 +826,7 @@ static int update_user_pages(struct kgd_mem *mem, struct mm_struct *mm,
+ 		if (!pages)
+ 			return -ENOMEM;
+ 
++		mem->busy = true;
+ 		mutex_unlock(&mem->lock);
+ 
+ 		while (true) {
+@@ -834,6 +835,7 @@ static int update_user_pages(struct kgd_mem *mem, struct mm_struct *mm,
+ 			up_read(&mm->mmap_sem);
+ 
+ 			mutex_lock(&mem->lock);
++			mem->busy = false;
+ 			if (ret != 0)
+ 				return ret;
+ 
+-- 
+2.7.4
+

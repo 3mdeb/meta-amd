@@ -1,0 +1,117 @@
+From 0a0d6e59d9f797845a58628dc99ad9da7ecb8e88 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Mon, 15 May 2017 13:59:31 -0400
+Subject: [PATCH 1669/2094] drm/amd/display: Use dc_update_surfaces_for_stream
+ for flip.
+
+Today we use special interface for flip because of fear of cuncurency issues
+over dc->current_ctx. This should be no longer an issue when flipping on
+multiple CRTCs concurently since for fast update (as flip is) no new context
+is created and the exsisitng is not destroyed. For full updates case when
+removing or adding streams on once CRTC while flipping on another
+Adding all current active CRTC's states to the atomic commit in
+amdgpu_dm_atomic_check will garntee that any such full update commit
+will wait for completion of any outstanding flip.
+
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Reviewed-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c  |  9 ++++++---
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_types.c    | 23 +++++++++++++++++++++-
+ 2 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index ccaa1a8..a7c86fb 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -1484,6 +1484,7 @@ static void dm_page_flip(struct amdgpu_device *adev,
+ 	struct amdgpu_crtc *acrtc;
+ 	const struct dc_stream *stream;
+ 	struct dc_flip_addrs addr = { {0} };
++	struct dc_surface_update surface_updates[1] = { {0} };
+ 
+ 	/*
+ 	 * TODO risk of concurrency issues
+@@ -1546,9 +1547,11 @@ static void dm_page_flip(struct amdgpu_device *adev,
+ 		acrtc->base.state->event = NULL;
+ 	}
+ 
+-	dc_flip_surface_addrs(adev->dm.dc,
+-			      dc_stream_get_status(stream)->surfaces,
+-			      &addr, 1);
++	surface_updates->surface = dc_stream_get_status(stream)->surfaces[0];
++	surface_updates->flip_addr = &addr;
++
++
++	dc_update_surfaces_for_stream(adev->dm.dc, surface_updates, 1, stream);
+ 
+ 	DRM_DEBUG_DRIVER("%s Flipping to hi: 0x%x, low: 0x%x \n",
+ 			 __func__,
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+index 548222b..3f7fc4c 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+@@ -3083,6 +3083,7 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 	struct dc *dc = adev->dm.dc;
+ 	bool need_to_validate = false;
+ 	struct validate_context *context;
++	bool wait_4_prev_commits = false;
+ 
+ 	ret = drm_atomic_helper_check(dev, state);
+ 
+@@ -3159,6 +3160,7 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 
+ 			new_stream_count++;
+ 			need_to_validate = true;
++			wait_4_prev_commits = true;
+ 			break;
+ 		}
+ 
+@@ -3204,6 +3206,7 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 
+ 			new_stream_count++;
+ 			need_to_validate = true;
++			wait_4_prev_commits = true;
+ 
+ 			break;
+ 		}
+@@ -3215,6 +3218,7 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 						set,
+ 						set_count,
+ 						acrtc->stream);
++				wait_4_prev_commits = true;
+ 			}
+ 			break;
+ 		}
+@@ -3307,9 +3311,26 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 
+ 	context = dc_get_validate_context(dc, set, set_count);
+ 
+-	if (need_to_validate == false || set_count == 0 || context)
++	if (need_to_validate == false || set_count == 0 || context) {
++
+ 		ret = 0;
+ 
++		if (wait_4_prev_commits) {
++			list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
++				struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
++				struct drm_crtc_state *crtc_state;
++
++				if (acrtc->stream) {
++					crtc_state = drm_atomic_get_crtc_state(state, crtc);
++					if (IS_ERR(crtc_state)) {
++						ret = PTR_ERR(crtc_state);
++						break;
++					}
++				}
++			}
++		}
++	}
++
+ 	if (context) {
+ 		dc_resource_validate_ctx_destruct(context);
+ 		dm_free(context);
+-- 
+2.7.4
+

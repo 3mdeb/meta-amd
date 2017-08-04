@@ -1,0 +1,192 @@
+From ad381b41fed3a9de4f4e942a2916aca229abbab1 Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <David1.Zhou@amd.com>
+Date: Mon, 15 May 2017 16:48:27 +0800
+Subject: [PATCH 2045/2094] drm/amdgpu: return -ENODEV to user space when vram
+ is lost v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+below ioctl will return -ENODEV:
+amdgpu_cs_ioctl
+amdgpu_cs_wait_ioctl
+amdgpu_cs_wait_fences_ioctl
+amdgpu_gem_va_ioctl
+amdgpu_info_ioctl
+
+v2: only for map and replace cases in amdgpu_gem_va_ioctl
+
+Change-Id: I8970cde3301b7cfeb4263cc0f0e54aece215c98e
+Signed-off-by: Chunming Zhou <David1.Zhou@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+
+Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu.h
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c     |  9 +++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  4 +++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c    |  5 +++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c    | 10 ++++++++++
+ 5 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 59dcf6b..076926f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -859,6 +859,7 @@ struct amdgpu_fpriv {
+ 	struct amdgpu_ctx_mgr	ctx_mgr;
+ 	spinlock_t		sem_handles_lock;
+ 	struct idr		sem_handles;
++	u32			vram_lost_counter;
+ };
+ 
+ /*
+@@ -1611,6 +1612,7 @@ struct amdgpu_device {
+ 	atomic64_t			num_evictions;
+ 	atomic64_t                      num_vram_cpu_page_faults;
+ 	atomic_t			gpu_reset_counter;
++	atomic_t			vram_lost_counter;
+ 
+ 	/* data for buffer migration throttling */
+ 	struct {
+@@ -2004,6 +2006,8 @@ static inline bool amdgpu_has_atpx(void) { return false; }
+ extern const struct drm_ioctl_desc amdgpu_ioctls_kms[];
+ extern const int amdgpu_max_kms_ioctl;
+ 
++bool amdgpu_kms_vram_lost(struct amdgpu_device *adev,
++			struct amdgpu_fpriv *fpriv);
+ int amdgpu_driver_load_kms(struct drm_device *dev, unsigned long flags);
+ int amdgpu_driver_unload_kms(struct drm_device *dev);
+ void amdgpu_driver_lastclose_kms(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 0cfa233..05aa377 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -1097,6 +1097,7 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ {
+ 	struct amdgpu_device *adev = dev->dev_private;
++	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+ 	union drm_amdgpu_cs *cs = data;
+ 	struct amdgpu_cs_parser parser = {};
+ 	bool reserved_buffers = false;
+@@ -1104,6 +1105,8 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 
+ 	if (!adev->accel_working)
+ 		return -EBUSY;
++	if (amdgpu_kms_vram_lost(adev, fpriv))
++		return -ENODEV;
+ 
+ 	parser.adev = adev;
+ 	parser.filp = filp;
+@@ -1165,12 +1168,15 @@ int amdgpu_cs_wait_ioctl(struct drm_device *dev, void *data,
+ {
+ 	union drm_amdgpu_wait_cs *wait = data;
+ 	struct amdgpu_device *adev = dev->dev_private;
++	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+ 	unsigned long timeout = amdgpu_gem_timeout(wait->in.timeout);
+ 	struct amdgpu_ring *ring = NULL;
+ 	struct amdgpu_ctx *ctx;
+ 	struct fence *fence;
+ 	long r;
+ 
++	if (amdgpu_kms_vram_lost(adev, fpriv))
++		return -ENODEV;
+ 	r = amdgpu_cs_get_ring(adev, wait->in.ip_type, wait->in.ip_instance,
+ 			       wait->in.ring, &ring);
+ 	if (r)
+@@ -1344,12 +1350,15 @@ int amdgpu_cs_wait_fences_ioctl(struct drm_device *dev, void *data,
+ 				struct drm_file *filp)
+ {
+ 	struct amdgpu_device *adev = dev->dev_private;
++	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+ 	union drm_amdgpu_wait_fences *wait = data;
+ 	uint32_t fence_count = wait->in.fence_count;
+ 	struct drm_amdgpu_fence *fences_user;
+ 	struct drm_amdgpu_fence *fences;
+ 	int r;
+ 
++	if (amdgpu_kms_vram_lost(adev, fpriv))
++		return -ENODEV;
+ 	/* Get the fences from userspace */
+ 	fences = kmalloc_array(fence_count, sizeof(struct drm_amdgpu_fence),
+ 			GFP_KERNEL);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 0731459..4def032 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2930,8 +2930,10 @@ int amdgpu_gpu_reset(struct amdgpu_device *adev)
+ 			if (r)
+ 				goto out;
+ 			vram_lost = amdgpu_check_vram_lost(adev);
+-			if (vram_lost)
++			if (vram_lost) {
+ 				DRM_ERROR("VRAM is lost!\n");
++				atomic_inc(&adev->vram_lost_counter);
++			}
+ 			r = amdgpu_ttm_recover_gart(adev);
+ 			if (r)
+ 				goto out;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 3c77199..b135913 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -779,6 +779,11 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 			args->operation);
+ 		return -EINVAL;
+ 	}
++	if ((args->operation == AMDGPU_VA_OP_MAP) ||
++	    (args->operation == AMDGPU_VA_OP_REPLACE)) {
++		if (amdgpu_kms_vram_lost(adev, fpriv))
++			return -ENODEV;
++	}
+ 
+ 	INIT_LIST_HEAD(&list);
+ 	if ((args->operation != AMDGPU_VA_OP_CLEAR) &&
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 9504b23..e7554cb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -267,6 +267,7 @@ static int amdgpu_firmware_info(struct drm_amdgpu_info_firmware *fw_info,
+ static int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ {
+ 	struct amdgpu_device *adev = dev->dev_private;
++	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+ 	struct drm_amdgpu_info *info = data;
+ 	struct amdgpu_mode_info *minfo = &adev->mode_info;
+ 	void __user *out = (void __user *)(uintptr_t)info->return_pointer;
+@@ -279,6 +280,8 @@ static int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file
+ 
+ 	if (!info->return_size || !info->return_pointer)
+ 		return -EINVAL;
++	if (amdgpu_kms_vram_lost(adev, fpriv))
++		return -ENODEV;
+ 
+ 	switch (info->query) {
+ 	case AMDGPU_INFO_VIRTUAL_RANGE: {
+@@ -814,6 +817,12 @@ void amdgpu_driver_lastclose_kms(struct drm_device *dev)
+ 	vga_switcheroo_process_delayed_switch();
+ }
+ 
++bool amdgpu_kms_vram_lost(struct amdgpu_device *adev,
++			  struct amdgpu_fpriv *fpriv)
++{
++	return fpriv->vram_lost_counter != atomic_read(&adev->vram_lost_counter);
++}
++
+ /**
+  * amdgpu_driver_open_kms - drm callback for open
+  *
+@@ -868,6 +877,7 @@ int amdgpu_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
+ 
+ 	amdgpu_ctx_mgr_init(&fpriv->ctx_mgr);
+ 
++	fpriv->vram_lost_counter = atomic_read(&adev->vram_lost_counter);
+ 	file_priv->driver_priv = fpriv;
+ 
+ out_suspend:
+-- 
+2.7.4
+

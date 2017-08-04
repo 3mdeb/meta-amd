@@ -50,11 +50,18 @@ SRC_URI = "git://anongit.freedesktop.org/mesa/drm;branch=master \
 	       file://0031-amdgpu-add-raven-family-id.patch \
 	       file://0032-amdgpu-drm-add-AMDGPU_HW_IP_VCN_DEC.patch \
 	       file://0033-amdgpu-drm-add-AMDGPU_HW_IP_VCN_ENC.patch \
+	       file://0034-Bump-version-to-2.4.81.patch \
 	       file://0034-tests-amdgpu-rename-uvd-messages-to-decode-messages.patch \
 	       file://0035-tests-amdgpu-separate-decode-messages.patch \
 	       file://0036-tests-amdgpu-move-decode-sum-to-common.patch \
 	       file://0037-tests-amdgpu-add-vcn-tests-support-and-sets.patch \
 	       file://0038-tests-amdgpu-implement-vcn-dec-unit-tests.patch \
+	       file://0044-amdgpu-move-asic-id-table-to-a-separate-file.patch \
+	       file://0046-tests-amdgpu-bypass-UVD-CS-tests-on-raven.patch \
+	       file://0047-tests-amdgpu-bypass-UVD-ENC-tests-on-raven.patch \
+	       file://0048-tests-amdgpu-bypass-VCE-tests-on-raven.patch \
+	       file://0050-amdgpu-Add-gpu-always-on-cu-bitmap.patch \
+	       file://amdgpu.ids \
 "
 
 S = "${WORKDIR}/git"
@@ -88,4 +95,6 @@ FILES_${PN}-amdgpu = "${libdir}/libdrm_amdgpu.so.*"
 
 do_install_append() {
 	cp ${S}/include/drm/amdgpu_drm.h ${D}/usr/include/libdrm
+	install -vd  ${D}/usr/share/libdrm
+	cp ${WORKDIR}/amdgpu.ids ${D}/usr/share/libdrm
 }

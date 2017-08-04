@@ -16,7 +16,7 @@ PROVIDES += "llvm"
 LLVM_RELEASE = "${PV}"
 LLVM_DIR = "llvm${LLVM_RELEASE}"
 
-SRCREV = "24aaeeb480bf8d17697922f4e4b7648f26e80bae"
+SRCREV = "5db707b0ff5ce707a78082219658a999b6b6eaa3"
 PV = "5.0"
 PATCH_VERSION = "0"
 SRC_URI = "git://llvm.org/git/llvm.git;branch=master;protocol=http \

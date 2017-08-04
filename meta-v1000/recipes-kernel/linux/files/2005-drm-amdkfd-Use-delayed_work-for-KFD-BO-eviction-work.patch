@@ -1,0 +1,102 @@
+From f3fdbfa00111ce2f81cf0c58b70e7e8140b7ace2 Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Date: Wed, 29 Mar 2017 11:50:12 -0400
+Subject: [PATCH 2005/2094] drm/amdkfd: Use delayed_work for KFD BO eviction
+ work
+
+This is necessary for implementing "prevent KFD process starvation due
+to repeated evictions".
+
+Change-Id: I552452bb63fd40cf8f3ae217e6db075520bef833
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c  | 14 ++++++++------
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c |  4 ++--
+ 3 files changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index b2e9afb..a1d4837 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -881,16 +881,16 @@ int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
+ 	if (!p)
+ 		return -ENODEV;
+ 
+-	if (work_pending(&p->eviction_work.work)) {
++	if (delayed_work_pending(&p->eviction_work.dwork)) {
+ 		/* It is possible has TTM has lined up couple of BOs of the same
+ 		 * process to be evicted. Check if the fence is same which
+-		 * indicates that previous work item scheduled is not complted
++		 * indicates that previous work item scheduled is not completed
+ 		 */
+ 		if (p->eviction_work.eviction_fence == fence)
+ 			goto out;
+ 		else {
+ 			WARN(1, "Starting new evict with previous evict is not completed\n");
+-			if (cancel_work_sync(&p->eviction_work.work))
++			if (cancel_delayed_work_sync(&p->eviction_work.dwork))
+ 				fence_put(p->eviction_work.eviction_fence);
+ 		}
+ 	}
+@@ -899,7 +899,7 @@ int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
+ 	 * to kfd_evict_bo_worker
+ 	 */
+ 	p->eviction_work.eviction_fence = fence_get(fence);
+-	schedule_work(&p->eviction_work.work);
++	schedule_delayed_work(&p->eviction_work.dwork, 0);
+ out:
+ 	kfd_unref_process(p);
+ 	return 0;
+@@ -910,9 +910,11 @@ void kfd_evict_bo_worker(struct work_struct *work)
+ 	int ret;
+ 	struct kfd_process *p;
+ 	struct kfd_eviction_work *eviction_work;
++	struct delayed_work *dwork;
+ 
+-	eviction_work = container_of(work, struct kfd_eviction_work,
+-				     work);
++	dwork = to_delayed_work(work);
++	eviction_work = container_of(dwork, struct kfd_eviction_work,
++				     dwork);
+ 
+ 	/* Process termination destroys this worker thread. So during the
+ 	 * lifetime of this thread, kfd_process p will be valid
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index d160ae0..99917fc 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -575,7 +575,7 @@ struct qcm_process_device {
+ 
+ /* KFD Memory Eviction */
+ struct kfd_eviction_work {
+-	struct work_struct work;
++	struct delayed_work dwork;
+ 	struct fence *eviction_fence;
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index c43ed61..de4216f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -393,7 +393,7 @@ static void kfd_process_notifier_release(struct mmu_notifier *mn,
+ 	p = container_of(mn, struct kfd_process, mmu_notifier);
+ 	BUG_ON(p->mm != mm);
+ 
+-	cancel_work_sync(&p->eviction_work.work);
++	cancel_delayed_work_sync(&p->eviction_work.dwork);
+ 	cancel_delayed_work_sync(&p->restore_work);
+ 
+ 	mutex_lock(&kfd_processes_mutex);
+@@ -563,7 +563,7 @@ static struct kfd_process *create_process(const struct task_struct *thread,
+ 	if (err)
+ 		goto err_init_cwsr;
+ 
+-	INIT_WORK(&process->eviction_work.work, kfd_evict_bo_worker);
++	INIT_DELAYED_WORK(&process->eviction_work.dwork, kfd_evict_bo_worker);
+ 	INIT_DELAYED_WORK(&process->restore_work, kfd_restore_bo_worker);
+ 
+ 	/* If PeerDirect interface was not detected try to detect it again
+-- 
+2.7.4
+

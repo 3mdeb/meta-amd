@@ -1,0 +1,133 @@
+From 80838b9444dfa757cc4e66fa7ae38d5dda284768 Mon Sep 17 00:00:00 2001
+From: Flora Cui <flora.cui@amd.com>
+Date: Thu, 4 Jun 2015 16:33:43 +0800
+Subject: [PATCH 1698/2094] drm/radeon: add interface to query cu info for cik
+
+Signed-off-by: Flora Cui <flora.cui@amd.com>
+Reviewed-by: Ben Goz <ben.goz@amd.com>
+---
+ drivers/gpu/drm/radeon/cik.c         | 36 ++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/radeon/radeon.h      |  7 +++++++
+ drivers/gpu/drm/radeon/radeon_asic.c |  1 +
+ drivers/gpu/drm/radeon/radeon_asic.h |  1 +
+ drivers/gpu/drm/radeon/radeon_kms.c  | 11 +++++++++--
+ 5 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/cik.c b/drivers/gpu/drm/radeon/cik.c
+index b338d58..a8e535d 100644
+--- a/drivers/gpu/drm/radeon/cik.c
++++ b/drivers/gpu/drm/radeon/cik.c
+@@ -9823,3 +9823,39 @@ static void cik_program_aspm(struct radeon_device *rdev)
+ 		}
+ 	}
+ }
++
++int cik_get_cu_info(struct radeon_device *rdev, struct radeon_cu_info *cu_info)
++{
++	int i, j, k, counter, active_cu_number = 0;
++	u32 mask, bitmap, ao_bitmap, ao_cu_mask = 0;
++
++	if (!rdev || !cu_info)
++		return -EINVAL;
++
++	memset(cu_info, 0, sizeof(*cu_info));
++	for (i = 0; i < rdev->config.cik.max_shader_engines; i++) {
++		for (j = 0; j < rdev->config.cik.max_sh_per_se; j++) {
++			mask = 1;
++			ao_bitmap = 0;
++			counter = 0;
++			bitmap = cik_get_cu_active_bitmap(rdev, i, j);
++			cu_info->bitmap[i][j] = bitmap;
++
++			for (k = 0; k < rdev->config.cik.max_cu_per_sh; k++) {
++				if (bitmap & mask) {
++					if (counter < 2)
++						ao_bitmap |= mask;
++					counter++;
++				}
++				mask <<= 1;
++			}
++			active_cu_number += counter;
++			ao_cu_mask |= (ao_bitmap << (i * 16 + j * 8));
++		}
++	}
++
++	cu_info->number = active_cu_number;
++	cu_info->ao_cu_mask = ao_cu_mask;
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 07d3f49..60896d5 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -1851,6 +1851,12 @@ struct radeon_asic_ring {
+ 	void (*ring_start)(struct radeon_device *rdev, struct radeon_ring *cp);
+ };
+ 
++struct radeon_cu_info {
++	uint32_t number; /* total active CU number */
++	uint32_t ao_cu_mask;
++	uint32_t bitmap[4][4];
++};
++
+ /*
+  * ASIC specific functions.
+  */
+@@ -1873,6 +1879,7 @@ struct radeon_asic {
+ 	uint64_t (*get_gpu_clock_counter)(struct radeon_device *rdev);
+ 	/* get register for info ioctl */
+ 	int (*get_allowed_info_register)(struct radeon_device *rdev, u32 reg, u32 *val);
++	int (*get_cu_info)(struct radeon_device *rdev, struct radeon_cu_info *info);
+ 	/* gart */
+ 	struct {
+ 		void (*tlb_flush)(struct radeon_device *rdev);
+diff --git a/drivers/gpu/drm/radeon/radeon_asic.c b/drivers/gpu/drm/radeon/radeon_asic.c
+index bc5121d..e126cc9 100644
+--- a/drivers/gpu/drm/radeon/radeon_asic.c
++++ b/drivers/gpu/drm/radeon/radeon_asic.c
+@@ -2207,6 +2207,7 @@ static struct radeon_asic kv_asic = {
+ 	.get_xclk = &cik_get_xclk,
+ 	.get_gpu_clock_counter = &cik_get_gpu_clock_counter,
+ 	.get_allowed_info_register = cik_get_allowed_info_register,
++	.get_cu_info = &cik_get_cu_info,
+ 	.gart = {
+ 		.tlb_flush = &cik_pcie_gart_tlb_flush,
+ 		.get_page_entry = &rs600_gart_get_page_entry,
+diff --git a/drivers/gpu/drm/radeon/radeon_asic.h b/drivers/gpu/drm/radeon/radeon_asic.h
+index e3f036c..39138aa 100644
+--- a/drivers/gpu/drm/radeon/radeon_asic.h
++++ b/drivers/gpu/drm/radeon/radeon_asic.h
+@@ -781,6 +781,7 @@ void dce8_bandwidth_update(struct radeon_device *rdev);
+  * cik
+  */
+ uint64_t cik_get_gpu_clock_counter(struct radeon_device *rdev);
++int cik_get_cu_info(struct radeon_device *rdev, struct radeon_cu_info *cu_info);
+ u32 cik_get_xclk(struct radeon_device *rdev);
+ uint32_t cik_pciep_rreg(struct radeon_device *rdev, uint32_t reg);
+ void cik_pciep_wreg(struct radeon_device *rdev, uint32_t reg, uint32_t v);
+diff --git a/drivers/gpu/drm/radeon/radeon_kms.c b/drivers/gpu/drm/radeon/radeon_kms.c
+index 4388dde..d6d58bc 100644
+--- a/drivers/gpu/drm/radeon/radeon_kms.c
++++ b/drivers/gpu/drm/radeon/radeon_kms.c
+@@ -537,8 +537,15 @@ static int radeon_info_ioctl(struct drm_device *dev, void *data, struct drm_file
+ 		value64 = atomic64_read(&rdev->gtt_usage);
+ 		break;
+ 	case RADEON_INFO_ACTIVE_CU_COUNT:
+-		if (rdev->family >= CHIP_BONAIRE)
+-			*value = rdev->config.cik.active_cus;
++		if (rdev->family >= CHIP_BONAIRE) {
++			if (rdev->asic->get_cu_info) {
++				struct radeon_cu_info cu_info;
++
++				rdev->asic->get_cu_info(rdev, &cu_info);
++				*value = cu_info.number;
++			} else
++				*value = rdev->config.cik.active_cus;
++		}
+ 		else if (rdev->family >= CHIP_TAHITI)
+ 			*value = rdev->config.si.active_cus;
+ 		else if (rdev->family >= CHIP_CAYMAN)
+-- 
+2.7.4
+

@@ -1,0 +1,863 @@
+From 48f01fc89e413638c47c5d3a1a19db5fa6c9cefe Mon Sep 17 00:00:00 2001
+From: Eric Cook <Eric.Cook@amd.com>
+Date: Tue, 18 Apr 2017 15:24:50 -0400
+Subject: [PATCH 1370/2094] drm/amd/display: FreeSync Auto Sweep Support
+
+Implement core support to allow for FreeSync Auto Sweep to work
+
+Signed-off-by: Eric Cook <Eric.Cook@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |  28 +++
+ drivers/gpu/drm/amd/display/dc/core/dc_debug.c     |   5 +-
+ drivers/gpu/drm/amd/display/dc/dc.h                |   6 +
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    |  13 ++
+ .../display/dc/dce110/dce110_timing_generator.c    |  61 +++---
+ .../display/dc/dce110/dce110_timing_generator.h    |   9 +-
+ .../display/dc/dce110/dce110_timing_generator_v.c  |  23 +--
+ .../display/dc/dce120/dce120_timing_generator.c    |  73 ++++++-
+ .../amd/display/dc/dce80/dce80_timing_generator.c  |   2 +-
+ .../drm/amd/display/dc/inc/hw/timing_generator.h   |  10 +-
+ drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h  |   3 +
+ .../drm/amd/display/modules/freesync/freesync.c    | 227 ++++++++++++++++-----
+ .../gpu/drm/amd/display/modules/inc/mod_freesync.h |  20 ++
+ 13 files changed, 357 insertions(+), 123 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 93c936d..2e74fae 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -175,6 +175,31 @@ static bool stream_adjust_vmin_vmax(struct dc *dc,
+ 	return ret;
+ }
+ 
++static bool stream_get_crtc_position(struct dc *dc,
++		const struct dc_stream **stream, int num_streams,
++		unsigned int *v_pos, unsigned int *nom_v_pos)
++{
++	/* TODO: Support multiple streams */
++	struct core_dc *core_dc = DC_TO_CORE(dc);
++	struct core_stream *core_stream = DC_STREAM_TO_CORE(stream[0]);
++	int i = 0;
++	bool ret = false;
++	struct crtc_position position;
++
++	for (i = 0; i < MAX_PIPES; i++) {
++		struct pipe_ctx *pipe =
++				&core_dc->current_context->res_ctx.pipe_ctx[i];
++
++		if (pipe->stream == core_stream && pipe->stream_enc) {
++			core_dc->hwss.get_position(&pipe, 1, &position);
++
++			*v_pos = position.vertical_count;
++			*nom_v_pos = position.nominal_vcount;
++			ret = true;
++		}
++	}
++	return ret;
++}
+ 
+ static bool set_gamut_remap(struct dc *dc,
+ 			const struct dc_stream **stream, int num_streams)
+@@ -349,6 +374,9 @@ static void allocate_dc_stream_funcs(struct core_dc *core_dc)
+ 	core_dc->public.stream_funcs.set_static_screen_events =
+ 			set_static_screen_events;
+ 
++	core_dc->public.stream_funcs.get_crtc_position =
++			stream_get_crtc_position;
++
+ 	core_dc->public.stream_funcs.set_gamut_remap =
+ 			set_gamut_remap;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_debug.c b/drivers/gpu/drm/amd/display/dc/core/dc_debug.c
+index fb48b89..ee840e7 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_debug.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_debug.c
+@@ -287,6 +287,7 @@ void context_timing_trace(
+ 	struct core_dc *core_dc = DC_TO_CORE(dc);
+ 	struct dal_logger *logger =  core_dc->ctx->logger;
+ 	int h_pos[MAX_PIPES], v_pos[MAX_PIPES];
++	struct crtc_position position;
+ 
+ 	for (i = 0; i < core_dc->res_pool->pipe_count; i++) {
+ 		struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[i];
+@@ -294,7 +295,9 @@ void context_timing_trace(
+ 		if (pipe_ctx->stream == NULL)
+ 			continue;
+ 
+-		pipe_ctx->tg->funcs->get_position(pipe_ctx->tg, &h_pos[i], &v_pos[i]);
++		pipe_ctx->tg->funcs->get_position(pipe_ctx->tg, &position);
++		h_pos[i] = position.horizontal_count;
++		v_pos[i] = position.vertical_count;
+ 	}
+ 	for (i = 0; i < core_dc->res_pool->pipe_count; i++) {
+ 		struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[i];
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index d12aa72..647c095 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -103,6 +103,12 @@ struct dc_stream_funcs {
+ 			int num_streams,
+ 			int vmin,
+ 			int vmax);
++	bool (*get_crtc_position)(struct dc *dc,
++			const struct dc_stream **stream,
++			int num_streams,
++			unsigned int *v_pos,
++			unsigned int *nom_v_pos);
++
+ 
+ 	void (*stream_update_scaling)(const struct dc *dc,
+ 			const struct dc_stream *dc_stream,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 6a93c96..0e69ace 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -1362,6 +1362,18 @@ static void set_drr(struct pipe_ctx **pipe_ctx,
+ 	}
+ }
+ 
++static void get_position(struct pipe_ctx **pipe_ctx,
++		int num_pipes,
++		struct crtc_position *position)
++{
++	int i = 0;
++
++	/* TODO: handle pipes > 1
++	 */
++	for (i = 0; i < num_pipes; i++)
++		pipe_ctx[i]->tg->funcs->get_position(pipe_ctx[i]->tg, position);
++}
++
+ static void set_static_screen_control(struct pipe_ctx **pipe_ctx,
+ 		int num_pipes, const struct dc_static_screen_events *events)
+ {
+@@ -2486,6 +2498,7 @@ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.pipe_control_lock = dce_pipe_control_lock,
+ 	.set_bandwidth = dce110_set_bandwidth,
+ 	.set_drr = set_drr,
++	.get_position = get_position,
+ 	.set_static_screen_control = set_static_screen_control,
+ 	.reset_hw_ctx_wrap = reset_hw_ctx_wrap,
+ 	.prog_pixclk_crtc_otg = dce110_prog_pixclk_crtc_otg,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
+index 2376072..ec59927 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
+@@ -518,34 +518,38 @@ uint32_t dce110_timing_generator_get_vblank_counter(struct timing_generator *tg)
+ 
+ /**
+  *****************************************************************************
+- *  Function: dce110_get_crtc_positions
++ *  Function: dce110_timing_generator_get_position
+  *
+  *  @brief
+  *     Returns CRTC vertical/horizontal counters
+  *
+- *  @param [out] v_position, h_position
++ *  @param [out] position
+  *****************************************************************************
+  */
+-
+-void dce110_timing_generator_get_crtc_positions(
+-	struct timing_generator *tg,
+-	int32_t *h_position,
+-	int32_t *v_position)
++void dce110_timing_generator_get_position(struct timing_generator *tg,
++	struct crtc_position *position)
+ {
+ 	uint32_t value;
+ 	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 
+ 	value = dm_read_reg(tg->ctx, CRTC_REG(mmCRTC_STATUS_POSITION));
+ 
+-	*h_position = get_reg_field_value(
++	position->horizontal_count = get_reg_field_value(
+ 			value,
+ 			CRTC_STATUS_POSITION,
+ 			CRTC_HORZ_COUNT);
+ 
+-	*v_position = get_reg_field_value(
++	position->vertical_count = get_reg_field_value(
+ 			value,
+ 			CRTC_STATUS_POSITION,
+ 			CRTC_VERT_COUNT);
++
++	value = dm_read_reg(tg->ctx, CRTC_REG(mmCRTC_NOM_VERT_POSITION));
++
++	position->nominal_vcount = get_reg_field_value(
++			value,
++			CRTC_NOM_VERT_POSITION,
++			CRTC_VERT_COUNT_NOM);
+ }
+ 
+ /**
+@@ -566,18 +570,23 @@ void dce110_timing_generator_get_crtc_scanoutpos(
+ 	uint32_t *v_position)
+ {
+ 	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
++	struct crtc_position position;
+ 
+-	uint32_t v_blank_start_end  = dm_read_reg(tg->ctx,
++	uint32_t value  = dm_read_reg(tg->ctx,
+ 			CRTC_REG(mmCRTC_V_BLANK_START_END));
+ 
+-	*v_blank_start = get_reg_field_value(v_blank_start_end,
++	*v_blank_start = get_reg_field_value(value,
+ 					     CRTC_V_BLANK_START_END,
+ 					     CRTC_V_BLANK_START);
+-	*v_blank_end = get_reg_field_value(v_blank_start_end,
++	*v_blank_end = get_reg_field_value(value,
+ 					   CRTC_V_BLANK_START_END,
+ 					   CRTC_V_BLANK_END);
+ 
+-	dce110_timing_generator_get_crtc_positions(tg, h_position, v_position);
++	dce110_timing_generator_get_position(
++			tg, &position);
++
++	*h_position = position.horizontal_count;
++	*v_position = position.vertical_count;
+ }
+ 
+ /* TODO: is it safe to assume that mask/shift of Primary and Underlay
+@@ -1344,15 +1353,13 @@ void dce110_timing_generator_tear_down_global_swap_lock(
+  */
+ bool dce110_timing_generator_is_counter_moving(struct timing_generator *tg)
+ {
+-	uint32_t h1 = 0;
+-	uint32_t h2 = 0;
+-	uint32_t v1 = 0;
+-	uint32_t v2 = 0;
++	struct crtc_position position1, position2;
+ 
+-	tg->funcs->get_position(tg, &h1, &v1);
+-	tg->funcs->get_position(tg, &h2, &v2);
++	tg->funcs->get_position(tg, &position1);
++	tg->funcs->get_position(tg, &position2);
+ 
+-	if (h1 == h2 && v1 == v2)
++	if (position1.horizontal_count == position2.horizontal_count &&
++		position1.vertical_count == position2.vertical_count)
+ 		return false;
+ 	else
+ 		return true;
+@@ -1750,18 +1757,6 @@ void dce110_tg_set_overscan_color(struct timing_generator *tg,
+ 	dm_write_reg(ctx, addr, value);
+ }
+ 
+-void dce110_tg_get_position(struct timing_generator *tg,
+-	struct crtc_position *position)
+-{
+-	int32_t h_position;
+-	int32_t v_position;
+-
+-	dce110_timing_generator_get_crtc_positions(tg, &h_position, &v_position);
+-
+-	position->horizontal_count = (uint32_t)h_position;
+-	position->vertical_count = (uint32_t)v_position;
+-}
+-
+ void dce110_tg_program_timing(struct timing_generator *tg,
+ 	const struct dc_crtc_timing *timing,
+ 	bool use_vbios)
+@@ -1895,7 +1890,7 @@ static const struct timing_generator_funcs dce110_tg_funcs = {
+ 		.enable_crtc = dce110_timing_generator_enable_crtc,
+ 		.disable_crtc = dce110_timing_generator_disable_crtc,
+ 		.is_counter_moving = dce110_timing_generator_is_counter_moving,
+-		.get_position = dce110_timing_generator_get_crtc_positions,
++		.get_position = dce110_timing_generator_get_position,
+ 		.get_frame_count = dce110_timing_generator_get_vblank_counter,
+ 		.get_scanoutpos = dce110_timing_generator_get_crtc_scanoutpos,
+ 		.set_early_control = dce110_timing_generator_set_early_control,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h
+index f14a4d9..a5d63c6 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h
+@@ -151,11 +151,9 @@ void dce110_timing_generator_set_early_control(
+ uint32_t dce110_timing_generator_get_vblank_counter(
+ 		struct timing_generator *tg);
+ 
+-/* Get current H and V position */
+-void dce110_timing_generator_get_crtc_positions(
++void dce110_timing_generator_get_position(
+ 	struct timing_generator *tg,
+-	int32_t *h_position,
+-	int32_t *v_position);
++	struct crtc_position *position);
+ 
+ /* return true if TG counter is moving. false if TG is stopped */
+ bool dce110_timing_generator_is_counter_moving(struct timing_generator *tg);
+@@ -251,9 +249,6 @@ void dce110_tg_program_blank_color(struct timing_generator *tg,
+ void dce110_tg_set_overscan_color(struct timing_generator *tg,
+ 	const struct tg_color *overscan_color);
+ 
+-void dce110_tg_get_position(struct timing_generator *tg,
+-	struct crtc_position *position);
+-
+ void dce110_tg_program_timing(struct timing_generator *tg,
+ 	const struct dc_crtc_timing *timing,
+ 	bool use_vbios);
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator_v.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator_v.c
+index c95b694..759c55bb 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator_v.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator_v.c
+@@ -570,24 +570,11 @@ static void dce110_timing_generator_v_set_early_control(
+ 	dm_write_reg(tg->ctx, address, regval);
+ }
+ 
+-static void dce110_timing_generator_v_get_crtc_positions(
+-	struct timing_generator *tg,
+-	int32_t *h_position,
+-	int32_t *v_position)
++static void dce110_timing_generator_get_underlay_position(struct timing_generator *tg,
++	struct crtc_position *position)
+ {
+-	uint32_t value;
+-
+-	value = dm_read_reg(tg->ctx, mmCRTCV_STATUS_POSITION);
+-
+-	*h_position = get_reg_field_value(
+-			value,
+-			CRTCV_STATUS_POSITION,
+-			CRTC_HORZ_COUNT);
+-
+-	*v_position = get_reg_field_value(
+-			value,
+-			CRTCV_STATUS_POSITION,
+-			CRTC_VERT_COUNT);
++	//Should never hit this case
++	ASSERT(false);
+ }
+ 
+ static uint32_t dce110_timing_generator_v_get_vblank_counter(struct timing_generator *tg)
+@@ -665,7 +652,7 @@ static const struct timing_generator_funcs dce110_tg_v_funcs = {
+ 		.enable_crtc = dce110_timing_generator_v_enable_crtc,
+ 		.disable_crtc = dce110_timing_generator_v_disable_crtc,
+ 		.is_counter_moving = dce110_timing_generator_v_is_counter_moving,
+-		.get_position = dce110_timing_generator_v_get_crtc_positions,
++		.get_position = dce110_timing_generator_get_underlay_position,
+ 		.get_frame_count = dce110_timing_generator_v_get_vblank_counter,
+ 		.set_early_control = dce110_timing_generator_v_set_early_control,
+ 		.wait_for_state = dce110_timing_generator_v_wait_for_state,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c b/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c
+index 1318df7..245356e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c
++++ b/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c
+@@ -180,10 +180,9 @@ uint32_t dce120_timing_generator_get_vblank_counter(
+ }
+ 
+ /* Get current H and V position */
+-void dce120_timing_generator_get_crtc_positions(
++void dce120_timing_generator_get_crtc_position(
+ 	struct timing_generator *tg,
+-	int32_t *h_position,
+-	int32_t *v_position)
++	struct crtc_position *position)
+ {
+ 	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t value = dm_read_reg_soc15(
+@@ -191,11 +190,19 @@ void dce120_timing_generator_get_crtc_positions(
+ 				mmCRTC0_CRTC_STATUS_POSITION,
+ 				tg110->offsets.crtc);
+ 
+-	*h_position = get_reg_field_value(
+-					value, CRTC0_CRTC_STATUS_POSITION, CRTC_HORZ_COUNT);
++	position->horizontal_count = get_reg_field_value(value,
++			CRTC0_CRTC_STATUS_POSITION, CRTC_HORZ_COUNT);
+ 
+-	*v_position = get_reg_field_value(
+-						value, CRTC0_CRTC_STATUS_POSITION, CRTC_VERT_COUNT);
++	position->vertical_count = get_reg_field_value(value,
++			CRTC0_CRTC_STATUS_POSITION, CRTC_VERT_COUNT);
++
++	value = dm_read_reg_soc15(
++				tg->ctx,
++				mmCRTC0_CRTC_NOM_VERT_POSITION,
++				tg110->offsets.crtc);
++
++	position->nominal_vcount = get_reg_field_value(value,
++			CRTC0_CRTC_NOM_VERT_POSITION, CRTC_VERT_COUNT_NOM);
+ }
+ 
+ /* wait until TG is in beginning of vertical blank region */
+@@ -576,6 +583,49 @@ void dce120_timing_generator_set_drr(
+ 	}
+ }
+ 
++/**
++ *****************************************************************************
++ *  Function: dce120_timing_generator_get_position
++ *
++ *  @brief
++ *     Returns CRTC vertical/horizontal counters
++ *
++ *  @param [out] position
++ *****************************************************************************
++ */
++void dce120_timing_generator_get_position(struct timing_generator *tg,
++	struct crtc_position *position)
++{
++	uint32_t value;
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
++
++	value = dm_read_reg_soc15(
++			tg->ctx,
++			mmCRTC0_CRTC_STATUS_POSITION,
++			tg110->offsets.crtc);
++
++	position->horizontal_count = get_reg_field_value(
++			value,
++			CRTC0_CRTC_STATUS_POSITION,
++			CRTC_HORZ_COUNT);
++
++	position->vertical_count = get_reg_field_value(
++			value,
++			CRTC0_CRTC_STATUS_POSITION,
++			CRTC_VERT_COUNT);
++
++	value = dm_read_reg_soc15(
++			tg->ctx,
++			mmCRTC0_CRTC_NOM_VERT_POSITION,
++			tg110->offsets.crtc);
++
++	position->nominal_vcount = get_reg_field_value(
++			value,
++			CRTC0_CRTC_NOM_VERT_POSITION,
++			CRTC_VERT_COUNT_NOM);
++}
++
++
+ void dce120_timing_generator_get_crtc_scanoutpos(
+ 	struct timing_generator *tg,
+ 	uint32_t *v_blank_start,
+@@ -584,6 +634,7 @@ void dce120_timing_generator_get_crtc_scanoutpos(
+ 	uint32_t *v_position)
+ {
+ 	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
++	struct crtc_position position;
+ 
+ 	uint32_t v_blank_start_end = dm_read_reg_soc15(
+ 			tg->ctx,
+@@ -597,7 +648,11 @@ void dce120_timing_generator_get_crtc_scanoutpos(
+ 					   CRTC0_CRTC_V_BLANK_START_END,
+ 					   CRTC_V_BLANK_END);
+ 
+-	dce120_timing_generator_get_crtc_positions(tg, h_position, v_position);
++	dce120_timing_generator_get_crtc_position(
++			tg, &position);
++
++	*h_position = position.horizontal_count;
++	*v_position = position.vertical_count;
+ }
+ 
+ void dce120_timing_generator_enable_advanced_request(
+@@ -1076,7 +1131,7 @@ static struct timing_generator_funcs dce120_tg_funcs = {
+ 		/* used by enable_timing_synchronization. Not need for FPGA */
+ 		.is_counter_moving = dce110_timing_generator_is_counter_moving,
+ 		/* never be called */
+-		.get_position = dce120_timing_generator_get_crtc_positions,
++		.get_position = dce120_timing_generator_get_crtc_position,
+ 		.get_frame_count = dce120_timing_generator_get_vblank_counter,
+ 		.get_scanoutpos = dce120_timing_generator_get_crtc_scanoutpos,
+ 		.set_early_control = dce120_timing_generator_set_early_control,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce80/dce80_timing_generator.c b/drivers/gpu/drm/amd/display/dc/dce80/dce80_timing_generator.c
+index 1198f2f..179a6d6 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce80/dce80_timing_generator.c
++++ b/drivers/gpu/drm/amd/display/dc/dce80/dce80_timing_generator.c
+@@ -121,7 +121,7 @@ static const struct timing_generator_funcs dce80_tg_funcs = {
+ 		.enable_crtc = dce110_timing_generator_enable_crtc,
+ 		.disable_crtc = dce110_timing_generator_disable_crtc,
+ 		.is_counter_moving = dce110_timing_generator_is_counter_moving,
+-		.get_position = dce110_timing_generator_get_crtc_positions,
++		.get_position = dce110_timing_generator_get_position,
+ 		.get_frame_count = dce110_timing_generator_get_vblank_counter,
+ 		.get_scanoutpos = dce110_timing_generator_get_crtc_scanoutpos,
+ 		.set_early_control = dce110_timing_generator_set_early_control,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+index 235cfe8..2c4a9d0 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+@@ -30,9 +30,9 @@ struct dc_bios;
+ 
+ /* Contains CRTC vertical/horizontal pixel counters */
+ struct crtc_position {
+-	uint32_t vertical_count;
+-	uint32_t horizontal_count;
+-	uint32_t nominal_vcount;
++	int32_t vertical_count;
++	int32_t horizontal_count;
++	int32_t nominal_vcount;
+ };
+ 
+ struct dcp_gsl_params {
+@@ -105,8 +105,8 @@ struct timing_generator_funcs {
+ 	bool (*disable_crtc)(struct timing_generator *tg);
+ 	bool (*is_counter_moving)(struct timing_generator *tg);
+ 	void (*get_position)(struct timing_generator *tg,
+-								int32_t *h_position,
+-								int32_t *v_position);
++				struct crtc_position *position);
++
+ 	uint32_t (*get_frame_count)(struct timing_generator *tg);
+ 	void (*get_scanoutpos)(
+ 		struct timing_generator *tg,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index b42e4a0..afdb860 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -131,6 +131,9 @@ struct hw_sequencer_funcs {
+ 	void (*set_drr)(struct pipe_ctx **pipe_ctx, int num_pipes,
+ 			int vmin, int vmax);
+ 
++	void (*get_position)(struct pipe_ctx **pipe_ctx, int num_pipes,
++			struct crtc_position *position);
++
+ 	void (*set_static_screen_control)(struct pipe_ctx **pipe_ctx,
+ 			int num_pipes, const struct dc_static_screen_events *events);
+ 
+diff --git a/drivers/gpu/drm/amd/display/modules/freesync/freesync.c b/drivers/gpu/drm/amd/display/modules/freesync/freesync.c
+index 78b4f28..f6223e6 100644
+--- a/drivers/gpu/drm/amd/display/modules/freesync/freesync.c
++++ b/drivers/gpu/drm/amd/display/modules/freesync/freesync.c
+@@ -76,6 +76,16 @@ struct fixed_refresh {
+ 	bool program_fixed_refresh;
+ };
+ 
++struct freesync_range {
++	unsigned int min_refresh;
++	unsigned int max_frame_duration;
++	unsigned int vmax;
++
++	unsigned int max_refresh;
++	unsigned int min_frame_duration;
++	unsigned int vmin;
++};
++
+ struct freesync_state {
+ 	bool fullscreen;
+ 	bool static_screen;
+@@ -89,6 +99,7 @@ struct freesync_state {
+ 	struct gradual_static_ramp static_ramp;
+ 	struct below_the_range btr;
+ 	struct fixed_refresh fixed_refresh;
++	struct freesync_range freesync_range;
+ };
+ 
+ struct freesync_entity {
+@@ -342,8 +353,11 @@ static void update_stream(struct core_freesync *core_freesync,
+ 	}
+ }
+ 
+-static void calc_vmin_vmax(struct core_freesync *core_freesync,
+-		const struct dc_stream *stream, int *vmin, int *vmax)
++static void calc_freesync_range(struct core_freesync *core_freesync,
++		const struct dc_stream *stream,
++		struct freesync_state *state,
++		unsigned int min_refresh_in_uhz,
++		unsigned int max_refresh_in_uhz)
+ {
+ 	unsigned int min_frame_duration_in_ns = 0, max_frame_duration_in_ns = 0;
+ 	unsigned int index = map_index_from_stream(core_freesync, stream);
+@@ -351,29 +365,50 @@ static void calc_vmin_vmax(struct core_freesync *core_freesync,
+ 
+ 	min_frame_duration_in_ns = ((unsigned int) (div64_u64(
+ 					(1000000000ULL * 1000000),
+-					core_freesync->map[index].state.
+-					nominal_refresh_rate_in_micro_hz)));
++					max_refresh_in_uhz)));
+ 	max_frame_duration_in_ns = ((unsigned int) (div64_u64(
+-					(1000000000ULL * 1000000),
+-					core_freesync->map[index].caps->min_refresh_in_micro_hz)));
++		(1000000000ULL * 1000000),
++		min_refresh_in_uhz)));
++
++	state->freesync_range.min_refresh = min_refresh_in_uhz;
++	state->freesync_range.max_refresh = max_refresh_in_uhz;
+ 
+-	*vmax = div64_u64(div64_u64(((unsigned long long)(
+-			max_frame_duration_in_ns) * stream->timing.pix_clk_khz),
+-			stream->timing.h_total), 1000000);
+-	*vmin = div64_u64(div64_u64(((unsigned long long)(
+-			min_frame_duration_in_ns) * stream->timing.pix_clk_khz),
+-			stream->timing.h_total), 1000000);
++	state->freesync_range.max_frame_duration = max_frame_duration_in_ns;
++	state->freesync_range.min_frame_duration = min_frame_duration_in_ns;
++
++	state->freesync_range.vmax = div64_u64(div64_u64(((unsigned long long)(
++		max_frame_duration_in_ns) * stream->timing.pix_clk_khz),
++		stream->timing.h_total), 1000000);
++	state->freesync_range.vmin = div64_u64(div64_u64(((unsigned long long)(
++		min_frame_duration_in_ns) * stream->timing.pix_clk_khz),
++		stream->timing.h_total), 1000000);
+ 
+ 	/* In case of 4k free sync monitor, vmin or vmax cannot be less than vtotal */
+-	if (*vmin < vtotal) {
++	if (state->freesync_range.vmin < vtotal) {
+ 		ASSERT(false);
+-		*vmin = vtotal;
++		state->freesync_range.vmin = vtotal;
+ 	}
+ 
+-	if (*vmax < vtotal) {
++	if (state->freesync_range.vmax < vtotal) {
+ 		ASSERT(false);
+-		*vmax = vtotal;
++		state->freesync_range.vmax = vtotal;
+ 	}
++
++	/* Determine whether BTR can be supported */
++	if (max_frame_duration_in_ns >=
++			2 * min_frame_duration_in_ns)
++		core_freesync->map[index].caps->btr_supported = true;
++	else
++		core_freesync->map[index].caps->btr_supported = false;
++
++	/* Cache the time variables */
++	state->time.max_render_time_in_us =
++		max_frame_duration_in_ns / 1000;
++	state->time.min_render_time_in_us =
++		min_frame_duration_in_ns / 1000;
++	state->btr.mid_point_in_us =
++		(max_frame_duration_in_ns +
++		min_frame_duration_in_ns) / 2000;
+ }
+ 
+ static void calc_v_total_from_duration(const struct dc_stream *stream,
+@@ -518,9 +553,8 @@ static bool set_freesync_on_streams(struct core_freesync *core_freesync,
+ 				state->fixed_refresh.fixed_refresh_active == false) {
+ 				/* Enable freesync */
+ 
+-				calc_vmin_vmax(core_freesync,
+-						streams[stream_idx],
+-						&v_total_min, &v_total_max);
++				v_total_min = state->freesync_range.vmin;
++				v_total_max = state->freesync_range.vmax;
+ 
+ 				/* Update the freesync context for the stream */
+ 				update_stream_freesync_context(core_freesync,
+@@ -696,7 +730,7 @@ void mod_freesync_handle_v_update(struct mod_freesync *mod_freesync,
+ 					(1000000000ULL * 1000000),
+ 					state->nominal_refresh_rate_in_micro_hz)));
+ 
+-			calc_vmin_vmax(core_freesync, *streams, &vmin, &vmax);
++			vmin = state->freesync_range.vmin;
+ 
+ 			inserted_frame_v_total = vmin;
+ 
+@@ -941,11 +975,120 @@ bool mod_freesync_get_user_enable(struct mod_freesync *mod_freesync,
+ 	return true;
+ }
+ 
++bool mod_freesync_override_min_max(struct mod_freesync *mod_freesync,
++		const struct dc_stream *streams,
++		unsigned int min_refresh,
++		unsigned int max_refresh)
++{
++	unsigned int index = 0;
++	struct core_freesync *core_freesync;
++	struct freesync_state *state;
++
++	if (mod_freesync == NULL)
++		return false;
++
++	core_freesync = MOD_FREESYNC_TO_CORE(mod_freesync);
++	index = map_index_from_stream(core_freesync, streams);
++	state = &core_freesync->map[index].state;
++
++	if (min_refresh == 0 || max_refresh == 0) {
++		/* Restore defaults */
++		calc_freesync_range(core_freesync, streams, state,
++			core_freesync->map[index].caps->
++			min_refresh_in_micro_hz,
++			state->nominal_refresh_rate_in_micro_hz);
++	} else {
++		calc_freesync_range(core_freesync, streams,
++				state,
++				min_refresh,
++				max_refresh);
++
++		/* Program vtotal min/max */
++		core_freesync->dc->stream_funcs.adjust_vmin_vmax(
++			core_freesync->dc, &streams, 1,
++			state->freesync_range.vmin,
++			state->freesync_range.vmax);
++	}
++
++	return true;
++}
++
++bool mod_freesync_get_min_max(struct mod_freesync *mod_freesync,
++		const struct dc_stream *stream,
++		unsigned int *min_refresh,
++		unsigned int *max_refresh)
++{
++	unsigned int index = 0;
++	struct core_freesync *core_freesync = NULL;
++
++	if (mod_freesync == NULL)
++		return false;
++
++	core_freesync = MOD_FREESYNC_TO_CORE(mod_freesync);
++	index = map_index_from_stream(core_freesync, stream);
++
++	*min_refresh =
++		core_freesync->map[index].state.freesync_range.min_refresh;
++	*max_refresh =
++		core_freesync->map[index].state.freesync_range.max_refresh;
++
++	return true;
++}
++
++bool mod_freesync_get_vmin_vmax(struct mod_freesync *mod_freesync,
++		const struct dc_stream *stream,
++		unsigned int *vmin,
++		unsigned int *vmax)
++{
++	unsigned int index = 0;
++	struct core_freesync *core_freesync = NULL;
++
++	if (mod_freesync == NULL)
++		return false;
++
++	core_freesync = MOD_FREESYNC_TO_CORE(mod_freesync);
++	index = map_index_from_stream(core_freesync, stream);
++
++	*vmin =
++		core_freesync->map[index].state.freesync_range.vmin;
++	*vmax =
++		core_freesync->map[index].state.freesync_range.vmax;
++
++	return true;
++}
++
++bool mod_freesync_get_v_position(struct mod_freesync *mod_freesync,
++		const struct dc_stream *stream,
++		unsigned int *nom_v_pos,
++		unsigned int *v_pos)
++{
++	unsigned int index = 0;
++	struct core_freesync *core_freesync = NULL;
++	struct crtc_position position;
++
++	if (mod_freesync == NULL)
++		return false;
++
++	core_freesync = MOD_FREESYNC_TO_CORE(mod_freesync);
++	index = map_index_from_stream(core_freesync, stream);
++
++	if (core_freesync->dc->stream_funcs.get_crtc_position(
++			core_freesync->dc, &stream, 1,
++			&position.vertical_count, &position.nominal_vcount)) {
++
++		*nom_v_pos = position.vertical_count;
++		*v_pos = position.nominal_vcount;
++
++		return true;
++	}
++
++	return false;
++}
++
+ void mod_freesync_notify_mode_change(struct mod_freesync *mod_freesync,
+ 		const struct dc_stream **streams, int num_streams)
+ {
+ 	unsigned int stream_index, map_index;
+-	unsigned min_frame_duration_in_ns, max_frame_duration_in_ns;
+ 	struct freesync_state *state;
+ 	struct core_freesync *core_freesync = NULL;
+ 
+@@ -965,37 +1108,23 @@ void mod_freesync_notify_mode_change(struct mod_freesync *mod_freesync,
+ 			unsigned long long temp;
+ 			temp = streams[stream_index]->timing.pix_clk_khz;
+ 			temp *= 1000ULL * 1000ULL * 1000ULL;
+-			temp = div_u64(temp, streams[stream_index]->timing.h_total);
+-			temp = div_u64(temp, streams[stream_index]->timing.v_total);
+-			state->nominal_refresh_rate_in_micro_hz = (unsigned int) temp;
++			temp = div_u64(temp,
++					streams[stream_index]->timing.h_total);
++			temp = div_u64(temp,
++					streams[stream_index]->timing.v_total);
++			state->nominal_refresh_rate_in_micro_hz =
++					(unsigned int) temp;
+ 
+ 			/* Update the stream */
+ 			update_stream(core_freesync, streams[stream_index]);
+ 
+-			/* Determine whether BTR can be supported */
+-			min_frame_duration_in_ns = ((unsigned int) (div64_u64(
+-					(1000000000ULL * 1000000),
+-					state->nominal_refresh_rate_in_micro_hz)));
+-
+-			max_frame_duration_in_ns = ((unsigned int) (div64_u64(
+-					(1000000000ULL * 1000000),
+-					core_freesync->map[map_index].caps->min_refresh_in_micro_hz)));
+-
+-			if (max_frame_duration_in_ns >=
+-					2 * min_frame_duration_in_ns)
+-				core_freesync->map[map_index].caps->btr_supported = true;
+-			else
+-				core_freesync->map[map_index].caps->btr_supported = false;
+-
+-			/* Cache the time variables */
+-			state->time.max_render_time_in_us =
+-				max_frame_duration_in_ns / 1000;
+-			state->time.min_render_time_in_us =
+-				min_frame_duration_in_ns / 1000;
+-			state->btr.mid_point_in_us =
+-				(max_frame_duration_in_ns +
+-				min_frame_duration_in_ns) / 2000;
+-
++			/* Calculate vmin/vmax and refresh rate for
++			 * current mode
++			 */
++			calc_freesync_range(core_freesync, *streams, state,
++				core_freesync->map[stream_index].caps->
++				min_refresh_in_micro_hz,
++				state->nominal_refresh_rate_in_micro_hz);
+ 		}
+ 	}
+ 
+@@ -1178,7 +1307,7 @@ static void apply_fixed_refresh(struct core_freesync *core_freesync,
+ 	/* Fixed Refresh set to "active" so engage (fix to max) */
+ 	} else {
+ 
+-		calc_vmin_vmax(core_freesync, stream, &vmin, &vmax);
++		vmin = state->freesync_range.vmin;
+ 
+ 		vmax = vmin;
+ 
+diff --git a/drivers/gpu/drm/amd/display/modules/inc/mod_freesync.h b/drivers/gpu/drm/amd/display/modules/inc/mod_freesync.h
+index 783ff2e..3947cc4 100644
+--- a/drivers/gpu/drm/amd/display/modules/inc/mod_freesync.h
++++ b/drivers/gpu/drm/amd/display/modules/inc/mod_freesync.h
+@@ -129,6 +129,26 @@ bool mod_freesync_get_user_enable(struct mod_freesync *mod_freesync,
+ 		const struct dc_stream *stream,
+ 		struct mod_freesync_user_enable *user_enable);
+ 
++bool mod_freesync_override_min_max(struct mod_freesync *mod_freesync,
++		const struct dc_stream *streams,
++		unsigned int min_refresh,
++		unsigned int max_refresh);
++
++bool mod_freesync_get_min_max(struct mod_freesync *mod_freesync,
++		const struct dc_stream *stream,
++		unsigned int *min_refresh,
++		unsigned int *max_refresh);
++
++bool mod_freesync_get_vmin_vmax(struct mod_freesync *mod_freesync,
++		const struct dc_stream *stream,
++		unsigned int *vmin,
++		unsigned int *vmax);
++
++bool mod_freesync_get_v_position(struct mod_freesync *mod_freesync,
++		const struct dc_stream *stream,
++		unsigned int *nom_v_pos,
++		unsigned int *v_pos);
++
+ void mod_freesync_handle_v_update(struct mod_freesync *mod_freesync,
+ 		const struct dc_stream **streams, int num_streams);
+ 
+-- 
+2.7.4
+

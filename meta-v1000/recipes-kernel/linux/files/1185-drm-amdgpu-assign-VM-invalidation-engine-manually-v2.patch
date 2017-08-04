@@ -1,0 +1,130 @@
+From 42d2c6e78699f8ff296852cf3e731b85e0ad5a64 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 31 Mar 2017 11:03:50 +0200
+Subject: [PATCH 1185/2094] drm/amdgpu: assign VM invalidation engine manually
+ v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+For Vega10 we have 18 VM invalidation engines for each VMHUB.
+
+Start to assign them manually to the rings.
+
+v2: add a BUG_ON if we use to many engines
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Andres Rodriguez <andresx7@gmail.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c    |  2 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c    | 16 ++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c    |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/vce_v4_0.c    |  2 +-
+ 6 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+index 45bb87b..5786cc3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -179,6 +179,7 @@ struct amdgpu_ring {
+ 	unsigned		cond_exe_offs;
+ 	u64			cond_exe_gpu_addr;
+ 	volatile u32		*cond_exe_cpu_addr;
++	unsigned		vm_inv_eng;
+ #if defined(CONFIG_DEBUG_FS)
+ 	struct dentry *ent;
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index 55a17ce..f6b2329 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -2959,7 +2959,7 @@ static void gfx_v9_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	int usepfp = (ring->funcs->type == AMDGPU_RING_TYPE_GFX);
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
+-	unsigned eng = ring->idx;
++	unsigned eng = ring->vm_inv_eng;
+ 
+ 	pd_addr = pd_addr | 0x1; /* valid bit */
+ 	/* now only use physical base address of PDE and valid */
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 7f5cc75..a71521e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -386,6 +386,22 @@ static int gmc_v9_0_early_init(void *handle)
+ static int gmc_v9_0_late_init(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++	unsigned vm_inv_eng[AMDGPU_MAX_VMHUBS] = { 0 };
++	unsigned i;
++
++	for(i = 0; i < adev->num_rings; ++i) {
++		struct amdgpu_ring *ring = adev->rings[i];
++		unsigned vmhub = ring->funcs->vmhub;
++
++		ring->vm_inv_eng = vm_inv_eng[vmhub]++;
++		dev_info(adev->dev, "ring %u uses VM inv eng %u on hub %u\n",
++			 ring->idx, ring->vm_inv_eng, ring->funcs->vmhub);
++	}
++
++	/* Engine 17 is used for GART flushes */
++	for(i = 0; i < AMDGPU_MAX_VMHUBS; ++i)
++		BUG_ON(vm_inv_eng[i] > 17);
++
+ 	return amdgpu_irq_get(adev, &adev->mc.vm_fault, 0);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+index add9371..d5065a1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+@@ -1041,7 +1041,7 @@ static void sdma_v4_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
+-	unsigned eng = ring->idx;
++	unsigned eng = ring->vm_inv_eng;
+ 
+ 	pd_addr = pd_addr | 0x1; /* valid bit */
+ 	/* now only use physical base address of PDE and valid */
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c
+index 45e86f8..bf35d56 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c
+@@ -1037,7 +1037,7 @@ static void uvd_v7_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
+ 	uint32_t data0, data1, mask;
+-	unsigned eng = ring->idx;
++	unsigned eng = ring->vm_inv_eng;
+ 
+ 	pd_addr = pd_addr | 0x1; /* valid bit */
+ 	/* now only use physical base address of PDE and valid */
+@@ -1078,7 +1078,7 @@ static void uvd_v7_0_enc_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
+-	unsigned eng = ring->idx;
++	unsigned eng = ring->vm_inv_eng;
+ 
+ 	pd_addr = pd_addr | 0x1; /* valid bit */
+ 	/* now only use physical base address of PDE and valid */
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
+index c567d13..76fc8ed 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
+@@ -970,7 +970,7 @@ static void vce_v4_0_emit_vm_flush(struct amdgpu_ring *ring,
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
+-	unsigned eng = ring->idx;
++	unsigned eng = ring->vm_inv_eng;
+ 
+ 	pd_addr = pd_addr | 0x1; /* valid bit */
+ 	/* now only use physical base address of PDE and valid */
+-- 
+2.7.4
+

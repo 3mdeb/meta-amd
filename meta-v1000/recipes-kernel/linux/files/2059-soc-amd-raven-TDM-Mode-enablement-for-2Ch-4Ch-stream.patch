@@ -1,0 +1,208 @@
+From 505997f91850c857852d594d4d614f2b49bb40f7 Mon Sep 17 00:00:00 2001
+From: Vijendar Mukunda <Vijendar.Mukunda@amd.com>
+Date: Tue, 6 Jun 2017 23:06:48 +0530
+Subject: [PATCH 2059/2094] soc/amd/raven: TDM Mode enablement for 2Ch/4Ch
+ streams
+
+Implemented TDM mode changes to support 2Ch/4ch streams
+and 16/32 bit as container size
+
+Signed-off-by: Vijendar Mukunda <Vijendar.Mukunda@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ sound/soc/amd/raven/acp3x-dummy5102.c | 40 +++++++++++++++++++++++++++++++++--
+ sound/soc/amd/raven/acp3x-pcm-dma.c   | 27 +++++++++++------------
+ sound/soc/amd/raven/acp3x.h           |  8 +++----
+ sound/soc/amd/raven/dummy-w5102.c     |  2 +-
+ 4 files changed, 57 insertions(+), 20 deletions(-)
+
+diff --git a/sound/soc/amd/raven/acp3x-dummy5102.c b/sound/soc/amd/raven/acp3x-dummy5102.c
+index 0282c59..94a8748 100644
+--- a/sound/soc/amd/raven/acp3x-dummy5102.c
++++ b/sound/soc/amd/raven/acp3x-dummy5102.c
+@@ -27,12 +27,48 @@
+ #include <sound/soc.h>
+ #include <sound/soc-dapm.h>
+ #include <linux/module.h>
++#include <sound/pcm.h>
++#include <sound/pcm_params.h>
+ 
+ static int acp3x_hw_params(struct snd_pcm_substream *substream,
+ 				struct snd_pcm_hw_params *params)
+ 
+ {
+-	return 0;
++      struct snd_soc_pcm_runtime *rtd = substream->private_data;
++      struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
++      unsigned int fmt;
++      unsigned int slot_width;
++      unsigned int channels;
++      int ret = 0;
++
++      fmt = params_format(params);
++      switch (fmt) {
++	case SNDRV_PCM_FORMAT_S16_LE:
++		slot_width = 16;
++		break;
++	case SNDRV_PCM_FORMAT_S24_LE:
++		slot_width = 32;
++		break;
++	case SNDRV_PCM_FORMAT_S32_LE:
++                slot_width = 32;
++		break;
++	default:
++		printk(KERN_WARNING "acp3x: unsupported PCM format");
++		return -EINVAL;
++      }
++
++      channels = params_channels(params);
++
++      if (channels == 0x04) {
++                ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0x3, 0x3, 4, slot_width);
++                if (ret < 0)
++                       return ret;
++      } else {
++               ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0x3, 0x3, 2, slot_width);
++               if (ret < 0)
++                       return ret;
++      }
++      return 0;
+ }
+ 
+ static struct snd_soc_ops acp3x_wm5102_ops = {
+@@ -52,7 +88,7 @@ static struct snd_soc_dai_link acp3x_dai_w5102[] = {
+ 		.cpu_dai_name = "acp3x_rv_i2s.0",
+ 		.codec_dai_name = "dummy_w5102_dai",
+ 		.codec_name = "dummy_w5102.0",
+-		.dai_fmt =     SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF
++                .dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_NB_NF
+ 				| SND_SOC_DAIFMT_CBM_CFM,
+ 		.ops = &acp3x_wm5102_ops,
+ 		.init = acp3x_init,
+diff --git a/sound/soc/amd/raven/acp3x-pcm-dma.c b/sound/soc/amd/raven/acp3x-pcm-dma.c
+index 5246d28..880423b 100644
+--- a/sound/soc/amd/raven/acp3x-pcm-dma.c
++++ b/sound/soc/amd/raven/acp3x-pcm-dma.c
+@@ -52,7 +52,7 @@ static const struct snd_pcm_hardware acp3x_pcm_hardware_playback = {
+ 		   SNDRV_PCM_FMTBIT_U8 | SNDRV_PCM_FMTBIT_S24_LE |
+ 		   SNDRV_PCM_FMTBIT_S32_LE,
+ 	.channels_min = 2,
+-	.channels_max = 8,
++	.channels_max = 6,
+ 	.rates = SNDRV_PCM_RATE_8000_96000,
+ 	.rate_min = 8000,
+ 	.rate_max = 96000,
+@@ -228,12 +228,12 @@ static void config_acp3x_dma(struct i2s_stream_instance *rtd, int direction)
+ 	struct page *pg = rtd->pg;
+ 
+ 	/* 8 scratch registers used to map one 64 bit address.
+-	 * For 2 pages (4096 * 2 bytes), it will be 16 registers.
++	 * For 2 pages (8192 * 2 bytes), it will be 16 registers.
+ 	 */
+ 	if (direction == SNDRV_PCM_STREAM_PLAYBACK)
+ 		val = 0;
+ 	else
+-		val = 16;
++		val = 32;
+ 
+ 	/* Group Enable */
+ 	rv_writel(ACP_SRAM_PTE_OFFSET | BIT(31), rtd->acp3x_base +
+@@ -461,22 +461,22 @@ static int acp3x_dai_set_tdm_slot(struct snd_soc_dai *cpu_dai, u32 tx_mask,
+ 				u32 rx_mask, int slots, int slot_width)
+ {
+ 	u32 val = 0;
+-	u16 resolution;
++	u16 slot_len;
+ 
+ 	struct i2s_dev_data *adata = snd_soc_dai_get_drvdata(cpu_dai);
+ 
+ 	switch (slot_width) {
+ 	case 8:
+-		resolution = 0;
++		slot_len = 8;
+ 	break;
+ 	case 16:
+-		resolution = 2;
++		slot_len = 16;
+ 	break;
+ 	case 24:
+-		resolution = 4;
++		slot_len = 24;
+ 	break;
+ 	case 32:
+-		resolution = 5;
++		slot_len = 0;
+ 	break;
+ 	default:
+ 		return -EINVAL;
+@@ -488,7 +488,7 @@ static int acp3x_dai_set_tdm_slot(struct snd_soc_dai *cpu_dai, u32 tx_mask,
+ 	val = rv_readl(adata->acp3x_base + mmACP_BTTDM_IRER);
+ 	rv_writel((val | 0x2), adata->acp3x_base + mmACP_BTTDM_IRER);
+ 
+-	val = (FRM_LEN | ((slots-1) << 15) | (resolution << 18));
++	val = (FRM_LEN | ((slots) << 15) | (slot_len << 18));
+ 	rv_writel(val, adata->acp3x_base + mmACP_BTTDM_TXFRMT);
+ 	rv_writel(val, adata->acp3x_base + mmACP_BTTDM_RXFRMT);
+ 
+@@ -500,6 +500,7 @@ static int acp3x_dai_i2s_hwparams(struct snd_pcm_substream *substream,
+ 				struct snd_pcm_hw_params *params,
+ 				struct snd_soc_dai *dai)
+ {
++	u32 val = 0;
+ 	struct i2s_stream_instance *rtd = substream->runtime->private_data;
+ 
+ 	switch (params_format(params)) {
+@@ -521,12 +522,12 @@ static int acp3x_dai_i2s_hwparams(struct snd_pcm_substream *substream,
+ 		return -EINVAL;
+ 	}
+ 
++	val = rv_readl(rtd->acp3x_base + mmACP_BTTDM_ITER);
++	val = val | (rtd->xfer_resolution  << 3);
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+-		rv_writel((rtd->xfer_resolution  << 3),
+-			rtd->acp3x_base + mmACP_BTTDM_ITER);
++		rv_writel(val, rtd->acp3x_base + mmACP_BTTDM_ITER);
+ 	else
+-		rv_writel((rtd->xfer_resolution  << 3),
+-			rtd->acp3x_base + mmACP_BTTDM_IRER);
++		rv_writel(val, rtd->acp3x_base + mmACP_BTTDM_IRER);
+ 
+ 	return 0;
+ }
+diff --git a/sound/soc/amd/raven/acp3x.h b/sound/soc/amd/raven/acp3x.h
+index 70fed97..fa252c6 100644
+--- a/sound/soc/amd/raven/acp3x.h
++++ b/sound/soc/amd/raven/acp3x.h
+@@ -13,12 +13,12 @@
+ 
+ #define PLAYBACK_MIN_NUM_PERIODS    2
+ #define PLAYBACK_MAX_NUM_PERIODS    2
+-#define PLAYBACK_MAX_PERIOD_SIZE    4096
+-#define PLAYBACK_MIN_PERIOD_SIZE    4096
++#define PLAYBACK_MAX_PERIOD_SIZE    8192
++#define PLAYBACK_MIN_PERIOD_SIZE    8192
+ #define CAPTURE_MIN_NUM_PERIODS     2
+ #define CAPTURE_MAX_NUM_PERIODS     2
+-#define CAPTURE_MAX_PERIOD_SIZE     4096
+-#define CAPTURE_MIN_PERIOD_SIZE     4096
++#define CAPTURE_MAX_PERIOD_SIZE     8192
++#define CAPTURE_MIN_PERIOD_SIZE     8192
+ 
+ #define MAX_BUFFER (PLAYBACK_MAX_PERIOD_SIZE * PLAYBACK_MAX_NUM_PERIODS)
+ #define MIN_BUFFER MAX_BUFFER
+diff --git a/sound/soc/amd/raven/dummy-w5102.c b/sound/soc/amd/raven/dummy-w5102.c
+index 3e09e32..af6439a 100644
+--- a/sound/soc/amd/raven/dummy-w5102.c
++++ b/sound/soc/amd/raven/dummy-w5102.c
+@@ -56,7 +56,7 @@ static struct snd_soc_dai_driver w5102_stub_dai = {
+ 	.playback	= {
+ 		.stream_name	= "Playback",
+ 		.channels_min	= 2,
+-		.channels_max	= 2,
++		.channels_max	= 6,
+ 		.rates		= W5102_RATES,
+ 		.formats	= W5102_FORMATS,
+ 	},
+-- 
+2.7.4
+

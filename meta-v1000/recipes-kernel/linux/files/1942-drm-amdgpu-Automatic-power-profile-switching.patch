@@ -1,0 +1,151 @@
+From bf3d272bc260d01c497b3c30d864f4e468b1f1bc Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Wed, 5 Oct 2016 16:25:45 -0400
+Subject: [PATCH 1942/2094] drm/amdgpu: Automatic power profile switching
+
+Switch between compute and graphic profiles automatically when KFD
+compute work starts and stops. It uses the number of KFD VMs as a
+criteria for the existence of KFD compute work.
+
+Change-Id: I11d34f45d901f4dd1e16e4a64c1ad1010088d9b8
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c          |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c           | 38 +++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h           |  9 +++++-
+ 4 files changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 3ec1ff1..f144171 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1327,7 +1327,7 @@ int amdgpu_amdkfd_gpuvm_create_process_vm(struct kgd_dev *kgd, void **vm,
+ 		return -ENOMEM;
+ 
+ 	/* Initialize the VM context, allocate the page directory and zero it */
+-	ret = amdgpu_vm_init(adev, &new_vm->base);
++	ret = amdgpu_vm_init(adev, &new_vm->base, true);
+ 	if (ret != 0) {
+ 		pr_err("Failed init vm ret %d\n", ret);
+ 		/* Undo everything related to the new VM context */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 5e81f3f..ccb7401 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -809,7 +809,7 @@ int amdgpu_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
+ 		goto out_suspend;
+ 	}
+ 
+-	r = amdgpu_vm_init(adev, &fpriv->vm);
++	r = amdgpu_vm_init(adev, &fpriv->vm, false);
+ 	if (r) {
+ 		kfree(fpriv);
+ 		goto out_suspend;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 290493a..7cc01c6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -2297,7 +2297,8 @@ void amdgpu_vm_adjust_size(struct amdgpu_device *adev, uint64_t vm_size)
+  *
+  * Init @vm fields.
+  */
+-int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm)
++int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
++		   bool is_kfd_vm)
+ {
+ 	const unsigned align = min(AMDGPU_VM_PTB_ALIGN_SIZE,
+ 		AMDGPU_VM_PTE_COUNT(adev) * 8);
+@@ -2345,6 +2346,22 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ 	vm->last_eviction_counter = atomic64_read(&adev->num_evictions);
+ 	amdgpu_bo_unreserve(vm->root.bo);
+ 
++	vm->is_kfd_vm = is_kfd_vm;
++	if (is_kfd_vm && adev->pp_enabled) {
++		mutex_lock(&adev->vm_manager.lock);
++
++		if (adev->vm_manager.n_kfd_vms++ == 0) {
++			/* First KFD VM: enable compute power profile */
++			if (adev->pp_enabled)
++				amdgpu_dpm_switch_power_profile(adev,
++						AMD_PP_COMPUTE_PROFILE);
++			else if (adev->pm.funcs->switch_power_profile)
++				adev->pm.funcs->switch_power_profile(adev,
++						AMD_PP_COMPUTE_PROFILE);
++		}
++		mutex_unlock(&adev->vm_manager.lock);
++	}
++
+ 	return 0;
+ 
+ error_free_root:
+@@ -2396,6 +2413,23 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ 	bool prt_fini_needed = !!adev->gart.gart_funcs->set_prt;
+ 	int i;
+ 
++	if (vm->is_kfd_vm && adev->pp_enabled) {
++		mutex_lock(&adev->vm_manager.lock);
++
++		WARN(adev->vm_manager.n_kfd_vms == 0, "Unbalanced number of KFD VMs");
++
++		if (--adev->vm_manager.n_kfd_vms == 0) {
++			/* Last KFD VM: enable graphics power profile */
++			if (adev->pp_enabled)
++				amdgpu_dpm_switch_power_profile(adev,
++						AMD_PP_GFX_PROFILE);
++			else if (adev->pm.funcs->switch_power_profile)
++				adev->pm.funcs->switch_power_profile(adev,
++						AMD_PP_GFX_PROFILE);
++		}
++		mutex_unlock(&adev->vm_manager.lock);
++	}
++
+ 	amd_sched_entity_fini(vm->entity.sched, &vm->entity);
+ 
+ 	if (!RB_EMPTY_ROOT(&vm->va)) {
+@@ -2457,6 +2491,8 @@ void amdgpu_vm_manager_init(struct amdgpu_device *adev)
+ 	atomic64_set(&adev->vm_manager.client_counter, 0);
+ 	spin_lock_init(&adev->vm_manager.prt_lock);
+ 	atomic_set(&adev->vm_manager.num_prt_users, 0);
++
++	adev->vm_manager.n_kfd_vms = 0;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 27546df..0fdb064 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -129,6 +129,9 @@ struct amdgpu_vm {
+ 	struct amdgpu_vm_id	*reserved_vmid[AMDGPU_MAX_VMHUBS];
+ 	/* each VM will map on CSA */
+ 	struct amdgpu_bo_va *csa_bo_va;
++
++	/* Flag to indicate if this is a KFD VM */
++	bool                    is_kfd_vm : 1;
+ };
+ 
+ struct amdgpu_vm_id {
+@@ -186,11 +189,15 @@ struct amdgpu_vm_manager {
+ 	/* partial resident texture handling */
+ 	spinlock_t				prt_lock;
+ 	atomic_t				num_prt_users;
++
++	/* Number of KFD VMs, used for detecting KFD activity */
++	unsigned                                n_kfd_vms;
+ };
+ 
+ void amdgpu_vm_manager_init(struct amdgpu_device *adev);
+ void amdgpu_vm_manager_fini(struct amdgpu_device *adev);
+-int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm);
++int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
++		   bool is_kfd_vm);
+ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm);
+ void amdgpu_vm_get_pd_bo(struct amdgpu_vm *vm,
+ 			 struct list_head *validated,
+-- 
+2.7.4
+

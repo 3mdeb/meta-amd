@@ -1,0 +1,280 @@
+From 1926877415d5358a3dc18466509c85cfde43daf4 Mon Sep 17 00:00:00 2001
+From: Amber Lin <Amber.Lin@amd.com>
+Date: Tue, 21 Mar 2017 10:42:35 -0400
+Subject: [PATCH 2014/2094] drm/amdkfd: Complete direct IO links
+
+On top of reporting GPU->CPU IO links, this patch adds CPU<->CPU and
+CPU->GPU direct links so all direct IO links will be reported at sysfs.
+
+Change-Id: Ia7373e57332f13a0ca3a3b5c47af2733b718cf5a
+Signed-off-by: Amber Lin <Amber.Lin@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_crat.c     | 104 +++++++++++++++++++++++++-----
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h     |   2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_topology.c |  43 ++++++------
+ 3 files changed, 106 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+index ae33580..b357950 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+@@ -299,9 +299,8 @@ static int kfd_parse_subtype_cache(struct crat_subtype_cache *cache,
+ static int kfd_parse_subtype_iolink(struct crat_subtype_iolink *iolink,
+ 					struct list_head *device_list)
+ {
+-	struct kfd_iolink_properties *props;
+-	struct kfd_topology_device *dev;
+-	uint32_t i = 0;
++	struct kfd_iolink_properties *props, *props2;
++	struct kfd_topology_device *dev, *cpu_dev;
+ 	uint32_t id_from;
+ 	uint32_t id_to;
+ 
+@@ -323,10 +322,10 @@ static int kfd_parse_subtype_iolink(struct crat_subtype_iolink *iolink,
+ 			props->ver_min = iolink->version_minor;
+ 			props->iolink_type = iolink->io_interface_type;
+ 
+-			/*
+-			 * weight factor (derived from CDIR), currently always 1
+-			 */
+-			props->weight = 1;
++			if (props->iolink_type == CRAT_IOLINK_TYPE_PCIEXPRESS)
++				props->weight = 20;
++			else
++				props->weight = node_distance(id_from, id_to);
+ 
+ 			props->min_latency = iolink->minimum_latency;
+ 			props->max_latency = iolink->maximum_latency;
+@@ -338,10 +337,27 @@ static int kfd_parse_subtype_iolink(struct crat_subtype_iolink *iolink,
+ 			dev->io_link_count++;
+ 			dev->node_props.io_links_count++;
+ 			list_add_tail(&props->list, &dev->io_link_props);
+-
+ 			break;
+ 		}
+-		i++;
++	}
++
++	/* CPU topology is created before GPUs are detected, so CPU->GPU
++	 * links are not built at that time. If a PCIe type is discovered, it
++	 * means a GPU is detected and we are adding GPU->CPU to the topology.
++	 * At this time, also add the corresponded CPU->GPU link.
++	 */
++	if (props && props->iolink_type == CRAT_IOLINK_TYPE_PCIEXPRESS) {
++		cpu_dev = topology_device_by_nodeid(id_to);
++		if (!cpu_dev)
++			return -ENODEV;
++		/* same everything but the other direction */
++		props2 = kmemdup(props, sizeof(*props2), GFP_KERNEL);
++		props2->node_from = id_to;
++		props2->node_to = id_from;
++		props2->kobj = NULL;
++		cpu_dev->io_link_count++;
++		cpu_dev->node_props.io_links_count++;
++		list_add_tail(&props2->list, &cpu_dev->io_link_props);
+ 	}
+ 
+ 	return 0;
+@@ -713,7 +729,7 @@ int kfd_create_crat_image_acpi(void **crat_image, size_t *size)
+  * expected to cover all known conditions. But to be safe additional check
+  * is put in the code to ensure we don't overwrite.
+  */
+-#define VCRAT_SIZE_FOR_CPU	PAGE_SIZE
++#define VCRAT_SIZE_FOR_CPU	(2 * PAGE_SIZE)
+ #define VCRAT_SIZE_FOR_GPU	(3 * PAGE_SIZE)
+ 
+ /* kfd_fill_cu_for_cpu - Fill in Compute info for the given CPU NUMA node
+@@ -771,7 +787,7 @@ static int kfd_fill_mem_info_for_cpu(int numa_node_id, int *avail_size,
+ 	pg_data_t *pgdat;
+ 	int zone_type;
+ 
+-	*avail_size -= sizeof(struct crat_subtype_computeunit);
++	*avail_size -= sizeof(struct crat_subtype_memory);
+ 	if (*avail_size < 0)
+ 		return -ENOMEM;
+ 
+@@ -799,6 +815,49 @@ static int kfd_fill_mem_info_for_cpu(int numa_node_id, int *avail_size,
+ 	return 0;
+ }
+ 
++static int kfd_fill_iolink_info_for_cpu(int numa_node_id, int *avail_size,
++				uint32_t *num_entries,
++				struct crat_subtype_iolink *sub_type_hdr)
++{
++	int nid;
++	struct cpuinfo_x86 *c = &cpu_data(0);
++	uint8_t link_type;
++
++	if (c->x86_vendor == X86_VENDOR_AMD)
++		link_type = CRAT_IOLINK_TYPE_HYPERTRANSPORT;
++	else
++		link_type = CRAT_IOLINK_TYPE_QPI_1_1;
++
++	*num_entries = 0;
++
++	/* Create IO links from this node to other CPU nodes */
++	for_each_online_node(nid) {
++		if (nid == numa_node_id) /* node itself */
++			continue;
++
++		*avail_size -= sizeof(struct crat_subtype_iolink);
++		if (*avail_size < 0)
++			return -ENOMEM;
++
++		memset(sub_type_hdr, 0, sizeof(struct crat_subtype_iolink));
++
++		/* Fill in subtype header data */
++		sub_type_hdr->type = CRAT_SUBTYPE_IOLINK_AFFINITY;
++		sub_type_hdr->length = sizeof(struct crat_subtype_iolink);
++		sub_type_hdr->flags = CRAT_SUBTYPE_FLAGS_ENABLED;
++
++		/* Fill in IO link data */
++		sub_type_hdr->proximity_domain_from = numa_node_id;
++		sub_type_hdr->proximity_domain_to = nid;
++		sub_type_hdr->io_interface_type = link_type;
++
++		(*num_entries)++;
++		sub_type_hdr++;
++	}
++
++	return 0;
++}
++
+ /* kfd_create_vcrat_image_cpu - Create Virtual CRAT for CPU
+  *
+  *	@pcrat_image: Fill in VCRAT for CPU
+@@ -813,6 +872,7 @@ static int kfd_create_vcrat_image_cpu(void *pcrat_image, size_t *size)
+ 	struct crat_subtype_generic *sub_type_hdr;
+ 	int avail_size = *size;
+ 	int numa_node_id;
++	uint32_t entries = 0;
+ 	int ret = 0;
+ 
+ 	if (pcrat_image == NULL || avail_size < VCRAT_SIZE_FOR_CPU)
+@@ -870,6 +930,18 @@ static int kfd_create_vcrat_image_cpu(void *pcrat_image, size_t *size)
+ 		sub_type_hdr = (typeof(sub_type_hdr))((char *)sub_type_hdr +
+ 			sub_type_hdr->length);
+ 
++		/* Fill in Subtype: IO Link */
++		ret = kfd_fill_iolink_info_for_cpu(numa_node_id, &avail_size,
++				&entries,
++				(struct crat_subtype_iolink *)sub_type_hdr);
++		if (ret < 0)
++			return ret;
++		crat_table->length += (sub_type_hdr->length * entries);
++		crat_table->total_entries += entries;
++
++		sub_type_hdr = (typeof(sub_type_hdr))((char *)sub_type_hdr +
++				sub_type_hdr->length * entries);
++
+ 		crat_table->num_domains++;
+ 	}
+ 
+@@ -930,7 +1002,6 @@ static int kfd_fill_gpu_direct_io_link(int *avail_size,
+ 			struct crat_subtype_iolink *sub_type_hdr,
+ 			uint32_t proximity_domain)
+ {
+-	int proximity_domain_to;
+ 	*avail_size -= sizeof(struct crat_subtype_iolink);
+ 	if (*avail_size < 0)
+ 		return -ENOMEM;
+@@ -946,12 +1017,11 @@ static int kfd_fill_gpu_direct_io_link(int *avail_size,
+ 	 * TODO: Fill-in other fields of iolink subtype */
+ 	sub_type_hdr->io_interface_type = CRAT_IOLINK_TYPE_PCIEXPRESS;
+ 	sub_type_hdr->proximity_domain_from = proximity_domain;
+-	proximity_domain_to =
+-		kfd_get_proximity_domain(kdev->pdev->bus);
+-	if (proximity_domain_to == -1)
+-		return -EINVAL;
++	if (kdev->pdev->dev.numa_node == NUMA_NO_NODE)
++		sub_type_hdr->proximity_domain_to = 0;
++	else
++		sub_type_hdr->proximity_domain_to = kdev->pdev->dev.numa_node;
+ 
+-	sub_type_hdr->proximity_domain_to = proximity_domain_to;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 7f182be..3485b8e 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -834,13 +834,13 @@ int kfd_topology_init(void);
+ void kfd_topology_shutdown(void);
+ int kfd_topology_add_device(struct kfd_dev *gpu);
+ int kfd_topology_remove_device(struct kfd_dev *gpu);
++struct kfd_topology_device *topology_device_by_nodeid(uint32_t node_id);
+ struct kfd_dev *kfd_device_by_id(uint32_t gpu_id);
+ struct kfd_dev *kfd_device_by_pci_dev(const struct pci_dev *pdev);
+ struct kfd_dev *kfd_device_by_kgd(const struct kgd_dev *kgd);
+ uint32_t kfd_get_gpu_id(struct kfd_dev *dev);
+ int kfd_topology_enum_kfd_devices(uint8_t idx, struct kfd_dev **kdev);
+ int kfd_numa_node_to_apic_id(int numa_node_id);
+-int kfd_get_proximity_domain(const struct pci_bus *bus);
+ 
+ /* Interrupts */
+ int kfd_interrupt_init(struct kfd_dev *dev);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+index 41ab924..3fd9634 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+@@ -43,6 +43,24 @@ static struct kfd_system_properties sys_props;
+ static DECLARE_RWSEM(topology_lock);
+ static atomic_t topology_crat_proximity_domain;
+ 
++struct kfd_topology_device *topology_device_by_nodeid(uint32_t node_id)
++{
++	struct kfd_topology_device *top_dev;
++	struct kfd_topology_device *device = NULL;
++
++	down_read(&topology_lock);
++
++	list_for_each_entry(top_dev, &topology_device_list, list)
++		if (top_dev->proximity_domain == node_id) {
++			device = top_dev;
++			break;
++		}
++
++	up_read(&topology_lock);
++
++	return device;
++}
++
+ struct kfd_dev *kfd_device_by_id(uint32_t gpu_id)
+ {
+ 	struct kfd_topology_device *top_dev;
+@@ -1238,31 +1256,6 @@ int kfd_numa_node_to_apic_id(int numa_node_id)
+ 	return kfd_cpumask_to_apic_id(cpumask_of_node(numa_node_id));
+ }
+ 
+-/* kfd_get_proximity_domain - Find proximity_domain (node id) to which
+- *  given PCI bus belongs to. CRAT table contains only the APIC ID
+- *  of the parent NUMA node. So use that as the search parameter.
+- * Return -1 on failure
+- */
+-int kfd_get_proximity_domain(const struct pci_bus *bus)
+-{
+-	struct kfd_topology_device *dev;
+-	int proximity_domain = -1;
+-
+-	down_read(&topology_lock);
+-
+-	list_for_each_entry(dev, &topology_device_list, list)
+-		if (dev->node_props.cpu_cores_count &&
+-			dev->node_props.cpu_core_id_base ==
+-			kfd_cpumask_to_apic_id(cpumask_of_pcibus(bus))) {
+-				proximity_domain = dev->proximity_domain;
+-			break;
+-		}
+-
+-	up_read(&topology_lock);
+-
+-	return proximity_domain;
+-}
+-
+ #if defined(CONFIG_DEBUG_FS)
+ 
+ int kfd_debugfs_hqds_by_device(struct seq_file *m, void *data)
+-- 
+2.7.4
+

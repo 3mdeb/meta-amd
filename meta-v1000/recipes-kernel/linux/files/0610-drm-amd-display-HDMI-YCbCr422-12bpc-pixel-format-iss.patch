@@ -1,0 +1,259 @@
+From 0ed9a5d2e7ba19ced172fa20b518cda673aa7613 Mon Sep 17 00:00:00 2001
+From: Charlene Liu <charlene.liu@amd.com>
+Date: Wed, 1 Feb 2017 20:35:53 -0500
+Subject: [PATCH 0610/2094] drm/amd/display: HDMI YCbCr422 12bpc pixel format
+ issue
+
+Change-Id: I7c7ff93d61b4bc29194ee0e4252be956721e7e9e
+Signed-off-by: Charlene Liu <charlene.liu@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c      |  7 ++++-
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c  | 30 ++++++++++----------
+ .../gpu/drm/amd/display/dc/dce/dce_clock_source.c  | 29 ++++++++++----------
+ drivers/gpu/drm/amd/display/dc/dce/dce_opp.c       | 32 +++++++++++++++++-----
+ .../drm/amd/display/dc/dce/dce_stream_encoder.c    | 16 +++++++----
+ .../drm/amd/display/dc/dce110/dce110_resource.c    |  3 ++
+ drivers/gpu/drm/amd/display/dc/inc/clock_source.h  |  2 +-
+ drivers/gpu/drm/amd/display/dc/inc/hw/opp.h        |  1 +
+ 8 files changed, 76 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index ec5de32..2b92939 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -1267,6 +1267,7 @@ static void enable_link_hdmi(struct pipe_ctx *pipe_ctx)
+ {
+ 	struct core_stream *stream = pipe_ctx->stream;
+ 	struct core_link *link = stream->sink->link;
++	enum dc_color_depth display_color_depth;
+ 
+ 	if (dc_is_hdmi_signal(pipe_ctx->stream->signal))
+ 		dal_ddc_service_write_scdc_data(
+@@ -1277,10 +1278,14 @@ static void enable_link_hdmi(struct pipe_ctx *pipe_ctx)
+ 	memset(&stream->sink->link->public.cur_link_settings, 0,
+ 			sizeof(struct dc_link_settings));
+ 
++	display_color_depth = stream->public.timing.display_color_depth;
++	if (stream->public.timing.pixel_encoding == PIXEL_ENCODING_YCBCR422)
++		display_color_depth = COLOR_DEPTH_888;
++
+ 	link->link_enc->funcs->enable_tmds_output(
+ 			link->link_enc,
+ 			pipe_ctx->clock_source->id,
+-			stream->public.timing.display_color_depth,
++			display_color_depth,
+ 			pipe_ctx->stream->signal == SIGNAL_TYPE_HDMI_TYPE_A,
+ 			pipe_ctx->stream->signal == SIGNAL_TYPE_DVI_DUAL_LINK,
+ 			stream->phy_pix_clk);
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 3d8a85e..856a33a 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -1045,25 +1045,25 @@ static int get_norm_pix_clk(const struct dc_crtc_timing *timing)
+ 
+ 	if (timing->pixel_encoding == PIXEL_ENCODING_YCBCR420)
+ 		pix_clk /= 2;
+-
+-	switch (timing->display_color_depth) {
+-	case COLOR_DEPTH_888:
+-		normalized_pix_clk = pix_clk;
+-		break;
+-	case COLOR_DEPTH_101010:
+-		normalized_pix_clk = (pix_clk * 30) / 24;
++	if (timing->pixel_encoding != PIXEL_ENCODING_YCBCR422) {
++		switch (timing->display_color_depth) {
++		case COLOR_DEPTH_888:
++			normalized_pix_clk = pix_clk;
++			break;
++		case COLOR_DEPTH_101010:
++			normalized_pix_clk = (pix_clk * 30) / 24;
++			break;
++		case COLOR_DEPTH_121212:
++			normalized_pix_clk = (pix_clk * 36) / 24;
+ 		break;
+-	case COLOR_DEPTH_121212:
+-		normalized_pix_clk = (pix_clk * 36) / 24;
++		case COLOR_DEPTH_161616:
++			normalized_pix_clk = (pix_clk * 48) / 24;
+ 		break;
+-	case COLOR_DEPTH_161616:
+-		normalized_pix_clk = (pix_clk * 48) / 24;
+-		break;
+-	default:
+-		ASSERT(0);
++		default:
++			ASSERT(0);
+ 		break;
++		}
+ 	}
+-
+ 	return normalized_pix_clk;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c b/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c
+index 78f4327..a9f3921 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c
+@@ -390,25 +390,24 @@ static bool pll_adjust_pix_clk(
+ 	struct bp_adjust_pixel_clock_parameters bp_adjust_pixel_clock_params = {
+ 							0 };
+ 	enum bp_result bp_result;
+-
+ 	switch (pix_clk_params->signal_type) {
+ 	case SIGNAL_TYPE_HDMI_TYPE_A: {
+ 		requested_clk_khz = pix_clk_params->requested_pix_clk;
+-
+-		switch (pix_clk_params->color_depth) {
+-		case COLOR_DEPTH_101010:
+-			requested_clk_khz = (requested_clk_khz * 5) >> 2;
+-			break; /* x1.25*/
+-		case COLOR_DEPTH_121212:
+-			requested_clk_khz = (requested_clk_khz * 6) >> 2;
+-			break; /* x1.5*/
+-		case COLOR_DEPTH_161616:
+-			requested_clk_khz = requested_clk_khz * 2;
+-			break; /* x2.0*/
+-		default:
+-			break;
++		if (pix_clk_params->pixel_encoding != PIXEL_ENCODING_YCBCR422) {
++			switch (pix_clk_params->color_depth) {
++			case COLOR_DEPTH_101010:
++				requested_clk_khz = (requested_clk_khz * 5) >> 2;
++				break; /* x1.25*/
++			case COLOR_DEPTH_121212:
++				requested_clk_khz = (requested_clk_khz * 6) >> 2;
++				break; /* x1.5*/
++			case COLOR_DEPTH_161616:
++				requested_clk_khz = requested_clk_khz * 2;
++				break; /* x2.0*/
++			default:
++				break;
++			}
+ 		}
+-
+ 		actual_pix_clk_khz = requested_clk_khz;
+ 	}
+ 		break;
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c b/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c
+index 9247afd..a2f57cf 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c
+@@ -366,19 +366,37 @@ static void set_truncation(
+ 			FMT_TRUNCATE_EN, 0,
+ 			FMT_TRUNCATE_DEPTH, 0,
+ 			FMT_TRUNCATE_MODE, 0);
+-	/* no 10bpc trunc on DCE11*/
++
++
++	if (params->pixel_encoding == PIXEL_ENCODING_YCBCR422) {
++		/*  8bpc trunc on YCbCr422*/
++		if (params->flags.TRUNCATE_DEPTH == 1)
++			REG_UPDATE_3(FMT_BIT_DEPTH_CONTROL,
++					FMT_TRUNCATE_EN, 1,
++					FMT_TRUNCATE_DEPTH, 1,
++					FMT_TRUNCATE_MODE, 0);
++		else if (params->flags.TRUNCATE_DEPTH == 2)
++			/*  10bpc trunc on YCbCr422*/
++			REG_UPDATE_3(FMT_BIT_DEPTH_CONTROL,
++					FMT_TRUNCATE_EN, 1,
++					FMT_TRUNCATE_DEPTH, 2,
++					FMT_TRUNCATE_MODE, 0);
++		return;
++	}
++	/* on other format-to do */
+ 	if (params->flags.TRUNCATE_ENABLED == 0 ||
+-		params->flags.TRUNCATE_DEPTH == 2)
++			params->flags.TRUNCATE_DEPTH == 2)
+ 		return;
+-
+ 	/*Set truncation depth and Enable truncation*/
+ 	REG_UPDATE_3(FMT_BIT_DEPTH_CONTROL,
+-		FMT_TRUNCATE_EN, 1,
+-		FMT_TRUNCATE_DEPTH, params->flags.TRUNCATE_MODE,
+-		FMT_TRUNCATE_MODE, params->flags.TRUNCATE_DEPTH);
+-
++				FMT_TRUNCATE_EN, 1,
++				FMT_TRUNCATE_DEPTH,
++				params->flags.TRUNCATE_MODE,
++				FMT_TRUNCATE_MODE,
++				params->flags.TRUNCATE_DEPTH);
+ }
+ 
++
+ /**
+  *	set_spatial_dither
+  *	1) set spatial dithering mode: pattern of seed
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_stream_encoder.c b/drivers/gpu/drm/amd/display/dc/dce/dce_stream_encoder.c
+index 7e6661b..a28d9c7 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_stream_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_stream_encoder.c
+@@ -367,14 +367,20 @@ static void dce110_stream_encoder_hdmi_set_stream_attribute(
+ 			HDMI_DEEP_COLOR_ENABLE, 1);
+ 		break;
+ 	case COLOR_DEPTH_121212:
+-		REG_UPDATE_2(HDMI_CONTROL,
+-			HDMI_DEEP_COLOR_DEPTH, 2,
+-			HDMI_DEEP_COLOR_ENABLE, 1);
++		if (crtc_timing->pixel_encoding == PIXEL_ENCODING_YCBCR422) {
++			REG_UPDATE_2(HDMI_CONTROL,
++					HDMI_DEEP_COLOR_DEPTH, 2,
++					HDMI_DEEP_COLOR_ENABLE, 0);
++		} else {
++			REG_UPDATE_2(HDMI_CONTROL,
++					HDMI_DEEP_COLOR_DEPTH, 2,
++					HDMI_DEEP_COLOR_ENABLE, 1);
++			}
+ 		break;
+ 	case COLOR_DEPTH_161616:
+ 		REG_UPDATE_2(HDMI_CONTROL,
+-			HDMI_DEEP_COLOR_DEPTH, 3,
+-			HDMI_DEEP_COLOR_ENABLE, 1);
++				HDMI_DEEP_COLOR_DEPTH, 3,
++				HDMI_DEEP_COLOR_ENABLE, 1);
+ 		break;
+ 	default:
+ 		break;
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+index 8dc69be..4c108d0 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+@@ -814,6 +814,9 @@ void dce110_resource_build_bit_depth_reduction_params(
+ 		fmt_bit_depth->flags.HIGHPASS_RANDOM = 1;
+ 		fmt_bit_depth->flags.TRUNCATE_ENABLED = 1;
+ 		fmt_bit_depth->flags.TRUNCATE_DEPTH = 2;
++
++		fmt_bit_depth->pixel_encoding =
++				stream->public.timing.pixel_encoding;
+ 	}
+ 
+ 	return;
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/clock_source.h b/drivers/gpu/drm/amd/display/dc/inc/clock_source.h
+index c91c781..47ef904 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/clock_source.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/clock_source.h
+@@ -94,7 +94,7 @@ struct pixel_clk_params {
+ 	enum dc_color_depth color_depth;
+ 	struct csdp_ref_clk_ds_params de_spread_params;
+ /*> de-spread info, relevant only for on-the-fly tune-up pixel rate*/
+-
++	enum dc_pixel_encoding pixel_encoding;
+ 	struct pixel_clk_flags flags;
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
+index a10c4e2..e01b831 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
+@@ -86,6 +86,7 @@ struct bit_depth_reduction_params {
+ 	uint32_t r_seed_value;
+ 	uint32_t b_seed_value;
+ 	uint32_t g_seed_value;
++	enum dc_pixel_encoding pixel_encoding;
+ };
+ 
+ enum wide_gamut_regamma_mode {
+-- 
+2.7.4
+

@@ -1,0 +1,130 @@
+From be85140a015382f7aab998c235458148539fc60f Mon Sep 17 00:00:00 2001
+From: Trigger Huang <trigger.huang@amd.com>
+Date: Mon, 17 Apr 2017 08:50:18 -0400
+Subject: [PATCH 1220/2094] drm/amdgpu: Destroy psp ring in hw_fini
+
+Fix issue that PSP initialization will fail if reload amdgpu module.
+That's because the PSP ring must be destroyed to be ready for the
+next time PSP initialization.
+
+Changes in v2:
+	- Move psp_ring_destroy before all BOs free (suggested by
+	  Ray Huang).
+Changes in v3:
+	- Check firmware load type, if it is not PSP, we should do
+	  nothing in fw_fini(), and of course will not destroy
+	  PSP ring too (suggested by Ray Huang).
+
+Signed-off-by: Trigger Huang <trigger.huang@amd.com>
+Reviewed-by: Xiangliang Yu <Xiangliang.Yu@amd.com>
+Reviewed-by: Huang Rui <ray.huang@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c |  9 +++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h |  3 +++
+ drivers/gpu/drm/amd/amdgpu/psp_v3_1.c   | 27 +++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/psp_v3_1.h   |  2 ++
+ 4 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index 19180aa..1e380fe 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -56,6 +56,7 @@ static int psp_sw_init(void *handle)
+ 		psp->prep_cmd_buf = psp_v3_1_prep_cmd_buf;
+ 		psp->ring_init = psp_v3_1_ring_init;
+ 		psp->ring_create = psp_v3_1_ring_create;
++		psp->ring_destroy = psp_v3_1_ring_destroy;
+ 		psp->cmd_submit = psp_v3_1_cmd_submit;
+ 		psp->compare_sram_data = psp_v3_1_compare_sram_data;
+ 		psp->smu_reload_quirk = psp_v3_1_smu_reload_quirk;
+@@ -411,8 +412,12 @@ static int psp_hw_fini(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	struct psp_context *psp = &adev->psp;
+ 
+-	if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP)
+-		amdgpu_ucode_fini_bo(adev);
++	if (adev->firmware.load_type != AMDGPU_FW_LOAD_PSP)
++		return 0;
++
++	amdgpu_ucode_fini_bo(adev);
++
++	psp_ring_destroy(psp, PSP_RING_TYPE__KM);
+ 
+ 	if (psp->tmr_buf)
+ 		amdgpu_bo_free_kernel(&psp->tmr_bo, &psp->tmr_mc_addr, &psp->tmr_buf);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+index 28faba5..0301e4e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+@@ -66,6 +66,8 @@ struct psp_context
+ 			    struct psp_gfx_cmd_resp *cmd);
+ 	int (*ring_init)(struct psp_context *psp, enum psp_ring_type ring_type);
+ 	int (*ring_create)(struct psp_context *psp, enum psp_ring_type ring_type);
++	int (*ring_destroy)(struct psp_context *psp,
++			    enum psp_ring_type ring_type);
+ 	int (*cmd_submit)(struct psp_context *psp, struct amdgpu_firmware_info *ucode,
+ 			  uint64_t cmd_buf_mc_addr, uint64_t fence_mc_addr, int index);
+ 	bool (*compare_sram_data)(struct psp_context *psp,
+@@ -116,6 +118,7 @@ struct amdgpu_psp_funcs {
+ #define psp_prep_cmd_buf(ucode, type) (psp)->prep_cmd_buf((ucode), (type))
+ #define psp_ring_init(psp, type) (psp)->ring_init((psp), (type))
+ #define psp_ring_create(psp, type) (psp)->ring_create((psp), (type))
++#define psp_ring_destroy(psp, type) ((psp)->ring_destroy((psp), (type)))
+ #define psp_cmd_submit(psp, ucode, cmd_mc, fence_mc, index) \
+ 		(psp)->cmd_submit((psp), (ucode), (cmd_mc), (fence_mc), (index))
+ #define psp_compare_sram_data(psp, ucode, type) \
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
+index d351583..60a6407 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
+@@ -321,6 +321,33 @@ int psp_v3_1_ring_create(struct psp_context *psp, enum psp_ring_type ring_type)
+ 	return ret;
+ }
+ 
++int psp_v3_1_ring_destroy(struct psp_context *psp, enum psp_ring_type ring_type)
++{
++	int ret = 0;
++	struct psp_ring *ring;
++	unsigned int psp_ring_reg = 0;
++	struct amdgpu_device *adev = psp->adev;
++
++	ring = &psp->km_ring;
++
++	/* Write the ring destroy command to C2PMSG_64 */
++	psp_ring_reg = 3 << 16;
++	WREG32(SOC15_REG_OFFSET(MP0, 0, mmMP0_SMN_C2PMSG_64), psp_ring_reg);
++
++	/* there might be handshake issue with hardware which needs delay */
++	mdelay(20);
++
++	/* Wait for response flag (bit 31) in C2PMSG_64 */
++	ret = psp_wait_for(psp, SOC15_REG_OFFSET(MP0, 0, mmMP0_SMN_C2PMSG_64),
++			   0x80000000, 0x80000000, false);
++
++	if (ring->ring_mem)
++		amdgpu_bo_free_kernel(&adev->firmware.rbuf,
++				      &ring->ring_mem_mc_addr,
++				      (void **)&ring->ring_mem);
++	return ret;
++}
++
+ int psp_v3_1_cmd_submit(struct psp_context *psp,
+ 		        struct amdgpu_firmware_info *ucode,
+ 		        uint64_t cmd_buf_mc_addr, uint64_t fence_mc_addr,
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h
+index 5230d278..9dcd0b2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h
+@@ -41,6 +41,8 @@ extern int psp_v3_1_ring_init(struct psp_context *psp,
+ 			      enum psp_ring_type ring_type);
+ extern int psp_v3_1_ring_create(struct psp_context *psp,
+ 				enum psp_ring_type ring_type);
++extern int psp_v3_1_ring_destroy(struct psp_context *psp,
++				enum psp_ring_type ring_type);
+ extern int psp_v3_1_cmd_submit(struct psp_context *psp,
+ 			       struct amdgpu_firmware_info *ucode,
+ 			       uint64_t cmd_buf_mc_addr, uint64_t fence_mc_addr,
+-- 
+2.7.4
+
