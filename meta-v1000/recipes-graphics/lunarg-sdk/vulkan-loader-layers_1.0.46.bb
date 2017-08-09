@@ -6,7 +6,7 @@ DESCRIPTION = "Vulkan is a new generation graphics and compute API that \
 SECTION = "graphics"
 HOMEPAGE = "https://www.khronos.org/vulkan"
 DEPENDS = "bison-native libx11 libxcb glslang glslang-native spirv-tools \
-            libice libxext libsm"
+            libice libxext libsm libxrandr"
 
 RDEPENDS_${PN} = "${PN}-layer-libs libxcb-sync libxcb-present libxcb-dri3"
 
