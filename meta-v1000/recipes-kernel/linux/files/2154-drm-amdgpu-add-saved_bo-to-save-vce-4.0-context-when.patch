@@ -1,0 +1,118 @@
+From 80f0423cde05d8b4b9e2702fee826170895fe1ed Mon Sep 17 00:00:00 2001
+From: Leo Liu <leo.liu@amd.com>
+Date: Wed, 31 May 2017 14:25:54 -0400
+Subject: [PATCH 2154/2500] drm/amdgpu: add saved_bo to save vce 4.0 context
+ when suspend
+
+We are using PSP to resume firmware after suspend, and it is
+resumed at where it got suspended, so we'd better save the
+the context.
+
+Signed-off-by: Leo Liu <leo.liu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/vce_v4_0.c   | 45 +++++++++++++++++++++++++++------
+ 2 files changed, 38 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h
+index f5f35cc..f83e0c3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.h
+@@ -34,6 +34,7 @@ struct amdgpu_vce {
+ 	struct amdgpu_bo	*vcpu_bo;
+ 	uint64_t		gpu_addr;
+ 	void			*cpu_addr;
++	void			*saved_bo;
+ 	unsigned		fw_version;
+ 	unsigned		fb_version;
+ 	atomic_t		handles[AMDGPU_MAX_VCE_HANDLES];
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
+index 0b7fcc1..1ecd6bb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
+@@ -419,15 +419,19 @@ static int vce_v4_0_sw_init(void *handle)
+ 
+ 	if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) {
+ 		const struct common_firmware_header *hdr;
++		unsigned size = amdgpu_bo_size(adev->vce.vcpu_bo);
++
++		adev->vce.saved_bo = kmalloc(size, GFP_KERNEL);
++		if (!adev->vce.saved_bo)
++			return -ENOMEM;
++
+ 		hdr = (const struct common_firmware_header *)adev->vce.fw->data;
+ 		adev->firmware.ucode[AMDGPU_UCODE_ID_VCE].ucode_id = AMDGPU_UCODE_ID_VCE;
+ 		adev->firmware.ucode[AMDGPU_UCODE_ID_VCE].fw = adev->vce.fw;
+ 		adev->firmware.fw_size +=
+ 			ALIGN(le32_to_cpu(hdr->ucode_size_bytes), PAGE_SIZE);
+ 		DRM_INFO("PSP loading VCE firmware\n");
+-	}
+-
+-	if (adev->firmware.load_type != AMDGPU_FW_LOAD_PSP) {
++	} else {
+ 		r = amdgpu_vce_resume(adev);
+ 		if (r)
+ 			return r;
+@@ -466,6 +470,11 @@ static int vce_v4_0_sw_fini(void *handle)
+ 	/* free MM table */
+ 	amdgpu_virt_free_mm_table(adev);
+ 
++	if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) {
++		kfree(adev->vce.saved_bo);
++		adev->vce.saved_bo = NULL;
++	}
++
+ 	r = amdgpu_vce_suspend(adev);
+ 	if (r)
+ 		return r;
+@@ -522,8 +531,18 @@ static int vce_v4_0_hw_fini(void *handle)
+ 
+ static int vce_v4_0_suspend(void *handle)
+ {
+-	int r;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++	int r;
++
++	if (adev->vce.vcpu_bo == NULL)
++		return 0;
++
++	if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) {
++		unsigned size = amdgpu_bo_size(adev->vce.vcpu_bo);
++		void *ptr = adev->vce.cpu_addr;
++
++		memcpy_fromio(adev->vce.saved_bo, ptr, size);
++	}
+ 
+ 	r = vce_v4_0_hw_fini(adev);
+ 	if (r)
+@@ -534,12 +553,22 @@ static int vce_v4_0_suspend(void *handle)
+ 
+ static int vce_v4_0_resume(void *handle)
+ {
+-	int r;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++	int r;
+ 
+-	r = amdgpu_vce_resume(adev);
+-	if (r)
+-		return r;
++	if (adev->vce.vcpu_bo == NULL)
++		return -EINVAL;
++
++	if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) {
++		unsigned size = amdgpu_bo_size(adev->vce.vcpu_bo);
++		void *ptr = adev->vce.cpu_addr;
++
++		memcpy_toio(ptr, adev->vce.saved_bo, size);
++	} else {
++		r = amdgpu_vce_resume(adev);
++		if (r)
++			return r;
++	}
+ 
+ 	return vce_v4_0_hw_init(adev);
+ }
+-- 
+2.7.4
+

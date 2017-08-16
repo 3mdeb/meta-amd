@@ -1,0 +1,422 @@
+From 5fa5abf2d957a82f37b7d587d9c144a72dd2f0cc Mon Sep 17 00:00:00 2001
+From: Lan Xiao <Lan.Xiao@amd.com>
+Date: Fri, 23 Jun 2017 16:06:48 -0400
+Subject: [PATCH 2435/2500] drm/amd: Implement parallel memory mapping on mGPUs
+
+Alter the KFD-KGD interface to optimize multi-GPU memory mappings to
+work concurrently instead of sequentially. Return the fences
+during the process, wait for all fences after the mappings are done.
+The fences are stored in the associated kgd_mem object.
+
+This change also enables interruptible waiting with proper signal
+handling
+
+Change-Id: I9ae7f4bd54165b14dd5b37df5df6516aa80cba83
+Signed-off-by: Lan Xiao <Lan.Xiao@amd.com>
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h        |  4 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c  | 74 +++++++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c          | 25 ++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h          |  2 +
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c          |  7 +++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c          |  8 +++
+ drivers/gpu/drm/amd/include/kgd_kfd_interface.h   |  2 +
+ 10 files changed, 105 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 06c6ccc..c4dd388 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -63,6 +63,8 @@ struct kgd_mem {
+ 	struct amdkfd_process_info *process_info;
+ 	struct page **user_pages;
+ 
++	struct amdgpu_sync sync;
++
+ 	/* flags bitfield */
+ 	bool coherent      : 1;
+ 	bool no_substitute : 1;
+@@ -187,6 +189,8 @@ int amdgpu_amdkfd_get_dmabuf_info(struct kgd_dev *kgd, int dma_buf_fd,
+ 	})
+ 
+ /* GPUVM API */
++int amdgpu_amdkfd_gpuvm_sync_memory(
++		struct kgd_dev *kgd, struct kgd_mem *mem, bool intr);
+ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
+ 		struct kgd_dev *kgd, uint64_t va, uint64_t size,
+ 		void *vm, struct kgd_mem **mem,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+index ca3e9c7..639344e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+@@ -216,6 +216,7 @@ static const struct kfd2kgd_calls kfd2kgd = {
+ 	.read_vmid_from_vmfault_reg = read_vmid_from_vmfault_reg,
+ 	.write_vmid_invalidate_request = write_vmid_invalidate_request,
+ 	.invalidate_tlbs = invalidate_tlbs,
++	.sync_memory = amdgpu_amdkfd_gpuvm_sync_memory,
+ 	.alloc_memory_of_gpu = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu,
+ 	.free_memory_of_gpu = amdgpu_amdkfd_gpuvm_free_memory_of_gpu,
+ 	.map_memory_to_gpu = amdgpu_amdkfd_gpuvm_map_memory_to_gpu,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+index 2d550df..9efebdc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+@@ -189,6 +189,7 @@ static const struct kfd2kgd_calls kfd2kgd = {
+ 			get_atc_vmid_pasid_mapping_valid,
+ 	.write_vmid_invalidate_request = write_vmid_invalidate_request,
+ 	.invalidate_tlbs = invalidate_tlbs,
++	.sync_memory = amdgpu_amdkfd_gpuvm_sync_memory,
+ 	.alloc_memory_of_gpu = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu,
+ 	.free_memory_of_gpu = amdgpu_amdkfd_gpuvm_free_memory_of_gpu,
+ 	.map_memory_to_gpu = amdgpu_amdkfd_gpuvm_map_memory_to_gpu,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
+index aedf94d..4689924 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
+@@ -234,6 +234,7 @@ static const struct kfd2kgd_calls kfd2kgd = {
+ 			get_atc_vmid_pasid_mapping_valid,
+ 	.write_vmid_invalidate_request = write_vmid_invalidate_request,
+ 	.invalidate_tlbs = invalidate_tlbs,
++	.sync_memory = amdgpu_amdkfd_gpuvm_sync_memory,
+ 	.alloc_memory_of_gpu = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu,
+ 	.free_memory_of_gpu = amdgpu_amdkfd_gpuvm_free_memory_of_gpu,
+ 	.map_memory_to_gpu = amdgpu_amdkfd_gpuvm_map_memory_to_gpu,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index c87c9fb..8aa9ca4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -652,6 +652,8 @@ static int __alloc_memory_of_gpu(struct kgd_dev *kgd, uint64_t va,
+ 
+ 	alloc_domain = userptr ? AMDGPU_GEM_DOMAIN_CPU : domain;
+ 
++	amdgpu_sync_create(&(*mem)->sync);
++
+ 	ret = amdgpu_amdkfd_reserve_system_mem_limit(adev, size, alloc_domain);
+ 	if (ret) {
+ 		pr_err("Insufficient system memory\n");
+@@ -727,7 +729,7 @@ struct bo_vm_reservation_context {
+ 	struct amdgpu_bo_list_entry *vm_pd;
+ 	struct ww_acquire_ctx ticket;
+ 	struct list_head list, duplicates;
+-	struct amdgpu_sync sync;
++	struct amdgpu_sync *sync;
+ 	bool reserved;
+ };
+ 
+@@ -748,7 +750,7 @@ static int reserve_bo_and_vm(struct kgd_mem *mem,
+ 
+ 	ctx->reserved = false;
+ 	ctx->n_vms = 1;
+-	amdgpu_sync_create(&ctx->sync);
++	ctx->sync = &mem->sync;
+ 
+ 	INIT_LIST_HEAD(&ctx->list);
+ 	INIT_LIST_HEAD(&ctx->duplicates);
+@@ -809,7 +811,7 @@ static int reserve_bo_and_cond_vms(struct kgd_mem *mem,
+ 	ctx->reserved = false;
+ 	ctx->n_vms = 0;
+ 	ctx->vm_pd = NULL;
+-	amdgpu_sync_create(&ctx->sync);
++	ctx->sync = &mem->sync;
+ 
+ 	INIT_LIST_HEAD(&ctx->list);
+ 	INIT_LIST_HEAD(&ctx->duplicates);
+@@ -864,19 +866,27 @@ static int reserve_bo_and_cond_vms(struct kgd_mem *mem,
+ 	return ret;
+ }
+ 
+-static void unreserve_bo_and_vms(struct bo_vm_reservation_context *ctx,
+-				 bool wait)
++static int unreserve_bo_and_vms(struct bo_vm_reservation_context *ctx,
++				 bool wait, bool intr)
+ {
+-	if (wait) /* FIXME: when called from user context, this needs to be interruptible */
+-		amdgpu_sync_wait(&ctx->sync, false);
++	int ret = 0;
++
++	if (wait) {
++		ret = amdgpu_sync_wait(ctx->sync, intr);
++		if (ret)
++			return ret;
++	}
+ 
+ 	if (ctx->reserved)
+ 		ttm_eu_backoff_reservation(&ctx->ticket, &ctx->list);
+ 	kfree(ctx->vm_pd);
+ 
+-	amdgpu_sync_free(&ctx->sync);
++	ctx->sync = NULL;
++
+ 	ctx->reserved = false;
+ 	ctx->vm_pd = NULL;
++
++	return ret;
+ }
+ 
+ static int unmap_bo_from_gpuvm(struct amdgpu_device *adev,
+@@ -1048,6 +1058,25 @@ static struct sg_table *create_doorbell_sg(uint64_t addr, uint32_t size)
+ 	return sg;
+ }
+ 
++int amdgpu_amdkfd_gpuvm_sync_memory(
++		struct kgd_dev *kgd, struct kgd_mem *mem, bool intr)
++{
++	int ret = 0;
++	struct amdgpu_sync sync;
++	struct amdgpu_device *adev;
++
++	adev = get_amdgpu_device(kgd);
++	amdgpu_sync_create(&sync);
++
++	mutex_lock(&mem->lock);
++	amdgpu_sync_clone(adev, &mem->sync, &sync);
++	mutex_unlock(&mem->lock);
++
++	ret = amdgpu_sync_wait(&sync, intr);
++	amdgpu_sync_free(&sync);
++	return ret;
++}
++
+ #define BOOL_TO_STR(b)	(b == true) ? "true" : "false"
+ 
+ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
+@@ -1134,7 +1163,7 @@ int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
+ 	struct amdgpu_device *adev;
+ 	struct kfd_bo_va_list *entry, *tmp;
+ 	struct bo_vm_reservation_context ctx;
+-	int ret;
++	int ret = 0;
+ 	struct ttm_validate_buffer *bo_list_entry;
+ 	struct amdkfd_process_info *process_info;
+ 	unsigned long bo_size;
+@@ -1196,7 +1225,10 @@ int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
+ 				entry, bo_size);
+ 	}
+ 
+-	unreserve_bo_and_vms(&ctx, false);
++	ret = unreserve_bo_and_vms(&ctx, false, true);
++
++	/* Free the sync object */
++	amdgpu_sync_free(&mem->sync);
+ 
+ 	/* If the SG is not NULL, it's one we created for a doorbell
+ 	 * BO. We need to free it.
+@@ -1210,7 +1242,7 @@ int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
+ 	amdgpu_bo_unref(&mem->bo);
+ 	kfree(mem);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+@@ -1305,7 +1337,7 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ 					entry->va, entry->va + bo_size,
+ 					entry);
+ 
+-			ret = map_bo_to_gpuvm(adev, entry, &ctx.sync,
++			ret = map_bo_to_gpuvm(adev, entry, ctx.sync,
+ 					      is_invalid_userptr);
+ 			if (ret != 0) {
+ 				pr_err("Failed to map radeon bo to gpuvm\n");
+@@ -1322,7 +1354,7 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ 		amdgpu_bo_fence(bo,
+ 				&kfd_vm->process_info->eviction_fence->base,
+ 				true);
+-	unreserve_bo_and_vms(&ctx, true);
++	ret = unreserve_bo_and_vms(&ctx, false, true);
+ 
+ 	mutex_unlock(&mem->process_info->lock);
+ 	mutex_unlock(&mem->lock);
+@@ -1335,7 +1367,7 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ 	if (bo_va_entry)
+ 		remove_bo_from_vm(adev, bo_va_entry, bo_size);
+ add_bo_to_vm_failed:
+-	unreserve_bo_and_vms(&ctx, false);
++	unreserve_bo_and_vms(&ctx, false, false);
+ bo_reserve_failed:
+ 	mutex_unlock(&mem->process_info->lock);
+ 	mutex_unlock(&mem->lock);
+@@ -1566,7 +1598,7 @@ int amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
+ 					entry->va + bo_size,
+ 					entry);
+ 
+-			ret = unmap_bo_from_gpuvm(adev, entry, &ctx.sync);
++			ret = unmap_bo_from_gpuvm(adev, entry, ctx.sync);
+ 			if (ret == 0) {
+ 				entry->is_mapped = false;
+ 			} else {
+@@ -1597,7 +1629,7 @@ int amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
+ 	}
+ 
+ unreserve_out:
+-	unreserve_bo_and_vms(&ctx, false);
++	unreserve_bo_and_vms(&ctx, false, false);
+ out:
+ 	mutex_unlock(&mem->lock);
+ 	return ret;
+@@ -2232,6 +2264,7 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info)
+ 	struct amdgpu_amdkfd_fence *old_fence;
+ 	int ret = 0, i;
+ 	struct list_head duplicate_save;
++	struct amdgpu_sync sync_obj;
+ 
+ 	INIT_LIST_HEAD(&duplicate_save);
+ 	INIT_LIST_HEAD(&ctx.list);
+@@ -2284,7 +2317,8 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info)
+ 	if (!list_empty(&duplicate_save))
+ 		pr_err("BUG: list of BOs to reserve has duplicates!\n");
+ 
+-	amdgpu_sync_create(&ctx.sync);
++	amdgpu_sync_create(&sync_obj);
++	ctx.sync = &sync_obj;
+ 
+ 	/* Validate PDs and PTs */
+ 	ret = process_validate_vms(process_info);
+@@ -2319,7 +2353,7 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info)
+ 			ret = update_gpuvm_pte((struct amdgpu_device *)
+ 					      bo_va_entry->kgd_dev,
+ 					      bo_va_entry,
+-					      &ctx.sync);
++					      ctx.sync);
+ 			if (ret) {
+ 				pr_debug("Memory eviction: update PTE failed. Try again\n");
+ 				goto validate_map_fail;
+@@ -2327,7 +2361,7 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info)
+ 		}
+ 	}
+ 
+-	amdgpu_sync_wait(&ctx.sync, false);
++	amdgpu_sync_wait(ctx.sync, false);
+ 
+ 	/* Wait for validate to finish and attach new eviction fence */
+ 	list_for_each_entry(mem, &process_info->kfd_bo_list,
+@@ -2347,7 +2381,7 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info)
+ 	}
+ validate_map_fail:
+ 	ttm_eu_backoff_reservation(&ctx.ticket, &ctx.list);
+-	amdgpu_sync_free(&ctx.sync);
++	amdgpu_sync_free(&sync_obj);
+ ttm_reserve_fail:
+ 	mutex_unlock(&process_info->lock);
+ evict_fence_fail:
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+index 921bd97..654f758 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+@@ -313,6 +313,31 @@ struct fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync)
+ 	return NULL;
+ }
+ 
++int amdgpu_sync_clone(struct amdgpu_device *adev,
++					 struct amdgpu_sync *source,
++					 struct amdgpu_sync *clone)
++{
++	struct amdgpu_sync_entry *e;
++	struct hlist_node *tmp;
++	struct fence *f;
++	int i, r;
++
++	hash_for_each_safe(source->fences, i, tmp, e, node) {
++
++		f = e->fence;
++		if (!fence_is_signaled(f)) {
++			r = amdgpu_sync_fence(adev, clone, f);
++			if (r)
++				return r;
++		} else {
++			hash_del(&e->node);
++			fence_put(f);
++			kmem_cache_free(amdgpu_sync_slab, e);
++		}
++	}
++	return 0;
++}
++
+ int amdgpu_sync_wait(struct amdgpu_sync *sync, bool intr)
+ {
+ 	struct amdgpu_sync_entry *e;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h
+index 226a3c8..69f4c6c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h
+@@ -49,6 +49,8 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ struct fence *amdgpu_sync_peek_fence(struct amdgpu_sync *sync,
+ 				     struct amdgpu_ring *ring);
+ struct fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync);
++int amdgpu_sync_clone(struct amdgpu_device *adev, struct amdgpu_sync *source,
++					 struct amdgpu_sync *clone);
+ int amdgpu_sync_wait(struct amdgpu_sync *sync, bool intr);
+ void amdgpu_sync_free(struct amdgpu_sync *sync);
+ int amdgpu_sync_init(void);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 9fa7a14..dc76b15 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1380,6 +1380,12 @@ static int kfd_ioctl_map_memory_to_gpu(struct file *filep,
+ 			pr_err("Failed to map\n");
+ 	}
+ 
++	err = dev->kfd2kgd->sync_memory(dev->kgd, (struct kgd_mem *) mem, true);
++	if (err) {
++		pr_debug("Sync memory failed, wait interrupted by user signal\n");
++		goto sync_memory_failed;
++	}
++
+ 	if (args->device_ids_array_size > 0 && devices_arr)
+ 		kfree(devices_arr);
+ 
+@@ -1389,6 +1395,7 @@ static int kfd_ioctl_map_memory_to_gpu(struct file *filep,
+ 	up_write(&p->lock);
+ get_mem_obj_from_handle_failed:
+ copy_from_user_failed:
++sync_memory_failed:
+ 	kfree(devices_arr);
+ 	return err;
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 6246055..a4577bd 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -111,6 +111,13 @@ static int kfd_process_alloc_gpuvm(struct kfd_process *p,
+ 	if (err)
+ 		goto err_map_mem;
+ 
++	err = kdev->kfd2kgd->sync_memory(kdev->kgd, (struct kgd_mem *) mem,
++				true);
++	if (err) {
++		pr_debug("Sync memory failed, wait interrupted by user signal\n");
++		goto sync_memory_failed;
++	}
++
+ 	/* Create an obj handle so kfd_process_device_remove_obj_handle
+ 	 * will take care of the bo removal when the process finishes.
+ 	 * We do not need to take p->lock, because the process is just
+@@ -126,6 +133,7 @@ static int kfd_process_alloc_gpuvm(struct kfd_process *p,
+ 	return err;
+ 
+ free_gpuvm:
++sync_memory_failed:
+ 	kfd_process_free_gpuvm(mem, pdd);
+ 	return err;
+ 
+diff --git a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+index ad05b81..3e7f5d1 100644
+--- a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+@@ -342,6 +342,8 @@ struct kfd2kgd_calls {
+ 
+ 	int (*invalidate_tlbs)(struct kgd_dev *kgd, uint16_t pasid);
+ 
++	int (*sync_memory)(struct kgd_dev *kgd, struct kgd_mem *mem, bool intr);
++
+ 	int (*alloc_memory_of_gpu)(struct kgd_dev *kgd, uint64_t va,
+ 			uint64_t size, void *vm,
+ 			struct kgd_mem **mem, uint64_t *offset,
+-- 
+2.7.4
+

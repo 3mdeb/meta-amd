@@ -1,0 +1,68 @@
+From 5b738ef214ce644d07adbb2fd05af3a2bd0ce2d0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michel=20D=C3=A4nzer?= <michel.daenzer@amd.com>
+Date: Tue, 4 Jul 2017 17:16:42 +0900
+Subject: [PATCH 2487/2500] drm/amdgpu: Try evicting from CPU visible to
+ invisible VRAM first
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This gives BOs which haven't been accessed by the CPU since they were
+moved to visible VRAM another chance to stay in VRAM when another BO
+needs to go to visible VRAM.
+
+This should allow BOs to stay in VRAM longer in some cases.
+
+v2:
+* Only do this for BOs which don't have the
+  AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED flag set.
+
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Michel Dänzer <michel.daenzer@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index fc85d7c..8fb91b8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -233,7 +233,35 @@ static void amdgpu_evict_flags(struct ttm_buffer_object *bo,
+ 		    adev->mman.buffer_funcs_ring &&
+ 		    adev->mman.buffer_funcs_ring->ready == false) {
+ 			amdgpu_ttm_placement_from_domain(abo, AMDGPU_GEM_DOMAIN_CPU);
++		} else if (adev->mc.visible_vram_size < adev->mc.real_vram_size &&
++			   !(abo->flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)) {
++			unsigned fpfn = adev->mc.visible_vram_size >> PAGE_SHIFT;
++			struct drm_mm_node *node = bo->mem.mm_node;
++			unsigned long pages_left;
++
++			for (pages_left = bo->mem.num_pages;
++			     pages_left;
++			     pages_left -= node->size, node++) {
++				if (node->start < fpfn)
++					break;
++			}
++
++			if (!pages_left)
++				goto gtt;
++
++			/* Try evicting to the CPU inaccessible part of VRAM
++			 * first, but only set GTT as busy placement, so this
++			 * BO will be evicted to GTT rather than causing other
++			 * BOs to be evicted from VRAM
++			 */
++			amdgpu_ttm_placement_from_domain(abo, AMDGPU_GEM_DOMAIN_VRAM |
++							 AMDGPU_GEM_DOMAIN_GTT);
++			abo->placements[0].fpfn = fpfn;
++			abo->placements[0].lpfn = 0;
++			abo->placement.busy_placement = &abo->placements[1];
++			abo->placement.num_busy_placement = 1;
+ 		} else {
++gtt:
+ 			amdgpu_ttm_placement_from_domain(abo, AMDGPU_GEM_DOMAIN_GTT);
+ 		}
+ 		break;
+-- 
+2.7.4
+

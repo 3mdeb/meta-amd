@@ -1,0 +1,333 @@
+From 243577419be03717995882158b3701319acb8c39 Mon Sep 17 00:00:00 2001
+From: Andres Rodriguez <andresx7@gmail.com>
+Date: Wed, 1 Feb 2017 19:08:23 -0500
+Subject: [PATCH 2138/2500] drm/amdgpu: take ownership of per-pipe
+ configuration v3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Make amdgpu the owner of all per-pipe state of the HQDs.
+
+This change will allow us to split the queues between kfd and amdgpu
+with a queue granularity instead of pipe granularity.
+
+This patch fixes kfd allocating an HDP_EOP region for its 3 pipes which
+goes unused.
+
+v2: support for gfx9
+v3: fix gfx7 HPD intitialization
+
+Reviewed-by: Edward O'Callaghan <funfunctor@folklore1984.net>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Andres Rodriguez <andresx7@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+
+Change-Id: I5f0177684b204d9531a63c69f88355d052f96471
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h                |  4 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c  | 13 +------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c  |  1 +
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c              | 36 +++++++++++++-----
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c              | 33 +++++++++++-----
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c              | 24 ++++++++----
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 44 +---------------------
+ 7 files changed, 72 insertions(+), 83 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 4090d42..34e3b93 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -937,9 +937,9 @@ struct amdgpu_mec {
+ 	u64			hpd_eop_gpu_addr;
+ 	struct amdgpu_bo	*mec_fw_obj;
+ 	u64			mec_fw_gpu_addr;
+-	u32 num_pipe;
+ 	u32 num_mec;
+-	u32 num_queue;
++	u32 num_pipe_per_mec;
++	u32 num_queue_per_pipe;
+ 	void			*mqd_backup[AMDGPU_MAX_COMPUTE_RINGS + 1];
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+index f87c20f..e96e487 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+@@ -337,18 +337,7 @@ static int kgd_set_pasid_vmid_mapping(struct kgd_dev *kgd, unsigned int pasid,
+ static int kgd_init_pipeline(struct kgd_dev *kgd, uint32_t pipe_id,
+ 				uint32_t hpd_size, uint64_t hpd_gpu_addr)
+ {
+-	struct amdgpu_device *adev = get_amdgpu_device(kgd);
+-
+-	uint32_t mec = (++pipe_id / CIK_PIPE_PER_MEC) + 1;
+-	uint32_t pipe = (pipe_id % CIK_PIPE_PER_MEC);
+-
+-	lock_srbm(kgd, mec, pipe, 0, 0);
+-	WREG32(mmCP_HPD_EOP_BASE_ADDR, lower_32_bits(hpd_gpu_addr >> 8));
+-	WREG32(mmCP_HPD_EOP_BASE_ADDR_HI, upper_32_bits(hpd_gpu_addr >> 8));
+-	WREG32(mmCP_HPD_EOP_VMID, 0);
+-	WREG32(mmCP_HPD_EOP_CONTROL, hpd_size);
+-	unlock_srbm(kgd);
+-
++	/* amdgpu owns the per-pipe state */
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+index c6fc5a6..7bddffa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+@@ -324,6 +324,7 @@ static int kgd_set_pasid_vmid_mapping(struct kgd_dev *kgd, unsigned int pasid,
+ static int kgd_init_pipeline(struct kgd_dev *kgd, uint32_t pipe_id,
+ 				uint32_t hpd_size, uint64_t hpd_gpu_addr)
+ {
++	/* amdgpu owns the per-pipe state */
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 4ec7a75..5885d26 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2829,6 +2829,7 @@ static int gfx_v7_0_mec_init(struct amdgpu_device *adev)
+ {
+ 	int r;
+ 	u32 *hpd;
++	size_t mec_hpd_size;
+ 
+ 	/*
+ 	 * KV:    2 MEC, 4 Pipes/MEC, 8 Queues/Pipe - 64 Queues total
+@@ -2836,13 +2837,26 @@ static int gfx_v7_0_mec_init(struct amdgpu_device *adev)
+ 	 * Nonetheless, we assign only 1 pipe because all other pipes will
+ 	 * be handled by KFD
+ 	 */
+-	adev->gfx.mec.num_mec = 1;
+-	adev->gfx.mec.num_pipe = 1;
+-	adev->gfx.mec.num_queue = adev->gfx.mec.num_mec * adev->gfx.mec.num_pipe * 8;
++	switch (adev->asic_type) {
++	case CHIP_KAVERI:
++		adev->gfx.mec.num_mec = 2;
++		break;
++	case CHIP_BONAIRE:
++	case CHIP_HAWAII:
++	case CHIP_KABINI:
++	case CHIP_MULLINS:
++	default:
++		adev->gfx.mec.num_mec = 1;
++		break;
++	}
++	adev->gfx.mec.num_pipe_per_mec = 4;
++	adev->gfx.mec.num_queue_per_pipe = 8;
+ 
++	mec_hpd_size = adev->gfx.mec.num_mec * adev->gfx.mec.num_pipe_per_mec
++		* GFX7_MEC_HPD_SIZE * 2;
+ 	if (adev->gfx.mec.hpd_eop_obj == NULL) {
+ 		r = amdgpu_bo_create(adev,
+-				     adev->gfx.mec.num_mec * adev->gfx.mec.num_pipe * GFX7_MEC_HPD_SIZE * 2,
++				     mec_hpd_size,
+ 				     PAGE_SIZE, true,
+ 				     AMDGPU_GEM_DOMAIN_GTT, 0, NULL, NULL,
+ 				     &adev->gfx.mec.hpd_eop_obj);
+@@ -2872,7 +2886,7 @@ static int gfx_v7_0_mec_init(struct amdgpu_device *adev)
+ 	}
+ 
+ 	/* clear memory.  Not sure if this is required or not */
+-	memset(hpd, 0, adev->gfx.mec.num_mec * adev->gfx.mec.num_pipe * GFX7_MEC_HPD_SIZE * 2);
++	memset(hpd, 0, mec_hpd_size);
+ 
+ 	amdgpu_bo_kunmap(adev->gfx.mec.hpd_eop_obj);
+ 	amdgpu_bo_unreserve(adev->gfx.mec.hpd_eop_obj);
+@@ -2919,16 +2933,18 @@ struct hqd_registers
+ 	u32 cp_mqd_control;
+ };
+ 
+-static void gfx_v7_0_compute_pipe_init(struct amdgpu_device *adev, int me, int pipe)
++static void gfx_v7_0_compute_pipe_init(struct amdgpu_device *adev,
++				       int mec, int pipe)
+ {
+ 	u64 eop_gpu_addr;
+ 	u32 tmp;
+-	size_t eop_offset = me * pipe * GFX7_MEC_HPD_SIZE * 2;
++	size_t eop_offset = (mec * adev->gfx.mec.num_pipe_per_mec + pipe)
++			    * GFX7_MEC_HPD_SIZE * 2;
+ 
+ 	mutex_lock(&adev->srbm_mutex);
+ 	eop_gpu_addr = adev->gfx.mec.hpd_eop_gpu_addr + eop_offset;
+ 
+-	cik_srbm_select(adev, me, pipe, 0, 0);
++	cik_srbm_select(adev, mec + 1, pipe, 0, 0);
+ 
+ 	/* write the EOP addr */
+ 	WREG32(mmCP_HPD_EOP_BASE_ADDR, eop_gpu_addr >> 8);
+@@ -3176,9 +3192,9 @@ static int gfx_v7_0_cp_compute_resume(struct amdgpu_device *adev)
+ 	tmp |= (1 << 23);
+ 	WREG32(mmCP_CPF_DEBUG, tmp);
+ 
+-	/* init the pipes */
++	/* init all pipes (even the ones we don't own) */
+ 	for (i = 0; i < adev->gfx.mec.num_mec; i++)
+-		for (j = 0; j < adev->gfx.mec.num_pipe; j++)
++		for (j = 0; j < adev->gfx.mec.num_pipe_per_mec; j++)
+ 			gfx_v7_0_compute_pipe_init(adev, i, j);
+ 
+ 	/* init the queues */
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index b5000af..36fac30 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -1426,18 +1426,33 @@ static int gfx_v8_0_mec_init(struct amdgpu_device *adev)
+ {
+ 	int r;
+ 	u32 *hpd;
++	size_t mec_hpd_size;
+ 
+-	/*
+-	 * we assign only 1 pipe because all other pipes will
+-	 * be handled by KFD
+-	 */
+-	adev->gfx.mec.num_mec = 1;
+-	adev->gfx.mec.num_pipe = 1;
+-	adev->gfx.mec.num_queue = adev->gfx.mec.num_mec * adev->gfx.mec.num_pipe * 8;
++	switch (adev->asic_type) {
++	case CHIP_FIJI:
++	case CHIP_TONGA:
++	case CHIP_POLARIS11:
++	case CHIP_POLARIS12:
++	case CHIP_POLARIS10:
++	case CHIP_CARRIZO:
++		adev->gfx.mec.num_mec = 2;
++		break;
++	case CHIP_TOPAZ:
++	case CHIP_STONEY:
++	default:
++		adev->gfx.mec.num_mec = 1;
++		break;
++	}
++
++	adev->gfx.mec.num_pipe_per_mec = 4;
++	adev->gfx.mec.num_queue_per_pipe = 8;
++
++	/* only 1 pipe of the first MEC is owned by amdgpu */
++	mec_hpd_size = 1 * 1 * adev->gfx.mec.num_queue_per_pipe * GFX8_MEC_HPD_SIZE;
+ 
+ 	if (adev->gfx.mec.hpd_eop_obj == NULL) {
+ 		r = amdgpu_bo_create(adev,
+-				     adev->gfx.mec.num_queue * GFX8_MEC_HPD_SIZE,
++				     mec_hpd_size,
+ 				     PAGE_SIZE, true,
+ 				     AMDGPU_GEM_DOMAIN_GTT, 0, NULL, NULL,
+ 				     &adev->gfx.mec.hpd_eop_obj);
+@@ -1466,7 +1481,7 @@ static int gfx_v8_0_mec_init(struct amdgpu_device *adev)
+ 		return r;
+ 	}
+ 
+-	memset(hpd, 0, adev->gfx.mec.num_queue * GFX8_MEC_HPD_SIZE);
++	memset(hpd, 0, mec_hpd_size);
+ 
+ 	amdgpu_bo_kunmap(adev->gfx.mec.hpd_eop_obj);
+ 	amdgpu_bo_unreserve(adev->gfx.mec.hpd_eop_obj);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index d952c35..891d6ec 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -865,20 +865,28 @@ static int gfx_v9_0_mec_init(struct amdgpu_device *adev)
+ 	const __le32 *fw_data;
+ 	unsigned fw_size;
+ 	u32 *fw;
++	size_t mec_hpd_size;
+ 
+ 	const struct gfx_firmware_header_v1_0 *mec_hdr;
+ 
+-	/*
+-	 * we assign only 1 pipe because all other pipes will
+-	 * be handled by KFD
+-	 */
+-	adev->gfx.mec.num_mec = 1;
+-	adev->gfx.mec.num_pipe = 1;
+-	adev->gfx.mec.num_queue = adev->gfx.mec.num_mec * adev->gfx.mec.num_pipe * 8;
++	switch (adev->asic_type) {
++	case CHIP_VEGA10:
++		adev->gfx.mec.num_mec = 2;
++		break;
++	default:
++		adev->gfx.mec.num_mec = 1;
++		break;
++	}
++
++	adev->gfx.mec.num_pipe_per_mec = 4;
++	adev->gfx.mec.num_queue_per_pipe = 8;
++
++	/* only 1 pipe of the first MEC is owned by amdgpu */
++	mec_hpd_size = 1 * 1 * adev->gfx.mec.num_queue_per_pipe * GFX9_MEC_HPD_SIZE;
+ 
+ 	if (adev->gfx.mec.hpd_eop_obj == NULL) {
+ 		r = amdgpu_bo_create(adev,
+-				     adev->gfx.mec.num_queue * GFX9_MEC_HPD_SIZE,
++				     mec_hpd_size,
+ 				     PAGE_SIZE, true,
+ 				     AMDGPU_GEM_DOMAIN_GTT, 0, NULL, NULL,
+ 				     &adev->gfx.mec.hpd_eop_obj);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 74f6512..bad45d6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -727,49 +727,9 @@ set_pasid_vmid_mapping(struct device_queue_manager *dqm, unsigned int pasid,
+ int init_pipelines(struct device_queue_manager *dqm,
+ 			unsigned int pipes_num, unsigned int first_pipe)
+ {
+-	void *hpdptr;
+-	struct mqd_manager *mqd;
+-	unsigned int i, err, inx;
+-	uint64_t pipe_hpd_addr;
+-
+-	/*
+-	 * Allocate memory for the HPDs. This is hardware-owned per-pipe data.
+-	 * The driver never accesses this memory after zeroing it.
+-	 * It doesn't even have to be saved/restored on suspend/resume
+-	 * because it contains no data when there are no active queues.
+-	 */
+-
+-	err = kfd_gtt_sa_allocate(dqm->dev, CIK_HPD_EOP_BYTES * pipes_num,
+-					&dqm->pipeline_mem);
+-
+-	if (err) {
+-		pr_err("Failed to allocate vidmem num pipes: %d\n", pipes_num);
+-		return -ENOMEM;
+-	}
+-
+-	hpdptr = dqm->pipeline_mem->cpu_ptr;
+-	dqm->pipelines_addr = dqm->pipeline_mem->gpu_addr;
++	BUG_ON(!dqm || !dqm->dev);
+ 
+-	memset(hpdptr, 0, CIK_HPD_EOP_BYTES * pipes_num);
+-
+-	mqd = dqm->ops.get_mqd_manager(dqm, KFD_MQD_TYPE_COMPUTE);
+-	if (!mqd) {
+-		kfd_gtt_sa_free(dqm->dev, dqm->pipeline_mem);
+-		return -ENOMEM;
+-	}
+-
+-	for (i = 0; i < pipes_num; i++) {
+-		inx = i + first_pipe;
+-		/*
+-		 * HPD buffer on GTT is allocated by amdkfd, no need to waste
+-		 * space in GTT for pipelines we don't initialize
+-		 */
+-		pipe_hpd_addr = dqm->pipelines_addr + i * CIK_HPD_EOP_BYTES;
+-		pr_debug("Pipeline address %llX\n", pipe_hpd_addr);
+-		/* = log2(bytes/4)-1 */
+-		dqm->dev->kfd2kgd->init_pipeline(dqm->dev->kgd, inx,
+-				CIK_HPD_EOP_BYTES_LOG2 - 3, pipe_hpd_addr);
+-	}
++	pr_debug("kfd: In func %s\n", __func__);
+ 
+ 	return 0;
+ }
+-- 
+2.7.4
+
