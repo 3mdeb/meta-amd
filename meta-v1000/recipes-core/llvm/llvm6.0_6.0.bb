@@ -16,8 +16,8 @@ PROVIDES += "llvm"
 LLVM_RELEASE = "${PV}"
 LLVM_DIR = "llvm${LLVM_RELEASE}"
 
-SRCREV = "5db707b0ff5ce707a78082219658a999b6b6eaa3"
-PV = "5.0"
+SRCREV = "c29af95cf1272d51bebd1df288c4ae30125b6730"
+PV = "6.0"
 PATCH_VERSION = "0"
 SRC_URI = "git://llvm.org/git/llvm.git;branch=master;protocol=http \
            file://0001-CrossCompile.cmake-adjust-build-for-OE.patch \
