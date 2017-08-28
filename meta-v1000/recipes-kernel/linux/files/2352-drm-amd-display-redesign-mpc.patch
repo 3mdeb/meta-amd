@@ -1,0 +1,1103 @@
+From a4de2cbe753a12b1314bd1392a36145496a98df3 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Thu, 1 Jun 2017 18:35:54 -0400
+Subject: [PATCH 2352/2500] drm/amd/display: redesign mpc
+
+Change-Id: Ibe5fa2ade281c925f8946deace7964cbb6825a82
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Reviewed-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c   |   1 +
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c  |  10 +-
+ drivers/gpu/drm/amd/display/dc/dc_helper.c         |  10 +-
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  | 105 +++----
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c   | 336 +++++----------------
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.h   | 102 +++----
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_resource.c  |  73 +++--
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h    |  12 +-
+ drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h        |  81 ++---
+ 9 files changed, 228 insertions(+), 502 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c b/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c
+index f0f688b..66f0595 100644
+--- a/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c
++++ b/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c
+@@ -517,6 +517,7 @@ static void split_stream_across_pipes(
+ 	secondary_pipe->stream = primary_pipe->stream;
+ 	secondary_pipe->tg = primary_pipe->tg;
+ 
++	secondary_pipe->mpcc = pool->mpcc[secondary_pipe->pipe_idx];
+ 	secondary_pipe->mi = pool->mis[secondary_pipe->pipe_idx];
+ 	secondary_pipe->ipp = pool->ipps[secondary_pipe->pipe_idx];
+ 	secondary_pipe->xfm = pool->transforms[secondary_pipe->pipe_idx];
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 9f6a99f8..73d04ef 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -1008,8 +1008,6 @@ static int acquire_first_split_pipe(
+ 
+ 		if (pipe_ctx->top_pipe &&
+ 				pipe_ctx->top_pipe->surface == pipe_ctx->surface) {
+-			int mpc_idx = pipe_ctx->mpc_idx;
+-
+ 			pipe_ctx->top_pipe->bottom_pipe = pipe_ctx->bottom_pipe;
+ 			if (pipe_ctx->bottom_pipe)
+ 				pipe_ctx->bottom_pipe->top_pipe = pipe_ctx->top_pipe;
+@@ -1021,8 +1019,8 @@ static int acquire_first_split_pipe(
+ 			pipe_ctx->xfm = pool->transforms[i];
+ 			pipe_ctx->opp = pool->opps[i];
+ 			pipe_ctx->dis_clk = pool->display_clock;
++			pipe_ctx->mpcc = pool->mpcc[i];
+ 			pipe_ctx->pipe_idx = i;
+-			pipe_ctx->mpc_idx = mpc_idx;
+ 
+ 			pipe_ctx->stream = stream;
+ 			return i;
+@@ -1243,6 +1241,9 @@ static int acquire_first_free_pipe(
+ 		if (!res_ctx->pipe_ctx[i].stream) {
+ 			struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[i];
+ 
++#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
++			pipe_ctx->mpcc = pool->mpcc[i];
++#endif
+ 			pipe_ctx->tg = pool->timing_generators[i];
+ 			pipe_ctx->mi = pool->mis[i];
+ 			pipe_ctx->ipp = pool->ipps[i];
+@@ -1251,9 +1252,6 @@ static int acquire_first_free_pipe(
+ 			pipe_ctx->dis_clk = pool->display_clock;
+ 			pipe_ctx->pipe_idx = i;
+ 
+-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+-			pipe_ctx->mpc_idx = -1;
+-#endif
+ 
+ 			pipe_ctx->stream = stream;
+ 			return i;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_helper.c b/drivers/gpu/drm/amd/display/dc/dc_helper.c
+index 87fd5b9..8ed1440 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_helper.c
++++ b/drivers/gpu/drm/amd/display/dc/dc_helper.c
+@@ -135,8 +135,11 @@ uint32_t generic_reg_wait(const struct dc_context *ctx,
+ 	uint32_t reg_val;
+ 	int i;
+ 
+-	if (ctx->dce_environment == DCE_ENV_FPGA_MAXIMUS)
+-		time_out_num_tries *= 20;
++	if (IS_FPGA_MAXIMUS_DC(ctx->dce_environment)) {
++		/* 35 seconds */
++		delay_between_poll_us = 35000;
++		time_out_num_tries = 1000;
++	}
+ 
+ 	for (i = 0; i <= time_out_num_tries; i++) {
+ 		if (i) {
+@@ -157,7 +160,8 @@ uint32_t generic_reg_wait(const struct dc_context *ctx,
+ 
+ 	dm_error("REG_WAIT timeout %dus * %d tries - %s\n",
+ 			delay_between_poll_us, time_out_num_tries, func_name);
+-	if (ctx->dce_environment != DCE_ENV_FPGA_MAXIMUS)
++
++	if (!IS_FPGA_MAXIMUS_DC(ctx->dce_environment))
+ 		BREAK_TO_DEBUGGER();
+ 
+ 	return reg_val;
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index f2b581f..f509dfd 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -592,9 +592,19 @@ static void init_hw(struct core_dc *dc)
+ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+ 		struct timing_generator *tg =
+ 				dc->res_pool->timing_generators[i];
++		struct mpcc *mpcc =
++				dc->res_pool->mpcc[i];
++		struct mpcc_cfg mpcc_cfg;
++
++		lock_otg_master_update(dc->ctx, tg->inst);
++		mpcc_cfg.opp_id = 0xf;
++		mpcc_cfg.top_dpp_id = 0xf;
++		mpcc_cfg.bot_mpcc_id = 0xf;
++		mpcc_cfg.top_of_tree = true;
++		mpcc->funcs->set(mpcc, &mpcc_cfg);
++		unlock_otg_master(dc->ctx, tg->inst);
+ 
+ 		tg->funcs->disable_vga(tg);
+-
+ 		/* Blank controller using driver code instead of
+ 		 * command table.
+ 		 */
+@@ -819,8 +829,7 @@ static void reset_front_end_for_pipe(
+ 		struct pipe_ctx *pipe_ctx,
+ 		struct validate_context *context)
+ {
+-	struct dcn10_mpc *mpc = TO_DCN10_MPC(dc->res_pool->mpc);
+-	struct mpc_tree_cfg *tree_cfg = NULL;
++	struct mpcc_cfg mpcc_cfg;
+ 
+ 	if (!pipe_ctx->surface)
+ 		return;
+@@ -829,20 +838,14 @@ static void reset_front_end_for_pipe(
+ 
+ 	lock_otg_master_update(dc->ctx, pipe_ctx->tg->inst);
+ 
+-	/* TODO: build stream pipes group id. For now, use stream otg
+-	 * id as pipe group id
+-	 */
+-	tree_cfg = &dc->current_context->res_ctx.mpc_tree[pipe_ctx->mpc_idx];
+-
+-	if (!dcn10_remove_dpp(mpc, tree_cfg, pipe_ctx->pipe_idx)) {
+-		dm_logger_write(dc->ctx->logger, LOG_RESOURCE,
+-			"%s: failed to find dpp to be removed!\n",
+-			__func__);
+-	}
++	mpcc_cfg.opp_id = 0xf;
++	mpcc_cfg.top_dpp_id = 0xf;
++	mpcc_cfg.bot_mpcc_id = 0xf;
++	mpcc_cfg.top_of_tree = !pipe_ctx->top_pipe;
++	pipe_ctx->mpcc->funcs->set(pipe_ctx->mpcc, &mpcc_cfg);
+ 
+ 	pipe_ctx->top_pipe = NULL;
+ 	pipe_ctx->bottom_pipe = NULL;
+-	pipe_ctx->mpc_idx = -1;
+ 
+ 	unlock_master_tg_and_wait(dc->ctx, pipe_ctx->tg->inst);
+ 
+@@ -850,8 +853,6 @@ static void reset_front_end_for_pipe(
+ 
+ 	wait_no_outstanding_request(dc->ctx, pipe_ctx->pipe_idx);
+ 
+-	wait_mpcc_idle(mpc, pipe_ctx->pipe_idx);
+-
+ 	disable_clocks(dc->ctx, pipe_ctx->pipe_idx);
+ 
+ 	pipe_ctx->xfm->funcs->transform_reset(pipe_ctx->xfm);
+@@ -893,14 +894,10 @@ static void reset_hw_ctx_wrap(
+ 	reset_hw_ctx(dc, context, reset_front_end_for_pipe);
+ 	/* Reset Back End*/
+ 	reset_hw_ctx(dc, context, reset_back_end_for_pipe);
+-
+-	memcpy(context->res_ctx.mpc_tree,
+-			dc->current_context->res_ctx.mpc_tree,
+-			sizeof(struct mpc_tree_cfg) * dc->res_pool->pipe_count);
+ }
+ 
+-static bool patch_address_for_sbs_tb_stereo(struct pipe_ctx *pipe_ctx,
+-											PHYSICAL_ADDRESS_LOC *addr)
++static bool patch_address_for_sbs_tb_stereo(
++		struct pipe_ctx *pipe_ctx, PHYSICAL_ADDRESS_LOC *addr)
+ {
+ 	struct core_surface *surface = pipe_ctx->surface;
+ 	bool sec_split = pipe_ctx->top_pipe &&
+@@ -1670,14 +1667,10 @@ static void update_dchubp_dpp(
+ 	struct input_pixel_processor *ipp = pipe_ctx->ipp;
+ 	struct core_surface *surface = pipe_ctx->surface;
+ 	union plane_size size = surface->public.plane_size;
+-	struct mpc_tree_cfg *tree_cfg = NULL;
+ 	struct default_adjustment ocsc = {0};
+-	enum dc_color_space color_space;
+ 	struct tg_color black_color = {0};
+-	struct dcn10_mpc *mpc = TO_DCN10_MPC(dc->res_pool->mpc);
+-	struct pipe_ctx *temp_pipe;
+-	int i;
+-	int tree_pos = 0;
++	struct mpcc_cfg mpcc_cfg;
++	struct pipe_ctx *top_pipe;
+ 	bool per_pixel_alpha = surface->public.per_pixel_alpha && pipe_ctx->bottom_pipe;
+ 
+ 	/* TODO: proper fix once fpga works */
+@@ -1716,39 +1709,23 @@ static void update_dchubp_dpp(
+ 			1,
+ 			IPP_OUTPUT_FORMAT_12_BIT_FIX);
+ 
+-	/* mpc TODO un-hardcode object ids
+-	 * for pseudo code pipe_move.c :
+-	 * add_plane_mpcc(added_plane_inst, mpcc_inst, ...);
+-	 * Do we want to cache the tree_cfg?
+-	 */
+-
+-	/* TODO: build stream pipes group id. For now, use stream otg
+-	 * id as pipe group id
+-	 */
+ 	pipe_ctx->scl_data.lb_params.alpha_en = per_pixel_alpha;
+-	pipe_ctx->mpc_idx = pipe_ctx->tg->inst;
+-	tree_cfg = &context->res_ctx.mpc_tree[pipe_ctx->mpc_idx];
+-	if (tree_cfg->num_pipes == 0) {
+-		tree_cfg->opp_id = pipe_ctx->tg->inst;
+-		for (i = 0; i < MAX_PIPES; i++) {
+-			tree_cfg->dpp[i] = 0xf;
+-			tree_cfg->mpcc[i] = 0xf;
+-		}
+-	}
+-
+-	for (temp_pipe = pipe_ctx->top_pipe;
+-			temp_pipe != NULL; temp_pipe = temp_pipe->top_pipe)
+-		tree_pos++;
+-
+-	tree_cfg->dpp[tree_pos] = pipe_ctx->pipe_idx;
+-	tree_cfg->mpcc[tree_pos] = pipe_ctx->pipe_idx;
+-	tree_cfg->per_pixel_alpha[tree_pos] = per_pixel_alpha;
+-	tree_cfg->num_pipes = tree_pos + 1;
+-	dcn10_set_mpc_tree(mpc, tree_cfg);
++	for (top_pipe = pipe_ctx; top_pipe != NULL; top_pipe = top_pipe->top_pipe)
++		mpcc_cfg.opp_id = top_pipe->opp->inst;
++	mpcc_cfg.top_dpp_id = pipe_ctx->pipe_idx;
++	if (pipe_ctx->bottom_pipe)
++		mpcc_cfg.bot_mpcc_id = pipe_ctx->bottom_pipe->mpcc->inst;
++	else
++		mpcc_cfg.bot_mpcc_id = 0xf;
++	mpcc_cfg.top_of_tree = !pipe_ctx->top_pipe;
++	mpcc_cfg.per_pixel_alpha = per_pixel_alpha;
++	if (!dc->current_context->res_ctx.pipe_ctx[pipe_ctx->pipe_idx].surface)
++		pipe_ctx->mpcc->funcs->wait_for_idle(pipe_ctx->mpcc);
++	pipe_ctx->mpcc->funcs->set(pipe_ctx->mpcc, &mpcc_cfg);
+ 
+-	color_space = pipe_ctx->stream->public.output_color_space;
+-	color_space_to_black_color(dc, color_space, &black_color);
+-	dcn10_set_mpc_background_color(mpc, pipe_ctx->pipe_idx, &black_color);
++	color_space_to_black_color(
++		dc, pipe_ctx->stream->public.output_color_space, &black_color);
++	pipe_ctx->mpcc->funcs->set_bg_color(pipe_ctx->mpcc, &black_color);
+ 
+ 	pipe_ctx->scl_data.lb_params.depth = LB_PIXEL_DEPTH_30BPP;
+ 	/* scaler configuration */
+@@ -1853,13 +1830,8 @@ static void dcn10_apply_ctx_for_surface(
+ 
+ 
+ 		/* looking for top pipe to program */
+-		if (!pipe_ctx->top_pipe) {
+-			memcpy(context->res_ctx.mpc_tree,
+-					dc->current_context->res_ctx.mpc_tree,
+-					sizeof(struct mpc_tree_cfg) * dc->res_pool->pipe_count);
+-
++		if (!pipe_ctx->top_pipe)
+ 			program_all_pipe_in_tree(dc, pipe_ctx, context);
+-		}
+ 	}
+ 
+ 	dm_logger_write(dc->ctx->logger, LOG_BANDWIDTH_CALCS,
+@@ -1927,8 +1899,7 @@ static void dcn10_apply_ctx_for_surface(
+ 
+ 		if ((!pipe_ctx->surface && old_pipe_ctx->surface)
+ 				|| (!pipe_ctx->stream && old_pipe_ctx->stream))
+-			reset_front_end_for_pipe(dc,
+-					old_pipe_ctx, dc->current_context);
++			reset_front_end_for_pipe(dc, old_pipe_ctx, dc->current_context);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c
+index 58f8011..19af0ee 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c
+@@ -27,34 +27,26 @@
+ #include "dcn10_mpc.h"
+ 
+ #define REG(reg)\
+-	mpc->mpc_regs->reg
++	mpcc10->mpcc_regs->reg
+ 
+ #define CTX \
+-	mpc->base.ctx
++	mpcc10->base.ctx
+ 
+ #undef FN
+ #define FN(reg_name, field_name) \
+-	mpc->mpc_shift->field_name, mpc->mpc_mask->field_name
++	mpcc10->mpcc_shift->field_name, mpcc10->mpcc_mask->field_name
+ 
+ #define MODE_TOP_ONLY 1
+ #define MODE_BLEND 3
++#define BLND_PP_ALPHA 0
++#define BLND_GLOBAL_ALPHA 2
+ 
+-/* Internal function to set mpc output mux */
+-static void set_output_mux(struct dcn10_mpc *mpc,
+-	uint8_t opp_id,
+-	uint8_t mpcc_id)
+-{
+-	if (mpcc_id != 0xf)
+-		REG_UPDATE(OPP_PIPE_CONTROL[opp_id],
+-				OPP_PIPE_CLOCK_EN, 1);
+-
+-	REG_SET(MUX[opp_id], 0, MPC_OUT_MUX, mpcc_id);
+-}
+ 
+-void dcn10_set_mpc_background_color(struct dcn10_mpc *mpc,
+-	unsigned int mpcc_inst,
+-	struct tg_color *bg_color)
++void dcn10_mpcc_set_bg_color(
++		struct mpcc *mpcc,
++		struct tg_color *bg_color)
+ {
++	struct dcn10_mpcc *mpcc10 = TO_DCN10_MPCC(mpcc);
+ 	/* mpc color is 12 bit.  tg_color is 10 bit */
+ 	/* todo: might want to use 16 bit to represent color and have each
+ 	 * hw block translate to correct color depth.
+@@ -63,277 +55,89 @@ void dcn10_set_mpc_background_color(struct dcn10_mpc *mpc,
+ 	uint32_t bg_g_y = bg_color->color_g_y << 2;
+ 	uint32_t bg_b_cb = bg_color->color_b_cb << 2;
+ 
+-	REG_SET(MPCC_BG_R_CR[mpcc_inst], 0,
++	REG_SET(MPCC_BG_R_CR, 0,
+ 			MPCC_BG_R_CR, bg_r_cr);
+-	REG_SET(MPCC_BG_G_Y[mpcc_inst], 0,
++	REG_SET(MPCC_BG_G_Y, 0,
+ 			MPCC_BG_G_Y, bg_g_y);
+-	REG_SET(MPCC_BG_B_CB[mpcc_inst], 0,
++	REG_SET(MPCC_BG_B_CB, 0,
+ 			MPCC_BG_B_CB, bg_b_cb);
+ }
+ 
+-/* This function programs MPC tree configuration
+- * Assume it is the initial time to setup MPC tree_configure, means
+- * the instance of dpp/mpcc/opp specified in structure tree_cfg are
+- * in idle status.
+- * Before invoke this function, ensure that master lock of OPTC specified
+- * by opp_id is set.
+- *
+- * tree_cfg[in] - new MPC_TREE_CFG
+- */
+-
+-void dcn10_set_mpc_tree(struct dcn10_mpc *mpc,
+-	struct mpc_tree_cfg *tree_cfg)
++static void set_output_mux(struct dcn10_mpcc *mpcc10, int opp_id, int mpcc_id)
+ {
+-	int i;
+-
+-	for (i = 0; i < tree_cfg->num_pipes; i++) {
+-		uint8_t mpcc_inst = tree_cfg->mpcc[i];
+-
+-		REG_SET(MPCC_OPP_ID[mpcc_inst], 0,
+-			MPCC_OPP_ID, tree_cfg->opp_id);
+-
+-		REG_SET(MPCC_TOP_SEL[mpcc_inst], 0,
+-			MPCC_TOP_SEL, tree_cfg->dpp[i]);
+-
+-		if (i == tree_cfg->num_pipes-1) {
+-			REG_SET(MPCC_BOT_SEL[mpcc_inst], 0,
+-				MPCC_BOT_SEL, 0xF);
+-
+-			REG_UPDATE(MPCC_CONTROL[mpcc_inst],
+-					MPCC_MODE, MODE_TOP_ONLY);
+-		} else {
+-			REG_SET(MPCC_BOT_SEL[mpcc_inst], 0,
+-				MPCC_BOT_SEL, tree_cfg->dpp[i+1]);
+-
+-			REG_UPDATE(MPCC_CONTROL[mpcc_inst],
+-					MPCC_MODE, MODE_BLEND);
+-		}
+-
+-		if (i == 0)
+-			set_output_mux(
+-				mpc, tree_cfg->opp_id, mpcc_inst);
+-
+-		REG_UPDATE_2(MPCC_CONTROL[mpcc_inst],
+-				MPCC_ALPHA_BLND_MODE,
+-				tree_cfg->per_pixel_alpha[i] ? 0 : 2,
+-				MPCC_ALPHA_MULTIPLIED_MODE, 0);
+-	}
++	ASSERT(mpcc10->opp_id == 0xf || opp_id == mpcc10->opp_id);
++	mpcc10->opp_id = opp_id;
++	REG_UPDATE(OPP_PIPE_CONTROL[opp_id], OPP_PIPE_CLOCK_EN, 1);
++	REG_SET(MUX[opp_id], 0, MPC_OUT_MUX, mpcc_id);
+ }
+ 
+-/*
+- * This is the function to remove current MPC tree specified by tree_cfg
+- * Before invoke this function, ensure that master lock of OPTC specified
+- * by opp_id is set.
+- *
+- *tree_cfg[in/out] - current MPC_TREE_CFG
+- */
+-void dcn10_delete_mpc_tree(struct dcn10_mpc *mpc,
+-	struct mpc_tree_cfg *tree_cfg)
++static void reset_output_mux(struct dcn10_mpcc *mpcc10)
+ {
+-	int i;
+-
+-	for (i = 0; i < tree_cfg->num_pipes; i++) {
+-		uint8_t mpcc_inst = tree_cfg->mpcc[i];
+-
+-		REG_SET(MPCC_OPP_ID[mpcc_inst], 0,
+-			MPCC_OPP_ID, 0xf);
+-
+-		REG_SET(MPCC_TOP_SEL[mpcc_inst], 0,
+-			MPCC_TOP_SEL, 0xf);
+-
+-		REG_SET(MPCC_BOT_SEL[mpcc_inst], 0,
+-			MPCC_BOT_SEL, 0xF);
+-
+-		/* add remove dpp/mpcc pair into pending list
+-		 * TODO FPGA AddToPendingList if empty from pseudo code
+-		 */
+-		tree_cfg->dpp[i] = 0xf;
+-		tree_cfg->mpcc[i] = 0xf;
+-		tree_cfg->per_pixel_alpha[i] = false;
+-	}
+-	set_output_mux(mpc, tree_cfg->opp_id, 0xf);
+-	tree_cfg->opp_id = 0xf;
+-	tree_cfg->num_pipes = 0;
++	REG_SET(MUX[mpcc10->opp_id], 0, MPC_OUT_MUX, 0xf);
++	REG_UPDATE(OPP_PIPE_CONTROL[mpcc10->opp_id], OPP_PIPE_CLOCK_EN, 0);
++	mpcc10->opp_id = 0xf;
+ }
+ 
+-/* TODO FPGA: how to handle DPP?
+- * Function to remove one of pipe from MPC configure tree by dpp idx
+- * Before invoke this function, ensure that master lock of OPTC specified
+- * by opp_id is set
+- * This function can be invoke multiple times to remove more than 1 dpps.
+- *
+- * tree_cfg[in/out] - current MPC_TREE_CFG
+- * idx[in] - index of dpp from tree_cfg to be removed.
+- */
+-bool dcn10_remove_dpp(struct dcn10_mpc *mpc,
+-	struct mpc_tree_cfg *tree_cfg,
+-	uint8_t idx)
++static void dcn10_mpcc_set(struct mpcc *mpcc, struct mpcc_cfg *cfg)
+ {
+-	int i;
+-	uint8_t mpcc_inst;
+-	bool found = false;
+-
+-	/* find dpp_idx from dpp array of tree_cfg */
+-	for (i = 0; i < tree_cfg->num_pipes; i++) {
+-		if (tree_cfg->dpp[i] == idx) {
+-			found = true;
+-			break;
+-		}
+-	}
+-
+-	if (!found) {
+-		BREAK_TO_DEBUGGER();
+-		return false;
+-	}
+-	mpcc_inst = tree_cfg->mpcc[i];
+-
+-	REG_SET(MPCC_OPP_ID[mpcc_inst], 0,
+-			MPCC_OPP_ID, 0xf);
+-
+-	REG_SET(MPCC_TOP_SEL[mpcc_inst], 0,
+-			MPCC_TOP_SEL, 0xf);
+-
+-	REG_SET(MPCC_BOT_SEL[mpcc_inst], 0,
+-			MPCC_BOT_SEL, 0xf);
+-
+-	if (i == 0) {
+-		if (tree_cfg->num_pipes > 1)
+-			set_output_mux(mpc,
+-				tree_cfg->opp_id, tree_cfg->mpcc[i+1]);
++	struct dcn10_mpcc *mpcc10 = TO_DCN10_MPCC(mpcc);
++	int alpha_blnd_mode = cfg->per_pixel_alpha ?
++			BLND_PP_ALPHA : BLND_GLOBAL_ALPHA;
++	int mpcc_mode = cfg->bot_mpcc_id != 0xf ?
++				MODE_BLEND : MODE_TOP_ONLY;
++
++	REG_SET(MPCC_OPP_ID, 0,
++		MPCC_OPP_ID, cfg->opp_id);
++
++	REG_SET(MPCC_TOP_SEL, 0,
++		MPCC_TOP_SEL, cfg->top_dpp_id);
++
++	REG_SET(MPCC_BOT_SEL, 0,
++		MPCC_BOT_SEL, cfg->bot_mpcc_id);
++
++	REG_SET_4(MPCC_CONTROL, 0xffffffff,
++		MPCC_MODE, mpcc_mode,
++		MPCC_ALPHA_BLND_MODE, alpha_blnd_mode,
++		MPCC_ALPHA_MULTIPLIED_MODE, 0/*TODO: cfg->per_pixel_alpha*/,
++		MPCC_BLND_ACTIVE_OVERLAP_ONLY, cfg->top_of_tree);
++
++	if (cfg->top_of_tree) {
++		if (cfg->opp_id != 0xf)
++			set_output_mux(mpcc10, cfg->opp_id, mpcc->inst);
+ 		else
+-			set_output_mux(mpc, tree_cfg->opp_id, 0xf);
+-	} else if (i == tree_cfg->num_pipes-1) {
+-		mpcc_inst = tree_cfg->mpcc[i - 1];
+-
+-		REG_SET(MPCC_BOT_SEL[mpcc_inst], 0,
+-				MPCC_BOT_SEL, 0xF);
+-
+-		/* prev mpc is now last, set to top only*/
+-		REG_UPDATE(MPCC_CONTROL[mpcc_inst],
+-				MPCC_MODE, MODE_TOP_ONLY);
+-	} else {
+-		mpcc_inst = tree_cfg->mpcc[i - 1];
+-
+-		REG_SET(MPCC_BOT_SEL[mpcc_inst], 0,
+-			MPCC_BOT_SEL, tree_cfg->mpcc[i+1]);
++			reset_output_mux(mpcc10);
+ 	}
+-
+-	/* update tree_cfg structure */
+-	while (i < tree_cfg->num_pipes - 1) {
+-		tree_cfg->dpp[i] = tree_cfg->dpp[i+1];
+-		tree_cfg->mpcc[i] = tree_cfg->mpcc[i+1];
+-		tree_cfg->per_pixel_alpha[i] = tree_cfg->per_pixel_alpha[i+1];
+-		i++;
+-	}
+-	tree_cfg->num_pipes--;
+-
+-	return true;
+ }
+ 
+-/* TODO FPGA: how to handle DPP?
+- * Function to add DPP/MPCC pair into MPC configure tree by position.
+- * Before invoke this function, ensure that master lock of OPTC specified
+- * by opp_id is set
+- * This function can be invoke multiple times to add more than 1 pipes.
+- *
+- * tree_cfg[in/out] - current MPC_TREE_CFG
+- * dpp_idx[in]	 - index of an idle dpp insatnce to be added.
+- * mpcc_idx[in]	 - index of an idle mpcc instance to be added.
+- * poistion[in]	 - position of dpp/mpcc pair to be added into current tree_cfg
+- *                 0 means insert to the most top layer of MPC tree
+- */
+-void dcn10_add_dpp(struct dcn10_mpc *mpc,
+-	struct mpc_tree_cfg *tree_cfg,
+-	uint8_t dpp_idx,
+-	uint8_t mpcc_idx,
+-	uint8_t per_pixel_alpha,
+-	uint8_t position)
++static void dcn10_mpcc_wait_idle(struct mpcc *mpcc)
+ {
+-	uint8_t prev;
+-	uint8_t next;
+-
+-	REG_SET(MPCC_OPP_ID[mpcc_idx], 0,
+-			MPCC_OPP_ID, tree_cfg->opp_id);
+-	REG_SET(MPCC_TOP_SEL[mpcc_idx], 0,
+-			MPCC_TOP_SEL, dpp_idx);
+-
+-	if (position == 0) {
+-		/* idle dpp/mpcc is added to the top layer of tree */
+-		REG_SET(MPCC_BOT_SEL[mpcc_idx], 0,
+-				MPCC_BOT_SEL, tree_cfg->mpcc[0]);
++	struct dcn10_mpcc *mpcc10 = TO_DCN10_MPCC(mpcc);
+ 
+-		/* bottom mpc is always top only */
+-		REG_UPDATE(MPCC_CONTROL[mpcc_idx],
+-				MPCC_MODE, MODE_TOP_ONLY);
+-		/* opp will get new output. from new added mpcc */
+-		set_output_mux(mpc, tree_cfg->opp_id, mpcc_idx);
+-
+-	} else if (position == tree_cfg->num_pipes) {
+-		/* idle dpp/mpcc is added to the bottom layer of tree */
+-
+-		/* get instance of previous bottom mpcc, set to middle layer */
+-		prev = tree_cfg->mpcc[position - 1];
+-
+-		REG_SET(MPCC_BOT_SEL[prev], 0,
+-				MPCC_BOT_SEL, mpcc_idx);
+-
+-		/* all mpcs other than bottom need to blend */
+-		REG_UPDATE(MPCC_CONTROL[prev],
+-				MPCC_MODE, MODE_BLEND);
+-
+-		/* mpcc_idx become new bottom mpcc*/
+-		REG_SET(MPCC_BOT_SEL[mpcc_idx], 0,
+-				MPCC_BOT_SEL, 0xf);
+-
+-		/* bottom mpc is always top only */
+-		REG_UPDATE(MPCC_CONTROL[mpcc_idx],
+-				MPCC_MODE, MODE_TOP_ONLY);
+-	} else {
+-		/* idle dpp/mpcc is added to middle of tree */
+-		prev = tree_cfg->mpcc[position - 1]; /* mpc a */
+-		next = tree_cfg->mpcc[position]; /* mpc b */
+-
+-		/* connect mpc inserted below mpc a*/
+-		REG_SET(MPCC_BOT_SEL[prev], 0,
+-				MPCC_BOT_SEL, mpcc_idx);
++	REG_WAIT(MPCC_STATUS, MPCC_IDLE, 1, 1000, 1000);
++}
+ 
+-		/* blend on mpc being inserted */
+-		REG_UPDATE(MPCC_CONTROL[mpcc_idx],
+-				MPCC_MODE, MODE_BLEND);
+ 
+-		/* Connect mpc b below one inserted */
+-		REG_SET(MPCC_BOT_SEL[mpcc_idx], 0,
+-				MPCC_BOT_SEL, next);
++const struct mpcc_funcs dcn10_mpcc_funcs = {
++		.set = dcn10_mpcc_set,
++		.wait_for_idle = dcn10_mpcc_wait_idle,
++		.set_bg_color = dcn10_mpcc_set_bg_color,
++};
+ 
+-	}
+-	/* premultiplied mode only if alpha is on for the layer*/
+-	REG_UPDATE_2(MPCC_CONTROL[mpcc_idx],
+-			MPCC_ALPHA_BLND_MODE,
+-			tree_cfg->per_pixel_alpha[position] ? 0 : 2,
+-			MPCC_ALPHA_MULTIPLIED_MODE, 0);
++void dcn10_mpcc_construct(struct dcn10_mpcc *mpcc10,
++	struct dc_context *ctx,
++	const struct dcn_mpcc_registers *mpcc_regs,
++	const struct dcn_mpcc_shift *mpcc_shift,
++	const struct dcn_mpcc_mask *mpcc_mask,
++	int inst)
++{
++	mpcc10->base.ctx = ctx;
+ 
+-	/*
+-	 * iterating from the last mpc/dpp pair to the one being added, shift
+-	 * them down one position
+-	 */
+-	for (next = tree_cfg->num_pipes; next > position; next--) {
+-		tree_cfg->dpp[next] = tree_cfg->dpp[next - 1];
+-		tree_cfg->mpcc[next] = tree_cfg->mpcc[next - 1];
+-		tree_cfg->per_pixel_alpha[next] = tree_cfg->per_pixel_alpha[next - 1];
+-	}
++	mpcc10->base.inst = inst;
++	mpcc10->base.funcs = &dcn10_mpcc_funcs;
+ 
+-	/* insert the new mpc/dpp pair into the tree_cfg*/
+-	tree_cfg->dpp[position] = dpp_idx;
+-	tree_cfg->mpcc[position] = mpcc_idx;
+-	tree_cfg->per_pixel_alpha[position] = per_pixel_alpha;
+-	tree_cfg->num_pipes++;
+-}
++	mpcc10->mpcc_regs = mpcc_regs;
++	mpcc10->mpcc_shift = mpcc_shift;
++	mpcc10->mpcc_mask = mpcc_mask;
+ 
+-void wait_mpcc_idle(struct dcn10_mpc *mpc,
+-	uint8_t mpcc_id)
+-{
+-	REG_WAIT(MPCC_STATUS[mpcc_id],
+-			MPCC_IDLE, 1,
+-			1000, 1000);
++	mpcc10->opp_id = inst;
+ }
+-
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.h b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.h
+index 3e4eb65..0f9f1b9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.h
+@@ -22,45 +22,45 @@
+  *
+  */
+ 
+-#ifndef __DC_MPC_DCN10_H__
+-#define __DC_MPC_DCN10_H__
++#ifndef __DC_MPCC_DCN10_H__
++#define __DC_MPCC_DCN10_H__
+ 
+ #include "mpc.h"
+ 
+-#define TO_DCN10_MPC(mpc_base)\
+-	container_of(mpc_base, struct dcn10_mpc, base)
++#define TO_DCN10_MPCC(mpcc_base) \
++	container_of(mpcc_base, struct dcn10_mpcc, base)
+ 
+-#define MAX_MPCC 4
+-#define MAX_MPC_OUT 4
+ #define MAX_OPP 4
+ 
+ #define MPC_COMMON_REG_LIST_DCN1_0(inst) \
+-	SRII(MPCC_TOP_SEL, MPCC, inst),\
+-	SRII(MPCC_BOT_SEL, MPCC, inst),\
+-	SRII(MPCC_CONTROL, MPCC, inst),\
+-	SRII(MPCC_STATUS, MPCC, inst),\
+-	SRII(MPCC_OPP_ID, MPCC, inst),\
+-	SRII(MPCC_BG_G_Y, MPCC, inst),\
+-	SRII(MPCC_BG_R_CR, MPCC, inst),\
+-	SRII(MPCC_BG_B_CB, MPCC, inst),\
+-	SRII(MPCC_BG_B_CB, MPCC, inst),\
+ 	SRII(MUX, MPC_OUT, inst),\
+ 	SRII(OPP_PIPE_CONTROL, OPP_PIPE, inst)
+ 
+-struct dcn_mpc_registers {
+-	uint32_t MPCC_TOP_SEL[MAX_MPCC];
+-	uint32_t MPCC_BOT_SEL[MAX_MPCC];
+-	uint32_t MPCC_CONTROL[MAX_MPCC];
+-	uint32_t MPCC_STATUS[MAX_MPCC];
+-	uint32_t MPCC_OPP_ID[MAX_MPCC];
+-	uint32_t MPCC_BG_G_Y[MAX_MPCC];
+-	uint32_t MPCC_BG_R_CR[MAX_MPCC];
+-	uint32_t MPCC_BG_B_CB[MAX_MPCC];
+-	uint32_t MUX[MAX_MPC_OUT];
++#define MPCC_COMMON_REG_LIST_DCN1_0(inst) \
++	SRI(MPCC_TOP_SEL, MPCC, inst),\
++	SRI(MPCC_BOT_SEL, MPCC, inst),\
++	SRI(MPCC_CONTROL, MPCC, inst),\
++	SRI(MPCC_STATUS, MPCC, inst),\
++	SRI(MPCC_OPP_ID, MPCC, inst),\
++	SRI(MPCC_BG_G_Y, MPCC, inst),\
++	SRI(MPCC_BG_R_CR, MPCC, inst),\
++	SRI(MPCC_BG_B_CB, MPCC, inst),\
++	SRI(MPCC_BG_B_CB, MPCC, inst)
++
++struct dcn_mpcc_registers {
++	uint32_t MPCC_TOP_SEL;
++	uint32_t MPCC_BOT_SEL;
++	uint32_t MPCC_CONTROL;
++	uint32_t MPCC_STATUS;
++	uint32_t MPCC_OPP_ID;
++	uint32_t MPCC_BG_G_Y;
++	uint32_t MPCC_BG_R_CR;
++	uint32_t MPCC_BG_B_CB;
+ 	uint32_t OPP_PIPE_CONTROL[MAX_OPP];
++	uint32_t MUX[MAX_OPP];
+ };
+ 
+-#define MPC_COMMON_MASK_SH_LIST_DCN1_0(mask_sh)\
++#define MPCC_COMMON_MASK_SH_LIST_DCN1_0(mask_sh)\
+ 	SF(MPCC0_MPCC_TOP_SEL, MPCC_TOP_SEL, mask_sh),\
+ 	SF(MPCC0_MPCC_BOT_SEL, MPCC_BOT_SEL, mask_sh),\
+ 	SF(MPCC0_MPCC_CONTROL, MPCC_MODE, mask_sh),\
+@@ -75,7 +75,7 @@ struct dcn_mpc_registers {
+ 	SF(MPC_OUT0_MUX, MPC_OUT_MUX, mask_sh),\
+ 	SF(OPP_PIPE0_OPP_PIPE_CONTROL, OPP_PIPE_CLOCK_EN, mask_sh)
+ 
+-#define MPC_REG_FIELD_LIST(type) \
++#define MPCC_REG_FIELD_LIST(type) \
+ 	type MPCC_TOP_SEL;\
+ 	type MPCC_BOT_SEL;\
+ 	type MPCC_MODE;\
+@@ -90,42 +90,28 @@ struct dcn_mpc_registers {
+ 	type MPC_OUT_MUX;\
+ 	type OPP_PIPE_CLOCK_EN;\
+ 
+-struct dcn_mpc_shift {
+-	MPC_REG_FIELD_LIST(uint8_t)
++struct dcn_mpcc_shift {
++	MPCC_REG_FIELD_LIST(uint8_t)
+ };
+ 
+-struct dcn_mpc_mask {
+-	MPC_REG_FIELD_LIST(uint32_t)
++struct dcn_mpcc_mask {
++	MPCC_REG_FIELD_LIST(uint32_t)
+ };
+ 
+-struct dcn10_mpc {
+-	struct mpc base;
+-	const struct dcn_mpc_registers *mpc_regs;
+-	const struct dcn_mpc_shift *mpc_shift;
+-	const struct dcn_mpc_mask *mpc_mask;
+-};
+-
+-void dcn10_delete_mpc_tree(struct dcn10_mpc *mpc,
+-	struct mpc_tree_cfg *tree_cfg);
+-
+-bool dcn10_remove_dpp(struct dcn10_mpc *mpc,
+-	struct mpc_tree_cfg *tree_cfg,
+-	uint8_t idx);
++struct dcn10_mpcc {
++	struct mpcc base;
++	const struct dcn_mpcc_registers *mpcc_regs;
++	const struct dcn_mpcc_shift *mpcc_shift;
++	const struct dcn_mpcc_mask *mpcc_mask;
+ 
+-void dcn10_add_dpp(struct dcn10_mpc *mpc,
+-	struct mpc_tree_cfg *tree_cfg,
+-	uint8_t dpp_idx,
+-	uint8_t mpcc_idx,
+-	uint8_t per_pixel_alpha,
+-	uint8_t position);
+-
+-void wait_mpcc_idle(struct dcn10_mpc *mpc,
+-	uint8_t mpcc_id);
++	int opp_id;
++};
+ 
+-void dcn10_set_mpc_tree(struct dcn10_mpc *mpc,
+-	struct mpc_tree_cfg *tree_cfg);
++void dcn10_mpcc_construct(struct dcn10_mpcc *mpcc10,
++	struct dc_context *ctx,
++	const struct dcn_mpcc_registers *mpcc_regs,
++	const struct dcn_mpcc_shift *mpcc_shift,
++	const struct dcn_mpcc_mask *mpcc_mask,
++	int inst);
+ 
+-void dcn10_set_mpc_background_color(struct dcn10_mpc *mpc,
+-	unsigned int mpcc_inst,
+-	struct tg_color *bg_color);
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+index 6ada9a2..142ac06 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+@@ -336,19 +336,28 @@ static const struct dcn_transform_mask tf_mask = {
+ };
+ 
+ 
+-static const struct dcn_mpc_registers mpc_regs = {
+-	MPC_COMMON_REG_LIST_DCN1_0(0),
+-	MPC_COMMON_REG_LIST_DCN1_0(1),
+-	MPC_COMMON_REG_LIST_DCN1_0(2),
+-	MPC_COMMON_REG_LIST_DCN1_0(3),
++#define mpcc_regs(id)\
++[id] = {\
++	MPCC_COMMON_REG_LIST_DCN1_0(id),\
++	MPC_COMMON_REG_LIST_DCN1_0(0),\
++	MPC_COMMON_REG_LIST_DCN1_0(1),\
++	MPC_COMMON_REG_LIST_DCN1_0(2),\
++	MPC_COMMON_REG_LIST_DCN1_0(3),\
++}
++
++static const struct dcn_mpcc_registers mpcc_regs[] = {
++	mpcc_regs(0),
++	mpcc_regs(1),
++	mpcc_regs(2),
++	mpcc_regs(3),
+ };
+ 
+-static const struct dcn_mpc_shift mpc_shift = {
+-	MPC_COMMON_MASK_SH_LIST_DCN1_0(__SHIFT)
++static const struct dcn_mpcc_shift mpcc_shift = {
++	MPCC_COMMON_MASK_SH_LIST_DCN1_0(__SHIFT)
+ };
+ 
+-static const struct dcn_mpc_mask mpc_mask = {
+-	MPC_COMMON_MASK_SH_LIST_DCN1_0(_MASK),
++static const struct dcn_mpcc_mask mpcc_mask = {
++	MPCC_COMMON_MASK_SH_LIST_DCN1_0(_MASK),
+ };
+ 
+ #define tg_regs(id)\
+@@ -509,28 +518,22 @@ static struct output_pixel_processor *dcn10_opp_create(
+ 	return &opp->base;
+ }
+ 
+-static struct mpc *dcn10_mpc_create(
+-	struct dc_context *ctx)
++static struct mpcc *dcn10_mpcc_create(
++	struct dc_context *ctx,
++	int inst)
+ {
+-	struct dcn10_mpc *mpc = dm_alloc(sizeof(struct dcn10_mpc));
++	struct dcn10_mpcc *mpcc10 = dm_alloc(sizeof(struct dcn10_mpcc));
+ 
+-	if (!mpc)
++	if (!mpcc10)
+ 		return NULL;
+ 
+-	mpc->base.ctx = ctx;
+-	mpc->mpc_regs = &mpc_regs;
+-	mpc->mpc_shift = &mpc_shift;
+-	mpc->mpc_mask = &mpc_mask;
++	dcn10_mpcc_construct(mpcc10, ctx,
++			&mpcc_regs[inst],
++			&mpcc_shift,
++			&mpcc_mask,
++			inst);
+ 
+-	return &mpc->base;
+-}
+-
+-static void dcn10_mpc_destroy(struct mpc **mpc_base)
+-{
+-	if (*mpc_base)
+-		dm_free(TO_DCN10_MPC(*mpc_base));
+-
+-	*mpc_base = NULL;
++	return &mpcc10->base;
+ }
+ 
+ static struct timing_generator *dcn10_timing_generator_create(
+@@ -736,6 +739,11 @@ static void destruct(struct dcn10_resource_pool *pool)
+ 			dm_free(DCN10TG_FROM_TG(pool->base.timing_generators[i]));
+ 			pool->base.timing_generators[i] = NULL;
+ 		}
++
++		if (pool->base.mpcc[i] != NULL)	{
++			dm_free(TO_DCN10_MPCC(pool->base.mpcc[i]));
++			pool->base.mpcc[i] = NULL;
++		}
+ 	}
+ 
+ 	for (i = 0; i < pool->base.stream_enc_count; i++) {
+@@ -760,9 +768,6 @@ static void destruct(struct dcn10_resource_pool *pool)
+ 		pool->base.dp_clock_source = NULL;
+ 	}
+ 
+-	if (pool->base.mpc != NULL)
+-		dcn10_mpc_destroy(&pool->base.mpc);
+-
+ 	if (pool->base.abm != NULL)
+ 		dce_abm_destroy(&pool->base.abm);
+ 
+@@ -1007,6 +1012,7 @@ static struct pipe_ctx *dcn10_acquire_idle_pipe_for_layer(
+ 	idle_pipe->stream = head_pipe->stream;
+ 	idle_pipe->tg = head_pipe->tg;
+ 
++	idle_pipe->mpcc = pool->mpcc[idle_pipe->pipe_idx];
+ 	idle_pipe->mi = pool->mis[idle_pipe->pipe_idx];
+ 	idle_pipe->ipp = pool->ipps[idle_pipe->pipe_idx];
+ 	idle_pipe->xfm = pool->transforms[idle_pipe->pipe_idx];
+@@ -1427,10 +1433,14 @@ static bool construct(
+ 			dm_error("DC: failed to create tg!\n");
+ 			goto otg_create_fail;
+ 		}
++		pool->base.mpcc[i] = dcn10_mpcc_create(ctx, i);
++		if (pool->base.mpcc[i] == NULL) {
++			BREAK_TO_DEBUGGER();
++			dm_error("DC: failed to create mpcc!\n");
++			goto mpcc_create_fail;
++		}
+ 	}
+ 
+-	pool->base.mpc = dcn10_mpc_create(ctx);
+-
+ 	if (!resource_construct(num_virtual_links, dc, &pool->base,
+ 			(!IS_FPGA_MAXIMUS_DC(dc->ctx->dce_environment) ?
+ 			&res_create_funcs : &res_create_maximus_funcs)))
+@@ -1444,6 +1454,7 @@ static bool construct(
+ 	return true;
+ 
+ disp_clk_create_fail:
++mpcc_create_fail:
+ otg_create_fail:
+ opp_create_fail:
+ transform_create_fail:
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index d8a378d..0308418 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -236,6 +236,9 @@ struct resource_pool {
+ 	struct output_pixel_processor *opps[MAX_PIPES];
+ 	struct timing_generator *timing_generators[MAX_PIPES];
+ 	struct stream_encoder *stream_enc[MAX_PIPES * 2];
++#ifdef CONFIG_DRM_AMD_DC_DCN1_0
++	struct mpcc *mpcc[MAX_PIPES];
++#endif
+ 
+ 	unsigned int pipe_count;
+ 	unsigned int underlay_pipe_index;
+@@ -259,9 +262,6 @@ struct resource_pool {
+ 
+ 	struct abm *abm;
+ 	struct dmcu *dmcu;
+-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+-	struct mpc *mpc;
+-#endif
+ 
+ 	const struct resource_funcs *funcs;
+ 	const struct resource_caps *res_cap;
+@@ -295,8 +295,9 @@ struct pipe_ctx {
+ 
+ 	struct pipe_ctx *top_pipe;
+ 	struct pipe_ctx *bottom_pipe;
++
+ #ifdef CONFIG_DRM_AMD_DC_DCN1_0
+-	uint8_t mpc_idx;
++	struct mpcc *mpcc;
+ 	struct _vcs_dpi_display_dlg_regs_st dlg_regs;
+ 	struct _vcs_dpi_display_ttu_regs_st ttu_regs;
+ 	struct _vcs_dpi_display_rq_regs_st rq_regs;
+@@ -306,9 +307,6 @@ struct pipe_ctx {
+ 
+ struct resource_context {
+ 	struct pipe_ctx pipe_ctx[MAX_PIPES];
+-#ifdef CONFIG_DRM_AMD_DC_DCN1_0
+-	struct mpc_tree_cfg mpc_tree[MAX_PIPES];
+-#endif
+ 	bool is_stream_enc_acquired[MAX_PIPES * 2];
+ 	bool is_audio_acquired[MAX_PIPES];
+ 	uint8_t clock_source_ref_count[MAX_CLOCK_SOURCES];
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h b/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
+index ec1a201..38d1587 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
+@@ -22,76 +22,29 @@
+  *
+  */
+ 
+-#ifndef __DC_MPC_H__
+-#define __DC_MPC_H__
++#ifndef __DC_MPCC_H__
++#define __DC_MPCC_H__
+ 
+-/* This structure define the mpc tree configuration
+- * num_pipes - number of pipes of the tree
+- * opp_id - instance id of OPP to drive MPC
+- * dpp- array of DPP index
+- * mpcc - array of MPCC index
+- * mode	- the most bottom layer MPCC mode control.
+- *  All other layers need to be program to 3
+- *
+- * The connection will be:
+- * mpcc[num_pipes-1]->mpcc[num_pipes-2]->...->mpcc[1]->mpcc[0]->OPP[opp_id]
+- * dpp[0]->mpcc[0]
+- * dpp[1]->mpcc[1]
+- * ...
+- * dpp[num_pipes-1]->mpcc[num_pipes-1]
+- * mpcc[0] is the most top layer of MPC tree,
+- * mpcc[num_pipes-1] is the most bottom layer.
+- */
+-
+-struct mpc_tree_cfg {
+-	uint8_t num_pipes;
+-	uint8_t opp_id;
+-	/* dpp pipes for blend */
+-	uint8_t dpp[6];
+-	/* mpcc insatnces for blend */
+-	uint8_t mpcc[6];
+-	bool per_pixel_alpha[6];
+-};
++#include "dc_hw_types.h"
+ 
+-struct mpcc_blnd_cfg {
+-	/* 0- perpixel alpha, 1- perpixel alpha combined with global gain,
+-	 * 2- global alpha
+-	 */
+-	uint8_t alpha_mode;
+-	uint8_t global_gain;
+-	uint8_t global_alpha;
+-	bool overlap_only;
+-	bool pre_multiplied_alpha;
++struct mpcc_cfg {
++	int top_dpp_id;
++	int bot_mpcc_id;
++	int opp_id;
++	bool per_pixel_alpha;
++	bool top_of_tree;
+ };
+ 
+-struct mpcc_sm_cfg {
+-	bool enable;
+-	/* 0-single plane, 2-row subsampling, 4-column subsampling,
+-	 * 6-checkboard subsampling
+-	 */
+-	uint8_t sm_mode;
+-	bool frame_alt; /* 0- disable, 1- enable */
+-	bool field_alt; /* 0- disable, 1- enable */
+-	/* 0-no force, 2-force frame polarity from top,
+-	 * 3-force frame polarity from bottom
+-	 */
+-	uint8_t force_next_frame_porlarity;
+-	/* 0-no force, 2-force field polarity from top,
+-	 * 3-force field polarity from bottom
+-	 */
+-	uint8_t force_next_field_polarity;
+-};
+-
+-struct mpcc_vupdate_lock_cfg {
+-	bool cfg_lock;
+-	bool adr_lock;
+-	bool adr_cfg_lock;
+-	bool cur0_lock;
+-	bool cur1_lock;
++struct mpcc {
++	const struct mpcc_funcs *funcs;
++	struct dc_context *ctx;
++	int inst;
+ };
+ 
+-struct mpc {
+-	struct dc_context *ctx;
++struct mpcc_funcs {
++	void (*set)(struct mpcc *mpcc, struct mpcc_cfg *cfg);
++	void (*wait_for_idle)(struct mpcc *mpcc);
++	void (*set_bg_color)( struct mpcc *mpcc, struct tg_color *bg_color);
+ };
+ 
+ #endif
+-- 
+2.7.4
+

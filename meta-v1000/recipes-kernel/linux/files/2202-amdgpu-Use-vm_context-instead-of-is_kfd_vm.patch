@@ -1,0 +1,156 @@
+From 3ea74ad3478ad2f7bd179b39120af977de8ac364 Mon Sep 17 00:00:00 2001
+From: Kent Russell <kent.russell@amd.com>
+Date: Mon, 29 May 2017 12:02:27 -0400
+Subject: [PATCH 2202/2500] amdgpu: Use vm_context instead of is_kfd_vm
+
+We really only care about the number of KFD VMs as we want to ensure
+that the power profile is set to Compute if we have at least one VM that
+is KFD-based (compute-based). Instead of a boolean, use vm_context and
+store this in the vm object for reference. This also allows us to merge
+smoothly with amdgpu after Harish's upstream changes
+
+Change-Id: I52cc50d8c41d1b4404450cfbddcdec129442affd
+Signed-off-by: Kent Russell <kent.russell@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c          |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c           | 19 ++++++++++---------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h           | 13 ++++++++-----
+ 4 files changed, 20 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 0a22074..669e2f1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1379,7 +1379,7 @@ int amdgpu_amdkfd_gpuvm_create_process_vm(struct kgd_dev *kgd, void **vm,
+ 		return -ENOMEM;
+ 
+ 	/* Initialize the VM context, allocate the page directory and zero it */
+-	ret = amdgpu_vm_init(adev, &new_vm->base, true);
++	ret = amdgpu_vm_init(adev, &new_vm->base, AMDGPU_VM_CONTEXT_COMPUTE);
+ 	if (ret != 0) {
+ 		pr_err("Failed init vm ret %d\n", ret);
+ 		/* Undo everything related to the new VM context */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index c14a61e..11c8bcc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -850,7 +850,7 @@ int amdgpu_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
+ 		goto out_suspend;
+ 	}
+ 
+-	r = amdgpu_vm_init(adev, &fpriv->vm, false);
++	r = amdgpu_vm_init(adev, &fpriv->vm, AMDGPU_VM_CONTEXT_GFX);
+ 	if (r) {
+ 		kfree(fpriv);
+ 		goto out_suspend;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 1bc44ab..2561855 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -2302,7 +2302,7 @@ void amdgpu_vm_adjust_size(struct amdgpu_device *adev, uint64_t vm_size)
+  * Init @vm fields.
+  */
+ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+-		   bool is_kfd_vm)
++		   int vm_context)
+ {
+ 	const unsigned align = min(AMDGPU_VM_PTB_ALIGN_SIZE,
+ 		AMDGPU_VM_PTE_COUNT(adev) * 8);
+@@ -2350,15 +2350,16 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 	vm->last_eviction_counter = atomic64_read(&adev->num_evictions);
+ 	amdgpu_bo_unreserve(vm->root.bo);
+ 
+-	vm->is_kfd_vm = is_kfd_vm;
+-	if (is_kfd_vm) {
++	vm->vm_context = vm_context;
++	if (vm_context == AMDGPU_VM_CONTEXT_COMPUTE) {
+ 		struct amdgpu_vm_id_manager *id_mgr =
+ 				&adev->vm_manager.id_mgr[AMDGPU_GFXHUB];
+ 
+ 		mutex_lock(&id_mgr->lock);
+-		if ((adev->vm_manager.n_kfd_vms++ == 0) &&
++
++		if ((adev->vm_manager.n_compute_vms++ == 0) &&
+ 			(!amdgpu_sriov_vf(adev))) {
+-			/* First KFD VM: enable compute power profile */
++			/* First Compute VM: enable compute power profile */
+ 			if (adev->pp_enabled)
+ 				amdgpu_dpm_switch_power_profile(adev,
+ 						AMD_PP_COMPUTE_PROFILE);
+@@ -2420,14 +2421,14 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ 	bool prt_fini_needed = !!adev->gart.gart_funcs->set_prt;
+ 	int i;
+ 
+-	if (vm->is_kfd_vm) {
++	if (vm->vm_context == AMDGPU_VM_CONTEXT_COMPUTE) {
+ 		struct amdgpu_vm_id_manager *id_mgr =
+ 				&adev->vm_manager.id_mgr[AMDGPU_GFXHUB];
+ 
+ 		mutex_lock(&id_mgr->lock);
+-		WARN(adev->vm_manager.n_kfd_vms == 0, "Unbalanced number of KFD VMs");
++		WARN(adev->vm_manager.n_compute_vms == 0, "Unbalanced number of Compute VMs");
+ 
+-		if ((--adev->vm_manager.n_kfd_vms == 0) &&
++		if ((--adev->vm_manager.n_compute_vms == 0) &&
+ 			(!amdgpu_sriov_vf(adev))) {
+ 			/* Last KFD VM: enable graphics power profile */
+ 			if (adev->pp_enabled)
+@@ -2502,7 +2503,7 @@ void amdgpu_vm_manager_init(struct amdgpu_device *adev)
+ 	spin_lock_init(&adev->vm_manager.prt_lock);
+ 	atomic_set(&adev->vm_manager.num_prt_users, 0);
+ 
+-	adev->vm_manager.n_kfd_vms = 0;
++	adev->vm_manager.n_compute_vms = 0;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 6df1d36..7b9d671 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -87,6 +87,9 @@ struct amdgpu_bo_list_entry;
+ /* max vmids dedicated for process */
+ #define AMDGPU_VM_MAX_RESERVED_VMID	1
+ 
++#define AMDGPU_VM_CONTEXT_GFX 0
++#define AMDGPU_VM_CONTEXT_COMPUTE 1
++
+ struct amdgpu_vm_pt {
+ 	struct amdgpu_bo	*bo;
+ 	uint64_t		addr;
+@@ -130,8 +133,8 @@ struct amdgpu_vm {
+ 	/* each VM will map on CSA */
+ 	struct amdgpu_bo_va *csa_bo_va;
+ 
+-	/* Flag to indicate if this is a KFD VM */
+-	bool                    is_kfd_vm : 1;
++	/* Whether this is a Compute or GFX Context */
++	int			vm_context;
+ };
+ 
+ struct amdgpu_vm_id {
+@@ -188,14 +191,14 @@ struct amdgpu_vm_manager {
+ 	spinlock_t				prt_lock;
+ 	atomic_t				num_prt_users;
+ 
+-	/* Number of KFD VMs, used for detecting KFD activity */
+-	unsigned                                n_kfd_vms;
++	/* Number of Compute VMs, used for detecting Compute activity */
++	unsigned                                n_compute_vms;
+ };
+ 
+ void amdgpu_vm_manager_init(struct amdgpu_device *adev);
+ void amdgpu_vm_manager_fini(struct amdgpu_device *adev);
+ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+-		   bool is_kfd_vm);
++		   int vm_context);
+ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm);
+ void amdgpu_vm_get_pd_bo(struct amdgpu_vm *vm,
+ 			 struct list_head *validated,
+-- 
+2.7.4
+

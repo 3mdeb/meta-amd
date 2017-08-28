@@ -1,0 +1,147 @@
+From 4513aeb9a353089e600d632bbf9023e9881dca6d Mon Sep 17 00:00:00 2001
+From: Shirish S <shirish.s@amd.com>
+Date: Thu, 25 May 2017 10:05:25 +0530
+Subject: [PATCH 2117/2500] drm/amdgpu: optimize amdgpu driver load & resume
+ time
+
+amdgpu_device_resume() & amdgpu_device_init() have a high
+time consuming call of amdgpu_late_init() which sets the
+clock_gating state of all IP blocks and is blocking.
+This patch defers only this setting of clock gating state
+operation to post resume of amdgpu driver but ideally before
+the UI comes up or in some cases post ui as well.
+
+With this change the resume time of amdgpu_device comes down
+from 1.299s to 0.199s which further helps in reducing the overall
+system resume time.
+
+V1: made the optimization applicable during driver load as well.
+
+TEST:(For ChromiumOS on STONEY only)
+* UI comes up
+* amdgpu_late_init() call gets called consistently and no errors reported.
+
+Change-Id: I6cc2817099793b394b382ca706185412a4456f5a
+Signed-off-by: Shirish S <shirish.s@amd.com>
+Reviewed-by: Huang Rui <ray.huang@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  3 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 46 +++++++++++++++++++++++-------
+ 2 files changed, 39 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 8f91e56..74c2601 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1699,6 +1699,9 @@ struct amdgpu_device {
+ 	/* amdkfd interface */
+ 	struct kfd_dev          *kfd;
+ 
++	/* delayed work_func for deferring clockgating during resume */
++	struct delayed_work     late_init_work;
++
+ 	struct amdgpu_virt	virt;
+ 
+ 	/* link all shadow bo */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 46b4e5b..4ffe434 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -59,6 +59,8 @@
+ MODULE_FIRMWARE("amdgpu/vega10_gpu_info.bin");
+ MODULE_FIRMWARE("amdgpu/raven_gpu_info.bin");
+ 
++#define AMDGPU_RESUME_MS		2000
++
+ static int amdgpu_debugfs_regs_init(struct amdgpu_device *adev);
+ static void amdgpu_debugfs_regs_cleanup(struct amdgpu_device *adev);
+ 
+@@ -1695,22 +1697,13 @@ static bool amdgpu_check_vram_lost(struct amdgpu_device *adev)
+ 			AMDGPU_RESET_MAGIC_NUM);
+ }
+ 
+-static int amdgpu_late_init(struct amdgpu_device *adev)
++static int amdgpu_late_set_cg_state(struct amdgpu_device *adev)
+ {
+ 	int i = 0, r;
+ 
+ 	for (i = 0; i < adev->num_ip_blocks; i++) {
+ 		if (!adev->ip_blocks[i].status.valid)
+ 			continue;
+-		if (adev->ip_blocks[i].version->funcs->late_init) {
+-			r = adev->ip_blocks[i].version->funcs->late_init((void *)adev);
+-			if (r) {
+-				DRM_ERROR("late_init of IP block <%s> failed %d\n",
+-					  adev->ip_blocks[i].version->funcs->name, r);
+-				return r;
+-			}
+-			adev->ip_blocks[i].status.late_initialized = true;
+-		}
+ 		/* skip CG for VCE/UVD, it's handled specially */
+ 		if (adev->ip_blocks[i].version->type != AMD_IP_BLOCK_TYPE_UVD &&
+ 		    adev->ip_blocks[i].version->type != AMD_IP_BLOCK_TYPE_VCE) {
+@@ -1724,6 +1717,29 @@ static int amdgpu_late_init(struct amdgpu_device *adev)
+ 			}
+ 		}
+ 	}
++	return 0;
++}
++
++static int amdgpu_late_init(struct amdgpu_device *adev)
++{
++	int i = 0, r;
++
++	for (i = 0; i < adev->num_ip_blocks; i++) {
++		if (!adev->ip_blocks[i].status.valid)
++			continue;
++		if (adev->ip_blocks[i].version->funcs->late_init) {
++			r = adev->ip_blocks[i].version->funcs->late_init((void *)adev);
++			if (r) {
++				DRM_ERROR("late_init of IP block <%s> failed %d\n",
++					  adev->ip_blocks[i].version->funcs->name, r);
++				return r;
++			}
++			adev->ip_blocks[i].status.late_initialized = true;
++		}
++	}
++
++	mod_delayed_work(system_wq, &adev->late_init_work,
++			msecs_to_jiffies(AMDGPU_RESUME_MS));
+ 
+ 	amdgpu_fill_reset_magic(adev);
+ 
+@@ -1817,6 +1833,13 @@ static int amdgpu_fini(struct amdgpu_device *adev)
+ 	return 0;
+ }
+ 
++static void amdgpu_late_init_func_handler(struct work_struct *work)
++{
++	struct amdgpu_device *adev =
++		container_of(work, struct amdgpu_device, late_init_work.work);
++	amdgpu_late_set_cg_state(adev);
++}
++
+ int amdgpu_suspend(struct amdgpu_device *adev)
+ {
+ 	int i, r;
+@@ -2116,6 +2139,8 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	INIT_LIST_HEAD(&adev->gtt_list);
+ 	spin_lock_init(&adev->gtt_list_lock);
+ 
++	INIT_DELAYED_WORK(&adev->late_init_work, amdgpu_late_init_func_handler);
++
+ 	if (adev->asic_type >= CHIP_BONAIRE) {
+ 		adev->rmmio_base = pci_resource_start(adev->pdev, 5);
+ 		adev->rmmio_size = pci_resource_len(adev->pdev, 5);
+@@ -2312,6 +2337,7 @@ void amdgpu_device_fini(struct amdgpu_device *adev)
+ 	amdgpu_fbdev_fini(adev);
+ 	r = amdgpu_fini(adev);
+ 	adev->accel_working = false;
++	cancel_delayed_work_sync(&adev->late_init_work);
+ 	/* free i2c buses */
+ 	if (!amdgpu_device_has_dc_support(adev))
+ 		amdgpu_i2c_fini(adev);
+-- 
+2.7.4
+

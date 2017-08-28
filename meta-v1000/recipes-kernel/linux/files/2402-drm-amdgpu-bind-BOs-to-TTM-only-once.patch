@@ -1,0 +1,151 @@
+From 5850406c18e799f53d862e7955dc28a11fab6a4d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 29 Jun 2017 10:44:39 +0200
+Subject: [PATCH 2402/2500] drm/amdgpu: bind BOs to TTM only once
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No need to do this on every round.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Felix Kuehling <Felix.Kuehling@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+
+Change-Id: I43dfcb11cf897cd91ea88452ff22c2bd2a96721e
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 72 +++++++++++++--------------------
+ 1 file changed, 29 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 76cf5f2..e3af40b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -295,31 +295,15 @@ static void amdgpu_move_null(struct ttm_buffer_object *bo,
+ 	new_mem->mm_node = NULL;
+ }
+ 
+-static int amdgpu_mm_node_addr(struct ttm_buffer_object *bo,
+-			       struct drm_mm_node *mm_node,
+-			       struct ttm_mem_reg *mem,
+-			       uint64_t *addr)
++static uint64_t amdgpu_mm_node_addr(struct ttm_buffer_object *bo,
++				    struct drm_mm_node *mm_node,
++				    struct ttm_mem_reg *mem)
+ {
+-	int r;
++	uint64_t addr;
+ 
+-	switch (mem->mem_type) {
+-	case TTM_PL_TT:
+-		r = amdgpu_ttm_bind(bo, mem);
+-		if (r)
+-			return r;
+-
+-	case TTM_PL_VRAM:
+-	case AMDGPU_PL_DGMA:
+-	case AMDGPU_PL_DGMA_IMPORT:
+-		*addr = mm_node->start << PAGE_SHIFT;
+-		*addr += bo->bdev->man[mem->mem_type].gpu_offset;
+-		break;
+-	default:
+-		DRM_ERROR("Unknown placement %d\n", mem->mem_type);
+-		return -EINVAL;
+-	}
+-
+-	return 0;
++	addr = mm_node->start << PAGE_SHIFT;
++	addr += bo->bdev->man[mem->mem_type].gpu_offset;
++	return addr;
+ }
+ 
+ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
+@@ -343,18 +327,25 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
+ 		return -EINVAL;
+ 	}
+ 
++	if (old_mem->mem_type == TTM_PL_TT) {
++		r = amdgpu_ttm_bind(bo, old_mem);
++		if (r)
++			return r;
++	}
++
+ 	old_mm = old_mem->mm_node;
+-	r = amdgpu_mm_node_addr(bo, old_mm, old_mem, &old_start);
+-	if (r)
+-		return r;
+ 	old_size = old_mm->size;
++	old_start = amdgpu_mm_node_addr(bo, old_mm, old_mem);
+ 
++	if (new_mem->mem_type == TTM_PL_TT) {
++		r = amdgpu_ttm_bind(bo, new_mem);
++		if (r)
++			return r;
++	}
+ 
+ 	new_mm = new_mem->mm_node;
+-	r = amdgpu_mm_node_addr(bo, new_mm, new_mem, &new_start);
+-	if (r)
+-		return r;
+ 	new_size = new_mm->size;
++	new_start = amdgpu_mm_node_addr(bo, new_mm, new_mem);
+ 
+ 	num_pages = new_mem->num_pages;
+ 	while (num_pages) {
+@@ -376,10 +367,7 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
+ 
+ 		old_size -= cur_pages;
+ 		if (!old_size) {
+-			r = amdgpu_mm_node_addr(bo, ++old_mm, old_mem,
+-						&old_start);
+-			if (r)
+-				goto error;
++			old_start = amdgpu_mm_node_addr(bo, ++old_mm, old_mem);
+ 			old_size = old_mm->size;
+ 		} else {
+ 			old_start += cur_pages * PAGE_SIZE;
+@@ -387,11 +375,7 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
+ 
+ 		new_size -= cur_pages;
+ 		if (!new_size) {
+-			r = amdgpu_mm_node_addr(bo, ++new_mm, new_mem,
+-						&new_start);
+-			if (r)
+-				goto error;
+-
++			new_start = amdgpu_mm_node_addr(bo, ++new_mm, new_mem);
+ 			new_size = new_mm->size;
+ 		} else {
+ 			new_start += cur_pages * PAGE_SIZE;
+@@ -1758,6 +1742,12 @@ int amdgpu_fill_buffer(struct amdgpu_bo *bo,
+ 		return -EINVAL;
+ 	}
+ 
++	if (bo->tbo.mem.mem_type == TTM_PL_TT) {
++		r = amdgpu_ttm_bind(&bo->tbo, &bo->tbo.mem);
++		if (r)
++			return r;
++	}
++
+ 	num_pages = bo->tbo.num_pages;
+ 	mm_node = bo->tbo.mem.mm_node;
+ 	num_loops = 0;
+@@ -1793,11 +1783,7 @@ int amdgpu_fill_buffer(struct amdgpu_bo *bo,
+ 		uint32_t byte_count = mm_node->size << PAGE_SHIFT;
+ 		uint64_t dst_addr;
+ 
+-		r = amdgpu_mm_node_addr(&bo->tbo, mm_node,
+-					&bo->tbo.mem, &dst_addr);
+-		if (r)
+-			return r;
+-
++		dst_addr = amdgpu_mm_node_addr(&bo->tbo, mm_node, &bo->tbo.mem);
+ 		while (byte_count) {
+ 			uint32_t cur_size_in_bytes = min(byte_count, max_bytes);
+ 
+-- 
+2.7.4
+

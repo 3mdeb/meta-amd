@@ -1,0 +1,110 @@
+From cd628fa9e6cc447688248c201e3879f792bf399e Mon Sep 17 00:00:00 2001
+From: Hersen Wu <hersenxs.wu@amd.com>
+Date: Fri, 9 Jun 2017 11:32:06 -0400
+Subject: [PATCH 2357/2500] drm/amd/display: DAL3 RV get DPREFCLK
+ SpreadspectrumInfo from smu_info
+
+Change-Id: I1900542d1f137cdb1afa28b8bbff69ad64b6e6c7
+Signed-off-by: Hersen Wu <hersenxs.wu@amd.com>
+Reviewed-by: Charlene Liu <Charlene.Liu@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c | 14 ++++++++---
+ drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c    | 29 +++++++++++++++++++++-
+ 2 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c b/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
+index fcd3b72..3a69f9c 100644
+--- a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
++++ b/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
+@@ -1136,6 +1136,7 @@ static enum bp_result get_ss_info_v4_2(
+ {
+ 	enum bp_result result = BP_RESULT_OK;
+ 	struct atom_display_controller_info_v4_2 *disp_cntl_tbl = NULL;
++	struct atom_smu_info_v3_1 *smu_info = NULL;
+ 
+ 	if (!ss_info)
+ 		return BP_RESULT_BADINPUT;
+@@ -1143,11 +1144,18 @@ static enum bp_result get_ss_info_v4_2(
+ 	if (!DATA_TABLES(dce_info))
+ 		return BP_RESULT_BADBIOSTABLE;
+ 
++	if (!DATA_TABLES(smu_info))
++		return BP_RESULT_BADBIOSTABLE;
++
+ 	disp_cntl_tbl =  GET_IMAGE(struct atom_display_controller_info_v4_2,
+ 							DATA_TABLES(dce_info));
+ 	if (!disp_cntl_tbl)
+ 		return BP_RESULT_BADBIOSTABLE;
+ 
++	smu_info =  GET_IMAGE(struct atom_smu_info_v3_1, DATA_TABLES(smu_info));
++	if (!smu_info)
++		return BP_RESULT_BADBIOSTABLE;
++
+ 	ss_info->type.STEP_AND_DELAY_INFO = false;
+ 	ss_info->spread_percentage_divider = 1000;
+ 	/* BIOS no longer uses target clock.  Always enable for now */
+@@ -1173,10 +1181,10 @@ static enum bp_result get_ss_info_v4_2(
+ 	/* TODO LVDS not support anymore? */
+ 	case AS_SIGNAL_TYPE_DISPLAY_PORT:
+ 		ss_info->spread_spectrum_percentage =
+-				disp_cntl_tbl->dp_ss_percentage;
++				smu_info->gpuclk_ss_percentage;
+ 		ss_info->spread_spectrum_range =
+-				disp_cntl_tbl->dp_ss_rate_10hz * 10;
+-		if (disp_cntl_tbl->dp_ss_mode & ATOM_SS_CENTRE_SPREAD_MODE)
++				smu_info->gpuclk_ss_rate_10hz * 10;
++		if (smu_info->gpuclk_ss_mode & ATOM_SS_CENTRE_SPREAD_MODE)
+ 			ss_info->type.CENTER_MODE = true;
+ 		break;
+ 	case AS_SIGNAL_TYPE_GPU_PLL:
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c b/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c
+index 04cd701..84b0860 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c
+@@ -246,6 +246,33 @@ static int dce_clocks_get_dp_ref_freq(struct display_clock *clk)
+ 	return dp_ref_clk_khz;
+ }
+ 
++/* TODO: This is DCN DPREFCLK: it could be program by DENTIST by VBIOS
++ * or CLK0_CLK11 by SMU. For DCE120, it is wlays 600Mhz. Will re-visit
++ * clock implementation
++ */
++static int dce_clocks_get_dp_ref_freq_wrkaround(struct display_clock *clk)
++{
++	struct dce_disp_clk *clk_dce = TO_DCE_CLOCKS(clk);
++	int dp_ref_clk_khz = 600000;
++
++	if (clk_dce->ss_on_dprefclk && clk_dce->dprefclk_ss_divider != 0) {
++		struct fixed32_32 ss_percentage = dal_fixed32_32_div_int(
++				dal_fixed32_32_from_fraction(
++						clk_dce->dprefclk_ss_percentage,
++						clk_dce->dprefclk_ss_divider), 200);
++		struct fixed32_32 adj_dp_ref_clk_khz;
++
++		ss_percentage = dal_fixed32_32_sub(dal_fixed32_32_one,
++								ss_percentage);
++		adj_dp_ref_clk_khz =
++			dal_fixed32_32_mul_int(
++				ss_percentage,
++				dp_ref_clk_khz);
++		dp_ref_clk_khz = dal_fixed32_32_floor(adj_dp_ref_clk_khz);
++	}
++
++	return dp_ref_clk_khz;
++}
+ static enum dm_pp_clocks_state dce_get_required_clocks_state(
+ 	struct display_clock *clk,
+ 	struct state_dependent_clocks *req_clocks)
+@@ -605,7 +632,7 @@ static bool dce_apply_clock_voltage_request(
+ 
+ 
+ static const struct display_clock_funcs dce120_funcs = {
+-	.get_dp_ref_clk_frequency = dce_clocks_get_dp_ref_freq,
++	.get_dp_ref_clk_frequency = dce_clocks_get_dp_ref_freq_wrkaround,
+ 	.apply_clock_voltage_request = dce_apply_clock_voltage_request,
+ 	.set_clock = dce112_set_clock
+ };
+-- 
+2.7.4
+

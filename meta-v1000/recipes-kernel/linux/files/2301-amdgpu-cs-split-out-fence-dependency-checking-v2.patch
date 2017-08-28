@@ -1,0 +1,139 @@
+From 6d67361387488473f1ce6b9d7e8ca34d092959dd Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Thu, 9 Mar 2017 03:45:52 +0000
+Subject: [PATCH 2301/2500] amdgpu/cs: split out fence dependency checking (v2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This just splits out the fence depenency checking into it's
+own function to make it easier to add semaphore dependencies.
+
+v2: rebase onto other changes.
+
+v1-Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c | 93 +++++++++++++++++++---------------
+ 1 file changed, 51 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 97f7655..087d0ca 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -922,59 +922,68 @@ static int amdgpu_cs_ib_fill(struct amdgpu_device *adev,
+ 	return 0;
+ }
+ 
+-static int amdgpu_cs_dependencies(struct amdgpu_device *adev,
+-				  struct amdgpu_cs_parser *p)
++static int amdgpu_cs_process_fence_dep(struct amdgpu_cs_parser *p,
++				       struct amdgpu_cs_chunk *chunk)
+ {
+ 	struct amdgpu_fpriv *fpriv = p->filp->driver_priv;
+-	int i, j, r;
++	unsigned num_deps;
++	int i, r;
++	struct drm_amdgpu_cs_chunk_dep *deps;
+ 
+-	for (i = 0; i < p->nchunks; ++i) {
+-		struct drm_amdgpu_cs_chunk_dep *deps;
+-		struct amdgpu_cs_chunk *chunk;
+-		unsigned num_deps;
++	deps = (struct drm_amdgpu_cs_chunk_dep *)chunk->kdata;
++	num_deps = chunk->length_dw * 4 /
++		sizeof(struct drm_amdgpu_cs_chunk_dep);
+ 
+-		chunk = &p->chunks[i];
++	for (i = 0; i < num_deps; ++i) {
++		struct amdgpu_ring *ring;
++		struct amdgpu_ctx *ctx;
++		struct fence *fence;
+ 
+-		if (chunk->chunk_id != AMDGPU_CHUNK_ID_DEPENDENCIES)
+-			continue;
++		ctx = amdgpu_ctx_get(fpriv, deps[i].ctx_id);
++		if (ctx == NULL)
++			return -EINVAL;
+ 
+-		deps = (struct drm_amdgpu_cs_chunk_dep *)chunk->kdata;
+-		num_deps = chunk->length_dw * 4 /
+-			sizeof(struct drm_amdgpu_cs_chunk_dep);
++		r = amdgpu_queue_mgr_map(p->adev, &ctx->queue_mgr,
++					 deps[i].ip_type,
++					 deps[i].ip_instance,
++					 deps[i].ring, &ring);
++		if (r) {
++			amdgpu_ctx_put(ctx);
++			return r;
++		}
+ 
+-		for (j = 0; j < num_deps; ++j) {
+-			struct amdgpu_ring *ring;
+-			struct amdgpu_ctx *ctx;
+-			struct fence *fence;
++		fence = amdgpu_ctx_get_fence(ctx, ring,
++					     deps[i].handle);
++		if (IS_ERR(fence)) {
++			r = PTR_ERR(fence);
++			amdgpu_ctx_put(ctx);
++			return r;
++		} else if (fence) {
++			r = amdgpu_sync_fence(p->adev, &p->job->sync,
++					      fence);
++			fence_put(fence);
++			amdgpu_ctx_put(ctx);
++			if (r)
++				return r;
++		}
++	}
++	return 0;
++}
+ 
+-			ctx = amdgpu_ctx_get(fpriv, deps[j].ctx_id);
+-			if (ctx == NULL)
+-				return -EINVAL;
++static int amdgpu_cs_dependencies(struct amdgpu_device *adev,
++				  struct amdgpu_cs_parser *p)
++{
++	int i, r;
+ 
+-			r = amdgpu_queue_mgr_map(adev, &ctx->queue_mgr,
+-						 deps[j].ip_type,
+-						 deps[j].ip_instance,
+-						 deps[j].ring, &ring);
+-			if (r) {
+-				amdgpu_ctx_put(ctx);
+-				return r;
+-			}
++	for (i = 0; i < p->nchunks; ++i) {
++		struct amdgpu_cs_chunk *chunk;
+ 
+-			fence = amdgpu_ctx_get_fence(ctx, ring,
+-						     deps[j].handle);
+-			if (IS_ERR(fence)) {
+-				r = PTR_ERR(fence);
+-				amdgpu_ctx_put(ctx);
+-				return r;
++		chunk = &p->chunks[i];
+ 
+-			} else if (fence) {
+-				r = amdgpu_sync_fence(adev, &p->job->sync,
+-						      fence);
+-				fence_put(fence);
+-				amdgpu_ctx_put(ctx);
+-				if (r)
+-					return r;
+-			}
++		if (chunk->chunk_id == AMDGPU_CHUNK_ID_DEPENDENCIES) {
++			r = amdgpu_cs_process_fence_dep(p, chunk);
++			if (r)
++				return r;
+ 		}
+ 	}
+ 
+-- 
+2.7.4
+
