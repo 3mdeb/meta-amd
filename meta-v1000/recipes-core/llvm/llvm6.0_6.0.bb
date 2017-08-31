@@ -6,7 +6,7 @@ HOMEPAGE = "http://llvm.org"
 LICENSE = "NCSA"
 LIC_FILES_CHKSUM = "file://LICENSE.TXT;md5=e825e017edc35cfd58e26116e5251771"
 
-DEPENDS = "libffi libxml2-native llvm-common zlib ninja-native"
+DEPENDS = "libffi libxml2 libxml2-native llvm-common zlib ninja-native"
 RDEPENDS_${PN} += "ncurses-terminfo"
 
 inherit perlnative pythonnative cmake
