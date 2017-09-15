@@ -8,7 +8,7 @@ DEPENDS = "vulkan-loader-layers xcb-util-keysyms"
 
 RDEPENDS_${PN} = "${PN}-layer-libs"
 
-inherit cmake python3native cmake_qt5
+inherit cmake python3native
 
 REQUIRED_DISTRO_FEATURES = "x11"
 
