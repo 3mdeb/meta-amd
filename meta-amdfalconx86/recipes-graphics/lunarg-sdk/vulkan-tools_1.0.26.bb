@@ -22,7 +22,9 @@ SRC_URI = "git://github.com/LunarG/VulkanTools;branch=sdk-${PV} \
            file://0001-CMakeLists-add-include-path-so-Xlib.h-is-found-as-ne.patch \
            file://0002-obey-CMAKE_INSTALL_LIBDIR.patch \
            file://0003-vktrace-do-not-link-to-internal-loader.patch\
-           file://0004-json-correct-layer-lib-paths.patch"
+           file://0004-json-correct-layer-lib-paths.patch \
+           file://0005-CMakeLists-add-include-paths-for-xcb-and-Xlib.patch \
+"
 
 EXTRA_OECMAKE = " \
     -DBUILD_LOADER=0 \

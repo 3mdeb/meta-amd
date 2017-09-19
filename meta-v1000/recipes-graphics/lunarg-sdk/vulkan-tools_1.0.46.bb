@@ -26,7 +26,9 @@ SRC_URI = "git://github.com/LunarG/VulkanTools;branch=sdk-${PV} \
            file://0005-vktrace_layer-force-linker-flags.patch \
            file://0006-CMakeList-only-search-for-jsoncpp-when-needed.patch \
            file://0007-layersvt-obey-CMAKE_INSTALL_LIBDIR.patch \
-           file://0008-CMakeLists-only-deploy-headers-when-needed.patch"
+           file://0008-CMakeLists-only-deploy-headers-when-needed.patch \
+           file://0009-CMakeLists-add-include-paths-for-xcb-and-Xlib.patch \
+"
 
 EXTRA_OECMAKE = " \
     -DBUILD_LOADER=0 \
