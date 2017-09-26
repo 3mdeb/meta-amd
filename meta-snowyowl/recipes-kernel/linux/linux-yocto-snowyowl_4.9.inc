@@ -19,6 +19,7 @@ SRC_URI_append_snowyowl += "file://snowyowl-user-features.scc \
     file://wifi-drivers.cfg \
     file://amd-xgbe.cfg \
     file://amd-ccp.cfg \
+    file://kvm.cfg \
     file://afalg.cfg \
     ${@bb.utils.contains('DISTRO_FEATURES', 'bluetooth', 'file://enable-bluetooth.cfg', 'file://disable-bluetooth.cfg', d)} \
     ${@bb.utils.contains('DISTRO', 'mel', 'file://enable-kgdb.cfg', 'file://disable-kgdb.cfg', d)} \
