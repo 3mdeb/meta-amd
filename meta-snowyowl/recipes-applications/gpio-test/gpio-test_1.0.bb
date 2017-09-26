@@ -3,12 +3,10 @@ SECTION = "applications"
 LICENSE = "BSD"
 DEPENDS = "readline"
 LIC_FILES_CHKSUM = "\
-		    file://gpio-test.c;md5=a3c16a86984fd87136f24605bccd26fd \
+		    file://gpio-test.c;md5=9aa0845b3afce575a1f2fe5a94210389 \
 		    file://gpio-test.h;md5=c7aaa743b172cf584032f9bfc5e85044 \
 		   "
 
-PR = "r1"
-PV = "1.0"
 
 SRC_URI = "\
 	   file://gpio-test.c \
