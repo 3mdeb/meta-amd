@@ -43,7 +43,7 @@
 #include "gpio-test.h"
 
 #define GPIO_APP_VERSION	"0.2"
-#define AMD_GPIO_NUM_PINS	192
+#define AMD_GPIO_NUM_PINS	256
 static int gpio_in_use[AMD_GPIO_NUM_PINS];
 
 char *show_prompt(void)
@@ -109,41 +109,14 @@ void parse_cmd(const char *cmdline)
 {
 	int fd;
 
-	if ((cmdline == NULL) || (strncmp(cmdline, "exit", 4) == 0)) {
-		int i;
-		int ret;
-		char gpio[3 + 1];
-
-		printf("\nExiting...\n");
-
-		/* We need to unexport all the GPIO pins exported earlier */
-		for (i = 0; i < AMD_GPIO_NUM_PINS; i++) {
-			if (gpio_in_use[i]) {
-				int fd;
-
-				fd = open("/sys/class/gpio/unexport", O_WRONLY);
-				if (fd < 0) {
-					printf("\nPlease make sure AMD GPIO driver is loaded\n");
-					exit(EXIT_FAILURE);
-				}
-				memset(gpio, '\0', (3 + 1));
-				snprintf(gpio, 4, "%d", i);
-
-				ret = write(fd, gpio, strlen(gpio));
-				if (ret < 0)
-					perror("Error writing to /sys/class/gpio/unexport");
-			}
-		}
-
-		exit(EXIT_SUCCESS);
-	} else if (strncmp(cmdline, "help", 4) == 0)
+	if (strncmp(cmdline, "help", 4) == 0)
 		print_usage();
 	else if (strncmp(cmdline, "getnumgpio", 10) == 0) {
 		int fd;
 		char ngpio[3 + 1];
 
 		memset(ngpio, '\0', (3 + 1));
-		fd = open("/sys/class/gpio/gpiochip0/ngpio", O_RDONLY);
+		fd = open("/sys/class/gpio/gpiochip256/ngpio", O_RDONLY);
 		if (fd < 0) {
 			printf("\nPlease make sure AMD GPIO driver is loaded\n");
 			exit(EXIT_FAILURE);
@@ -160,7 +133,7 @@ void parse_cmd(const char *cmdline)
 		char gpiobase[3 + 1];
 
 		memset(gpiobase, '\0', (3 + 1));
-		fd = open("/sys/class/gpio/gpiochip0/base", O_RDONLY);
+		fd = open("/sys/class/gpio/gpiochip256/base", O_RDONLY);
 		if (fd < 0) {
 			printf("\nPlease make sure AMD GPIO driver is loaded\n");
 			exit(EXIT_FAILURE);
@@ -178,7 +151,7 @@ void parse_cmd(const char *cmdline)
 		/* Zero initialize gpioname array */
 		memset(gpioname, '\0', sizeof(gpioname));
 
-		fd = open("/sys/class/gpio/gpiochip0/label", O_RDONLY);
+		fd = open("/sys/class/gpio/gpiochip256/label", O_RDONLY);
 		if (fd < 0) {
 			printf("\nPlease make sure AMD GPIO driver is loaded\n");
 			exit(EXIT_FAILURE);
@@ -192,7 +165,7 @@ void parse_cmd(const char *cmdline)
 	} else if (strncmp(cmdline, "getgpiovalue", 12) == 0) {
 		int fd;
 		int gpio_num;
-		char gpio[4 + 1];
+		char gpio[3 + 1];
 		char pathname[80];
 		int ret = 0;
 
@@ -213,7 +186,7 @@ void parse_cmd(const char *cmdline)
 		}
 
 		memset(gpio, '\0', (3 + 1));
-		if (snprintf(gpio, 3, "%d", gpio_num) < 1) {
+		if (snprintf(gpio, (3 + 1), "%d", gpio_num) < 1) {
 			printf("Invalid inputs, please try again\n");
 			close(fd);
 			return;
@@ -262,7 +235,7 @@ void parse_cmd(const char *cmdline)
 			}
 		} else {
 			if (errno == EINVAL)
-				printf("\nInvalid GPIO number\n");
+				printf("\nGPIO number is reserved\n");
 			else
 				perror("Error exporting GPIO number");
 
@@ -271,7 +244,7 @@ void parse_cmd(const char *cmdline)
 	} else if (strncmp(cmdline, "getgpiomode", 11) == 0) {
 		int fd;
 		int gpio_num;
-		char gpio[4 + 1];
+		char gpio[3 + 1];
 		char pathname[80];
 		int ret = 0;
 
@@ -292,7 +265,7 @@ void parse_cmd(const char *cmdline)
 		}
 
 		memset(gpio, '\0', (3 + 1));
-		if (snprintf(gpio, 3, "%d", gpio_num) < 1) {
+		if (snprintf(gpio, (3 + 1), "%d", gpio_num) < 1) {
 			printf("Invalid inputs, please try again\n");
 			close(fd);
 			return;
@@ -342,7 +315,7 @@ void parse_cmd(const char *cmdline)
 			}
 		} else {
 			if (errno == EINVAL)
-				printf("\nInvalid GPIO number\n");
+				printf("\nGPIO number is reserved \n");
 			else
 				perror("Error exporting GPIO number");
 
@@ -351,18 +324,18 @@ void parse_cmd(const char *cmdline)
 	} else if (strncmp(cmdline, "setgpiomode", 11) == 0) {
 		int fd;
 		int gpio_num;
-		char mode[4 + 1];
+		char mode[3 + 1];
 		char gpio[3 + 1];
 		int ret;
 
-		memset(mode, (4 + 1), 0);
+		memset(mode, (3 + 1), 0);
 		if (sscanf(cmdline, "setgpiomode %d %s", &gpio_num, mode) < 2) {
 			printf("Invalid inputs, please try again\n\n");
 			return;
 		}
 
 		memset(gpio, '\0', (3 + 1));
-		if (snprintf(gpio, 3, "%d", gpio_num) < 1) {
+		if (snprintf(gpio, (3 + 1), "%d", gpio_num) < 1) {
 			printf("Invalid inputs, please try again\n");
 			return;
 		}
@@ -413,7 +386,7 @@ void parse_cmd(const char *cmdline)
 			}
 		} else {
 			if (errno == EINVAL)
-				printf("\nInvalid GPIO number\n");
+				printf("\nGPIO number is reserved\n");
 			else
 				perror("Error exporting GPIO number");
 
@@ -433,7 +406,7 @@ void parse_cmd(const char *cmdline)
 		}
 
 		memset(gpio, '\0', (3 + 1));
-		if (snprintf(gpio, 3, "%d", gpio_num) < 1) {
+		if (snprintf(gpio, (3 + 1), "%d", gpio_num) < 1) {
 			printf("Invalid inputs, please try again\n");
 			return;
 		}
@@ -486,7 +459,7 @@ void parse_cmd(const char *cmdline)
 			}
 		} else {
 			if (errno == EINVAL)
-				printf("\nInvalid GPIO number\n");
+				printf("\nGPIO number is reserved\n");
 			else
 				perror("Error exporting GPIO number");
 
@@ -497,6 +470,27 @@ void parse_cmd(const char *cmdline)
 			perror("Error executing \'dmesg | grep GPIO\'");
 	} else if (strncmp(cmdline, "license", 7) == 0) {
 		show_license();
+	} else if (strncmp(cmdline, "exit", 4) == 0) {
+		int i;
+		int ret;
+		char gpio[3 + 1];
+		printf("\nExiting...\n");
+		for (i = 0; i < AMD_GPIO_NUM_PINS; i++) {
+			if (gpio_in_use[i]) {
+				int fd;
+				fd = open("/sys/class/gpio/unexport", O_WRONLY);
+				if (fd < 0) {
+					printf("\nPlease make sure AMD GPIO driver is loaded\n");
+					exit(EXIT_FAILURE);
+				}
+				memset(gpio, '\0', (3 + 1));
+				snprintf(gpio, (3 + 1), "%d", i);
+				ret = write(fd, gpio, strlen(gpio));
+				if (ret < 0)
+					perror("Error writing to /sys/class/gpio/unexport");
+			}
+		}
+		exit(EXIT_SUCCESS);
 	} else {
 		printf("\nUnknown command\n");
 		print_usage();
