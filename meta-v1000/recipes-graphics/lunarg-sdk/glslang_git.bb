@@ -14,9 +14,8 @@ LIC_FILES_CHKSUM = "file://glslang/Include/Types.h;beginline=1;endline=36;md5=9d
 
 S = "${WORKDIR}/git"
 
-SRCREV = "714e58b2fc5a45714596e6aa2f6ac8f64260365c"
+SRCREV = "91c46c656720a6e1e71a3411cd1f4f792b427b2d"
 SRC_URI = "git://github.com/KhronosGroup/glslang \
-           file://0001-CMakeLists.txt-obey-CMAKE_INSTALL_LIBDIR.patch \
            file://0002-spirv-do-not-install-conflicting-headers.patch"
 
 FILES_${PN} += "${libdir}/*"
