@@ -14,9 +14,8 @@ LIC_FILES_CHKSUM = "file://LICENSE.txt;md5=99c647ca3d4f6a4b9d8628f757aad156"
 
 S = "${WORKDIR}/git"
 
-SRCREV = "d29cb8879f2b48e78302db07bd0b8a4030222da3"
+SRCREV = "a686d52e1be1a40ae13aa7ac467d56f96c087892"
 SRC_URI = "git://github.com/LunarG/VulkanSamples;branch=sdk-${PV} \
-           file://0001-CMakeLists-do-not-deploy-headers-unnecessarily.patch \
            file://0002-install-samples.patch"
 
 EXTRA_OECMAKE = " \
@@ -27,4 +26,5 @@ EXTRA_OECMAKE = " \
     -DBUILD_VKJSON=0 \
     -DBUILD_WSI_MIR_SUPPORT=0 \
     -DBUILD_WSI_WAYLAND_SUPPORT=0 \
+    -DINSTALL_LVL_FILES=0 \
 "

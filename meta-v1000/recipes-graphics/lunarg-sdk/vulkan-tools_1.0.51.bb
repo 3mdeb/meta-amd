@@ -17,17 +17,11 @@ LIC_FILES_CHKSUM = "file://LICENSE.txt;md5=99c647ca3d4f6a4b9d8628f757aad156"
 
 S = "${WORKDIR}/git"
 
-SRCREV = "acc7e724948d0e2389b1fa95d1281be749efab81"
+SRCREV = "4ca219323ca2bb0f092ffa76a580523d787feaba"
 SRC_URI = "git://github.com/LunarG/VulkanTools;branch=sdk-${PV} \
-           file://0001-json-fix-layer-paths.patch \
            file://0002-vktrace-do-not-link-to-internal-loader.patch \
-           file://0003-CMakeLists-do-not-use-hardcoded-source-paths.patch \
            file://0004-CMakeLists-add-include-path-so-Xlib.h-is-found-as-ne.patch \
            file://0005-vktrace_layer-force-linker-flags.patch \
-           file://0006-CMakeList-only-search-for-jsoncpp-when-needed.patch \
-           file://0007-layersvt-obey-CMAKE_INSTALL_LIBDIR.patch \
-           file://0008-CMakeLists-only-deploy-headers-when-needed.patch \
-           file://0009-CMakeLists-add-include-paths-for-xcb-and-Xlib.patch \
 "
 
 EXTRA_OECMAKE = " \
@@ -41,24 +35,12 @@ EXTRA_OECMAKE = " \
     -DBUILD_WSI_WAYLAND_SUPPORT=0 \
     -DBUILD_WSI_MIR_SUPPORT=0 \
     -DBUILD_VIA=0 \
+    -DINSTALL_LVL_FILES=0 \
 "
 PACKAGES =+ "${PN}-layer-libs"
 FILES_${PN}-layer-libs = "${libdir}/libVkLayer_*.so"
 
 INSANE_SKIP_${PN}-layer-libs = "ldflags"
-
-do_install_append() {
-    install -d ${D}${bindir}
-    cp -f ${B}/vktrace/vktrace ${D}${bindir}
-    cp -f ${B}/vktrace/vkreplay ${D}${bindir}
-
-    install -d ${D}${libdir}
-    cp -f ${B}/vktrace/libVkLayer_vktrace_layer.so ${D}${libdir}
-
-    install -d ${D}${sysconfdir}/vulkan/explicit_layer.d
-    cp -f ${S}/layersvt/${HOST_OS}/*.json ${D}${sysconfdir}/vulkan/explicit_layer.d
-    cp -f ${S}/vktrace/vktrace_layer/${HOST_OS}/*.json ${D}${sysconfdir}/vulkan/explicit_layer.d
-}
 
 # Conditional building of vktraceviewer
 QTBITS ?= "${@bb.utils.contains('BBFILE_COLLECTIONS', 'qt5-layer', 'cmake_qt5', '',d)}"
@@ -71,3 +53,4 @@ do_install_append() {
         install ${B}/vktrace/vktraceviewer ${D}${bindir}
     fi
 }
+
