@@ -1,0 +1,143 @@
+From 9cdb2d8f7e3a3ea21a677a8c9160c69dc968ad0b Mon Sep 17 00:00:00 2001
+From: Monk Liu <monk.liu@amd.com>
+Date: Tue, 8 Aug 2017 12:09:07 -0400
+Subject: [PATCH 45/46] amdgpu: merge and cleanup amdgpu_bo_free
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+since bo_reference and bo_internal_free are
+all only used by bo_free, so we just merge them
+together
+
+Change-Id: I01355e7d450b075458b946717d5bddfa0a0c2d3c
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Monk Liu <monk.liu@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ amdgpu/amdgpu_bo.c       | 52 +++++++++++++++++++++++++++---------------------
+ amdgpu/amdgpu_internal.h | 33 ------------------------------
+ 2 files changed, 29 insertions(+), 56 deletions(-)
+
+diff --git a/amdgpu/amdgpu_bo.c b/amdgpu/amdgpu_bo.c
+index 1d90e5e..57aaf97 100644
+--- a/amdgpu/amdgpu_bo.c
++++ b/amdgpu/amdgpu_bo.c
+@@ -54,27 +54,6 @@ static void amdgpu_close_kms_handle(amdgpu_device_handle dev,
+ 	drmIoctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &args);
+ }
+ 
+-drm_private void amdgpu_bo_free_internal(amdgpu_bo_handle bo)
+-{
+-	/* Remove the buffer from the hash tables. */
+-	util_hash_table_remove(bo->dev->bo_handles,
+-			       (void*)(uintptr_t)bo->handle);
+-	if (bo->flink_name) {
+-		util_hash_table_remove(bo->dev->bo_flink_names,
+-				       (void*)(uintptr_t)bo->flink_name);
+-	}
+-
+-	/* Release CPU access. */
+-	if (bo->cpu_map_count > 0) {
+-		bo->cpu_map_count = 1;
+-		amdgpu_bo_cpu_unmap(bo);
+-	}
+-
+-	amdgpu_close_kms_handle(bo->dev, bo->handle);
+-	pthread_mutex_destroy(&bo->cpu_access_mutex);
+-	free(bo);
+-}
+-
+ int amdgpu_bo_alloc(amdgpu_device_handle dev,
+ 		    struct amdgpu_bo_alloc_request *alloc_buffer,
+ 		    amdgpu_bo_handle *buf_handle)
+@@ -623,8 +602,35 @@ int amdgpu_bo_get_phys_address(amdgpu_bo_handle buf_handle,
+ 
+ int amdgpu_bo_free(amdgpu_bo_handle buf_handle)
+ {
+-	/* Just drop the reference. */
+-	amdgpu_bo_reference(&buf_handle, NULL);
++	struct amdgpu_device *dev;
++	struct amdgpu_bo *bo = buf_handle;
++
++	assert(bo != NULL);
++	dev = bo->dev;
++	pthread_mutex_lock(&dev->bo_table_mutex);
++
++	if (update_references(&bo->refcount, NULL)) {
++		/* Remove the buffer from the hash tables. */
++		util_hash_table_remove(dev->bo_handles,
++					(void*)(uintptr_t)bo->handle);
++
++		if (bo->flink_name) {
++			util_hash_table_remove(dev->bo_flink_names,
++						(void*)(uintptr_t)bo->flink_name);
++		}
++
++		/* Release CPU access. */
++		if (bo->cpu_map_count > 0) {
++			bo->cpu_map_count = 1;
++			amdgpu_bo_cpu_unmap(bo);
++		}
++
++		amdgpu_close_kms_handle(dev, bo->handle);
++		pthread_mutex_destroy(&bo->cpu_access_mutex);
++		free(bo);
++	}
++
++	pthread_mutex_unlock(&dev->bo_table_mutex);
+ 	return 0;
+ }
+ 
+diff --git a/amdgpu/amdgpu_internal.h b/amdgpu/amdgpu_internal.h
+index d7a3d50..fd522f3 100644
+--- a/amdgpu/amdgpu_internal.h
++++ b/amdgpu/amdgpu_internal.h
+@@ -161,8 +161,6 @@ struct amdgpu_semaphore {
+  * Functions.
+  */
+ 
+-drm_private void amdgpu_bo_free_internal(amdgpu_bo_handle bo);
+-
+ drm_private void amdgpu_vamgr_init(struct amdgpu_bo_va_mgr *mgr, uint64_t start,
+ 		       uint64_t max, uint64_t alignment);
+ 
+@@ -221,35 +219,4 @@ static inline bool update_references(atomic_t *dst, atomic_t *src)
+ 	return false;
+ }
+ 
+-/**
+- * Assignment between two amdgpu_bo pointers with reference counting.
+- *
+- * Usage:
+- *    struct amdgpu_bo *dst = ... , *src = ...;
+- *
+- *    dst = src;
+- *    // No reference counting. Only use this when you need to move
+- *    // a reference from one pointer to another.
+- *
+- *    amdgpu_bo_reference(&dst, src);
+- *    // Reference counters are updated. dst is decremented and src is
+- *    // incremented. dst is freed if its reference counter is 0.
+- */
+-static inline void amdgpu_bo_reference(struct amdgpu_bo **dst,
+-					struct amdgpu_bo *src)
+-{
+-	pthread_mutex_t *mlock;
+-	struct amdgpu_bo* bo = *dst;
+-
+-	assert(bo != NULL);
+-	mlock = &bo->dev->bo_table_mutex;
+-	pthread_mutex_lock(mlock);
+-
+-	if (update_references(&bo->refcount, src ? &src->refcount : NULL))
+-		amdgpu_bo_free_internal(bo);
+-
+-	pthread_mutex_unlock(mlock);
+-	*dst = src;
+-}
+-
+ #endif
+-- 
+2.7.4
+
