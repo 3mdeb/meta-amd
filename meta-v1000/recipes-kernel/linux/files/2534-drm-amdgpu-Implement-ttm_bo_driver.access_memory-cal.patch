@@ -1,0 +1,222 @@
+From ffb0b6b17fe6a0ea4b804739a74aa8b404fbd412 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Mon, 3 Jul 2017 14:18:27 -0400
+Subject: [PATCH 2534/2831] drm/amdgpu: Implement ttm_bo_driver.access_memory
+ callback v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Allows gdb to access contents of user mode mapped VRAM BOs.
+
+v2: return error for non-VRAM pools
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Michel Dänzer <michel.daenzer@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 62 ++++++++++++++++++++++++++
+ drivers/gpu/drm/ttm/ttm_bo_vm.c         | 77 +++++++++++++++++++++++++++++++++
+ include/drm/ttm/ttm_bo_driver.h         | 17 ++++++++
+ 3 files changed, 156 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 8fb91b8..a211d17 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1195,6 +1195,67 @@ static bool amdgpu_ttm_bo_eviction_valuable(struct ttm_buffer_object *bo,
+ 	return ttm_bo_eviction_valuable(bo, place);
+ }
+ 
++static int amdgpu_ttm_access_memory(struct ttm_buffer_object *bo,
++				    unsigned long offset,
++				    void *buf, int len, int write)
++{
++	struct amdgpu_bo *abo = container_of(bo, struct amdgpu_bo, tbo);
++	struct amdgpu_device *adev = amdgpu_ttm_adev(abo->tbo.bdev);
++	struct drm_mm_node *nodes = abo->tbo.mem.mm_node;
++	uint32_t value = 0;
++	int ret = 0;
++	uint64_t pos;
++	unsigned long flags;
++
++	if (bo->mem.mem_type != TTM_PL_VRAM)
++		return -EIO;
++
++	while (offset >= (nodes->size << PAGE_SHIFT)) {
++		offset -= nodes->size << PAGE_SHIFT;
++		++nodes;
++	}
++	pos = (nodes->start << PAGE_SHIFT) + offset;
++
++	while (len && pos < adev->mc.mc_vram_size) {
++		uint64_t aligned_pos = pos & ~(uint64_t)3;
++		uint32_t bytes = 4 - (pos & 3);
++		uint32_t shift = (pos & 3) * 8;
++		uint32_t mask = 0xffffffff << shift;
++
++		if (len < bytes) {
++			mask &= 0xffffffff >> (bytes - len) * 8;
++			bytes = len;
++		}
++
++		spin_lock_irqsave(&adev->mmio_idx_lock, flags);
++		WREG32(mmMM_INDEX, ((uint32_t)aligned_pos) | 0x80000000);
++		WREG32(mmMM_INDEX_HI, aligned_pos >> 31);
++		if (!write || mask != 0xffffffff)
++			value = RREG32(mmMM_DATA);
++		if (write) {
++			value &= ~mask;
++			value |= (*(uint32_t *)buf << shift) & mask;
++			WREG32(mmMM_DATA, value);
++		}
++		spin_unlock_irqrestore(&adev->mmio_idx_lock, flags);
++		if (!write) {
++			value = (value & mask) >> shift;
++			memcpy(buf, &value, bytes);
++		}
++
++		ret += bytes;
++		buf = (uint8_t *)buf + bytes;
++		pos += bytes;
++		len -= bytes;
++		if (pos >= (nodes->start + nodes->size) << PAGE_SHIFT) {
++			++nodes;
++			pos = (nodes->start << PAGE_SHIFT);
++		}
++	}
++
++	return ret;
++}
++
+ static struct ttm_bo_driver amdgpu_bo_driver = {
+ 	.ttm_tt_create = &amdgpu_ttm_tt_create,
+ 	.ttm_tt_populate = &amdgpu_ttm_tt_populate,
+@@ -1210,6 +1271,7 @@ static struct ttm_bo_driver amdgpu_bo_driver = {
+ 	.io_mem_reserve = &amdgpu_ttm_io_mem_reserve,
+ 	.io_mem_free = &amdgpu_ttm_io_mem_free,
+ 	.io_mem_pfn = amdgpu_ttm_io_mem_pfn,
++	.access_memory = &amdgpu_ttm_access_memory
+ };
+ 
+ #define AMDGPU_DIRECT_GMA_SIZE_MAX 96
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_vm.c b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+index dba2674..8b8299e 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+@@ -294,6 +294,83 @@ static void ttm_bo_vm_close(struct vm_area_struct *vma)
+ 	vma->vm_private_data = NULL;
+ }
+ 
++static int ttm_bo_vm_access_kmap(struct ttm_buffer_object *bo,
++                                 unsigned long offset,
++                                 void *buf, int len, int write)
++{
++        unsigned long page = offset >> PAGE_SHIFT;
++        unsigned long bytes_left = len;
++        int ret;
++
++        /* Copy a page at a time, that way no extra virtual address
++         * mapping is needed
++         */
++        offset -= page << PAGE_SHIFT;
++        do {
++                unsigned long bytes = min(bytes_left, PAGE_SIZE - offset);
++                struct ttm_bo_kmap_obj map;
++                void *ptr;
++                bool is_iomem;
++
++                ret = ttm_bo_kmap(bo, page, 1, &map);
++                if (ret)
++                        return ret;
++
++                ptr = (uint8_t *)ttm_kmap_obj_virtual(&map, &is_iomem) + offset;
++                WARN_ON_ONCE(is_iomem);
++                if (write)
++                        memcpy(ptr, buf, bytes);
++                else
++                        memcpy(buf, ptr, bytes);
++                ttm_bo_kunmap(&map);
++
++                page++;
++                bytes_left -= bytes;
++                offset = 0;
++        } while (bytes_left);
++
++        return len;
++}
++
++static int ttm_bo_vm_access(struct vm_area_struct *vma, unsigned long addr,
++                            void *buf, int len, int write)
++{
++        unsigned long offset = (addr) - vma->vm_start;
++        struct ttm_buffer_object *bo = vma->vm_private_data;
++        int ret;
++
++        if (len < 1 || (offset + len) >> PAGE_SHIFT > bo->num_pages)
++                return -EIO;
++
++        ret = ttm_bo_reserve(bo, true, false, NULL);
++        if (ret)
++                return ret;
++
++        switch (bo->mem.mem_type) {
++        case TTM_PL_SYSTEM:
++                if (unlikely(bo->ttm->page_flags & TTM_PAGE_FLAG_SWAPPED)) {
++                        ret = ttm_tt_swapin(bo->ttm);
++                        if (unlikely(ret != 0))
++                                return ret;
++                }
++                /* fall through */
++        case TTM_PL_TT:
++                ret = ttm_bo_vm_access_kmap(bo, offset, buf, len, write);
++                break;
++        default:
++                if (bo->bdev->driver->access_memory)
++                        ret = bo->bdev->driver->access_memory(
++                                bo, offset, buf, len, write);
++                else
++                        ret = -EIO;
++        }
++
++        ttm_bo_unreserve(bo);
++
++        return ret;
++}
++
++
+ static const struct vm_operations_struct ttm_bo_vm_ops = {
+ 	.fault = ttm_bo_vm_fault,
+ 	.open = ttm_bo_vm_open,
+diff --git a/include/drm/ttm/ttm_bo_driver.h b/include/drm/ttm/ttm_bo_driver.h
+index 9902976..77fdaeb 100644
+--- a/include/drm/ttm/ttm_bo_driver.h
++++ b/include/drm/ttm/ttm_bo_driver.h
+@@ -472,6 +472,23 @@ struct ttm_bo_driver {
+ 	 */
+ 	unsigned long (*io_mem_pfn)(struct ttm_buffer_object *bo,
+ 				    unsigned long page_offset);
++	
++	/**
++	 * Read/write memory buffers for ptrace access
++	 *
++	 * @bo: the BO to access
++	 * @offset: the offset from the start of the BO
++	 * @buf: pointer to source/destination buffer
++	 * @len: number of bytes to copy
++	 * @write: whether to read (0) from or write (non-0) to BO
++	 *
++	 * If successful, this function should return the number of
++	 * bytes copied, -EIO otherwise. If the number of bytes
++	 * returned is < len, the function may be called again with
++	 * the remainder of the buffer to copy.
++	 */
++	int (*access_memory)(struct ttm_buffer_object *bo, unsigned long offset,
++			     void *buf, int len, int write);	
+ };
+ 
+ /**
+-- 
+2.7.4
+

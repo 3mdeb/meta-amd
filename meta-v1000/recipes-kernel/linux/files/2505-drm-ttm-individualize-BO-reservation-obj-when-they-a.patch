@@ -1,0 +1,174 @@
+From baabc3093ca1c384c0e88f79af4a43ca4fd077e4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 20 Jul 2017 20:55:06 +0200
+Subject: [PATCH 2505/2831] drm/ttm: individualize BO reservation obj when they
+ are freed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Use the BOs reservation object when it is put on the ddelete list. This way we
+avoid delaying freeing up the BO because of new fences on the reservation object.
+
+This is used by dma-buf and amdgpu's VM page tables.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/ttm/ttm_bo.c | 55 +++++++++++++++++++++++++++++++++++++-------
+ include/linux/reservation.h  | 34 +++++++++++++++++++++++++++
+ 2 files changed, 81 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index 2b4744e..45fce1e 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -411,14 +411,33 @@ static void ttm_bo_cleanup_memtype_use(struct ttm_buffer_object *bo)
+ 	ww_mutex_unlock (&bo->resv->lock);
+ }
+ 
++static int ttm_bo_individualize_resv(struct ttm_buffer_object *bo)
++{
++	int r;
++
++	if (bo->resv == &bo->ttm_resv)
++		return 0;
++
++	reservation_object_init(&bo->ttm_resv);
++	BUG_ON(reservation_object_lock(&bo->ttm_resv, NULL));
++
++	r = reservation_object_copy_fences(&bo->ttm_resv, bo->resv);
++	if (r) {
++		reservation_object_unlock(&bo->ttm_resv);
++		reservation_object_fini(&bo->ttm_resv);
++	}
++
++	return r;
++}						
++
+ static void ttm_bo_flush_all_fences(struct ttm_buffer_object *bo)
+ {
+ 	struct reservation_object_list *fobj;
+ 	struct fence *fence;
+ 	int i;
+ 
+-	fobj = reservation_object_get_list(bo->resv);
+-	fence = reservation_object_get_excl(bo->resv);
++	fobj = reservation_object_get_list(&bo->ttm_resv);
++	fence = reservation_object_get_excl(&bo->ttm_resv);
+ 	if (fence && !fence->ops->signaled)
+ 		fence_enable_sw_signaling(fence);
+ 
+@@ -451,9 +470,20 @@ static void ttm_bo_cleanup_refs_or_queue(struct ttm_buffer_object *bo)
+ 			ttm_bo_list_ref_sub(bo, put_count, true);
+ 
+ 			return;
+-		} else
+-			ttm_bo_flush_all_fences(bo);
++		}
+ 
++		ret = ttm_bo_individualize_resv(bo);
++		if (ret) {
++			/* Last resort, if we fail to allocate memory for the
++			 * fences block for the BO to become idle and free it.
++			 */
++			spin_unlock(&glob->lru_lock);
++			ttm_bo_wait(bo, true, true);
++			ttm_bo_cleanup_memtype_use(bo);
++			return;
++		}
++		ttm_bo_flush_all_fences(bo);
++ 
+ 		/*
+ 		 * Make NO_EVICT bos immediately available to
+ 		 * shrinkers, now that they are queued for
+@@ -463,7 +493,8 @@ static void ttm_bo_cleanup_refs_or_queue(struct ttm_buffer_object *bo)
+ 			bo->mem.placement &= ~TTM_PL_FLAG_NO_EVICT;
+ 			ttm_bo_add_to_lru(bo);
+ 		}
+-
++		if (bo->resv != &bo->ttm_resv)
++			reservation_object_unlock(&bo->ttm_resv);
+ 		__ttm_bo_unreserve(bo);
+ 	}
+ 
+@@ -492,18 +523,26 @@ static int ttm_bo_cleanup_refs_and_unlock(struct ttm_buffer_object *bo,
+ 					  bool no_wait_gpu)
+ {
+ 	struct ttm_bo_global *glob = bo->glob;
++	struct reservation_object *resv;
+ 	int put_count;
+ 	int ret;
+ 
+-	ret = ttm_bo_wait(bo, false, true);
++	if (unlikely(list_empty(&bo->ddestroy)))
++		resv = bo->resv;
++	else
++		resv = &bo->ttm_resv;
++
++	if (reservation_object_test_signaled_rcu(resv, true))
++		ret = 0;
++	else
++		ret = -EBUSY;
+ 
+ 	if (ret && !no_wait_gpu) {
+ 		long lret;
+ 		ww_mutex_unlock(&bo->resv->lock);
+ 		spin_unlock(&glob->lru_lock);
+ 
+-		lret = reservation_object_wait_timeout_rcu(bo->resv,
+-							   true,
++		lret = reservation_object_wait_timeout_rcu(resv, true,
+ 							   interruptible,
+ 							   30 * HZ);
+ 
+diff --git a/include/linux/reservation.h b/include/linux/reservation.h
+index 6647b0d..30d8a94 100644
+--- a/include/linux/reservation.h
++++ b/include/linux/reservation.h
+@@ -145,6 +145,40 @@ reservation_object_get_list(struct reservation_object *obj)
+ }
+ 
+ /**
++ * reservation_object_lock - lock the reservation object
++ * @obj: the reservation object
++ * @ctx: the locking context
++ *
++ * Locks the reservation object for exclusive access and modification. Note,
++ * that the lock is only against other writers, readers will run concurrently
++ * with a writer under RCU. The seqlock is used to notify readers if they
++ * overlap with a writer.
++ *
++ * As the reservation object may be locked by multiple parties in an
++ * undefined order, a #ww_acquire_ctx is passed to unwind if a cycle
++ * is detected. See ww_mutex_lock() and ww_acquire_init(). A reservation
++ * object may be locked by itself by passing NULL as @ctx.
++ */
++static inline int
++reservation_object_lock(struct reservation_object *obj,
++                        struct ww_acquire_ctx *ctx)
++{
++        return ww_mutex_lock(&obj->lock, ctx);
++}
++
++/**
++ * reservation_object_unlock - unlock the reservation object
++ * @obj: the reservation object
++ *
++ * Unlocks the reservation object following exclusive access.
++ */
++static inline void
++reservation_object_unlock(struct reservation_object *obj)
++{
++        ww_mutex_unlock(&obj->lock);
++}
++
++/**
+  * reservation_object_get_excl - get the reservation object's
+  * exclusive fence, with update-side lock held
+  * @obj: the reservation object
+-- 
+2.7.4
+

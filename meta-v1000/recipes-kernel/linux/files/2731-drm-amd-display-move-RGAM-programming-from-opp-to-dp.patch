@@ -1,0 +1,2147 @@
+From 3081b5c5b6d65405fa08ef780a8ce85743aff469 Mon Sep 17 00:00:00 2001
+From: Yue Hin Lau <Yuehin.Lau@amd.com>
+Date: Sun, 23 Jul 2017 12:13:37 -0400
+Subject: [PATCH 2731/2831] drm/amd/display: move RGAM programming from opp to
+ dpp
+
+Change-Id: Icac2b9268287e2aeee72672aae95935fc45141d0
+Signed-off-by: Yue Hin Lau <Yuehin.Lau@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c   | 432 ++++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h   | 499 ++++++++++++++++++++-
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  |  16 +-
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.c   | 428 ------------------
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.h   | 492 +-------------------
+ drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h  |   7 +
+ drivers/gpu/drm/amd/display/dc/inc/hw/opp.h        |   7 -
+ drivers/gpu/drm/amd/display/dc/inc/hw/transform.h  |  29 ++
+ 8 files changed, 972 insertions(+), 938 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
+index 0f3f1a3..b6aaa95 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
+@@ -1134,6 +1134,431 @@ static void oppn10_set_output_csc_adjustment(
+ 	oppn10_program_color_matrix(xfm, tbl_entry);
+ }
+ 
++static void oppn10_power_on_regamma_lut(
++	struct transform *xfm_base,
++	bool power_on)
++{
++	struct dcn10_dpp *xfm = TO_DCN10_DPP(xfm_base);
++	REG_SET(CM_MEM_PWR_CTRL, 0,
++			RGAM_MEM_PWR_FORCE, power_on == true ? 0:1);
++
++}
++
++static void opp_program_regamma_lut(
++		struct transform *xfm_base,
++		const struct pwl_result_data *rgb,
++		uint32_t num)
++{
++	uint32_t i;
++	struct dcn10_dpp *xfm = TO_DCN10_DPP(xfm_base);
++	for (i = 0 ; i < num; i++) {
++		REG_SET(CM_RGAM_LUT_DATA, 0, CM_RGAM_LUT_DATA, rgb[i].red_reg);
++		REG_SET(CM_RGAM_LUT_DATA, 0, CM_RGAM_LUT_DATA, rgb[i].green_reg);
++		REG_SET(CM_RGAM_LUT_DATA, 0, CM_RGAM_LUT_DATA, rgb[i].blue_reg);
++
++		REG_SET(CM_RGAM_LUT_DATA, 0,
++				CM_RGAM_LUT_DATA, rgb[i].delta_red_reg);
++		REG_SET(CM_RGAM_LUT_DATA, 0,
++				CM_RGAM_LUT_DATA, rgb[i].delta_green_reg);
++		REG_SET(CM_RGAM_LUT_DATA, 0,
++				CM_RGAM_LUT_DATA, rgb[i].delta_blue_reg);
++
++	}
++
++}
++
++static void opp_configure_regamma_lut(
++		struct transform *xfm_base,
++		bool is_ram_a)
++{
++	struct dcn10_dpp *xfm = TO_DCN10_DPP(xfm_base);
++
++	REG_UPDATE(CM_RGAM_LUT_WRITE_EN_MASK,
++			CM_RGAM_LUT_WRITE_EN_MASK, 7);
++	REG_UPDATE(CM_RGAM_LUT_WRITE_EN_MASK,
++			CM_RGAM_LUT_WRITE_SEL, is_ram_a == true ? 0:1);
++	REG_SET(CM_RGAM_LUT_INDEX, 0, CM_RGAM_LUT_INDEX, 0);
++}
++
++/*program re gamma RAM A*/
++static void opp_program_regamma_luta_settings(
++		struct transform *xfm_base,
++		const struct pwl_params *params)
++{
++	const struct gamma_curve *curve;
++	struct dcn10_dpp *xfm = TO_DCN10_DPP(xfm_base);
++
++	REG_SET_2(CM_RGAM_RAMA_START_CNTL_B, 0,
++		CM_RGAM_RAMA_EXP_REGION_START_B, params->arr_points[0].custom_float_x,
++		CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_B, 0);
++	REG_SET_2(CM_RGAM_RAMA_START_CNTL_G, 0,
++		CM_RGAM_RAMA_EXP_REGION_START_G, params->arr_points[0].custom_float_x,
++		CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_G, 0);
++	REG_SET_2(CM_RGAM_RAMA_START_CNTL_R, 0,
++		CM_RGAM_RAMA_EXP_REGION_START_R, params->arr_points[0].custom_float_x,
++		CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_R, 0);
++
++	REG_SET(CM_RGAM_RAMA_SLOPE_CNTL_B, 0,
++		CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_B, params->arr_points[0].custom_float_slope);
++	REG_SET(CM_RGAM_RAMA_SLOPE_CNTL_G, 0,
++		CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_G, params->arr_points[0].custom_float_slope);
++	REG_SET(CM_RGAM_RAMA_SLOPE_CNTL_R, 0,
++		CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_R, params->arr_points[0].custom_float_slope);
++
++	REG_SET(CM_RGAM_RAMA_END_CNTL1_B, 0,
++		CM_RGAM_RAMA_EXP_REGION_END_B, params->arr_points[1].custom_float_x);
++	REG_SET_2(CM_RGAM_RAMA_END_CNTL2_B, 0,
++		CM_RGAM_RAMA_EXP_REGION_END_SLOPE_B, params->arr_points[1].custom_float_slope,
++		CM_RGAM_RAMA_EXP_REGION_END_BASE_B, params->arr_points[1].custom_float_y);
++
++	REG_SET(CM_RGAM_RAMA_END_CNTL1_G, 0,
++		CM_RGAM_RAMA_EXP_REGION_END_G, params->arr_points[1].custom_float_x);
++	REG_SET_2(CM_RGAM_RAMA_END_CNTL2_G, 0,
++		CM_RGAM_RAMA_EXP_REGION_END_SLOPE_G, params->arr_points[1].custom_float_slope,
++		CM_RGAM_RAMA_EXP_REGION_END_BASE_G, params->arr_points[1].custom_float_y);
++
++	REG_SET(CM_RGAM_RAMA_END_CNTL1_R, 0,
++		CM_RGAM_RAMA_EXP_REGION_END_R, params->arr_points[1].custom_float_x);
++	REG_SET_2(CM_RGAM_RAMA_END_CNTL2_R, 0,
++		CM_RGAM_RAMA_EXP_REGION_END_SLOPE_R, params->arr_points[1].custom_float_slope,
++		CM_RGAM_RAMA_EXP_REGION_END_BASE_R, params->arr_points[1].custom_float_y);
++
++	curve = params->arr_curve_points;
++	REG_SET_4(CM_RGAM_RAMA_REGION_0_1, 0,
++		CM_RGAM_RAMA_EXP_REGION0_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION0_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION1_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION1_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_2_3, 0,
++		CM_RGAM_RAMA_EXP_REGION2_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION2_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION3_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION3_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_4_5, 0,
++		CM_RGAM_RAMA_EXP_REGION4_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION4_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION5_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION5_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_6_7, 0,
++		CM_RGAM_RAMA_EXP_REGION6_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION6_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION7_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION7_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_8_9, 0,
++		CM_RGAM_RAMA_EXP_REGION8_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION8_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION9_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION9_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_10_11, 0,
++		CM_RGAM_RAMA_EXP_REGION10_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION10_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION11_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION11_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_12_13, 0,
++		CM_RGAM_RAMA_EXP_REGION12_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION12_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION13_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION13_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_14_15, 0,
++		CM_RGAM_RAMA_EXP_REGION14_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION14_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION15_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION15_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_16_17, 0,
++		CM_RGAM_RAMA_EXP_REGION16_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION16_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION17_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION17_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_18_19, 0,
++		CM_RGAM_RAMA_EXP_REGION18_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION18_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION19_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION19_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_20_21, 0,
++		CM_RGAM_RAMA_EXP_REGION20_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION20_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION21_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION21_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_22_23, 0,
++		CM_RGAM_RAMA_EXP_REGION22_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION22_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION23_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION23_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_24_25, 0,
++		CM_RGAM_RAMA_EXP_REGION24_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION24_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION25_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION25_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_26_27, 0,
++		CM_RGAM_RAMA_EXP_REGION26_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION26_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION27_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION27_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_28_29, 0,
++		CM_RGAM_RAMA_EXP_REGION28_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION28_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION29_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION29_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_30_31, 0,
++		CM_RGAM_RAMA_EXP_REGION30_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION30_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION31_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION31_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMA_REGION_32_33, 0,
++		CM_RGAM_RAMA_EXP_REGION32_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMA_EXP_REGION32_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMA_EXP_REGION33_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMA_EXP_REGION33_NUM_SEGMENTS, curve[1].segments_num);
++}
++
++/*program re gamma RAM B*/
++static void opp_program_regamma_lutb_settings(
++		struct transform *xfm_base,
++		const struct pwl_params *params)
++{
++	const struct gamma_curve *curve;
++	struct dcn10_dpp *xfm = TO_DCN10_DPP(xfm_base);
++
++	REG_SET_2(CM_RGAM_RAMB_START_CNTL_B, 0,
++		CM_RGAM_RAMB_EXP_REGION_START_B, params->arr_points[0].custom_float_x,
++		CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_B, 0);
++	REG_SET_2(CM_RGAM_RAMB_START_CNTL_G, 0,
++		CM_RGAM_RAMB_EXP_REGION_START_G, params->arr_points[0].custom_float_x,
++		CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_G, 0);
++	REG_SET_2(CM_RGAM_RAMB_START_CNTL_R, 0,
++		CM_RGAM_RAMB_EXP_REGION_START_R, params->arr_points[0].custom_float_x,
++		CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_R, 0);
++
++	REG_SET(CM_RGAM_RAMB_SLOPE_CNTL_B, 0,
++		CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_B, params->arr_points[0].custom_float_slope);
++	REG_SET(CM_RGAM_RAMB_SLOPE_CNTL_G, 0,
++		CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_G, params->arr_points[0].custom_float_slope);
++	REG_SET(CM_RGAM_RAMB_SLOPE_CNTL_R, 0,
++		CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_R, params->arr_points[0].custom_float_slope);
++
++	REG_SET(CM_RGAM_RAMB_END_CNTL1_B, 0,
++		CM_RGAM_RAMB_EXP_REGION_END_B, params->arr_points[1].custom_float_x);
++	REG_SET_2(CM_RGAM_RAMB_END_CNTL2_B, 0,
++		CM_RGAM_RAMB_EXP_REGION_END_SLOPE_B, params->arr_points[1].custom_float_slope,
++		CM_RGAM_RAMB_EXP_REGION_END_BASE_B, params->arr_points[1].custom_float_y);
++
++	REG_SET(CM_RGAM_RAMB_END_CNTL1_G, 0,
++		CM_RGAM_RAMB_EXP_REGION_END_G, params->arr_points[1].custom_float_x);
++	REG_SET_2(CM_RGAM_RAMB_END_CNTL2_G, 0,
++		CM_RGAM_RAMB_EXP_REGION_END_SLOPE_G, params->arr_points[1].custom_float_slope,
++		CM_RGAM_RAMB_EXP_REGION_END_BASE_G, params->arr_points[1].custom_float_y);
++
++	REG_SET(CM_RGAM_RAMB_END_CNTL1_R, 0,
++		CM_RGAM_RAMB_EXP_REGION_END_R, params->arr_points[1].custom_float_x);
++	REG_SET_2(CM_RGAM_RAMB_END_CNTL2_R, 0,
++		CM_RGAM_RAMB_EXP_REGION_END_SLOPE_R, params->arr_points[1].custom_float_slope,
++		CM_RGAM_RAMB_EXP_REGION_END_BASE_R, params->arr_points[1].custom_float_y);
++
++	curve = params->arr_curve_points;
++	REG_SET_4(CM_RGAM_RAMB_REGION_0_1, 0,
++		CM_RGAM_RAMB_EXP_REGION0_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION0_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION1_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION1_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_2_3, 0,
++		CM_RGAM_RAMB_EXP_REGION2_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION2_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION3_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION3_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_4_5, 0,
++		CM_RGAM_RAMB_EXP_REGION4_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION4_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION5_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION5_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_6_7, 0,
++		CM_RGAM_RAMB_EXP_REGION6_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION6_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION7_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION7_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_8_9, 0,
++		CM_RGAM_RAMB_EXP_REGION8_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION8_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION9_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION9_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_10_11, 0,
++		CM_RGAM_RAMB_EXP_REGION10_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION10_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION11_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION11_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_12_13, 0,
++		CM_RGAM_RAMB_EXP_REGION12_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION12_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION13_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION13_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_14_15, 0,
++		CM_RGAM_RAMB_EXP_REGION14_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION14_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION15_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION15_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_16_17, 0,
++		CM_RGAM_RAMB_EXP_REGION16_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION16_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION17_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION17_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_18_19, 0,
++		CM_RGAM_RAMB_EXP_REGION18_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION18_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION19_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION19_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_20_21, 0,
++		CM_RGAM_RAMB_EXP_REGION20_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION20_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION21_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION21_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_22_23, 0,
++		CM_RGAM_RAMB_EXP_REGION22_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION22_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION23_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION23_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_24_25, 0,
++		CM_RGAM_RAMB_EXP_REGION24_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION24_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION25_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION25_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_26_27, 0,
++		CM_RGAM_RAMB_EXP_REGION26_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION26_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION27_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION27_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_28_29, 0,
++		CM_RGAM_RAMB_EXP_REGION28_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION28_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION29_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION29_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_30_31, 0,
++		CM_RGAM_RAMB_EXP_REGION30_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION30_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION31_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION31_NUM_SEGMENTS, curve[1].segments_num);
++
++	curve += 2;
++	REG_SET_4(CM_RGAM_RAMB_REGION_32_33, 0,
++		CM_RGAM_RAMB_EXP_REGION32_LUT_OFFSET, curve[0].offset,
++		CM_RGAM_RAMB_EXP_REGION32_NUM_SEGMENTS, curve[0].segments_num,
++		CM_RGAM_RAMB_EXP_REGION33_LUT_OFFSET, curve[1].offset,
++		CM_RGAM_RAMB_EXP_REGION33_NUM_SEGMENTS, curve[1].segments_num);
++
++}
++
++static bool oppn10_set_regamma_pwl(
++	struct transform *xfm_base, const struct pwl_params *params)
++{
++	struct dcn10_dpp *xfm = TO_DCN10_DPP(xfm_base);
++
++	oppn10_power_on_regamma_lut(xfm_base, true);
++	opp_configure_regamma_lut(xfm_base, xfm->is_write_to_ram_a_safe);
++
++	if (xfm->is_write_to_ram_a_safe)
++		opp_program_regamma_luta_settings(xfm_base, params);
++	else
++		opp_program_regamma_lutb_settings(xfm_base, params);
++
++	opp_program_regamma_lut(
++			xfm_base, params->rgb_resulted, params->hw_points_num);
++
++	return true;
++}
++
++static void oppn10_set_regamma_mode(
++	struct transform *xfm_base,
++	enum opp_regamma mode)
++{
++	struct dcn10_dpp *xfm = TO_DCN10_DPP(xfm_base);
++	uint32_t re_mode = 0;
++	uint32_t obuf_bypass = 0; /* need for pipe split */
++	uint32_t obuf_hupscale = 0;
++
++	switch (mode) {
++	case OPP_REGAMMA_BYPASS:
++		re_mode = 0;
++		break;
++	case OPP_REGAMMA_SRGB:
++		re_mode = 1;
++		break;
++	case OPP_REGAMMA_3_6:
++		re_mode = 2;
++		break;
++	case OPP_REGAMMA_USER:
++		re_mode = xfm->is_write_to_ram_a_safe ? 3 : 4;
++		xfm->is_write_to_ram_a_safe = !xfm->is_write_to_ram_a_safe;
++		break;
++	default:
++		break;
++	}
++
++	REG_SET(CM_RGAM_CONTROL, 0, CM_RGAM_LUT_MODE, re_mode);
++	REG_UPDATE_2(OBUF_CONTROL,
++			OBUF_BYPASS, obuf_bypass,
++			OBUF_H_2X_UPSCALE_EN, obuf_hupscale);
++}
++
+ static struct transform_funcs dcn10_dpp_funcs = {
+ 		.transform_reset = dpp_reset,
+ 		.transform_set_scaler = dpp_set_scaler_manual_scale,
+@@ -1141,6 +1566,13 @@ static struct transform_funcs dcn10_dpp_funcs = {
+ 		.transform_set_gamut_remap = dcn_dpp_set_gamut_remap,
+ 		.opp_set_csc_adjustment = oppn10_set_output_csc_adjustment,
+ 		.opp_set_csc_default = oppn10_set_output_csc_default,
++		.opp_power_on_regamma_lut = oppn10_power_on_regamma_lut,
++		.opp_program_regamma_lut = opp_program_regamma_lut,
++		.opp_configure_regamma_lut = opp_configure_regamma_lut,
++		.opp_program_regamma_lutb_settings = opp_program_regamma_lutb_settings,
++		.opp_program_regamma_luta_settings = opp_program_regamma_luta_settings,
++		.opp_program_regamma_pwl = oppn10_set_regamma_pwl,
++		.opp_set_regamma_mode = oppn10_set_regamma_mode
+ };
+ 
+ /*****************************************/
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
+index 693060e..34085c0 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
+@@ -71,7 +71,8 @@
+ 	SRI(SCL_VERT_FILTER_INIT_C, DSCL, id), \
+ 	SRI(SCL_VERT_FILTER_INIT_BOT_C, DSCL, id), \
+ 	SRI(RECOUT_START, DSCL, id), \
+-	SRI(RECOUT_SIZE, DSCL, id)
++	SRI(RECOUT_SIZE, DSCL, id), \
++	SRI(OBUF_CONTROL, DSCL, id)
+ 
+ #define TF_REG_LIST_DCN10(id) \
+ 	TF_REG_LIST_DCN(id), \
+@@ -93,7 +94,70 @@
+ 	SRI(CM_OCSC_C21_C22, CM, id), \
+ 	SRI(CM_OCSC_C23_C24, CM, id), \
+ 	SRI(CM_OCSC_C31_C32, CM, id), \
+-	SRI(CM_OCSC_C33_C34, CM, id)
++	SRI(CM_OCSC_C33_C34, CM, id), \
++	SRI(CM_MEM_PWR_CTRL, CM, id), \
++	SRI(CM_RGAM_LUT_DATA, CM, id), \
++	SRI(CM_RGAM_LUT_WRITE_EN_MASK, CM, id),\
++	SRI(CM_RGAM_LUT_INDEX, CM, id), \
++	SRI(CM_RGAM_RAMB_START_CNTL_B, CM, id), \
++	SRI(CM_RGAM_RAMB_START_CNTL_G, CM, id), \
++	SRI(CM_RGAM_RAMB_START_CNTL_R, CM, id), \
++	SRI(CM_RGAM_RAMB_SLOPE_CNTL_B, CM, id), \
++	SRI(CM_RGAM_RAMB_SLOPE_CNTL_G, CM, id), \
++	SRI(CM_RGAM_RAMB_SLOPE_CNTL_R, CM, id), \
++	SRI(CM_RGAM_RAMB_END_CNTL1_B, CM, id), \
++	SRI(CM_RGAM_RAMB_END_CNTL2_B, CM, id), \
++	SRI(CM_RGAM_RAMB_END_CNTL1_G, CM, id), \
++	SRI(CM_RGAM_RAMB_END_CNTL2_G, CM, id), \
++	SRI(CM_RGAM_RAMB_END_CNTL1_R, CM, id), \
++	SRI(CM_RGAM_RAMB_END_CNTL2_R, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_0_1, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_2_3, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_4_5, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_6_7, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_8_9, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_10_11, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_12_13, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_14_15, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_16_17, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_18_19, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_20_21, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_22_23, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_24_25, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_26_27, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_28_29, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_30_31, CM, id), \
++	SRI(CM_RGAM_RAMB_REGION_32_33, CM, id), \
++	SRI(CM_RGAM_RAMA_START_CNTL_B, CM, id), \
++	SRI(CM_RGAM_RAMA_START_CNTL_G, CM, id), \
++	SRI(CM_RGAM_RAMA_START_CNTL_R, CM, id), \
++	SRI(CM_RGAM_RAMA_SLOPE_CNTL_B, CM, id), \
++	SRI(CM_RGAM_RAMA_SLOPE_CNTL_G, CM, id), \
++	SRI(CM_RGAM_RAMA_SLOPE_CNTL_R, CM, id), \
++	SRI(CM_RGAM_RAMA_END_CNTL1_B, CM, id), \
++	SRI(CM_RGAM_RAMA_END_CNTL2_B, CM, id), \
++	SRI(CM_RGAM_RAMA_END_CNTL1_G, CM, id), \
++	SRI(CM_RGAM_RAMA_END_CNTL2_G, CM, id), \
++	SRI(CM_RGAM_RAMA_END_CNTL1_R, CM, id), \
++	SRI(CM_RGAM_RAMA_END_CNTL2_R, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_0_1, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_2_3, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_4_5, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_6_7, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_8_9, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_10_11, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_12_13, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_14_15, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_16_17, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_18_19, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_20_21, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_22_23, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_24_25, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_26_27, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_28_29, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_30_31, CM, id), \
++	SRI(CM_RGAM_RAMA_REGION_32_33, CM, id), \
++	SRI(CM_RGAM_CONTROL, CM, id)
+ 
+ #define TF_REG_LIST_SH_MASK_DCN(mask_sh)\
+ 	TF_SF(CM0_CM_GAMUT_REMAP_CONTROL, CM_GAMUT_REMAP_MODE, mask_sh),\
+@@ -169,7 +233,8 @@
+ 	TF_SF(DSCL0_SCL_VERT_FILTER_INIT_BOT_C, SCL_V_INIT_FRAC_BOT_C, mask_sh),\
+ 	TF_SF(DSCL0_SCL_VERT_FILTER_INIT_BOT_C, SCL_V_INIT_INT_BOT_C, mask_sh),\
+ 	TF_SF(DSCL0_SCL_MODE, SCL_CHROMA_COEF_MODE, mask_sh),\
+-	TF_SF(DSCL0_SCL_MODE, SCL_COEF_RAM_SELECT_CURRENT, mask_sh)
++	TF_SF(DSCL0_SCL_MODE, SCL_COEF_RAM_SELECT_CURRENT, mask_sh), \
++	TF_SF(DSCL0_OBUF_CONTROL, OBUF_BYPASS, mask_sh)
+ 
+ #define TF_REG_LIST_SH_MASK_DCN10(mask_sh)\
+ 	TF_REG_LIST_SH_MASK_DCN(mask_sh),\
+@@ -214,7 +279,186 @@
+ 	TF_SF(CM0_CM_OCSC_C31_C32, CM_OCSC_C31, mask_sh), \
+ 	TF_SF(CM0_CM_OCSC_C31_C32, CM_OCSC_C32, mask_sh), \
+ 	TF_SF(CM0_CM_OCSC_C33_C34, CM_OCSC_C33, mask_sh), \
+-	TF_SF(CM0_CM_OCSC_C33_C34, CM_OCSC_C34, mask_sh)
++	TF_SF(CM0_CM_OCSC_C33_C34, CM_OCSC_C34, mask_sh), \
++	TF_SF(CM0_CM_MEM_PWR_CTRL, RGAM_MEM_PWR_FORCE, mask_sh), \
++	TF_SF(CM0_CM_RGAM_LUT_DATA, CM_RGAM_LUT_DATA, mask_sh), \
++	TF_SF(CM0_CM_RGAM_LUT_WRITE_EN_MASK, CM_RGAM_LUT_WRITE_EN_MASK, mask_sh), \
++	TF_SF(CM0_CM_RGAM_LUT_WRITE_EN_MASK, CM_RGAM_LUT_WRITE_SEL, mask_sh), \
++	TF_SF(CM0_CM_RGAM_LUT_INDEX, CM_RGAM_LUT_INDEX, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_START_CNTL_B, CM_RGAM_RAMB_EXP_REGION_START_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_START_CNTL_B, CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_START_CNTL_G, CM_RGAM_RAMB_EXP_REGION_START_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_START_CNTL_G, CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_START_CNTL_R, CM_RGAM_RAMB_EXP_REGION_START_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_START_CNTL_R, CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_SLOPE_CNTL_B, CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_SLOPE_CNTL_G, CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_SLOPE_CNTL_R, CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL1_B, CM_RGAM_RAMB_EXP_REGION_END_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL2_B, CM_RGAM_RAMB_EXP_REGION_END_SLOPE_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL2_B, CM_RGAM_RAMB_EXP_REGION_END_BASE_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL1_G, CM_RGAM_RAMB_EXP_REGION_END_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL2_G, CM_RGAM_RAMB_EXP_REGION_END_SLOPE_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL2_G, CM_RGAM_RAMB_EXP_REGION_END_BASE_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL1_R, CM_RGAM_RAMB_EXP_REGION_END_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL2_R, CM_RGAM_RAMB_EXP_REGION_END_SLOPE_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL2_R, CM_RGAM_RAMB_EXP_REGION_END_BASE_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_0_1, CM_RGAM_RAMB_EXP_REGION0_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_0_1, CM_RGAM_RAMB_EXP_REGION0_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_0_1, CM_RGAM_RAMB_EXP_REGION1_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_0_1, CM_RGAM_RAMB_EXP_REGION1_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_2_3, CM_RGAM_RAMB_EXP_REGION2_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_2_3, CM_RGAM_RAMB_EXP_REGION2_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_2_3, CM_RGAM_RAMB_EXP_REGION3_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_2_3, CM_RGAM_RAMB_EXP_REGION3_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_4_5, CM_RGAM_RAMB_EXP_REGION4_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_4_5, CM_RGAM_RAMB_EXP_REGION4_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_4_5, CM_RGAM_RAMB_EXP_REGION5_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_4_5, CM_RGAM_RAMB_EXP_REGION5_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_6_7, CM_RGAM_RAMB_EXP_REGION6_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_6_7, CM_RGAM_RAMB_EXP_REGION6_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_6_7, CM_RGAM_RAMB_EXP_REGION7_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_6_7, CM_RGAM_RAMB_EXP_REGION7_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_8_9, CM_RGAM_RAMB_EXP_REGION8_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_8_9, CM_RGAM_RAMB_EXP_REGION8_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_8_9, CM_RGAM_RAMB_EXP_REGION9_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_8_9, CM_RGAM_RAMB_EXP_REGION9_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_10_11, CM_RGAM_RAMB_EXP_REGION10_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_10_11, CM_RGAM_RAMB_EXP_REGION10_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_10_11, CM_RGAM_RAMB_EXP_REGION11_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_10_11, CM_RGAM_RAMB_EXP_REGION11_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_12_13, CM_RGAM_RAMB_EXP_REGION12_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_12_13, CM_RGAM_RAMB_EXP_REGION12_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_12_13, CM_RGAM_RAMB_EXP_REGION13_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_12_13, CM_RGAM_RAMB_EXP_REGION13_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_14_15, CM_RGAM_RAMB_EXP_REGION14_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_14_15, CM_RGAM_RAMB_EXP_REGION14_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_14_15, CM_RGAM_RAMB_EXP_REGION15_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_14_15, CM_RGAM_RAMB_EXP_REGION15_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_16_17, CM_RGAM_RAMB_EXP_REGION16_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_16_17, CM_RGAM_RAMB_EXP_REGION16_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_16_17, CM_RGAM_RAMB_EXP_REGION17_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_16_17, CM_RGAM_RAMB_EXP_REGION17_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_18_19, CM_RGAM_RAMB_EXP_REGION18_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_18_19, CM_RGAM_RAMB_EXP_REGION18_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_18_19, CM_RGAM_RAMB_EXP_REGION19_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_18_19, CM_RGAM_RAMB_EXP_REGION19_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_20_21, CM_RGAM_RAMB_EXP_REGION20_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_20_21, CM_RGAM_RAMB_EXP_REGION20_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_20_21, CM_RGAM_RAMB_EXP_REGION21_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_20_21, CM_RGAM_RAMB_EXP_REGION21_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_22_23, CM_RGAM_RAMB_EXP_REGION22_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_22_23, CM_RGAM_RAMB_EXP_REGION22_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_22_23, CM_RGAM_RAMB_EXP_REGION23_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_22_23, CM_RGAM_RAMB_EXP_REGION23_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_24_25, CM_RGAM_RAMB_EXP_REGION24_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_24_25, CM_RGAM_RAMB_EXP_REGION24_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_24_25, CM_RGAM_RAMB_EXP_REGION25_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_24_25, CM_RGAM_RAMB_EXP_REGION25_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_26_27, CM_RGAM_RAMB_EXP_REGION26_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_26_27, CM_RGAM_RAMB_EXP_REGION26_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_26_27, CM_RGAM_RAMB_EXP_REGION27_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_26_27, CM_RGAM_RAMB_EXP_REGION27_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_28_29, CM_RGAM_RAMB_EXP_REGION28_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_28_29, CM_RGAM_RAMB_EXP_REGION28_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_28_29, CM_RGAM_RAMB_EXP_REGION29_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_28_29, CM_RGAM_RAMB_EXP_REGION29_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_30_31, CM_RGAM_RAMB_EXP_REGION30_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_30_31, CM_RGAM_RAMB_EXP_REGION30_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_30_31, CM_RGAM_RAMB_EXP_REGION31_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_30_31, CM_RGAM_RAMB_EXP_REGION31_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_32_33, CM_RGAM_RAMB_EXP_REGION32_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_32_33, CM_RGAM_RAMB_EXP_REGION32_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_32_33, CM_RGAM_RAMB_EXP_REGION33_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_REGION_32_33, CM_RGAM_RAMB_EXP_REGION33_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_START_CNTL_B, CM_RGAM_RAMA_EXP_REGION_START_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_START_CNTL_B, CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_START_CNTL_G, CM_RGAM_RAMA_EXP_REGION_START_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_START_CNTL_G, CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_START_CNTL_R, CM_RGAM_RAMA_EXP_REGION_START_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_START_CNTL_R, CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_SLOPE_CNTL_B, CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_SLOPE_CNTL_G, CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_SLOPE_CNTL_R, CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_END_CNTL1_B, CM_RGAM_RAMA_EXP_REGION_END_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_END_CNTL2_B, CM_RGAM_RAMA_EXP_REGION_END_SLOPE_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_END_CNTL2_B, CM_RGAM_RAMA_EXP_REGION_END_BASE_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_END_CNTL1_G, CM_RGAM_RAMA_EXP_REGION_END_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_END_CNTL2_G, CM_RGAM_RAMA_EXP_REGION_END_SLOPE_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_END_CNTL2_G, CM_RGAM_RAMA_EXP_REGION_END_BASE_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_END_CNTL1_R, CM_RGAM_RAMA_EXP_REGION_END_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_END_CNTL2_R, CM_RGAM_RAMA_EXP_REGION_END_SLOPE_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_END_CNTL2_R, CM_RGAM_RAMA_EXP_REGION_END_BASE_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_0_1, CM_RGAM_RAMA_EXP_REGION0_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_0_1, CM_RGAM_RAMA_EXP_REGION0_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_0_1, CM_RGAM_RAMA_EXP_REGION1_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_0_1, CM_RGAM_RAMA_EXP_REGION1_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_2_3, CM_RGAM_RAMA_EXP_REGION2_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_2_3, CM_RGAM_RAMA_EXP_REGION2_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_2_3, CM_RGAM_RAMA_EXP_REGION3_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_2_3, CM_RGAM_RAMA_EXP_REGION3_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_4_5, CM_RGAM_RAMA_EXP_REGION4_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_4_5, CM_RGAM_RAMA_EXP_REGION4_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_4_5, CM_RGAM_RAMA_EXP_REGION5_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_4_5, CM_RGAM_RAMA_EXP_REGION5_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_6_7, CM_RGAM_RAMA_EXP_REGION6_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_6_7, CM_RGAM_RAMA_EXP_REGION6_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_6_7, CM_RGAM_RAMA_EXP_REGION7_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_6_7, CM_RGAM_RAMA_EXP_REGION7_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_8_9, CM_RGAM_RAMA_EXP_REGION8_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_8_9, CM_RGAM_RAMA_EXP_REGION8_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_8_9, CM_RGAM_RAMA_EXP_REGION9_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_8_9, CM_RGAM_RAMA_EXP_REGION9_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_10_11, CM_RGAM_RAMA_EXP_REGION10_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_10_11, CM_RGAM_RAMA_EXP_REGION10_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_10_11, CM_RGAM_RAMA_EXP_REGION11_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_10_11, CM_RGAM_RAMA_EXP_REGION11_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_12_13, CM_RGAM_RAMA_EXP_REGION12_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_12_13, CM_RGAM_RAMA_EXP_REGION12_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_12_13, CM_RGAM_RAMA_EXP_REGION13_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_12_13, CM_RGAM_RAMA_EXP_REGION13_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_14_15, CM_RGAM_RAMA_EXP_REGION14_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_14_15, CM_RGAM_RAMA_EXP_REGION14_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_14_15, CM_RGAM_RAMA_EXP_REGION15_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_14_15, CM_RGAM_RAMA_EXP_REGION15_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_16_17, CM_RGAM_RAMA_EXP_REGION16_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_16_17, CM_RGAM_RAMA_EXP_REGION16_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_16_17, CM_RGAM_RAMA_EXP_REGION17_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_16_17, CM_RGAM_RAMA_EXP_REGION17_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_18_19, CM_RGAM_RAMA_EXP_REGION18_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_18_19, CM_RGAM_RAMA_EXP_REGION18_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_18_19, CM_RGAM_RAMA_EXP_REGION19_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_18_19, CM_RGAM_RAMA_EXP_REGION19_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_20_21, CM_RGAM_RAMA_EXP_REGION20_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_20_21, CM_RGAM_RAMA_EXP_REGION20_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_20_21, CM_RGAM_RAMA_EXP_REGION21_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_20_21, CM_RGAM_RAMA_EXP_REGION21_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_22_23, CM_RGAM_RAMA_EXP_REGION22_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_22_23, CM_RGAM_RAMA_EXP_REGION22_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_22_23, CM_RGAM_RAMA_EXP_REGION23_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_22_23, CM_RGAM_RAMA_EXP_REGION23_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_24_25, CM_RGAM_RAMA_EXP_REGION24_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_24_25, CM_RGAM_RAMA_EXP_REGION24_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_24_25, CM_RGAM_RAMA_EXP_REGION25_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_24_25, CM_RGAM_RAMA_EXP_REGION25_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_26_27, CM_RGAM_RAMA_EXP_REGION26_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_26_27, CM_RGAM_RAMA_EXP_REGION26_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_26_27, CM_RGAM_RAMA_EXP_REGION27_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_26_27, CM_RGAM_RAMA_EXP_REGION27_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_28_29, CM_RGAM_RAMA_EXP_REGION28_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_28_29, CM_RGAM_RAMA_EXP_REGION28_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_28_29, CM_RGAM_RAMA_EXP_REGION29_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_28_29, CM_RGAM_RAMA_EXP_REGION29_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_30_31, CM_RGAM_RAMA_EXP_REGION30_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_30_31, CM_RGAM_RAMA_EXP_REGION30_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_30_31, CM_RGAM_RAMA_EXP_REGION31_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_30_31, CM_RGAM_RAMA_EXP_REGION31_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_32_33, CM_RGAM_RAMA_EXP_REGION32_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_32_33, CM_RGAM_RAMA_EXP_REGION32_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_32_33, CM_RGAM_RAMA_EXP_REGION33_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMA_REGION_32_33, CM_RGAM_RAMA_EXP_REGION33_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_RGAM_CONTROL, CM_RGAM_LUT_MODE, mask_sh), \
++	TF_SF(DSCL0_OBUF_CONTROL, OBUF_H_2X_UPSCALE_EN, mask_sh)
+ 
+ 
+ #define TF_REG_FIELD_LIST(type) \
+@@ -333,7 +577,187 @@
+ 	type CM_OCSC_C31; \
+ 	type CM_OCSC_C32; \
+ 	type CM_OCSC_C33; \
+-	type CM_OCSC_C34
++	type CM_OCSC_C34; \
++	type RGAM_MEM_PWR_FORCE; \
++	type CM_RGAM_LUT_DATA; \
++	type CM_RGAM_LUT_WRITE_EN_MASK; \
++	type CM_RGAM_LUT_WRITE_SEL; \
++	type CM_RGAM_LUT_INDEX; \
++	type CM_RGAM_RAMB_EXP_REGION_START_B; \
++	type CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_B; \
++	type CM_RGAM_RAMB_EXP_REGION_START_G; \
++	type CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_G; \
++	type CM_RGAM_RAMB_EXP_REGION_START_R; \
++	type CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_R; \
++	type CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_B; \
++	type CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_G; \
++	type CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_R; \
++	type CM_RGAM_RAMB_EXP_REGION_END_B; \
++	type CM_RGAM_RAMB_EXP_REGION_END_SLOPE_B; \
++	type CM_RGAM_RAMB_EXP_REGION_END_BASE_B; \
++	type CM_RGAM_RAMB_EXP_REGION_END_G; \
++	type CM_RGAM_RAMB_EXP_REGION_END_SLOPE_G; \
++	type CM_RGAM_RAMB_EXP_REGION_END_BASE_G; \
++	type CM_RGAM_RAMB_EXP_REGION_END_R; \
++	type CM_RGAM_RAMB_EXP_REGION_END_SLOPE_R; \
++	type CM_RGAM_RAMB_EXP_REGION_END_BASE_R; \
++	type CM_RGAM_RAMB_EXP_REGION0_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION0_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION1_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION1_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION2_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION2_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION3_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION3_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION4_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION4_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION5_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION5_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION6_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION6_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION7_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION7_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION8_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION8_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION9_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION9_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION10_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION10_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION11_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION11_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION12_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION12_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION13_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION13_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION14_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION14_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION15_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION15_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION16_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION16_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION17_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION17_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION18_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION18_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION19_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION19_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION20_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION20_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION21_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION21_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION22_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION22_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION23_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION23_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION24_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION24_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION25_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION25_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION26_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION26_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION27_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION27_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION28_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION28_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION29_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION29_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION30_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION30_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION31_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION31_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION32_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION32_NUM_SEGMENTS; \
++	type CM_RGAM_RAMB_EXP_REGION33_LUT_OFFSET; \
++	type CM_RGAM_RAMB_EXP_REGION33_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION_START_B; \
++	type CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_B; \
++	type CM_RGAM_RAMA_EXP_REGION_START_G; \
++	type CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_G; \
++	type CM_RGAM_RAMA_EXP_REGION_START_R; \
++	type CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_R; \
++	type CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_B; \
++	type CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_G; \
++	type CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_R; \
++	type CM_RGAM_RAMA_EXP_REGION_END_B; \
++	type CM_RGAM_RAMA_EXP_REGION_END_SLOPE_B; \
++	type CM_RGAM_RAMA_EXP_REGION_END_BASE_B; \
++	type CM_RGAM_RAMA_EXP_REGION_END_G; \
++	type CM_RGAM_RAMA_EXP_REGION_END_SLOPE_G; \
++	type CM_RGAM_RAMA_EXP_REGION_END_BASE_G; \
++	type CM_RGAM_RAMA_EXP_REGION_END_R; \
++	type CM_RGAM_RAMA_EXP_REGION_END_SLOPE_R; \
++	type CM_RGAM_RAMA_EXP_REGION_END_BASE_R; \
++	type CM_RGAM_RAMA_EXP_REGION0_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION0_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION1_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION1_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION2_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION2_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION3_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION3_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION4_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION4_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION5_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION5_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION6_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION6_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION7_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION7_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION8_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION8_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION9_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION9_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION10_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION10_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION11_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION11_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION12_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION12_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION13_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION13_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION14_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION14_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION15_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION15_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION16_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION16_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION17_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION17_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION18_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION18_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION19_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION19_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION20_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION20_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION21_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION21_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION22_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION22_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION23_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION23_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION24_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION24_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION25_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION25_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION26_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION26_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION27_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION27_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION28_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION28_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION29_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION29_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION30_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION30_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION31_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION31_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION32_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION32_NUM_SEGMENTS; \
++	type CM_RGAM_RAMA_EXP_REGION33_LUT_OFFSET; \
++	type CM_RGAM_RAMA_EXP_REGION33_NUM_SEGMENTS; \
++	type CM_RGAM_LUT_MODE; \
++	type OBUF_BYPASS; \
++	type OBUF_H_2X_UPSCALE_EN
+ 
+ struct dcn_dpp_shift {
+ 	TF_REG_FIELD_LIST(uint8_t);
+@@ -397,6 +821,70 @@ struct dcn_dpp_registers {
+ 	uint32_t CM_OCSC_C23_C24;
+ 	uint32_t CM_OCSC_C31_C32;
+ 	uint32_t CM_OCSC_C33_C34;
++	uint32_t CM_MEM_PWR_CTRL;
++	uint32_t CM_RGAM_LUT_DATA;
++	uint32_t CM_RGAM_LUT_WRITE_EN_MASK;
++	uint32_t CM_RGAM_LUT_INDEX;
++	uint32_t CM_RGAM_RAMB_START_CNTL_B;
++	uint32_t CM_RGAM_RAMB_START_CNTL_G;
++	uint32_t CM_RGAM_RAMB_START_CNTL_R;
++	uint32_t CM_RGAM_RAMB_SLOPE_CNTL_B;
++	uint32_t CM_RGAM_RAMB_SLOPE_CNTL_G;
++	uint32_t CM_RGAM_RAMB_SLOPE_CNTL_R;
++	uint32_t CM_RGAM_RAMB_END_CNTL1_B;
++	uint32_t CM_RGAM_RAMB_END_CNTL2_B;
++	uint32_t CM_RGAM_RAMB_END_CNTL1_G;
++	uint32_t CM_RGAM_RAMB_END_CNTL2_G;
++	uint32_t CM_RGAM_RAMB_END_CNTL1_R;
++	uint32_t CM_RGAM_RAMB_END_CNTL2_R;
++	uint32_t CM_RGAM_RAMB_REGION_0_1;
++	uint32_t CM_RGAM_RAMB_REGION_2_3;
++	uint32_t CM_RGAM_RAMB_REGION_4_5;
++	uint32_t CM_RGAM_RAMB_REGION_6_7;
++	uint32_t CM_RGAM_RAMB_REGION_8_9;
++	uint32_t CM_RGAM_RAMB_REGION_10_11;
++	uint32_t CM_RGAM_RAMB_REGION_12_13;
++	uint32_t CM_RGAM_RAMB_REGION_14_15;
++	uint32_t CM_RGAM_RAMB_REGION_16_17;
++	uint32_t CM_RGAM_RAMB_REGION_18_19;
++	uint32_t CM_RGAM_RAMB_REGION_20_21;
++	uint32_t CM_RGAM_RAMB_REGION_22_23;
++	uint32_t CM_RGAM_RAMB_REGION_24_25;
++	uint32_t CM_RGAM_RAMB_REGION_26_27;
++	uint32_t CM_RGAM_RAMB_REGION_28_29;
++	uint32_t CM_RGAM_RAMB_REGION_30_31;
++	uint32_t CM_RGAM_RAMB_REGION_32_33;
++	uint32_t CM_RGAM_RAMA_START_CNTL_B;
++	uint32_t CM_RGAM_RAMA_START_CNTL_G;
++	uint32_t CM_RGAM_RAMA_START_CNTL_R;
++	uint32_t CM_RGAM_RAMA_SLOPE_CNTL_B;
++	uint32_t CM_RGAM_RAMA_SLOPE_CNTL_G;
++	uint32_t CM_RGAM_RAMA_SLOPE_CNTL_R;
++	uint32_t CM_RGAM_RAMA_END_CNTL1_B;
++	uint32_t CM_RGAM_RAMA_END_CNTL2_B;
++	uint32_t CM_RGAM_RAMA_END_CNTL1_G;
++	uint32_t CM_RGAM_RAMA_END_CNTL2_G;
++	uint32_t CM_RGAM_RAMA_END_CNTL1_R;
++	uint32_t CM_RGAM_RAMA_END_CNTL2_R;
++	uint32_t CM_RGAM_RAMA_REGION_0_1;
++	uint32_t CM_RGAM_RAMA_REGION_2_3;
++	uint32_t CM_RGAM_RAMA_REGION_4_5;
++	uint32_t CM_RGAM_RAMA_REGION_6_7;
++	uint32_t CM_RGAM_RAMA_REGION_8_9;
++	uint32_t CM_RGAM_RAMA_REGION_10_11;
++	uint32_t CM_RGAM_RAMA_REGION_12_13;
++	uint32_t CM_RGAM_RAMA_REGION_14_15;
++	uint32_t CM_RGAM_RAMA_REGION_16_17;
++	uint32_t CM_RGAM_RAMA_REGION_18_19;
++	uint32_t CM_RGAM_RAMA_REGION_20_21;
++	uint32_t CM_RGAM_RAMA_REGION_22_23;
++	uint32_t CM_RGAM_RAMA_REGION_24_25;
++	uint32_t CM_RGAM_RAMA_REGION_26_27;
++	uint32_t CM_RGAM_RAMA_REGION_28_29;
++	uint32_t CM_RGAM_RAMA_REGION_30_31;
++	uint32_t CM_RGAM_RAMA_REGION_32_33;
++	uint32_t CM_RGAM_CONTROL;
++	uint32_t OBUF_CONTROL;
+ };
+ 
+ struct dcn10_dpp {
+@@ -413,6 +901,7 @@ struct dcn10_dpp {
+ 	int lb_pixel_depth_supported;
+ 	int lb_memory_size;
+ 	int lb_bits_per_entry;
++	bool is_write_to_ram_a_safe;
+ };
+ bool dcn10_dpp_construct(struct dcn10_dpp *xfm110,
+ 	struct dc_context *ctx,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 4cbca15..d61b63d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -1054,25 +1054,25 @@ static bool dcn10_set_output_transfer_func(
+ 	struct pipe_ctx *pipe_ctx,
+ 	const struct core_stream *stream)
+ {
+-	struct output_pixel_processor *opp = pipe_ctx->opp;
++	struct transform *xfm = pipe_ctx->xfm;
+ 
+-	if (opp == NULL)
++	if (xfm == NULL)
+ 		return false;
+ 
+-	opp->regamma_params.hw_points_num = GAMMA_HW_POINTS_NUM;
++	xfm->regamma_params.hw_points_num = GAMMA_HW_POINTS_NUM;
+ 
+ 	if (stream->public.out_transfer_func &&
+ 		stream->public.out_transfer_func->type ==
+ 			TF_TYPE_PREDEFINED &&
+ 		stream->public.out_transfer_func->tf ==
+ 			TRANSFER_FUNCTION_SRGB) {
+-		opp->funcs->opp_set_regamma_mode(opp, OPP_REGAMMA_SRGB);
++		xfm->funcs->opp_set_regamma_mode(xfm, OPP_REGAMMA_SRGB);
+ 	} else if (dcn10_translate_regamma_to_hw_format(
+-				stream->public.out_transfer_func, &opp->regamma_params)) {
+-			opp->funcs->opp_program_regamma_pwl(opp, &opp->regamma_params);
+-			opp->funcs->opp_set_regamma_mode(opp, OPP_REGAMMA_USER);
++				stream->public.out_transfer_func, &xfm->regamma_params)) {
++			xfm->funcs->opp_program_regamma_pwl(xfm, &xfm->regamma_params);
++			xfm->funcs->opp_set_regamma_mode(xfm, OPP_REGAMMA_USER);
+ 	} else {
+-		opp->funcs->opp_set_regamma_mode(opp, OPP_REGAMMA_BYPASS);
++		xfm->funcs->opp_set_regamma_mode(xfm, OPP_REGAMMA_BYPASS);
+ 	}
+ 
+ 	return true;
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.c
+index 5cf985e..f8e4724 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.c
+@@ -37,38 +37,7 @@
+ #define CTX \
+ 	oppn10->base.ctx
+ 
+-static void oppn10_set_regamma_mode(
+-	struct output_pixel_processor *opp,
+-	enum opp_regamma mode)
+-{
+-	struct dcn10_opp *oppn10 = TO_DCN10_OPP(opp);
+-	uint32_t re_mode = 0;
+-	uint32_t obuf_bypass = 0; /* need for pipe split */
+-	uint32_t obuf_hupscale = 0;
+-
+-	switch (mode) {
+-	case OPP_REGAMMA_BYPASS:
+-		re_mode = 0;
+-		break;
+-	case OPP_REGAMMA_SRGB:
+-		re_mode = 1;
+-		break;
+-	case OPP_REGAMMA_3_6:
+-		re_mode = 2;
+-		break;
+-	case OPP_REGAMMA_USER:
+-		re_mode = oppn10->is_write_to_ram_a_safe ? 3 : 4;
+-		oppn10->is_write_to_ram_a_safe = !oppn10->is_write_to_ram_a_safe;
+-		break;
+-	default:
+-		break;
+-	}
+ 
+-	REG_SET(CM_RGAM_CONTROL, 0, CM_RGAM_LUT_MODE, re_mode);
+-	REG_UPDATE_2(OBUF_CONTROL,
+-			OBUF_BYPASS, obuf_bypass,
+-			OBUF_H_2X_UPSCALE_EN, obuf_hupscale);
+-}
+ 
+ /************* FORMATTER ************/
+ 
+@@ -328,400 +297,6 @@ static void oppn10_program_fmt(
+ }
+ 
+ 
+-/*program re gamma RAM B*/
+-static void opp_program_regamma_lutb_settings(
+-		struct output_pixel_processor *opp,
+-		const struct pwl_params *params)
+-{
+-	const struct gamma_curve *curve;
+-	struct dcn10_opp *oppn10 = TO_DCN10_OPP(opp);
+-
+-	REG_SET_2(CM_RGAM_RAMB_START_CNTL_B, 0,
+-		CM_RGAM_RAMB_EXP_REGION_START_B, params->arr_points[0].custom_float_x,
+-		CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_B, 0);
+-	REG_SET_2(CM_RGAM_RAMB_START_CNTL_G, 0,
+-		CM_RGAM_RAMB_EXP_REGION_START_G, params->arr_points[0].custom_float_x,
+-		CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_G, 0);
+-	REG_SET_2(CM_RGAM_RAMB_START_CNTL_R, 0,
+-		CM_RGAM_RAMB_EXP_REGION_START_R, params->arr_points[0].custom_float_x,
+-		CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_R, 0);
+-
+-	REG_SET(CM_RGAM_RAMB_SLOPE_CNTL_B, 0,
+-		CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_B, params->arr_points[0].custom_float_slope);
+-	REG_SET(CM_RGAM_RAMB_SLOPE_CNTL_G, 0,
+-		CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_G, params->arr_points[0].custom_float_slope);
+-	REG_SET(CM_RGAM_RAMB_SLOPE_CNTL_R, 0,
+-		CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_R, params->arr_points[0].custom_float_slope);
+-
+-	REG_SET(CM_RGAM_RAMB_END_CNTL1_B, 0,
+-		CM_RGAM_RAMB_EXP_REGION_END_B, params->arr_points[1].custom_float_x);
+-	REG_SET_2(CM_RGAM_RAMB_END_CNTL2_B, 0,
+-		CM_RGAM_RAMB_EXP_REGION_END_SLOPE_B, params->arr_points[1].custom_float_slope,
+-		CM_RGAM_RAMB_EXP_REGION_END_BASE_B, params->arr_points[1].custom_float_y);
+-
+-	REG_SET(CM_RGAM_RAMB_END_CNTL1_G, 0,
+-		CM_RGAM_RAMB_EXP_REGION_END_G, params->arr_points[1].custom_float_x);
+-	REG_SET_2(CM_RGAM_RAMB_END_CNTL2_G, 0,
+-		CM_RGAM_RAMB_EXP_REGION_END_SLOPE_G, params->arr_points[1].custom_float_slope,
+-		CM_RGAM_RAMB_EXP_REGION_END_BASE_G, params->arr_points[1].custom_float_y);
+-
+-	REG_SET(CM_RGAM_RAMB_END_CNTL1_R, 0,
+-		CM_RGAM_RAMB_EXP_REGION_END_R, params->arr_points[1].custom_float_x);
+-	REG_SET_2(CM_RGAM_RAMB_END_CNTL2_R, 0,
+-		CM_RGAM_RAMB_EXP_REGION_END_SLOPE_R, params->arr_points[1].custom_float_slope,
+-		CM_RGAM_RAMB_EXP_REGION_END_BASE_R, params->arr_points[1].custom_float_y);
+-
+-	curve = params->arr_curve_points;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_0_1, 0,
+-		CM_RGAM_RAMB_EXP_REGION0_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION0_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION1_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION1_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_2_3, 0,
+-		CM_RGAM_RAMB_EXP_REGION2_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION2_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION3_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION3_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_4_5, 0,
+-		CM_RGAM_RAMB_EXP_REGION4_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION4_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION5_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION5_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_6_7, 0,
+-		CM_RGAM_RAMB_EXP_REGION6_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION6_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION7_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION7_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_8_9, 0,
+-		CM_RGAM_RAMB_EXP_REGION8_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION8_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION9_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION9_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_10_11, 0,
+-		CM_RGAM_RAMB_EXP_REGION10_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION10_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION11_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION11_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_12_13, 0,
+-		CM_RGAM_RAMB_EXP_REGION12_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION12_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION13_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION13_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_14_15, 0,
+-		CM_RGAM_RAMB_EXP_REGION14_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION14_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION15_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION15_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_16_17, 0,
+-		CM_RGAM_RAMB_EXP_REGION16_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION16_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION17_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION17_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_18_19, 0,
+-		CM_RGAM_RAMB_EXP_REGION18_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION18_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION19_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION19_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_20_21, 0,
+-		CM_RGAM_RAMB_EXP_REGION20_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION20_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION21_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION21_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_22_23, 0,
+-		CM_RGAM_RAMB_EXP_REGION22_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION22_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION23_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION23_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_24_25, 0,
+-		CM_RGAM_RAMB_EXP_REGION24_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION24_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION25_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION25_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_26_27, 0,
+-		CM_RGAM_RAMB_EXP_REGION26_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION26_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION27_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION27_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_28_29, 0,
+-		CM_RGAM_RAMB_EXP_REGION28_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION28_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION29_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION29_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_30_31, 0,
+-		CM_RGAM_RAMB_EXP_REGION30_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION30_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION31_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION31_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMB_REGION_32_33, 0,
+-		CM_RGAM_RAMB_EXP_REGION32_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMB_EXP_REGION32_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMB_EXP_REGION33_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMB_EXP_REGION33_NUM_SEGMENTS, curve[1].segments_num);
+-
+-}
+-
+-/*program re gamma RAM A*/
+-static void opp_program_regamma_luta_settings(
+-		struct output_pixel_processor *opp,
+-		const struct pwl_params *params)
+-{
+-	const struct gamma_curve *curve;
+-	struct dcn10_opp *oppn10 = TO_DCN10_OPP(opp);
+-
+-	REG_SET_2(CM_RGAM_RAMA_START_CNTL_B, 0,
+-		CM_RGAM_RAMA_EXP_REGION_START_B, params->arr_points[0].custom_float_x,
+-		CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_B, 0);
+-	REG_SET_2(CM_RGAM_RAMA_START_CNTL_G, 0,
+-		CM_RGAM_RAMA_EXP_REGION_START_G, params->arr_points[0].custom_float_x,
+-		CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_G, 0);
+-	REG_SET_2(CM_RGAM_RAMA_START_CNTL_R, 0,
+-		CM_RGAM_RAMA_EXP_REGION_START_R, params->arr_points[0].custom_float_x,
+-		CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_R, 0);
+-
+-	REG_SET(CM_RGAM_RAMA_SLOPE_CNTL_B, 0,
+-		CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_B, params->arr_points[0].custom_float_slope);
+-	REG_SET(CM_RGAM_RAMA_SLOPE_CNTL_G, 0,
+-		CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_G, params->arr_points[0].custom_float_slope);
+-	REG_SET(CM_RGAM_RAMA_SLOPE_CNTL_R, 0,
+-		CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_R, params->arr_points[0].custom_float_slope);
+-
+-	REG_SET(CM_RGAM_RAMA_END_CNTL1_B, 0,
+-		CM_RGAM_RAMA_EXP_REGION_END_B, params->arr_points[1].custom_float_x);
+-	REG_SET_2(CM_RGAM_RAMA_END_CNTL2_B, 0,
+-		CM_RGAM_RAMA_EXP_REGION_END_SLOPE_B, params->arr_points[1].custom_float_slope,
+-		CM_RGAM_RAMA_EXP_REGION_END_BASE_B, params->arr_points[1].custom_float_y);
+-
+-	REG_SET(CM_RGAM_RAMA_END_CNTL1_G, 0,
+-		CM_RGAM_RAMA_EXP_REGION_END_G, params->arr_points[1].custom_float_x);
+-	REG_SET_2(CM_RGAM_RAMA_END_CNTL2_G, 0,
+-		CM_RGAM_RAMA_EXP_REGION_END_SLOPE_G, params->arr_points[1].custom_float_slope,
+-		CM_RGAM_RAMA_EXP_REGION_END_BASE_G, params->arr_points[1].custom_float_y);
+-
+-	REG_SET(CM_RGAM_RAMA_END_CNTL1_R, 0,
+-		CM_RGAM_RAMA_EXP_REGION_END_R, params->arr_points[1].custom_float_x);
+-	REG_SET_2(CM_RGAM_RAMA_END_CNTL2_R, 0,
+-		CM_RGAM_RAMA_EXP_REGION_END_SLOPE_R, params->arr_points[1].custom_float_slope,
+-		CM_RGAM_RAMA_EXP_REGION_END_BASE_R, params->arr_points[1].custom_float_y);
+-
+-	curve = params->arr_curve_points;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_0_1, 0,
+-		CM_RGAM_RAMA_EXP_REGION0_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION0_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION1_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION1_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_2_3, 0,
+-		CM_RGAM_RAMA_EXP_REGION2_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION2_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION3_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION3_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_4_5, 0,
+-		CM_RGAM_RAMA_EXP_REGION4_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION4_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION5_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION5_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_6_7, 0,
+-		CM_RGAM_RAMA_EXP_REGION6_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION6_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION7_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION7_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_8_9, 0,
+-		CM_RGAM_RAMA_EXP_REGION8_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION8_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION9_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION9_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_10_11, 0,
+-		CM_RGAM_RAMA_EXP_REGION10_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION10_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION11_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION11_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_12_13, 0,
+-		CM_RGAM_RAMA_EXP_REGION12_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION12_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION13_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION13_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_14_15, 0,
+-		CM_RGAM_RAMA_EXP_REGION14_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION14_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION15_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION15_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_16_17, 0,
+-		CM_RGAM_RAMA_EXP_REGION16_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION16_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION17_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION17_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_18_19, 0,
+-		CM_RGAM_RAMA_EXP_REGION18_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION18_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION19_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION19_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_20_21, 0,
+-		CM_RGAM_RAMA_EXP_REGION20_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION20_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION21_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION21_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_22_23, 0,
+-		CM_RGAM_RAMA_EXP_REGION22_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION22_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION23_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION23_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_24_25, 0,
+-		CM_RGAM_RAMA_EXP_REGION24_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION24_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION25_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION25_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_26_27, 0,
+-		CM_RGAM_RAMA_EXP_REGION26_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION26_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION27_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION27_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_28_29, 0,
+-		CM_RGAM_RAMA_EXP_REGION28_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION28_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION29_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION29_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_30_31, 0,
+-		CM_RGAM_RAMA_EXP_REGION30_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION30_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION31_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION31_NUM_SEGMENTS, curve[1].segments_num);
+-
+-	curve += 2;
+-	REG_SET_4(CM_RGAM_RAMA_REGION_32_33, 0,
+-		CM_RGAM_RAMA_EXP_REGION32_LUT_OFFSET, curve[0].offset,
+-		CM_RGAM_RAMA_EXP_REGION32_NUM_SEGMENTS, curve[0].segments_num,
+-		CM_RGAM_RAMA_EXP_REGION33_LUT_OFFSET, curve[1].offset,
+-		CM_RGAM_RAMA_EXP_REGION33_NUM_SEGMENTS, curve[1].segments_num);
+-}
+-
+-static void opp_configure_regamma_lut(
+-		struct output_pixel_processor *opp,
+-		bool is_ram_a)
+-{
+-	struct dcn10_opp *oppn10 = TO_DCN10_OPP(opp);
+-
+-	REG_UPDATE(CM_RGAM_LUT_WRITE_EN_MASK,
+-			CM_RGAM_LUT_WRITE_EN_MASK, 7);
+-	REG_UPDATE(CM_RGAM_LUT_WRITE_EN_MASK,
+-			CM_RGAM_LUT_WRITE_SEL, is_ram_a == true ? 0:1);
+-	REG_SET(CM_RGAM_LUT_INDEX, 0, CM_RGAM_LUT_INDEX, 0);
+-}
+-
+-static void oppn10_power_on_regamma_lut(
+-	struct output_pixel_processor *opp,
+-	bool power_on)
+-{
+-	struct dcn10_opp *oppn10 = TO_DCN10_OPP(opp);
+-	REG_SET(CM_MEM_PWR_CTRL, 0,
+-			RGAM_MEM_PWR_FORCE, power_on == true ? 0:1);
+-
+-}
+-
+-
+-
+-
+-static void opp_program_regamma_lut(
+-		struct output_pixel_processor *opp,
+-		const struct pwl_result_data *rgb,
+-		uint32_t num)
+-{
+-	uint32_t i;
+-	struct dcn10_opp *oppn10 = TO_DCN10_OPP(opp);
+-	for (i = 0 ; i < num; i++) {
+-		REG_SET(CM_RGAM_LUT_DATA, 0, CM_RGAM_LUT_DATA, rgb[i].red_reg);
+-		REG_SET(CM_RGAM_LUT_DATA, 0, CM_RGAM_LUT_DATA, rgb[i].green_reg);
+-		REG_SET(CM_RGAM_LUT_DATA, 0, CM_RGAM_LUT_DATA, rgb[i].blue_reg);
+-
+-		REG_SET(CM_RGAM_LUT_DATA, 0,
+-				CM_RGAM_LUT_DATA, rgb[i].delta_red_reg);
+-		REG_SET(CM_RGAM_LUT_DATA, 0,
+-				CM_RGAM_LUT_DATA, rgb[i].delta_green_reg);
+-		REG_SET(CM_RGAM_LUT_DATA, 0,
+-				CM_RGAM_LUT_DATA, rgb[i].delta_blue_reg);
+-
+-	}
+-
+-}
+-
+-static bool oppn10_set_regamma_pwl(
+-	struct output_pixel_processor *opp, const struct pwl_params *params)
+-{
+-	struct dcn10_opp *oppn10 = TO_DCN10_OPP(opp);
+-
+-	oppn10_power_on_regamma_lut(opp, true);
+-	opp_configure_regamma_lut(opp, oppn10->is_write_to_ram_a_safe);
+-
+-	if (oppn10->is_write_to_ram_a_safe)
+-		opp_program_regamma_luta_settings(opp, params);
+-	else
+-		opp_program_regamma_lutb_settings(opp, params);
+-
+-	opp_program_regamma_lut(
+-		opp, params->rgb_resulted, params->hw_points_num);
+-
+-	return true;
+-}
+ 
+ static void oppn10_set_stereo_polarity(
+ 		struct output_pixel_processor *opp,
+@@ -743,10 +318,7 @@ static void dcn10_opp_destroy(struct output_pixel_processor **opp)
+ }
+ 
+ static struct opp_funcs dcn10_opp_funcs = {
+-		.opp_power_on_regamma_lut = oppn10_power_on_regamma_lut,
+ 		.opp_set_dyn_expansion = oppn10_set_dyn_expansion,
+-		.opp_program_regamma_pwl = oppn10_set_regamma_pwl,
+-		.opp_set_regamma_mode = oppn10_set_regamma_mode,
+ 		.opp_program_fmt = oppn10_program_fmt,
+ 		.opp_program_bit_depth_reduction = oppn10_program_bit_depth_reduction,
+ 		.opp_set_stereo_polarity = oppn10_set_stereo_polarity,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.h b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.h
+index 900298d..790ce60 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.h
+@@ -34,7 +34,6 @@
+ 	.field_name = reg_name ## __ ## field_name ## post_fix
+ 
+ #define OPP_REG_LIST_DCN(id) \
+-	SRI(OBUF_CONTROL, DSCL, id), \
+ 	SRI(FMT_BIT_DEPTH_CONTROL, FMT, id), \
+ 	SRI(FMT_CONTROL, FMT, id), \
+ 	SRI(FMT_DITHER_RAND_R_SEED, FMT, id), \
+@@ -45,73 +44,9 @@
+ 	SRI(FMT_MAP420_MEMORY_CONTROL, FMT, id)
+ 
+ #define OPP_REG_LIST_DCN10(id) \
+-	OPP_REG_LIST_DCN(id), \
+-	SRI(CM_RGAM_LUT_WRITE_EN_MASK, CM, id), \
+-	SRI(CM_RGAM_CONTROL, CM, id), \
+-	SRI(CM_RGAM_RAMB_START_CNTL_B, CM, id), \
+-	SRI(CM_RGAM_RAMB_START_CNTL_G, CM, id), \
+-	SRI(CM_RGAM_RAMB_START_CNTL_R, CM, id), \
+-	SRI(CM_RGAM_RAMB_SLOPE_CNTL_B, CM, id), \
+-	SRI(CM_RGAM_RAMB_SLOPE_CNTL_G, CM, id), \
+-	SRI(CM_RGAM_RAMB_SLOPE_CNTL_R, CM, id), \
+-	SRI(CM_RGAM_RAMB_END_CNTL1_B, CM, id), \
+-	SRI(CM_RGAM_RAMB_END_CNTL2_B, CM, id), \
+-	SRI(CM_RGAM_RAMB_END_CNTL1_G, CM, id), \
+-	SRI(CM_RGAM_RAMB_END_CNTL2_G, CM, id), \
+-	SRI(CM_RGAM_RAMB_END_CNTL1_R, CM, id), \
+-	SRI(CM_RGAM_RAMB_END_CNTL2_R, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_0_1, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_2_3, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_4_5, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_6_7, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_8_9, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_10_11, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_12_13, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_14_15, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_16_17, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_18_19, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_20_21, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_22_23, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_24_25, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_26_27, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_28_29, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_30_31, CM, id), \
+-	SRI(CM_RGAM_RAMB_REGION_32_33, CM, id), \
+-	SRI(CM_RGAM_RAMA_START_CNTL_B, CM, id), \
+-	SRI(CM_RGAM_RAMA_START_CNTL_G, CM, id), \
+-	SRI(CM_RGAM_RAMA_START_CNTL_R, CM, id), \
+-	SRI(CM_RGAM_RAMA_SLOPE_CNTL_B, CM, id), \
+-	SRI(CM_RGAM_RAMA_SLOPE_CNTL_G, CM, id), \
+-	SRI(CM_RGAM_RAMA_SLOPE_CNTL_R, CM, id), \
+-	SRI(CM_RGAM_RAMA_END_CNTL1_B, CM, id), \
+-	SRI(CM_RGAM_RAMA_END_CNTL2_B, CM, id), \
+-	SRI(CM_RGAM_RAMA_END_CNTL1_G, CM, id), \
+-	SRI(CM_RGAM_RAMA_END_CNTL2_G, CM, id), \
+-	SRI(CM_RGAM_RAMA_END_CNTL1_R, CM, id), \
+-	SRI(CM_RGAM_RAMA_END_CNTL2_R, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_0_1, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_2_3, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_4_5, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_6_7, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_8_9, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_10_11, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_12_13, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_14_15, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_16_17, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_18_19, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_20_21, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_22_23, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_24_25, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_26_27, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_28_29, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_30_31, CM, id), \
+-	SRI(CM_RGAM_RAMA_REGION_32_33, CM, id), \
+-	SRI(CM_RGAM_LUT_INDEX, CM, id), \
+-	SRI(CM_MEM_PWR_CTRL, CM, id), \
+-	SRI(CM_RGAM_LUT_DATA, CM, id)
++	OPP_REG_LIST_DCN(id)
+ 
+ #define OPP_MASK_SH_LIST_DCN(mask_sh) \
+-	OPP_SF(DSCL0_OBUF_CONTROL, OBUF_BYPASS, mask_sh), \
+ 	OPP_SF(FMT0_FMT_BIT_DEPTH_CONTROL, FMT_TRUNCATE_EN, mask_sh), \
+ 	OPP_SF(FMT0_FMT_BIT_DEPTH_CONTROL, FMT_TRUNCATE_DEPTH, mask_sh), \
+ 	OPP_SF(FMT0_FMT_BIT_DEPTH_CONTROL, FMT_TRUNCATE_MODE, mask_sh), \
+@@ -136,186 +71,7 @@
+ 	OPP_SF(FMT0_FMT_MAP420_MEMORY_CONTROL, FMT_MAP420MEM_PWR_FORCE, mask_sh)
+ 
+ #define OPP_MASK_SH_LIST_DCN10(mask_sh) \
+-	OPP_MASK_SH_LIST_DCN(mask_sh), \
+-	OPP_SF(DSCL0_OBUF_CONTROL, OBUF_H_2X_UPSCALE_EN, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_CONTROL, CM_RGAM_LUT_MODE, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_START_CNTL_B, CM_RGAM_RAMB_EXP_REGION_START_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_START_CNTL_B, CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_START_CNTL_G, CM_RGAM_RAMB_EXP_REGION_START_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_START_CNTL_G, CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_START_CNTL_R, CM_RGAM_RAMB_EXP_REGION_START_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_START_CNTL_R, CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_SLOPE_CNTL_B, CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_SLOPE_CNTL_G, CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_SLOPE_CNTL_R, CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_END_CNTL1_B, CM_RGAM_RAMB_EXP_REGION_END_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_END_CNTL2_B, CM_RGAM_RAMB_EXP_REGION_END_SLOPE_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_END_CNTL2_B, CM_RGAM_RAMB_EXP_REGION_END_BASE_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_END_CNTL1_G, CM_RGAM_RAMB_EXP_REGION_END_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_END_CNTL2_G, CM_RGAM_RAMB_EXP_REGION_END_SLOPE_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_END_CNTL2_G, CM_RGAM_RAMB_EXP_REGION_END_BASE_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_END_CNTL1_R, CM_RGAM_RAMB_EXP_REGION_END_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_END_CNTL2_R, CM_RGAM_RAMB_EXP_REGION_END_SLOPE_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_END_CNTL2_R, CM_RGAM_RAMB_EXP_REGION_END_BASE_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_0_1, CM_RGAM_RAMB_EXP_REGION0_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_0_1, CM_RGAM_RAMB_EXP_REGION0_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_0_1, CM_RGAM_RAMB_EXP_REGION1_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_0_1, CM_RGAM_RAMB_EXP_REGION1_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_2_3, CM_RGAM_RAMB_EXP_REGION2_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_2_3, CM_RGAM_RAMB_EXP_REGION2_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_2_3, CM_RGAM_RAMB_EXP_REGION3_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_2_3, CM_RGAM_RAMB_EXP_REGION3_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_4_5, CM_RGAM_RAMB_EXP_REGION4_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_4_5, CM_RGAM_RAMB_EXP_REGION4_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_4_5, CM_RGAM_RAMB_EXP_REGION5_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_4_5, CM_RGAM_RAMB_EXP_REGION5_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_6_7, CM_RGAM_RAMB_EXP_REGION6_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_6_7, CM_RGAM_RAMB_EXP_REGION6_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_6_7, CM_RGAM_RAMB_EXP_REGION7_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_6_7, CM_RGAM_RAMB_EXP_REGION7_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_8_9, CM_RGAM_RAMB_EXP_REGION8_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_8_9, CM_RGAM_RAMB_EXP_REGION8_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_8_9, CM_RGAM_RAMB_EXP_REGION9_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_8_9, CM_RGAM_RAMB_EXP_REGION9_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_10_11, CM_RGAM_RAMB_EXP_REGION10_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_10_11, CM_RGAM_RAMB_EXP_REGION10_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_10_11, CM_RGAM_RAMB_EXP_REGION11_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_10_11, CM_RGAM_RAMB_EXP_REGION11_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_12_13, CM_RGAM_RAMB_EXP_REGION12_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_12_13, CM_RGAM_RAMB_EXP_REGION12_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_12_13, CM_RGAM_RAMB_EXP_REGION13_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_12_13, CM_RGAM_RAMB_EXP_REGION13_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_14_15, CM_RGAM_RAMB_EXP_REGION14_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_14_15, CM_RGAM_RAMB_EXP_REGION14_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_14_15, CM_RGAM_RAMB_EXP_REGION15_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_14_15, CM_RGAM_RAMB_EXP_REGION15_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_16_17, CM_RGAM_RAMB_EXP_REGION16_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_16_17, CM_RGAM_RAMB_EXP_REGION16_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_16_17, CM_RGAM_RAMB_EXP_REGION17_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_16_17, CM_RGAM_RAMB_EXP_REGION17_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_18_19, CM_RGAM_RAMB_EXP_REGION18_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_18_19, CM_RGAM_RAMB_EXP_REGION18_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_18_19, CM_RGAM_RAMB_EXP_REGION19_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_18_19, CM_RGAM_RAMB_EXP_REGION19_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_20_21, CM_RGAM_RAMB_EXP_REGION20_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_20_21, CM_RGAM_RAMB_EXP_REGION20_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_20_21, CM_RGAM_RAMB_EXP_REGION21_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_20_21, CM_RGAM_RAMB_EXP_REGION21_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_22_23, CM_RGAM_RAMB_EXP_REGION22_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_22_23, CM_RGAM_RAMB_EXP_REGION22_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_22_23, CM_RGAM_RAMB_EXP_REGION23_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_22_23, CM_RGAM_RAMB_EXP_REGION23_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_24_25, CM_RGAM_RAMB_EXP_REGION24_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_24_25, CM_RGAM_RAMB_EXP_REGION24_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_24_25, CM_RGAM_RAMB_EXP_REGION25_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_24_25, CM_RGAM_RAMB_EXP_REGION25_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_26_27, CM_RGAM_RAMB_EXP_REGION26_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_26_27, CM_RGAM_RAMB_EXP_REGION26_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_26_27, CM_RGAM_RAMB_EXP_REGION27_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_26_27, CM_RGAM_RAMB_EXP_REGION27_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_28_29, CM_RGAM_RAMB_EXP_REGION28_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_28_29, CM_RGAM_RAMB_EXP_REGION28_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_28_29, CM_RGAM_RAMB_EXP_REGION29_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_28_29, CM_RGAM_RAMB_EXP_REGION29_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_30_31, CM_RGAM_RAMB_EXP_REGION30_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_30_31, CM_RGAM_RAMB_EXP_REGION30_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_30_31, CM_RGAM_RAMB_EXP_REGION31_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_30_31, CM_RGAM_RAMB_EXP_REGION31_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_32_33, CM_RGAM_RAMB_EXP_REGION32_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_32_33, CM_RGAM_RAMB_EXP_REGION32_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_32_33, CM_RGAM_RAMB_EXP_REGION33_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMB_REGION_32_33, CM_RGAM_RAMB_EXP_REGION33_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_START_CNTL_B, CM_RGAM_RAMA_EXP_REGION_START_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_START_CNTL_B, CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_START_CNTL_G, CM_RGAM_RAMA_EXP_REGION_START_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_START_CNTL_G, CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_START_CNTL_R, CM_RGAM_RAMA_EXP_REGION_START_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_START_CNTL_R, CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_SLOPE_CNTL_B, CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_SLOPE_CNTL_G, CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_SLOPE_CNTL_R, CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_END_CNTL1_B, CM_RGAM_RAMA_EXP_REGION_END_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_END_CNTL2_B, CM_RGAM_RAMA_EXP_REGION_END_SLOPE_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_END_CNTL2_B, CM_RGAM_RAMA_EXP_REGION_END_BASE_B, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_END_CNTL1_G, CM_RGAM_RAMA_EXP_REGION_END_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_END_CNTL2_G, CM_RGAM_RAMA_EXP_REGION_END_SLOPE_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_END_CNTL2_G, CM_RGAM_RAMA_EXP_REGION_END_BASE_G, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_END_CNTL1_R, CM_RGAM_RAMA_EXP_REGION_END_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_END_CNTL2_R, CM_RGAM_RAMA_EXP_REGION_END_SLOPE_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_END_CNTL2_R, CM_RGAM_RAMA_EXP_REGION_END_BASE_R, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_0_1, CM_RGAM_RAMA_EXP_REGION0_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_0_1, CM_RGAM_RAMA_EXP_REGION0_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_0_1, CM_RGAM_RAMA_EXP_REGION1_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_0_1, CM_RGAM_RAMA_EXP_REGION1_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_2_3, CM_RGAM_RAMA_EXP_REGION2_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_2_3, CM_RGAM_RAMA_EXP_REGION2_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_2_3, CM_RGAM_RAMA_EXP_REGION3_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_2_3, CM_RGAM_RAMA_EXP_REGION3_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_4_5, CM_RGAM_RAMA_EXP_REGION4_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_4_5, CM_RGAM_RAMA_EXP_REGION4_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_4_5, CM_RGAM_RAMA_EXP_REGION5_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_4_5, CM_RGAM_RAMA_EXP_REGION5_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_6_7, CM_RGAM_RAMA_EXP_REGION6_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_6_7, CM_RGAM_RAMA_EXP_REGION6_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_6_7, CM_RGAM_RAMA_EXP_REGION7_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_6_7, CM_RGAM_RAMA_EXP_REGION7_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_8_9, CM_RGAM_RAMA_EXP_REGION8_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_8_9, CM_RGAM_RAMA_EXP_REGION8_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_8_9, CM_RGAM_RAMA_EXP_REGION9_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_8_9, CM_RGAM_RAMA_EXP_REGION9_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_10_11, CM_RGAM_RAMA_EXP_REGION10_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_10_11, CM_RGAM_RAMA_EXP_REGION10_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_10_11, CM_RGAM_RAMA_EXP_REGION11_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_10_11, CM_RGAM_RAMA_EXP_REGION11_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_12_13, CM_RGAM_RAMA_EXP_REGION12_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_12_13, CM_RGAM_RAMA_EXP_REGION12_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_12_13, CM_RGAM_RAMA_EXP_REGION13_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_12_13, CM_RGAM_RAMA_EXP_REGION13_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_14_15, CM_RGAM_RAMA_EXP_REGION14_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_14_15, CM_RGAM_RAMA_EXP_REGION14_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_14_15, CM_RGAM_RAMA_EXP_REGION15_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_14_15, CM_RGAM_RAMA_EXP_REGION15_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_16_17, CM_RGAM_RAMA_EXP_REGION16_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_16_17, CM_RGAM_RAMA_EXP_REGION16_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_16_17, CM_RGAM_RAMA_EXP_REGION17_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_16_17, CM_RGAM_RAMA_EXP_REGION17_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_18_19, CM_RGAM_RAMA_EXP_REGION18_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_18_19, CM_RGAM_RAMA_EXP_REGION18_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_18_19, CM_RGAM_RAMA_EXP_REGION19_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_18_19, CM_RGAM_RAMA_EXP_REGION19_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_20_21, CM_RGAM_RAMA_EXP_REGION20_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_20_21, CM_RGAM_RAMA_EXP_REGION20_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_20_21, CM_RGAM_RAMA_EXP_REGION21_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_20_21, CM_RGAM_RAMA_EXP_REGION21_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_22_23, CM_RGAM_RAMA_EXP_REGION22_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_22_23, CM_RGAM_RAMA_EXP_REGION22_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_22_23, CM_RGAM_RAMA_EXP_REGION23_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_22_23, CM_RGAM_RAMA_EXP_REGION23_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_24_25, CM_RGAM_RAMA_EXP_REGION24_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_24_25, CM_RGAM_RAMA_EXP_REGION24_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_24_25, CM_RGAM_RAMA_EXP_REGION25_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_24_25, CM_RGAM_RAMA_EXP_REGION25_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_26_27, CM_RGAM_RAMA_EXP_REGION26_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_26_27, CM_RGAM_RAMA_EXP_REGION26_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_26_27, CM_RGAM_RAMA_EXP_REGION27_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_26_27, CM_RGAM_RAMA_EXP_REGION27_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_28_29, CM_RGAM_RAMA_EXP_REGION28_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_28_29, CM_RGAM_RAMA_EXP_REGION28_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_28_29, CM_RGAM_RAMA_EXP_REGION29_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_28_29, CM_RGAM_RAMA_EXP_REGION29_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_30_31, CM_RGAM_RAMA_EXP_REGION30_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_30_31, CM_RGAM_RAMA_EXP_REGION30_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_30_31, CM_RGAM_RAMA_EXP_REGION31_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_30_31, CM_RGAM_RAMA_EXP_REGION31_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_32_33, CM_RGAM_RAMA_EXP_REGION32_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_32_33, CM_RGAM_RAMA_EXP_REGION32_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_32_33, CM_RGAM_RAMA_EXP_REGION33_LUT_OFFSET, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_RAMA_REGION_32_33, CM_RGAM_RAMA_EXP_REGION33_NUM_SEGMENTS, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_LUT_WRITE_EN_MASK, CM_RGAM_LUT_WRITE_EN_MASK, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_LUT_WRITE_EN_MASK, CM_RGAM_LUT_WRITE_SEL, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_LUT_INDEX, CM_RGAM_LUT_INDEX, mask_sh), \
+-	OPP_SF(CM0_CM_MEM_PWR_CTRL, RGAM_MEM_PWR_FORCE, mask_sh), \
+-	OPP_SF(CM0_CM_RGAM_LUT_DATA, CM_RGAM_LUT_DATA, mask_sh)
++	OPP_MASK_SH_LIST_DCN(mask_sh)
+ 
+ #define OPP_DCN10_REG_FIELD_LIST(type) \
+ 	type DPG_EN; \
+@@ -352,9 +108,6 @@
+ 	type CM_COMB_C32; \
+ 	type CM_COMB_C33; \
+ 	type CM_COMB_C34; \
+-	type CM_RGAM_LUT_MODE; \
+-	type OBUF_BYPASS; \
+-	type OBUF_H_2X_UPSCALE_EN; \
+ 	type FMT_TRUNCATE_EN; \
+ 	type FMT_TRUNCATE_DEPTH; \
+ 	type FMT_TRUNCATE_MODE; \
+@@ -376,183 +129,6 @@
+ 	type FMT_DYNAMIC_EXP_EN; \
+ 	type FMT_DYNAMIC_EXP_MODE; \
+ 	type FMT_MAP420MEM_PWR_FORCE; \
+-	type CM_RGAM_RAMB_EXP_REGION_START_B; \
+-	type CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_B; \
+-	type CM_RGAM_RAMB_EXP_REGION_START_G; \
+-	type CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_G; \
+-	type CM_RGAM_RAMB_EXP_REGION_START_R; \
+-	type CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_R; \
+-	type CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_B; \
+-	type CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_G; \
+-	type CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_R; \
+-	type CM_RGAM_RAMB_EXP_REGION_END_B; \
+-	type CM_RGAM_RAMB_EXP_REGION_END_SLOPE_B; \
+-	type CM_RGAM_RAMB_EXP_REGION_END_BASE_B; \
+-	type CM_RGAM_RAMB_EXP_REGION_END_G; \
+-	type CM_RGAM_RAMB_EXP_REGION_END_SLOPE_G; \
+-	type CM_RGAM_RAMB_EXP_REGION_END_BASE_G; \
+-	type CM_RGAM_RAMB_EXP_REGION_END_R; \
+-	type CM_RGAM_RAMB_EXP_REGION_END_SLOPE_R; \
+-	type CM_RGAM_RAMB_EXP_REGION_END_BASE_R; \
+-	type CM_RGAM_RAMB_EXP_REGION0_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION0_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION1_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION1_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION2_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION2_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION3_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION3_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION4_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION4_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION5_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION5_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION6_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION6_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION7_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION7_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION8_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION8_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION9_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION9_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION10_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION10_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION11_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION11_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION12_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION12_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION13_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION13_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION14_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION14_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION15_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION15_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION16_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION16_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION17_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION17_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION18_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION18_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION19_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION19_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION20_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION20_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION21_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION21_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION22_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION22_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION23_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION23_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION24_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION24_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION25_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION25_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION26_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION26_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION27_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION27_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION28_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION28_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION29_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION29_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION30_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION30_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION31_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION31_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION32_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION32_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMB_EXP_REGION33_LUT_OFFSET; \
+-	type CM_RGAM_RAMB_EXP_REGION33_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION_START_B; \
+-	type CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_B; \
+-	type CM_RGAM_RAMA_EXP_REGION_START_G; \
+-	type CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_G; \
+-	type CM_RGAM_RAMA_EXP_REGION_START_R; \
+-	type CM_RGAM_RAMA_EXP_REGION_START_SEGMENT_R; \
+-	type CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_B; \
+-	type CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_G; \
+-	type CM_RGAM_RAMA_EXP_REGION_LINEAR_SLOPE_R; \
+-	type CM_RGAM_RAMA_EXP_REGION_END_B; \
+-	type CM_RGAM_RAMA_EXP_REGION_END_SLOPE_B; \
+-	type CM_RGAM_RAMA_EXP_REGION_END_BASE_B; \
+-	type CM_RGAM_RAMA_EXP_REGION_END_G; \
+-	type CM_RGAM_RAMA_EXP_REGION_END_SLOPE_G; \
+-	type CM_RGAM_RAMA_EXP_REGION_END_BASE_G; \
+-	type CM_RGAM_RAMA_EXP_REGION_END_R; \
+-	type CM_RGAM_RAMA_EXP_REGION_END_SLOPE_R; \
+-	type CM_RGAM_RAMA_EXP_REGION_END_BASE_R; \
+-	type CM_RGAM_RAMA_EXP_REGION0_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION0_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION1_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION1_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION2_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION2_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION3_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION3_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION4_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION4_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION5_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION5_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION6_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION6_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION7_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION7_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION8_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION8_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION9_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION9_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION10_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION10_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION11_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION11_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION12_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION12_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION13_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION13_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION14_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION14_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION15_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION15_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION16_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION16_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION17_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION17_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION18_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION18_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION19_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION19_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION20_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION20_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION21_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION21_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION22_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION22_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION23_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION23_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION24_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION24_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION25_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION25_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION26_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION26_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION27_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION27_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION28_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION28_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION29_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION29_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION30_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION30_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION31_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION31_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION32_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION32_NUM_SEGMENTS; \
+-	type CM_RGAM_RAMA_EXP_REGION33_LUT_OFFSET; \
+-	type CM_RGAM_RAMA_EXP_REGION33_NUM_SEGMENTS; \
+-	type CM_RGAM_LUT_WRITE_EN_MASK; \
+-	type CM_RGAM_LUT_WRITE_SEL; \
+-	type CM_RGAM_LUT_INDEX; \
+-	type RGAM_MEM_PWR_FORCE; \
+-	type CM_RGAM_LUT_DATA; \
+ 	type FMT_STEREOSYNC_OVERRIDE
+ 
+ struct dcn10_opp_shift {
+@@ -580,9 +156,6 @@ struct dcn10_opp_registers {
+ 	uint32_t CM_COMB_C23_C24;
+ 	uint32_t CM_COMB_C31_C32;
+ 	uint32_t CM_COMB_C33_C34;
+-	uint32_t CM_RGAM_LUT_WRITE_EN_MASK;
+-	uint32_t CM_RGAM_CONTROL;
+-	uint32_t OBUF_CONTROL;
+ 	uint32_t FMT_BIT_DEPTH_CONTROL;
+ 	uint32_t FMT_CONTROL;
+ 	uint32_t FMT_DITHER_RAND_R_SEED;
+@@ -591,67 +164,6 @@ struct dcn10_opp_registers {
+ 	uint32_t FMT_CLAMP_CNTL;
+ 	uint32_t FMT_DYNAMIC_EXP_CNTL;
+ 	uint32_t FMT_MAP420_MEMORY_CONTROL;
+-	uint32_t CM_RGAM_RAMB_START_CNTL_B;
+-	uint32_t CM_RGAM_RAMB_START_CNTL_G;
+-	uint32_t CM_RGAM_RAMB_START_CNTL_R;
+-	uint32_t CM_RGAM_RAMB_SLOPE_CNTL_B;
+-	uint32_t CM_RGAM_RAMB_SLOPE_CNTL_G;
+-	uint32_t CM_RGAM_RAMB_SLOPE_CNTL_R;
+-	uint32_t CM_RGAM_RAMB_END_CNTL1_B;
+-	uint32_t CM_RGAM_RAMB_END_CNTL2_B;
+-	uint32_t CM_RGAM_RAMB_END_CNTL1_G;
+-	uint32_t CM_RGAM_RAMB_END_CNTL2_G;
+-	uint32_t CM_RGAM_RAMB_END_CNTL1_R;
+-	uint32_t CM_RGAM_RAMB_END_CNTL2_R;
+-	uint32_t CM_RGAM_RAMB_REGION_0_1;
+-	uint32_t CM_RGAM_RAMB_REGION_2_3;
+-	uint32_t CM_RGAM_RAMB_REGION_4_5;
+-	uint32_t CM_RGAM_RAMB_REGION_6_7;
+-	uint32_t CM_RGAM_RAMB_REGION_8_9;
+-	uint32_t CM_RGAM_RAMB_REGION_10_11;
+-	uint32_t CM_RGAM_RAMB_REGION_12_13;
+-	uint32_t CM_RGAM_RAMB_REGION_14_15;
+-	uint32_t CM_RGAM_RAMB_REGION_16_17;
+-	uint32_t CM_RGAM_RAMB_REGION_18_19;
+-	uint32_t CM_RGAM_RAMB_REGION_20_21;
+-	uint32_t CM_RGAM_RAMB_REGION_22_23;
+-	uint32_t CM_RGAM_RAMB_REGION_24_25;
+-	uint32_t CM_RGAM_RAMB_REGION_26_27;
+-	uint32_t CM_RGAM_RAMB_REGION_28_29;
+-	uint32_t CM_RGAM_RAMB_REGION_30_31;
+-	uint32_t CM_RGAM_RAMB_REGION_32_33;
+-	uint32_t CM_RGAM_RAMA_START_CNTL_B;
+-	uint32_t CM_RGAM_RAMA_START_CNTL_G;
+-	uint32_t CM_RGAM_RAMA_START_CNTL_R;
+-	uint32_t CM_RGAM_RAMA_SLOPE_CNTL_B;
+-	uint32_t CM_RGAM_RAMA_SLOPE_CNTL_G;
+-	uint32_t CM_RGAM_RAMA_SLOPE_CNTL_R;
+-	uint32_t CM_RGAM_RAMA_END_CNTL1_B;
+-	uint32_t CM_RGAM_RAMA_END_CNTL2_B;
+-	uint32_t CM_RGAM_RAMA_END_CNTL1_G;
+-	uint32_t CM_RGAM_RAMA_END_CNTL2_G;
+-	uint32_t CM_RGAM_RAMA_END_CNTL1_R;
+-	uint32_t CM_RGAM_RAMA_END_CNTL2_R;
+-	uint32_t CM_RGAM_RAMA_REGION_0_1;
+-	uint32_t CM_RGAM_RAMA_REGION_2_3;
+-	uint32_t CM_RGAM_RAMA_REGION_4_5;
+-	uint32_t CM_RGAM_RAMA_REGION_6_7;
+-	uint32_t CM_RGAM_RAMA_REGION_8_9;
+-	uint32_t CM_RGAM_RAMA_REGION_10_11;
+-	uint32_t CM_RGAM_RAMA_REGION_12_13;
+-	uint32_t CM_RGAM_RAMA_REGION_14_15;
+-	uint32_t CM_RGAM_RAMA_REGION_16_17;
+-	uint32_t CM_RGAM_RAMA_REGION_18_19;
+-	uint32_t CM_RGAM_RAMA_REGION_20_21;
+-	uint32_t CM_RGAM_RAMA_REGION_22_23;
+-	uint32_t CM_RGAM_RAMA_REGION_24_25;
+-	uint32_t CM_RGAM_RAMA_REGION_26_27;
+-	uint32_t CM_RGAM_RAMA_REGION_28_29;
+-	uint32_t CM_RGAM_RAMA_REGION_30_31;
+-	uint32_t CM_RGAM_RAMA_REGION_32_33;
+-	uint32_t CM_RGAM_LUT_INDEX;
+-	uint32_t CM_MEM_PWR_CTRL;
+-	uint32_t CM_RGAM_LUT_DATA;
+ };
+ 
+ struct dcn10_opp {
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h b/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h
+index 137b4c8..589bdda 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h
+@@ -113,4 +113,11 @@ struct out_csc_color_matrix {
+ 	uint16_t regval[12];
+ };
+ 
++enum opp_regamma {
++	OPP_REGAMMA_BYPASS = 0,
++	OPP_REGAMMA_SRGB,
++	OPP_REGAMMA_3_6,
++	OPP_REGAMMA_USER
++};
++
+ #endif /* __DAL_HW_SHARED_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
+index ef36ffd..a43a09b 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
+@@ -196,13 +196,6 @@ struct pwl_float_data {
+ 	struct fixed31_32 b;
+ };
+ 
+-enum opp_regamma {
+-	OPP_REGAMMA_BYPASS = 0,
+-	OPP_REGAMMA_SRGB,
+-	OPP_REGAMMA_3_6,
+-	OPP_REGAMMA_USER,
+-};
+-
+ struct output_pixel_processor {
+ 	struct dc_context *ctx;
+ 	uint32_t inst;
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h b/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
+index 132c5db..f3d6675 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
+@@ -38,6 +38,7 @@ struct transform {
+ 	const struct transform_funcs *funcs;
+ 	struct dc_context *ctx;
+ 	int inst;
++	struct pwl_params regamma_params;
+ };
+ 
+ /* Colorimetry */
+@@ -190,6 +191,34 @@ struct transform_funcs {
+ 	void (*opp_set_csc_adjustment)(
+ 		struct transform *xfm,
+ 		const struct out_csc_color_matrix *tbl_entry);
++
++	void (*opp_power_on_regamma_lut)(
++		struct transform *xfm,
++		bool power_on);
++
++	void (*opp_program_regamma_lut)(
++			struct transform *xfm,
++			const struct pwl_result_data *rgb,
++			uint32_t num);
++
++	void (*opp_configure_regamma_lut)(
++			struct transform *xfm,
++			bool is_ram_a);
++
++	void (*opp_program_regamma_lutb_settings)(
++			struct transform *xfm,
++			const struct pwl_params *params);
++
++	void (*opp_program_regamma_luta_settings)(
++			struct transform *xfm,
++			const struct pwl_params *params);
++
++	bool (*opp_program_regamma_pwl)(
++		struct transform *xfm, const struct pwl_params *params);
++
++	void (*opp_set_regamma_mode)(
++			struct transform *xfm_base,
++			enum opp_regamma mode);
+ };
+ 
+ extern const uint16_t filter_2tap_16p[18];
+-- 
+2.7.4
+
