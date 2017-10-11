@@ -9,9 +9,6 @@ LIC_FILES_CHKSUM = "file://spi_amd.c;md5=053ef6a02a8242fbb536a45df556c7a7 \
 
 inherit module
 
-PR = "r0"
-PV = "1.0"
-
 SRC_URI = "file://Makefile \
            file://spi_amd.c \
            file://spi_amd.h \
