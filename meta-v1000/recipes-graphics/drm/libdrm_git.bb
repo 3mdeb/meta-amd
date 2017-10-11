@@ -70,7 +70,6 @@ EXTRA_OECONF = "--disable-cairo-tests \
 		 --enable-radeon \
                 "
 
-
 ALLOW_EMPTY_${PN}-drivers = "1"
 PACKAGES =+ "${PN}-tests ${PN}-drivers ${PN}-radeon ${PN}-nouveau ${PN}-omap \
              ${PN}-intel ${PN}-exynos ${PN}-kms ${PN}-freedreno ${PN}-amdgpu"

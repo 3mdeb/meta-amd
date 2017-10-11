@@ -4,7 +4,6 @@ LIC_FILES_CHKSUM = "file://amd_wdt.c;endline=29;md5=8e7a9706367d146e5073510a6e17
 
 inherit module
 
-
 SRC_URI = "file://Makefile \
            file://amd_wdt.c \
            file://amd_wdt.h \

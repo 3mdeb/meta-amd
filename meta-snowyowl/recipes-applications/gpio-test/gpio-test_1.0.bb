@@ -4,7 +4,6 @@ LICENSE = "BSD"
 DEPENDS = "readline"
 LIC_FILES_CHKSUM = "file://gpio-test.c;endline=29;md5=e41081b7b159d3f22320c8622cb2d356"
 
-
 SRC_URI = "\
 	   file://gpio-test.c \
 	   file://gpio-test.h \
