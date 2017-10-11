@@ -4,9 +4,6 @@ LICENSE = "BSD"
 DEPENDS = "readline"
 LIC_FILES_CHKSUM = "file://watchdog-test.c;md5=1d81025de7376754875ee74378f07d7a"
 
-PR = "r1"
-PV = "1.0"
-
 SRC_URI = "file://watchdog-test.c"
 
 S = "${WORKDIR}"

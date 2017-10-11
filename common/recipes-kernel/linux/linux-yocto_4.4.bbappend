@@ -9,4 +9,3 @@ SRC_URI_append_radeon += " \
 	file://radeon-gpu-config.cfg \
 "
 
-
