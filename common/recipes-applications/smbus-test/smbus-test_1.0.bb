@@ -6,9 +6,6 @@ LIC_FILES_CHKSUM = "file://smbus-test.c;md5=6e93b58b38eb7ba04529bb2b6c66ef70 \
                     file://i2c-dev.h;md5=11afa8583cd78137a63feb1a8b24cc51 \
                    "
 
-PR = "r1"
-PV = "1.0"
-
 SRC_URI = "file://smbus-test.c \
            file://i2c-dev.h \
           "
