@@ -1,0 +1,174 @@
+From 0014062036a6f728f0bc1baeec73d42a09d53ea3 Mon Sep 17 00:00:00 2001
+From: Corbin McElhanney <corbin.mcelhanney@amd.com>
+Date: Fri, 23 Jun 2017 17:45:50 -0400
+Subject: [PATCH 2567/2831] drm/amd/display: Add extra mode and clock info to
+ DTN logs
+
+Adds some additional information to logs in dc_commit_streams to
+better match Dal2.
+
+Also adds a new function, dc_raw_log, that has the same
+functionality as dc_conn_log, but does not attach display specific
+prefixes to the log output.
+
+Finally, adds a new DC log type, LOG_DTN, that logs to
+LogMinor_DispConnect_dtn in DM. This new log type and dc_raw_log
+are used to generate clock info in the logs to match Dal2.
+
+Change-Id: I36526c471dd0bb76870a8f0f9d6456407477bea0
+Signed-off-by: Corbin McElhanney <corbin.mcelhanney@amd.com>
+Reviewed-by: Aric Cyr <Aric.Cyr@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c  |  2 +-
+ .../gpu/drm/amd/display/dc/basics/log_helpers.c    | 30 +++++++++++++++++++++-
+ drivers/gpu/drm/amd/display/dc/basics/logger.c     |  6 +++--
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |  7 ++++-
+ drivers/gpu/drm/amd/display/dc/dm_helpers.h        |  3 ++-
+ .../gpu/drm/amd/display/include/logger_interface.h |  5 ++++
+ drivers/gpu/drm/amd/display/include/logger_types.h |  1 +
+ 7 files changed, 48 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+index 64db62e..df4d221 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+@@ -322,7 +322,7 @@ bool dm_helpers_dp_mst_send_payload_allocation(
+ 	return true;
+ }
+ 
+-bool dm_helpers_dc_conn_log(struct dc_context*ctx, const char *msg)
++bool dm_helpers_dc_conn_log(struct dc_context *ctx, struct log_entry *entry, enum dc_log_type event)
+ {
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/basics/log_helpers.c b/drivers/gpu/drm/amd/display/dc/basics/log_helpers.c
+index 1268be9..070ae6f 100644
+--- a/drivers/gpu/drm/amd/display/dc/basics/log_helpers.c
++++ b/drivers/gpu/drm/amd/display/dc/basics/log_helpers.c
+@@ -95,7 +95,35 @@ void dc_conn_log(struct dc_context *ctx,
+ 			dm_logger_append(&entry, "%2.2X ", hex_data[i]);
+ 
+ 	dm_logger_append(&entry, "^\n");
+-	dm_helpers_dc_conn_log(ctx, entry.buf);
++	dm_helpers_dc_conn_log(ctx, &entry, event);
++	dm_logger_close(&entry);
++
++	va_end(args);
++}
++
++void dc_raw_log(struct dc_context *ctx,
++		enum dc_log_type event,
++		const char *msg,
++		...)
++{
++	va_list args;
++	struct log_entry entry = { 0 };
++
++	dm_logger_open(ctx->logger, &entry, event);
++
++	va_start(args, msg);
++	entry.buf_offset += dm_log_to_buffer(
++		&entry.buf[entry.buf_offset],
++		LOG_MAX_LINE_SIZE - entry.buf_offset,
++		msg, args);
++
++	if (entry.buf[strlen(entry.buf) - 1] == '\n') {
++		entry.buf[strlen(entry.buf) - 1] = '\0';
++		entry.buf_offset--;
++	}
++
++	dm_logger_append(&entry, "^\n");
++	dm_helpers_dc_conn_log(ctx, &entry, event);
+ 	dm_logger_close(&entry);
+ 
+ 	va_end(args);
+diff --git a/drivers/gpu/drm/amd/display/dc/basics/logger.c b/drivers/gpu/drm/amd/display/dc/basics/logger.c
+index 4be8370..0b17374 100644
+--- a/drivers/gpu/drm/amd/display/dc/basics/logger.c
++++ b/drivers/gpu/drm/amd/display/dc/basics/logger.c
+@@ -59,7 +59,8 @@ static const struct dc_log_type_info log_type_info_tbl[] = {
+ 		{LOG_EVENT_LINK_TRAINING,   "LKTN"},
+ 		{LOG_EVENT_LINK_LOSS,       "LinkLoss"},
+ 		{LOG_EVENT_UNDERFLOW,       "Underflow"},
+-		{LOG_IF_TRACE,				"InterfaceTrace"}
++		{LOG_IF_TRACE,              "InterfaceTrace"},
++		{LOG_DTN,                   "DTN"}
+ };
+ 
+ 
+@@ -84,7 +85,8 @@ static const struct dc_log_type_info log_type_info_tbl[] = {
+ 		(1 << LOG_DETECTION_DP_CAPS) | \
+ 		(1 << LOG_BACKLIGHT)) | \
+ 		(1 << LOG_I2C_AUX) | \
+-		(1 << LOG_IF_TRACE) /* | \
++		(1 << LOG_IF_TRACE) | \
++		(1 << LOG_DTN) /* | \
+ 		(1 << LOG_DEBUG) | \
+ 		(1 << LOG_BIOS) | \
+ 		(1 << LOG_SURFACE) | \
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index b6eb1e2..5f75e24 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -944,9 +944,14 @@ bool dc_commit_streams(
+ 			dc_enable_stereo(dc, context, streams, stream_count);
+ 		}
+ 
+-		CONN_MSG_MODE(sink->link, "{%dx%d, %dx%d@%dKhz}",
++		CONN_MSG_MODE(sink->link, "{%ux%u, %ux%u@%u, %ux%u@%uKhz}",
++				context->streams[i]->public.src.width,
++				context->streams[i]->public.src.height,
+ 				context->streams[i]->public.timing.h_addressable,
+ 				context->streams[i]->public.timing.v_addressable,
++				context->streams[i]->public.timing.pix_clk_khz * 1000 /
++					context->streams[i]->public.timing.h_total /
++					context->streams[i]->public.timing.v_total, // Refresh rate
+ 				context->streams[i]->public.timing.h_total,
+ 				context->streams[i]->public.timing.v_total,
+ 				context->streams[i]->public.timing.pix_clk_khz);
+diff --git a/drivers/gpu/drm/amd/display/dc/dm_helpers.h b/drivers/gpu/drm/amd/display/dc/dm_helpers.h
+index 9fb606c..a831421 100644
+--- a/drivers/gpu/drm/amd/display/dc/dm_helpers.h
++++ b/drivers/gpu/drm/amd/display/dc/dm_helpers.h
+@@ -70,7 +70,8 @@ bool dm_helpers_dp_mst_start_top_mgr(
+ 
+ bool dm_helpers_dc_conn_log(
+ 		struct dc_context*ctx,
+-		const char *msg);
++		struct log_entry *entry,
++		enum dc_log_type event);
+ 
+ void dm_helpers_dp_mst_stop_top_mgr(
+ 		struct dc_context *ctx,
+diff --git a/drivers/gpu/drm/amd/display/include/logger_interface.h b/drivers/gpu/drm/amd/display/include/logger_interface.h
+index b75c343..ce5fef2 100644
+--- a/drivers/gpu/drm/amd/display/include/logger_interface.h
++++ b/drivers/gpu/drm/amd/display/include/logger_interface.h
+@@ -70,6 +70,11 @@ void dc_conn_log(struct dc_context *ctx,
+ 		const char *msg,
+ 		...);
+ 
++void dc_raw_log(struct dc_context *ctx,
++		enum dc_log_type event,
++		const char *msg,
++		...);
++
+ void logger_write(struct dal_logger *logger,
+ 		enum dc_log_type log_type,
+ 		const char *msg,
+diff --git a/drivers/gpu/drm/amd/display/include/logger_types.h b/drivers/gpu/drm/amd/display/include/logger_types.h
+index dfc0f10..42ffb93 100644
+--- a/drivers/gpu/drm/amd/display/include/logger_types.h
++++ b/drivers/gpu/drm/amd/display/include/logger_types.h
+@@ -37,6 +37,7 @@ enum dc_log_type {
+ 	LOG_WARNING,
+ 	LOG_DEBUG,
+ 	LOG_DC,
++	LOG_DTN,
+ 	LOG_SURFACE,
+ 	LOG_HW_HOTPLUG,
+ 	LOG_HW_LINK_TRAINING,
+-- 
+2.7.4
+

@@ -1,0 +1,231 @@
+From 680aff0e4ac9376c85ff1fc3c1312d69911d66e1 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Tue, 11 Jul 2017 14:41:51 -0400
+Subject: [PATCH 2612/2831] drm/amd/display: Introduce refcount for
+ dc_validate_context
+
+Linux requires to be able to release allocated context
+in case it was never commited.
+
+Change-Id: I6b0faa72c995d77c0bb21ba8aabb9bdc3b0e2770
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Reviewed-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c        | 64 ++++++++++++++++++-------
+ drivers/gpu/drm/amd/display/dc/dc.h             |  4 ++
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h |  2 +
+ 3 files changed, 54 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index a220c0a..dff96c5 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -423,7 +423,7 @@ static void allocate_dc_stream_funcs(struct core_dc *core_dc)
+ 
+ static void destruct(struct core_dc *dc)
+ {
+-	dc_resource_validate_ctx_destruct(dc->current_context);
++	dc_release_validate_context(dc->current_context);
+ 
+ 	destroy_links(dc);
+ 
+@@ -467,6 +467,8 @@ static bool construct(struct core_dc *dc,
+ 		goto val_ctx_fail;
+ 	}
+ 
++	dc->current_context->ref_count++;
++
+ 	dc_ctx->cgs_device = init_params->cgs_device;
+ 	dc_ctx->driver_context = init_params->driver;
+ 	dc_ctx->dc = &dc->public;
+@@ -683,6 +685,8 @@ struct validate_context *dc_get_validate_context(
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+ 
++	++context->ref_count;
++
+ 	if (!is_validation_required(core_dc, set, set_count)) {
+ 		dc_resource_validate_ctx_copy_construct(core_dc->current_context, context);
+ 		return context;
+@@ -698,8 +702,7 @@ struct validate_context *dc_get_validate_context(
+ 				__func__,
+ 				result);
+ 
+-		dc_resource_validate_ctx_destruct(context);
+-		dm_free(context);
++		dc_release_validate_context(context);
+ 		context = NULL;
+ 	}
+ 
+@@ -720,6 +723,8 @@ bool dc_validate_resources(
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+ 
++	++context->ref_count;
++
+ 	result = core_dc->res_pool->funcs->validate_with_context(
+ 				core_dc, set, set_count, context, NULL);
+ 
+@@ -731,8 +736,7 @@ bool dc_validate_resources(
+ 				result);
+ 	}
+ 
+-	dc_resource_validate_ctx_destruct(context);
+-	dm_free(context);
++	dc_release_validate_context(context);
+ 	context = NULL;
+ 
+ 	return result == DC_OK;
+@@ -750,11 +754,12 @@ bool dc_validate_guaranteed(
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+ 
++	++context->ref_count;
++
+ 	result = core_dc->res_pool->funcs->validate_guaranteed(
+ 					core_dc, stream, context);
+ 
+-	dc_resource_validate_ctx_destruct(context);
+-	dm_free(context);
++	dc_release_validate_context(context);
+ 
+ context_alloc_fail:
+ 	if (result != DC_OK) {
+@@ -972,8 +977,10 @@ static bool dc_commit_context_no_check(struct dc *dc, struct validate_context *c
+ 
+ 	dc_enable_stereo(dc, context, dc_streams, context->stream_count);
+ 
+-	dc_resource_validate_ctx_destruct(core_dc->current_context);
+-	dm_free(core_dc->current_context);
++	dc_release_validate_context(core_dc->current_context);
++
++	dc_retain_validate_context(context);
++
+ 	core_dc->current_context = context;
+ 
+ 	return (result == DC_OK);
+@@ -1045,6 +1052,8 @@ bool dc_commit_streams(
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+ 
++	++context->ref_count;
++
+ 	result = core_dc->res_pool->funcs->validate_with_context(
+ 			core_dc, set, stream_count, context, core_dc->current_context);
+ 	if (result != DC_OK){
+@@ -1053,7 +1062,6 @@ bool dc_commit_streams(
+ 					__func__,
+ 					result);
+ 		BREAK_TO_DEBUGGER();
+-		dc_resource_validate_ctx_destruct(context);
+ 		goto fail;
+ 	}
+ 
+@@ -1062,7 +1070,7 @@ bool dc_commit_streams(
+ 	return (result == DC_OK);
+ 
+ fail:
+-	dm_free(context);
++	dc_release_validate_context(context);
+ 
+ context_alloc_fail:
+ 	return (result == DC_OK);
+@@ -1155,6 +1163,23 @@ bool dc_commit_surfaces_to_stream(
+ 	return true;
+ }
+ 
++void dc_retain_validate_context(struct validate_context *context)
++{
++	ASSERT(context->ref_count > 0);
++	++context->ref_count;
++}
++
++void dc_release_validate_context(struct validate_context *context)
++{
++	ASSERT(context->ref_count > 0);
++	--context->ref_count;
++
++	if (context->ref_count == 0) {
++		dc_resource_validate_ctx_destruct(context);
++		dm_free(context);
++	}
++}
++
+ static bool is_surface_in_context(
+ 		const struct validate_context *context,
+ 		const struct dc_surface *surface)
+@@ -1341,6 +1366,7 @@ void dc_update_surfaces_and_stream(struct dc *dc,
+ 	enum surface_update_type update_type;
+ 	const struct dc_stream_status *stream_status;
+ 	struct core_stream *stream = DC_STREAM_TO_CORE(dc_stream);
++	struct dc_context *dc_ctx = core_dc->ctx;
+ 
+ 	stream_status = dc_stream_get_status(dc_stream);
+ 	ASSERT(stream_status);
+@@ -1403,6 +1429,11 @@ void dc_update_surfaces_and_stream(struct dc *dc,
+ 
+ 		/* initialize scratch memory for building context */
+ 		context = dm_alloc(sizeof(*context));
++		if (context == NULL)
++				goto context_alloc_fail;
++
++		++context->ref_count;
++
+ 		dc_resource_validate_ctx_copy_construct(
+ 				core_dc->current_context, context);
+ 
+@@ -1624,16 +1655,17 @@ void dc_update_surfaces_and_stream(struct dc *dc,
+ 	}
+ 
+ 	if (core_dc->current_context != context) {
+-		dc_resource_validate_ctx_destruct(core_dc->current_context);
+-		dm_free(core_dc->current_context);
+-
++		dc_release_validate_context(core_dc->current_context);
++		dc_retain_validate_context(context);
+ 		core_dc->current_context = context;
+ 	}
+ 	return;
+ 
+ fail:
+-	dc_resource_validate_ctx_destruct(context);
+-	dm_free(context);
++	dc_release_validate_context(context);
++
++context_alloc_fail:
++	DC_ERROR("Failed to allocate new validate context!\n");
+ }
+ 
+ uint8_t dc_get_current_stream_count(const struct dc *dc)
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 1824cad..b4c7251 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -655,6 +655,10 @@ enum surface_update_type dc_check_update_surfaces_for_stream(
+ 		struct dc_stream_update *stream_update,
+ 		const struct dc_stream_status *stream_status);
+ 
++
++void dc_retain_validate_context(struct validate_context *context);
++void dc_release_validate_context(struct validate_context *context);
++
+ /*******************************************************************************
+  * Link Interfaces
+  ******************************************************************************/
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index 3e9a0cc..d216522 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -361,6 +361,8 @@ struct validate_context {
+ #ifdef CONFIG_DRM_AMD_DC_DCN1_0
+ 	struct dcn_bw_internal_vars dcn_bw_vars;
+ #endif
++
++	int ref_count;
+ };
+ 
+ #endif /* _CORE_TYPES_H_ */
+-- 
+2.7.4
+

@@ -1,0 +1,216 @@
+From 29d12b18d73ffc50248b97d76ef7585af13178db Mon Sep 17 00:00:00 2001
+From: Tom St Denis <tom.stdenis@amd.com>
+Date: Mon, 31 Jul 2017 09:35:24 -0400
+Subject: [PATCH 2694/2831] drm/amd/amdgpu: Add tracepoint for DMA page mapping
+ (v4)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This helps map DMA addresses back to physical addresses.
+
+Signed-off-by: Tom St Denis <tom.stdenis@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+
+(v2):  Added tracepoints for USERPTR, SG mappings, and
+     SWIOTBL mappings.  Reformatted trace call perform
+     PCI decoding internal to the trace.
+
+(v3):  Add unmap tracepoints as well
+
+(v4):  Move traces into separate functions
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+
+Change-Id: Ie12dc8823353d5b5d7e6c34bc644297f1134bef7
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h | 56 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c   | 53 ++++++++++++++++++++++++++---
+ 2 files changed, 104 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
+index 84b82f4..fcf48a6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
+@@ -14,6 +14,62 @@
+ #define AMDGPU_JOB_GET_TIMELINE_NAME(job) \
+ 	 job->base.s_fence->finished.ops->get_timeline_name(&job->base.s_fence->finished)
+ 
++TRACE_EVENT(amdgpu_ttm_tt_populate,
++	    TP_PROTO(struct amdgpu_device *adev, uint64_t dma_address, uint64_t phys_address),
++	    TP_ARGS(adev, dma_address, phys_address),
++	    TP_STRUCT__entry(
++				__field(uint16_t, domain)
++				__field(uint8_t, bus)
++				__field(uint8_t, slot)
++				__field(uint8_t, func)
++				__field(uint64_t, dma)
++				__field(uint64_t, phys)
++			    ),
++	    TP_fast_assign(
++			   __entry->domain = pci_domain_nr(adev->pdev->bus);
++			   __entry->bus = adev->pdev->bus->number;
++			   __entry->slot = PCI_SLOT(adev->pdev->devfn);
++			   __entry->func = PCI_FUNC(adev->pdev->devfn);
++			   __entry->dma = dma_address;
++			   __entry->phys = phys_address;
++			   ),
++	    TP_printk("%04x:%02x:%02x.%x: 0x%llx => 0x%llx",
++		      (unsigned)__entry->domain,
++		      (unsigned)__entry->bus,
++		      (unsigned)__entry->slot,
++		      (unsigned)__entry->func,
++		      (unsigned long long)__entry->dma,
++		      (unsigned long long)__entry->phys)
++);
++
++TRACE_EVENT(amdgpu_ttm_tt_unpopulate,
++	    TP_PROTO(struct amdgpu_device *adev, uint64_t dma_address, uint64_t phys_address),
++	    TP_ARGS(adev, dma_address, phys_address),
++	    TP_STRUCT__entry(
++				__field(uint16_t, domain)
++				__field(uint8_t, bus)
++				__field(uint8_t, slot)
++				__field(uint8_t, func)
++				__field(uint64_t, dma)
++				__field(uint64_t, phys)
++			    ),
++	    TP_fast_assign(
++			   __entry->domain = pci_domain_nr(adev->pdev->bus);
++			   __entry->bus = adev->pdev->bus->number;
++			   __entry->slot = PCI_SLOT(adev->pdev->devfn);
++			   __entry->func = PCI_FUNC(adev->pdev->devfn);
++			   __entry->dma = dma_address;
++			   __entry->phys = phys_address;
++			   ),
++	    TP_printk("%04x:%02x:%02x.%x: 0x%llx => 0x%llx",
++		      (unsigned)__entry->domain,
++		      (unsigned)__entry->bus,
++		      (unsigned)__entry->slot,
++		      (unsigned)__entry->func,
++		      (unsigned long long)__entry->dma,
++		      (unsigned long long)__entry->phys)
++);
++
+ TRACE_EVENT(amdgpu_mm_rreg,
+ 	    TP_PROTO(unsigned did, uint32_t reg, uint32_t value),
+ 	    TP_ARGS(did, reg, value),
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 650a435..3457ca7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -43,6 +43,7 @@
+ #include <linux/pagemap.h>
+ #include <linux/debugfs.h>
+ #include "amdgpu.h"
++#include "amdgpu_trace.h"
+ #include "bif/bif_4_1_d.h"
+ #include "amdgpu_amdkfd.h"
+ 
+@@ -733,6 +734,38 @@ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages)
+ 	return r;
+ }
+ 
++static void amdgpu_trace_dma_map(struct ttm_tt *ttm)
++{
++	struct amdgpu_device *adev = amdgpu_ttm_adev(ttm->bdev);
++	struct amdgpu_ttm_tt *gtt = (void *)ttm;
++	unsigned i;
++
++	if (unlikely(trace_amdgpu_ttm_tt_populate_enabled())) {
++		for (i = 0; i < ttm->num_pages; i++) {
++			trace_amdgpu_ttm_tt_populate(
++				adev,
++				gtt->ttm.dma_address[i],
++				page_to_phys(ttm->pages[i]));
++		}
++	}
++}
++
++static void amdgpu_trace_dma_unmap(struct ttm_tt *ttm)
++{
++	struct amdgpu_device *adev = amdgpu_ttm_adev(ttm->bdev);
++	struct amdgpu_ttm_tt *gtt = (void *)ttm;
++	unsigned i;
++
++	if (unlikely(trace_amdgpu_ttm_tt_unpopulate_enabled())) {
++		for (i = 0; i < ttm->num_pages; i++) {
++			trace_amdgpu_ttm_tt_unpopulate(
++				adev,
++				gtt->ttm.dma_address[i],
++				page_to_phys(ttm->pages[i]));
++		}
++	}
++}
++
+ /* prepare the sg table with the user pages */
+ static int amdgpu_ttm_tt_pin_userptr(struct ttm_tt *ttm)
+ {
+@@ -759,6 +792,8 @@ static int amdgpu_ttm_tt_pin_userptr(struct ttm_tt *ttm)
+ 	drm_prime_sg_to_page_addr_arrays(ttm->sg, ttm->pages,
+ 					 gtt->ttm.dma_address, ttm->num_pages);
+ 
++	amdgpu_trace_dma_map(ttm);
++
+ 	return 0;
+ 
+ release_sg:
+@@ -792,6 +827,8 @@ static void amdgpu_ttm_tt_unpin_userptr(struct ttm_tt *ttm)
+ 		put_page(page);
+ 	}
+ 
++	amdgpu_trace_dma_unmap(ttm);
++
+ 	sg_free_table(ttm->sg);
+ }
+ 
+@@ -963,7 +1000,7 @@ static struct ttm_tt *amdgpu_ttm_tt_create(struct ttm_bo_device *bdev,
+ 
+ static int amdgpu_ttm_tt_populate(struct ttm_tt *ttm)
+ {
+-	struct amdgpu_device *adev;
++	struct amdgpu_device *adev = amdgpu_ttm_adev(ttm->bdev);
+ 	struct amdgpu_ttm_tt *gtt = (void *)ttm;
+ 	unsigned i;
+ 	int r;
+@@ -986,11 +1023,10 @@ static int amdgpu_ttm_tt_populate(struct ttm_tt *ttm)
+ 		drm_prime_sg_to_page_addr_arrays(ttm->sg, ttm->pages,
+ 						 gtt->ttm.dma_address, ttm->num_pages);
+ 		ttm->state = tt_unbound;
+-		return 0;
++		r = 0;
++		goto trace_mappings;
+ 	}
+ 
+-	adev = amdgpu_ttm_adev(ttm->bdev);
+-
+ 	r = ttm_pool_populate(ttm);
+ 	if (r) {
+ 		return r;
+@@ -1010,7 +1046,12 @@ static int amdgpu_ttm_tt_populate(struct ttm_tt *ttm)
+ 			return -EFAULT;
+ 		}
+ 	}
+-	return 0;
++
++	r = 0;
++trace_mappings:
++	if (likely(!r))
++		amdgpu_trace_dma_map(ttm);
++	return r;
+ }
+ 
+ static void amdgpu_ttm_tt_unpopulate(struct ttm_tt *ttm)
+@@ -1031,6 +1072,8 @@ static void amdgpu_ttm_tt_unpopulate(struct ttm_tt *ttm)
+ 
+ 	adev = amdgpu_ttm_adev(ttm->bdev);
+ 
++	amdgpu_trace_dma_unmap(ttm);
++
+ 	for (i = 0; i < ttm->num_pages; i++) {
+ 		if (gtt->ttm.dma_address[i]) {
+ 			pci_unmap_page(adev->pdev, gtt->ttm.dma_address[i],
+-- 
+2.7.4
+

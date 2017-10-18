@@ -1,0 +1,134 @@
+From 88992586e7ee36d2d43d7d498ba8cac6385ed7c4 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Fri, 28 Jul 2017 19:04:21 -0400
+Subject: [PATCH 2679/2831] drm/amdgpu/sdma4: drop allocation of poll_mem_offs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We already allocate this as part of the ring structure,
+use that instead.
+
+Cc: Frank Min <Frank.Min@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    |  1 -
+ drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c | 45 +++++++---------------------------
+ 2 files changed, 9 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 49dc7b5..97fcb84 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1172,7 +1172,6 @@ struct amdgpu_sdma_instance {
+ 
+ 	struct amdgpu_ring	ring;
+ 	bool			burst_nop;
+-	uint32_t		poll_mem_offs;
+ };
+ 
+ struct amdgpu_sdma {
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+index fb23afc..d883770 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+@@ -287,8 +287,6 @@ static uint64_t sdma_v4_0_ring_get_wptr(struct amdgpu_ring *ring)
+  */
+ static void sdma_v4_0_ring_set_wptr(struct amdgpu_ring *ring)
+ {
+-	int i;
+-	u32 offset;
+ 	struct amdgpu_device *adev = ring->adev;
+ 
+ 	DRM_DEBUG("Setting write pointer\n");
+@@ -306,16 +304,6 @@ static void sdma_v4_0_ring_set_wptr(struct amdgpu_ring *ring)
+ 		WRITE_ONCE(*wb, (ring->wptr << 2));
+ 		DRM_DEBUG("calling WDOORBELL64(0x%08x, 0x%016llx)\n",
+ 				ring->doorbell_index, ring->wptr << 2);
+-
+-		if (amdgpu_sriov_vf(adev)) {
+-			for (i = 0; i < adev->sdma.num_instances; i++) {
+-				if (&adev->sdma.instance[i].ring == ring) {
+-					offset = adev->sdma.instance[i].poll_mem_offs;
+-					atomic64_set((atomic64_t *)&adev->wb.wb[offset],
+-						     (ring->wptr << 2));
+-				}
+-			}
+-		}
+ 		WDOORBELL64(ring->doorbell_index, ring->wptr << 2);
+ 	} else {
+ 		int me = (ring == &ring->adev->sdma.instance[0].ring) ? 0 : 1;
+@@ -586,12 +574,13 @@ static void sdma_v4_0_enable(struct amdgpu_device *adev, bool enable)
+ static int sdma_v4_0_gfx_resume(struct amdgpu_device *adev)
+ {
+ 	struct amdgpu_ring *ring;
+-	u32 rb_cntl, ib_cntl, wptr_poll_addr_lo, wptr_poll_addr_hi, wptr_poll_cntl;
++	u32 rb_cntl, ib_cntl, wptr_poll_cntl;
+ 	u32 rb_bufsz;
+-	u32 wb_offset, poll_offset;
++	u32 wb_offset;
+ 	u32 doorbell;
+ 	u32 doorbell_offset;
+ 	u32 temp;
++	u64 wptr_gpu_addr;
+ 	int i, r;
+ 
+ 	for (i = 0; i < adev->sdma.num_instances; i++) {
+@@ -702,17 +691,14 @@ static int sdma_v4_0_gfx_resume(struct amdgpu_device *adev)
+ 			amdgpu_ttm_set_active_vram_size(adev, adev->mc.real_vram_size);
+ 
+ 		if (amdgpu_sriov_vf(adev)) {
+-			poll_offset = adev->sdma.instance[i].poll_mem_offs * 4;
+-
++			wptr_gpu_addr = adev->wb.gpu_addr + (ring->wptr_offs * 4);
+ 			wptr_poll_cntl = RREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_WPTR_POLL_CNTL));
+-			wptr_poll_addr_lo = RREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_WPTR_POLL_ADDR_LO));
+-			wptr_poll_addr_lo = REG_SET_FIELD(wptr_poll_addr_lo, SDMA0_GFX_RB_WPTR_POLL_ADDR_LO, ADDR,
+-								lower_32_bits(adev->wb.gpu_addr + poll_offset) >> 2);
+-			wptr_poll_addr_hi = upper_32_bits(adev->wb.gpu_addr + poll_offset);
+ 			wptr_poll_cntl = REG_SET_FIELD(wptr_poll_cntl, SDMA0_GFX_RB_WPTR_POLL_CNTL, F32_POLL_ENABLE, 1);
+ 
+-			WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_WPTR_POLL_ADDR_LO), wptr_poll_addr_lo);
+-			WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_WPTR_POLL_ADDR_HI), wptr_poll_addr_hi);
++			WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_WPTR_POLL_ADDR_LO),
++			       lower_32_bits(wptr_gpu_addr));
++			WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_WPTR_POLL_ADDR_HI),
++			       upper_32_bits(wptr_gpu_addr));
+ 			WREG32(sdma_v4_0_get_reg_offset(i, mmSDMA0_GFX_RB_WPTR_POLL_CNTL), wptr_poll_cntl);
+ 		}
+ 	}
+@@ -1261,15 +1247,6 @@ static int sdma_v4_0_sw_init(void *handle)
+ 				     (i == 0) ?
+ 				     AMDGPU_SDMA_IRQ_TRAP0 :
+ 				     AMDGPU_SDMA_IRQ_TRAP1);
+-
+-		if (amdgpu_sriov_vf(adev)) {
+-			r = amdgpu_wb_get_64bit(adev,
+-						&adev->sdma.instance[i].poll_mem_offs);
+-			if (r) {
+-				dev_err(adev->dev, "(%d) failed to allocate SDMA poll mem wb.\n", r);
+-				return r;
+-			}
+-		}
+ 		if (r)
+ 			return r;
+ 	}
+@@ -1282,13 +1259,9 @@ static int sdma_v4_0_sw_fini(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 	int i;
+ 
+-	for (i = 0; i < adev->sdma.num_instances; i++) {
++	for (i = 0; i < adev->sdma.num_instances; i++)
+ 		amdgpu_ring_fini(&adev->sdma.instance[i].ring);
+ 
+-		if (amdgpu_sriov_vf(adev))
+-			amdgpu_wb_free_64bit(adev,
+-					     adev->sdma.instance[i].poll_mem_offs);
+-	}
+ 	return 0;
+ }
+ 
+-- 
+2.7.4
+

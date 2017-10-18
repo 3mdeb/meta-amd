@@ -1,0 +1,314 @@
+From bea7b332a9b7b372b7fd41550dd875affe8bf273 Mon Sep 17 00:00:00 2001
+From: Bhawanpreet Lakha <Bhawanpreet.Lakha@amd.com>
+Date: Tue, 27 Jun 2017 16:34:27 -0400
+Subject: [PATCH 2566/2831] drm/amd/display: Connect DC resource to FBC
+ compressor
+
+- Connected DC resource to FBC compressor,
+- Initial Implementation of FBC for Stoney/Carrizo
+- Code is currently guarded with "ENABLE_FBC" compile time flag
+
+Change-Id: Ie5977bb58febdca4cb25206846d7e81ae528029c
+Signed-off-by: Bhawanpreet Lakha <Bhawanpreet.Lakha@amd.com>
+Reviewed-by: Roman Li <Roman.Li@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           | 19 ++++++
+ .../drm/amd/display/dc/dce110/dce110_compressor.c  | 78 +++++++++++-----------
+ .../drm/amd/display/dc/dce110/dce110_compressor.h  |  2 +-
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    | 15 +++++
+ .../drm/amd/display/dc/dce110/dce110_resource.c    | 10 +++
+ drivers/gpu/drm/amd/display/dc/inc/compressor.h    |  6 +-
+ drivers/gpu/drm/amd/display/dc/inc/core_dc.h       |  6 ++
+ 7 files changed, 94 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index fdcb385..b6eb1e2 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -843,6 +843,11 @@ bool dc_enable_stereo(
+ 	int i, j;
+ 	struct pipe_ctx *pipe;
+ 	struct core_dc *core_dc = DC_TO_CORE(dc);
++
++#ifdef ENABLE_FBC
++	struct compressor *fbc_compressor = core_dc->fbc_compressor;
++#endif
++
+ 	for (i = 0; i < MAX_PIPES; i++) {
+ 		if (context != NULL)
+ 			pipe = &context->res_ctx.pipe_ctx[i];
+@@ -854,6 +859,14 @@ bool dc_enable_stereo(
+ 				core_dc->hwss.setup_stereo(pipe, core_dc);
+ 		}
+ 	}
++
++#ifdef ENABLE_FBC
++	if (fbc_compressor != NULL &&
++	    fbc_compressor->funcs->is_fbc_enabled_in_hw(core_dc->fbc_compressor,
++							&pipe->tg->inst))
++		fbc_compressor->funcs->disable_fbc(fbc_compressor);
++
++#endif
+ 	return ret;
+ }
+ 
+@@ -1232,6 +1245,12 @@ void dc_update_surfaces_and_stream(struct dc *dc,
+ 	if (!stream_status)
+ 		return; /* Cannot commit surface to stream that is not committed */
+ 
++#ifdef ENABLE_FBC
++	if (srf_updates->flip_addr) {
++		if (srf_updates->flip_addr->address.grph.addr.low_part == 0)
++			ASSERT(0);
++	}
++#endif
+ 	context = core_dc->current_context;
+ 
+ 	/* update current stream with the new updates */
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_compressor.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_compressor.c
+index 5fe8304..1e59f4e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_compressor.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_compressor.c
+@@ -175,7 +175,6 @@ void dce110_compressor_power_up_fbc(struct compressor *compressor)
+ 
+ void dce110_compressor_enable_fbc(
+ 	struct compressor *compressor,
+-	uint32_t paths_num,
+ 	struct compr_addr_and_pitch_params *params)
+ {
+ 	struct dce110_compressor *cp110 = TO_DCE110_COMPRESSOR(compressor);
+@@ -366,43 +365,6 @@ void dce110_compressor_set_fbc_invalidation_triggers(
+ 	dm_write_reg(compressor->ctx, addr, value);
+ }
+ 
+-bool dce110_compressor_construct(struct dce110_compressor *compressor,
+-				 struct dc_context *ctx)
+-{
+-
+-	compressor->base.options.bits.FBC_SUPPORT = true;
+-
+-	 /* for dce 11 always use one dram channel for lpt */
+-	compressor->base.lpt_channels_num = 1;
+-	compressor->base.options.bits.DUMMY_BACKEND = false;
+-
+-	/*
+-	 * check if this system has more than 1 dram channel; if only 1 then lpt
+-	 * should not be supported
+-	 */
+-
+-
+-	compressor->base.options.bits.CLK_GATING_DISABLED = false;
+-
+-	compressor->base.ctx = ctx;
+-	compressor->base.embedded_panel_h_size = 0;
+-	compressor->base.embedded_panel_v_size = 0;
+-	compressor->base.memory_bus_width = ctx->asic_id.vram_width;
+-	compressor->base.allocated_size = 0;
+-	compressor->base.preferred_requested_size = 0;
+-	compressor->base.min_compress_ratio = FBC_COMPRESS_RATIO_INVALID;
+-	compressor->base.options.raw = 0;
+-	compressor->base.banks_num = 0;
+-	compressor->base.raw_size = 0;
+-	compressor->base.channel_interleave_size = 0;
+-	compressor->base.dram_channels_num = 0;
+-	compressor->base.lpt_channels_num = 0;
+-	compressor->base.attached_inst = 0;
+-	compressor->base.is_enabled = false;
+-
+-	return true;
+-}
+-
+ struct compressor *dce110_compressor_create(struct dc_context *ctx)
+ {
+ 	struct dce110_compressor *cp110 =
+@@ -503,3 +465,43 @@ static const struct compressor_funcs dce110_compressor_funcs = {
+ };
+ 
+ 
++bool dce110_compressor_construct(struct dce110_compressor *compressor,
++	struct dc_context *ctx)
++{
++
++	compressor->base.options.bits.FBC_SUPPORT = true;
++
++	/* for dce 11 always use one dram channel for lpt */
++	compressor->base.lpt_channels_num = 1;
++	compressor->base.options.bits.DUMMY_BACKEND = false;
++
++	/*
++	 * check if this system has more than 1 dram channel; if only 1 then lpt
++	 * should not be supported
++	 */
++
++
++	compressor->base.options.bits.CLK_GATING_DISABLED = false;
++
++	compressor->base.ctx = ctx;
++	compressor->base.embedded_panel_h_size = 0;
++	compressor->base.embedded_panel_v_size = 0;
++	compressor->base.memory_bus_width = ctx->asic_id.vram_width;
++	compressor->base.allocated_size = 0;
++	compressor->base.preferred_requested_size = 0;
++	compressor->base.min_compress_ratio = FBC_COMPRESS_RATIO_INVALID;
++	compressor->base.options.raw = 0;
++	compressor->base.banks_num = 0;
++	compressor->base.raw_size = 0;
++	compressor->base.channel_interleave_size = 0;
++	compressor->base.dram_channels_num = 0;
++	compressor->base.lpt_channels_num = 0;
++	compressor->base.attached_inst = 0;
++	compressor->base.is_enabled = false;
++#ifdef ENABLE_FBC
++	compressor->base.funcs = &dce110_compressor_funcs;
++
++#endif
++	return true;
++}
++
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_compressor.h b/drivers/gpu/drm/amd/display/dc/dce110/dce110_compressor.h
+index ff21c86..460cb77 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_compressor.h
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_compressor.h
+@@ -50,7 +50,7 @@ void dce110_compressor_destroy(struct compressor **cp);
+ /* FBC RELATED */
+ void dce110_compressor_power_up_fbc(struct compressor *cp);
+ 
+-void dce110_compressor_enable_fbc(struct compressor *cp, uint32_t paths_num,
++void dce110_compressor_enable_fbc(struct compressor *cp,
+ 	struct compr_addr_and_pitch_params *params);
+ 
+ void dce110_compressor_disable_fbc(struct compressor *cp);
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index fd1cb7f..72d5f75 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -33,6 +33,10 @@
+ #include "dce110_timing_generator.h"
+ #include "dce/dce_hwseq.h"
+ 
++#ifdef ENABLE_FBC
++#include "dce110_compressor.h"
++#endif
++
+ #include "bios/bios_parser_helper.h"
+ #include "timing_generator.h"
+ #include "mem_input.h"
+@@ -1166,6 +1170,10 @@ static void power_down_all_hw_blocks(struct core_dc *dc)
+ 	power_down_controllers(dc);
+ 
+ 	power_down_clock_sources(dc);
++
++#ifdef ENABLE_FBC
++	dc->fbc_compressor->funcs->disable_fbc(dc->fbc_compressor);
++#endif
+ }
+ 
+ static void disable_vga_and_power_gate_all_controllers(
+@@ -1630,6 +1638,10 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 	}
+ 
+ 	set_safe_displaymarks(&context->res_ctx, dc->res_pool);
++
++#ifdef ENABLE_FBC
++	dc->fbc_compressor->funcs->disable_fbc(dc->fbc_compressor);
++#endif
+ 	/*TODO: when pplib works*/
+ 	apply_min_clocks(dc, context, &clocks_state, true);
+ 
+@@ -2215,6 +2227,9 @@ static void init_hw(struct core_dc *dc)
+ 		abm->funcs->init_backlight(abm);
+ 		abm->funcs->abm_init(abm);
+ 	}
++#ifdef ENABLE_FBC
++	dc->fbc_compressor->funcs->power_up_fbc(dc->fbc_compressor);
++#endif
+ }
+ 
+ void dce110_fill_display_configs(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+index 45759b9..8b7bc1c 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+@@ -52,6 +52,10 @@
+ #include "dce/dce_abm.h"
+ #include "dce/dce_dmcu.h"
+ 
++#ifdef ENABLE_FBC
++#include "dce110/dce110_compressor.h"
++#endif
++
+ #include "reg_helper.h"
+ 
+ #include "dce/dce_11_0_d.h"
+@@ -1347,6 +1351,12 @@ static bool construct(
+ 		}
+ 	}
+ 
++#ifdef ENABLE_FBC
++	dc->fbc_compressor = dce110_compressor_create(ctx);
++
++
++
++#endif
+ 	if (!underlay_create(ctx, &pool->base))
+ 		goto res_create_fail;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/compressor.h b/drivers/gpu/drm/amd/display/dc/inc/compressor.h
+index 5fdc2fc..24cca18 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/compressor.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/compressor.h
+@@ -45,7 +45,7 @@ union fbc_physical_address {
+ };
+ 
+ struct compr_addr_and_pitch_params {
+-	enum controller_id controller_id;
++	/* enum controller_id controller_id; */
+ 	uint32_t inst;
+ 	uint32_t source_view_width;
+ 	uint32_t source_view_height;
+@@ -63,7 +63,7 @@ struct compressor;
+ struct compressor_funcs {
+ 
+ 	void (*power_up_fbc)(struct compressor *cp);
+-	void (*enable_fbc)(struct compressor *cp, uint32_t paths_num,
++	void (*enable_fbc)(struct compressor *cp,
+ 		struct compr_addr_and_pitch_params *params);
+ 	void (*disable_fbc)(struct compressor *cp);
+ 	void (*set_fbc_invalidation_triggers)(struct compressor *cp,
+@@ -78,7 +78,7 @@ struct compressor {
+ 	struct dc_context *ctx;
+ 	uint32_t attached_inst;
+ 	bool is_enabled;
+-	const struct compressor_funcs funcs;
++	const struct compressor_funcs *funcs;
+ 	union {
+ 		uint32_t raw;
+ 		struct {
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_dc.h b/drivers/gpu/drm/amd/display/dc/inc/core_dc.h
+index a48f5c4..17f5e46 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_dc.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_dc.h
+@@ -10,6 +10,7 @@
+ 
+ #include "core_types.h"
+ #include "hw_sequencer.h"
++#include "compressor.h"
+ 
+ #define DC_TO_CORE(dc)\
+ 	container_of(dc, struct core_dc, public)
+@@ -48,6 +49,11 @@ struct core_dc {
+ 	 * to compare to see if display config changed
+ 	 */
+ 	struct dm_pp_display_configuration prev_display_config;
++
++	/* FBC compressor */
++#ifdef ENABLE_FBC
++	struct compressor *fbc_compressor;
++#endif
+ };
+ 
+ #endif /* __CORE_DC_H__ */
+-- 
+2.7.4
+

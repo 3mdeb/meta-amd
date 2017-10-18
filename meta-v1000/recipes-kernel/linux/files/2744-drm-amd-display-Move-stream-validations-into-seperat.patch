@@ -1,0 +1,604 @@
+From d754dc61f17696fbe3c81032551f320bfc799be7 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Fri, 21 Jul 2017 16:34:36 -0400
+Subject: [PATCH 2744/2831] drm/amd/display: Move stream validations into
+ seperate function.
+
+Stateless streams validations (not require resource population)
+moved into hook to be called directly from DM.
+
+Call dc_validate_stream be before validate_with_context for
+non Linux APIs
+
+Change-Id: I3fdefbfd9d227abd06013eb63467c75f26fd4590
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Reviewed-by: Harry Wentland <Harry.Wentland@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           | 24 +++++++++
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c  | 61 +++++++++++++++-------
+ drivers/gpu/drm/amd/display/dc/dc.h                |  2 +
+ .../gpu/drm/amd/display/dc/dce/dce_link_encoder.c  |  7 ++-
+ .../gpu/drm/amd/display/dc/dce/dce_link_encoder.h  |  2 +-
+ .../drm/amd/display/dc/dce100/dce100_resource.c    | 24 ++-------
+ .../drm/amd/display/dc/dce110/dce110_resource.c    | 23 ++------
+ .../drm/amd/display/dc/dce112/dce112_resource.c    | 25 ++-------
+ .../gpu/drm/amd/display/dc/dce80/dce80_resource.c  | 25 ++-------
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_resource.c  | 25 ++-------
+ .../gpu/drm/amd/display/dc/inc/hw/link_encoder.h   |  2 +-
+ .../amd/display/dc/virtual/virtual_link_encoder.c  |  2 +-
+ 12 files changed, 90 insertions(+), 132 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 4263005..aa18a1f 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -664,6 +664,20 @@ static bool is_validation_required(
+ 	return false;
+ }
+ 
++static bool validate_streams (
++		const struct dc *dc,
++		const struct dc_validation_set set[],
++		int set_count)
++{
++	int i;
++
++	for (i = 0; i < set_count; i++)
++		if (!dc_validate_stream(dc, set[i].stream))
++			return false;
++
++	return true;
++}
++
+ struct validate_context *dc_get_validate_context(
+ 		const struct dc *dc,
+ 		const struct dc_validation_set set[],
+@@ -673,6 +687,7 @@ struct validate_context *dc_get_validate_context(
+ 	enum dc_status result = DC_ERROR_UNEXPECTED;
+ 	struct validate_context *context;
+ 
++
+ 	context = dm_alloc(sizeof(struct validate_context));
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+@@ -711,6 +726,9 @@ bool dc_validate_resources(
+ 	enum dc_status result = DC_ERROR_UNEXPECTED;
+ 	struct validate_context *context;
+ 
++	if (!validate_streams(dc, set, set_count))
++		return false;
++
+ 	context = dm_alloc(sizeof(struct validate_context));
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+@@ -742,6 +760,9 @@ bool dc_validate_guaranteed(
+ 	enum dc_status result = DC_ERROR_UNEXPECTED;
+ 	struct validate_context *context;
+ 
++	if (!dc_validate_stream(dc, stream))
++		return false;
++
+ 	context = dm_alloc(sizeof(struct validate_context));
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+@@ -1044,6 +1065,9 @@ bool dc_commit_streams(
+ 
+ 	}
+ 
++	if (!validate_streams(dc, set, stream_count))
++		return false;
++
+ 	context = dm_alloc(sizeof(struct validate_context));
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 71723fb..32a24e8 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -1416,23 +1416,17 @@ static int get_norm_pix_clk(const struct dc_crtc_timing *timing)
+ 	return normalized_pix_clk;
+ }
+ 
+-static void calculate_phy_pix_clks(struct validate_context *context)
++static void calculate_phy_pix_clks(struct core_stream *stream)
+ {
+-	int i;
+-
+-	for (i = 0; i < context->stream_count; i++) {
+-		struct core_stream *stream = context->streams[i];
+-
+-		update_stream_signal(stream);
+-
+-		/* update actual pixel clock on all streams */
+-		if (dc_is_hdmi_signal(stream->signal))
+-			stream->phy_pix_clk = get_norm_pix_clk(
+-				&stream->public.timing);
+-		else
+-			stream->phy_pix_clk =
+-				stream->public.timing.pix_clk_khz;
+-	}
++	update_stream_signal(stream);
++
++	/* update actual pixel clock on all streams */
++	if (dc_is_hdmi_signal(stream->signal))
++		stream->phy_pix_clk = get_norm_pix_clk(
++			&stream->public.timing);
++	else
++		stream->phy_pix_clk =
++			stream->public.timing.pix_clk_khz;
+ }
+ 
+ enum dc_status resource_map_pool_resources(
+@@ -1443,8 +1437,6 @@ enum dc_status resource_map_pool_resources(
+ 	const struct resource_pool *pool = dc->res_pool;
+ 	int i, j;
+ 
+-	calculate_phy_pix_clks(context);
+-
+ 	for (i = 0; old_context && i < context->stream_count; i++) {
+ 		struct core_stream *stream = context->streams[i];
+ 
+@@ -2516,3 +2508,36 @@ void resource_build_bit_depth_reduction_params(const struct core_stream *stream,
+ 
+ 	fmt_bit_depth->pixel_encoding = pixel_encoding;
+ }
++
++bool dc_validate_stream(const struct dc *dc, const struct dc_stream *stream)
++{
++	struct core_dc *core_dc = DC_TO_CORE(dc);
++	struct dc_context *dc_ctx = core_dc->ctx;
++	struct core_stream *core_stream = DC_STREAM_TO_CORE(stream);
++	struct core_link *link = core_stream->sink->link;
++	struct timing_generator *tg = core_dc->res_pool->timing_generators[0];
++	enum dc_status res = DC_OK;
++
++	calculate_phy_pix_clks(core_stream);
++
++	if (!tg->funcs->validate_timing(tg, &core_stream->public.timing))
++		res = DC_FAIL_CONTROLLER_VALIDATE;
++
++	if (res == DC_OK)
++		if (!link->link_enc->funcs->validate_output_with_stream(
++						link->link_enc, core_stream))
++			res = DC_FAIL_ENC_VALIDATE;
++
++	/* TODO: validate audio ASIC caps, encoder */
++
++	if (res == DC_OK)
++		res = dc_link_validate_mode_timing(core_stream,
++		      link,
++		      &core_stream->public.timing);
++
++	if (res != DC_OK)
++		DC_ERROR("Failed validation for stream %p, err:%d, !\n",
++				stream, res);
++
++	return res == DC_OK;
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 5eebc4b..98f7a48 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -571,6 +571,8 @@ struct dc_validation_set {
+ 	uint8_t surface_count;
+ };
+ 
++bool dc_validate_stream(const struct dc *dc, const struct dc_stream *stream);
++
+ /*
+  * This function takes a set of resources and checks that they are cofunctional.
+  *
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+index 318673d..aff0a44 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+@@ -1009,19 +1009,18 @@ bool dce110_link_encoder_construct(
+ 
+ bool dce110_link_encoder_validate_output_with_stream(
+ 	struct link_encoder *enc,
+-	struct pipe_ctx *pipe_ctx)
++	const struct core_stream *stream)
+ {
+-	struct core_stream *stream = pipe_ctx->stream;
+ 	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+ 	bool is_valid;
+ 
+-	switch (pipe_ctx->stream->signal) {
++	switch (stream->signal) {
+ 	case SIGNAL_TYPE_DVI_SINGLE_LINK:
+ 	case SIGNAL_TYPE_DVI_DUAL_LINK:
+ 		is_valid = dce110_link_encoder_validate_dvi_output(
+ 			enc110,
+ 			stream->sink->link->connector_signal,
+-			pipe_ctx->stream->signal,
++			stream->signal,
+ 			&stream->public.timing);
+ 	break;
+ 	case SIGNAL_TYPE_HDMI_TYPE_A:
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
+index fd6ba7e..ded6c61 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
+@@ -199,7 +199,7 @@ bool dce110_link_encoder_validate_wireless_output(
+ 
+ bool dce110_link_encoder_validate_output_with_stream(
+ 	struct link_encoder *enc,
+-	struct pipe_ctx *pipe_ctx);
++	const struct core_stream *stream);
+ 
+ /****************** HW programming ************************/
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+index 6938158..3d25a90 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+@@ -651,7 +651,7 @@ static void destruct(struct dce110_resource_pool *pool)
+ 		dal_irq_service_destroy(&pool->base.irqs);
+ }
+ 
+-static enum dc_status validate_mapped_resource(
++static enum dc_status build_mapped_resource(
+ 		const struct core_dc *dc,
+ 		struct validate_context *context,
+ 		struct validate_context *old_context)
+@@ -661,7 +661,6 @@ static enum dc_status validate_mapped_resource(
+ 
+ 	for (i = 0; i < context->stream_count; i++) {
+ 		struct core_stream *stream = context->streams[i];
+-		struct dc_link *link = stream->sink->link;
+ 
+ 		if (old_context && resource_is_stream_unchanged(old_context, stream))
+ 			continue;
+@@ -673,28 +672,11 @@ static enum dc_status validate_mapped_resource(
+ 			if (context->res_ctx.pipe_ctx[j].stream != stream)
+ 				continue;
+ 
+-			if (!pipe_ctx->tg->funcs->validate_timing(
+-				pipe_ctx->tg, &stream->public.timing))
+-				return DC_FAIL_CONTROLLER_VALIDATE;
+-
+ 			status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+ 			if (status != DC_OK)
+ 				return status;
+ 
+-			if (!link->link_enc->funcs->validate_output_with_stream(
+-				link->link_enc,
+-				pipe_ctx))
+-				return DC_FAIL_ENC_VALIDATE;
+-
+-			/* TODO: validate audio ASIC caps, encoder */
+-			status = dc_link_validate_mode_timing(stream,
+-							      link,
+-							      &stream->public.timing);
+-
+-			if (status != DC_OK)
+-				return status;
+-
+ 			resource_build_info_frame(pipe_ctx);
+ 
+ 			/* do not need to validate non root pipes */
+@@ -769,7 +751,7 @@ enum dc_status dce100_validate_with_context(
+ 	}
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context, old_context);
++		result = build_mapped_resource(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+ 		result = resource_build_scaling_params_for_context(dc, context);
+@@ -798,7 +780,7 @@ enum dc_status dce100_validate_guaranteed(
+ 		result = resource_map_clock_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context, NULL);
++		result = build_mapped_resource(dc, context, NULL);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+index 015306a..c773351 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+@@ -771,7 +771,7 @@ static bool is_surface_pixel_format_supported(struct pipe_ctx *pipe_ctx, unsigne
+ 	return true;
+ }
+ 
+-static enum dc_status validate_mapped_resource(
++static enum dc_status build_mapped_resource(
+ 		const struct core_dc *dc,
+ 		struct validate_context *context,
+ 		struct validate_context *old_context)
+@@ -781,7 +781,6 @@ static enum dc_status validate_mapped_resource(
+ 
+ 	for (i = 0; i < context->stream_count; i++) {
+ 		struct core_stream *stream = context->streams[i];
+-		struct dc_link *link = stream->sink->link;
+ 
+ 		if (old_context && resource_is_stream_unchanged(old_context, stream))
+ 			continue;
+@@ -797,29 +796,13 @@ static enum dc_status validate_mapped_resource(
+ 					dc->res_pool->underlay_pipe_index))
+ 				return DC_SURFACE_PIXEL_FORMAT_UNSUPPORTED;
+ 
+-			if (!pipe_ctx->tg->funcs->validate_timing(
+-				pipe_ctx->tg, &stream->public.timing))
+-				return DC_FAIL_CONTROLLER_VALIDATE;
+-
+ 			status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+ 			if (status != DC_OK)
+ 				return status;
+ 
+-			if (!link->link_enc->funcs->validate_output_with_stream(
+-				link->link_enc,
+-				pipe_ctx))
+-				return DC_FAIL_ENC_VALIDATE;
+-
+ 			/* TODO: validate audio ASIC caps, encoder */
+ 
+-			status = dc_link_validate_mode_timing(stream,
+-							      link,
+-							      &stream->public.timing);
+-
+-			if (status != DC_OK)
+-				return status;
+-
+ 			resource_build_info_frame(pipe_ctx);
+ 
+ 			/* do not need to validate non root pipes */
+@@ -976,7 +959,7 @@ enum dc_status dce110_validate_with_context(
+ 	}
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context, old_context);
++		result = build_mapped_resource(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+ 		result = resource_build_scaling_params_for_context(dc, context);
+@@ -1005,7 +988,7 @@ enum dc_status dce110_validate_guaranteed(
+ 		result = resource_map_clock_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context, NULL);
++		result = build_mapped_resource(dc, context, NULL);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+index ca1e13e..19cd999 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+@@ -720,7 +720,7 @@ static struct clock_source *find_matching_pll(
+ 	return 0;
+ }
+ 
+-static enum dc_status validate_mapped_resource(
++static enum dc_status build_mapped_resource(
+ 		const struct core_dc *dc,
+ 		struct validate_context *context,
+ 		struct validate_context *old_context)
+@@ -730,7 +730,6 @@ static enum dc_status validate_mapped_resource(
+ 
+ 	for (i = 0; i < context->stream_count; i++) {
+ 		struct core_stream *stream = context->streams[i];
+-		struct dc_link *link = stream->sink->link;
+ 
+ 		if (old_context && resource_is_stream_unchanged(old_context, stream))
+ 			continue;
+@@ -742,29 +741,11 @@ static enum dc_status validate_mapped_resource(
+ 			if (context->res_ctx.pipe_ctx[j].stream != stream)
+ 				continue;
+ 
+-			if (!pipe_ctx->tg->funcs->validate_timing(
+-				pipe_ctx->tg, &stream->public.timing))
+-				return DC_FAIL_CONTROLLER_VALIDATE;
+-
+ 			status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+ 			if (status != DC_OK)
+ 				return status;
+ 
+-			if (!link->link_enc->funcs->validate_output_with_stream(
+-				link->link_enc,
+-				pipe_ctx))
+-				return DC_FAIL_ENC_VALIDATE;
+-
+-			/* TODO: validate audio ASIC caps, encoder */
+-
+-			status = dc_link_validate_mode_timing(stream,
+-							      link,
+-							      &stream->public.timing);
+-
+-			if (status != DC_OK)
+-				return status;
+-
+ 			resource_build_info_frame(pipe_ctx);
+ 
+ 			/* do not need to validate non root pipes */
+@@ -952,7 +933,7 @@ enum dc_status dce112_validate_with_context(
+ 	}
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context, old_context);
++		result = build_mapped_resource(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+ 		result = resource_build_scaling_params_for_context(dc, context);
+@@ -981,7 +962,7 @@ enum dc_status dce112_validate_guaranteed(
+ 		result = resource_map_phy_clock_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context, NULL);
++		result = build_mapped_resource(dc, context, NULL);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+index b2319db..0123006 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+@@ -667,7 +667,7 @@ static void destruct(struct dce110_resource_pool *pool)
+ 	}
+ }
+ 
+-static enum dc_status validate_mapped_resource(
++static enum dc_status build_mapped_resource(
+ 		const struct core_dc *dc,
+ 		struct validate_context *context,
+ 		struct validate_context *old_context)
+@@ -677,7 +677,6 @@ static enum dc_status validate_mapped_resource(
+ 
+ 	for (i = 0; i < context->stream_count; i++) {
+ 		struct core_stream *stream = context->streams[i];
+-		struct dc_link *link = stream->sink->link;
+ 
+ 		if (old_context && resource_is_stream_unchanged(old_context, stream))
+ 			continue;
+@@ -689,29 +688,11 @@ static enum dc_status validate_mapped_resource(
+ 			if (context->res_ctx.pipe_ctx[j].stream != stream)
+ 				continue;
+ 
+-			if (!pipe_ctx->tg->funcs->validate_timing(
+-				pipe_ctx->tg, &stream->public.timing))
+-				return DC_FAIL_CONTROLLER_VALIDATE;
+-
+ 			status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+ 			if (status != DC_OK)
+ 				return status;
+ 
+-			if (!link->link_enc->funcs->validate_output_with_stream(
+-				link->link_enc,
+-				pipe_ctx))
+-				return DC_FAIL_ENC_VALIDATE;
+-
+-			/* TODO: validate audio ASIC caps, encoder */
+-
+-			status = dc_link_validate_mode_timing(stream,
+-							      link,
+-							      &stream->public.timing);
+-
+-			if (status != DC_OK)
+-				return status;
+-
+ 			resource_build_info_frame(pipe_ctx);
+ 
+ 			/* do not need to validate non root pipes */
+@@ -786,7 +767,7 @@ enum dc_status dce80_validate_with_context(
+ 	}
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context, old_context);
++		result = build_mapped_resource(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+ 		result = resource_build_scaling_params_for_context(dc, context);
+@@ -814,7 +795,7 @@ enum dc_status dce80_validate_guaranteed(
+ 		result = resource_map_clock_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context, NULL);
++		result = build_mapped_resource(dc, context, NULL);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+index 0110a43..b901ef9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+@@ -835,7 +835,7 @@ static enum dc_status build_pipe_hw_param(struct pipe_ctx *pipe_ctx)
+ 	return DC_OK;
+ }
+ 
+-static enum dc_status validate_mapped_resource(
++static enum dc_status build_mapped_resource(
+ 		const struct core_dc *dc,
+ 		struct validate_context *context,
+ 		struct validate_context *old_context)
+@@ -845,7 +845,6 @@ static enum dc_status validate_mapped_resource(
+ 
+ 	for (i = 0; i < context->stream_count; i++) {
+ 		struct core_stream *stream = context->streams[i];
+-		struct dc_link *link = stream->sink->link;
+ 
+ 		if (old_context && resource_is_stream_unchanged(old_context, stream)) {
+ 			if (stream != NULL && old_context->streams[i] != NULL) {
+@@ -870,29 +869,11 @@ static enum dc_status validate_mapped_resource(
+ 			if (context->res_ctx.pipe_ctx[j].stream != stream)
+ 				continue;
+ 
+-
+-			if (!pipe_ctx->tg->funcs->validate_timing(
+-					pipe_ctx->tg, &stream->public.timing))
+-				return DC_FAIL_CONTROLLER_VALIDATE;
+-
+ 			status = build_pipe_hw_param(pipe_ctx);
+ 
+ 			if (status != DC_OK)
+ 				return status;
+ 
+-			if (!link->link_enc->funcs->validate_output_with_stream(
+-				link->link_enc, pipe_ctx))
+-				return DC_FAIL_ENC_VALIDATE;
+-
+-			/* TODO: validate audio ASIC caps, encoder */
+-
+-			status = dc_link_validate_mode_timing(
+-				stream, link, &stream->public.timing);
+-
+-			if (status != DC_OK)
+-				return status;
+-
+-
+ 			/* do not need to validate non root pipes */
+ 			break;
+ 		}
+@@ -928,7 +909,7 @@ enum dc_status dcn10_validate_with_context(
+ 	if (result != DC_OK)
+ 		return result;
+ 
+-	result = validate_mapped_resource(dc, context, old_context);
++	result = build_mapped_resource(dc, context, old_context);
+ 	if (result != DC_OK)
+ 		return result;
+ 
+@@ -963,7 +944,7 @@ enum dc_status dcn10_validate_guaranteed(
+ 		result = resource_map_phy_clock_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context, NULL);
++		result = build_mapped_resource(dc, context, NULL);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+index d330d38..0ee7387 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+@@ -94,7 +94,7 @@ struct link_encoder {
+ 
+ struct link_encoder_funcs {
+ 	bool (*validate_output_with_stream)(
+-		struct link_encoder *enc, struct pipe_ctx *pipe_ctx);
++		struct link_encoder *enc, const struct core_stream *stream);
+ 	void (*hw_init)(struct link_encoder *enc);
+ 	void (*setup)(struct link_encoder *enc,
+ 		enum signal_type signal);
+diff --git a/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c b/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c
+index 12df499..d312874 100644
+--- a/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c
+@@ -30,7 +30,7 @@
+ 
+ static bool virtual_link_encoder_validate_output_with_stream(
+ 	struct link_encoder *enc,
+-	struct pipe_ctx *pipe_ctx) { return true; }
++	const struct core_stream *stream) { return true; }
+ 
+ static void virtual_link_encoder_hw_init(struct link_encoder *enc) {}
+ 
+-- 
+2.7.4
+

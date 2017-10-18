@@ -56,6 +56,13 @@ SRC_URI = "git://anongit.freedesktop.org/mesa/drm;branch=master \
 	       file://0037-tests-amdgpu-HYBRID-add-SSG-unit-test.patch \
 	       file://0038-amdgpu-Add-gpu-always-on-cu-bitmap.patch \
 	       file://0039-test-amdgpu-fix-test-failure-for-SI.patch \
+	       file://0040-drm-fix-missing-mutex-unlock-before-return.patch \
+	       file://0041-drm-fix-race-issue-between-two-bo-functions-v2.patch \
+	       file://0042-amdgpu-fix-potential-deadlock.patch \
+	       file://0043-Revert-amdgpu-fix-potential-deadlock.patch \
+	       file://0044-amdgpu-HYBRID-change-to-use-amdgpu_bo_free.patch \
+	       file://0045-amdgpu-merge-and-cleanup-amdgpu_bo_free.patch \
+	       file://0046-tests-amdgpu-update-uvd-enc-test-for-new-fw.patch \
 	       file://amdgpu.ids \
 "
 
