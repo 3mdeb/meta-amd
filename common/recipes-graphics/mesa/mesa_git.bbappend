@@ -26,6 +26,9 @@ SRC_URI_amd = "\
 			file://0003-st-mesa-Revert-patches-solves-perf-issues-with-mesa-.patch \
 			file://0004-st-mesa-fix-swizzle-issue-in-st_create_sampler_view_.patch \
 			file://0005-Revert-winsys-amdgpu-add-back-multithreaded-command-.patch \
+			file://0001-radeonsi-always-set-all-blend-registers.patch \
+			file://0002-radeonsi-set-CB_BLEND1_CONTROL.ENABLE-for-dual-sourc.patch \
+			file://0003-radeonsi-disable-RB-blend-optimizations-for-dual-sou.patch \
 "
 
 EXTRA_OECONF_append_amd = " \
