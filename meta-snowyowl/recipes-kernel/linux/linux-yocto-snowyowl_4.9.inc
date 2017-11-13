@@ -25,6 +25,6 @@ SRC_URI_append_snowyowl += "file://snowyowl-user-features.scc \
     ${@bb.utils.contains('DISTRO', 'mel', 'file://enable-kgdb.cfg', 'file://disable-kgdb.cfg', d)} \
 "
 
-KERNEL_FEATURES_append_snowyowl = " cfg/smp.scc cfg/sound.scc"
+KERNEL_FEATURES_append_snowyowl = " cfg/smp.scc"
 
 COMPATIBLE_MACHINE_snowyowl = "snowyowl"
