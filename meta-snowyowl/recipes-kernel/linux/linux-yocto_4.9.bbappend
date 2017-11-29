@@ -1,8 +1,5 @@
 require linux-yocto-snowyowl_4.9.inc
 
-MACHINE_FEATURES_remove = "alsa"
-MACHINE_EXTRA_RRECOMMENDS_remove = "alsa-utils"
-
 SRC_URI_append_snowyowl += "file://snowyowl-standard-only.cfg"
 SRC_URI_append_snowyowl += "file://disable-graphics.cfg"
 
