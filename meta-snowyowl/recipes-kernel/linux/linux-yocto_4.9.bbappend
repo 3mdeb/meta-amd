@@ -6,6 +6,13 @@ SRC_URI_append_snowyowl += "file://disable-graphics.cfg"
 KBRANCH_snowyowl ?= "standard/base"
 SRCREV_machine_snowyowl ?= "81055b89bd32414ecaf95156ce9a5fa6643e530a"
 
+# openssl-dev is required for features such as module signing
+DEPENDS_append = " openssl-native"
+
+# backported from OE-core so things such as openssl-native listed
+# above can be picked up from the native sysroot
+EXTRA_OEMAKE = " HOSTCC="${BUILD_CC} ${BUILD_CFLAGS} ${BUILD_LDFLAGS}" HOSTCPP="${BUILD_CPP}""
+
 do_validate_branches_append() {
     # Droping configs related to sound generating spurious warnings
     sed -i '/kconf hardware snd_hda_intel.cfg/d' ${WORKDIR}/${KMETA}/features/sound/snd_hda_intel.scc
