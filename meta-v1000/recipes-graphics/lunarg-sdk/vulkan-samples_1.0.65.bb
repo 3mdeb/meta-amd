@@ -14,7 +14,7 @@ LIC_FILES_CHKSUM = "file://LICENSE.txt;md5=99c647ca3d4f6a4b9d8628f757aad156"
 
 S = "${WORKDIR}/git"
 
-SRCREV = "a686d52e1be1a40ae13aa7ac467d56f96c087892"
+SRCREV = "b2a179cda8bb688dd0eaa82c08f864c1dfc3a98a"
 SRC_URI = "git://github.com/LunarG/VulkanSamples;branch=sdk-${PV} \
            file://0002-install-samples.patch"
 

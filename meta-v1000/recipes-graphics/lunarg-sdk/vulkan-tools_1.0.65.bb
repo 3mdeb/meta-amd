@@ -17,12 +17,13 @@ LIC_FILES_CHKSUM = "file://LICENSE.txt;md5=99c647ca3d4f6a4b9d8628f757aad156"
 
 S = "${WORKDIR}/git"
 
-SRCREV = "4ca219323ca2bb0f092ffa76a580523d787feaba"
+SRCREV = "2e2aca87835dbbeeee567cac99c917cd8171f9a1"
 SRC_URI = "git://github.com/LunarG/VulkanTools;branch=sdk-${PV} \
            file://0002-vktrace-do-not-link-to-internal-loader.patch \
            file://0004-CMakeLists-add-include-path-so-Xlib.h-is-found-as-ne.patch \
            file://0005-vktrace_layer-force-linker-flags.patch \
            file://0009-CMakeLists-add-include-paths-for-xcb-and-Xlib.patch \
+           file://0010-layersvt-drop-device_sim-as-we-don-t-have-jsoncpp-fo.patch \
 "
 
 EXTRA_OECMAKE = " \
@@ -37,6 +38,7 @@ EXTRA_OECMAKE = " \
     -DBUILD_WSI_MIR_SUPPORT=0 \
     -DBUILD_VIA=0 \
     -DINSTALL_LVL_FILES=0 \
+    -DBUILD_ICD=0 \
 "
 PACKAGES =+ "${PN}-layer-libs"
 FILES_${PN}-layer-libs = "${libdir}/libVkLayer_*.so"

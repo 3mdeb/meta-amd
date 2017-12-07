@@ -19,7 +19,7 @@ LIC_FILES_CHKSUM = "file://LICENSE.txt;md5=99c647ca3d4f6a4b9d8628f757aad156"
 
 S = "${WORKDIR}/git"
 
-SRCREV = "8d021e4d5a9f91436f4462df1dafb222908e296d"
+SRCREV = "4569d5658bbba977aa35bed2f456572582debd27"
 SRC_URI = "git://github.com/KhronosGroup/Vulkan-LoaderAndValidationLayers;branch=sdk-${PV} \
            file://0001-CMakeLists-add-include-path-so-Xlib.h-is-found-as-ne.patch \
            file://0002-install-demos.patch \
