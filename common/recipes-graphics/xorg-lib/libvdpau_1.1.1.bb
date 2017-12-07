@@ -11,8 +11,8 @@ DEPENDS = "xtrans libx11 libxext libice libsm libxscrnsaver libxt \
 LIC_FILES_CHKSUM = "file://COPYING;md5=83af8811a28727a13f04132cc33b7f58"
 
 SRC_URI = "http://people.freedesktop.org/~aplattner/vdpau/libvdpau-${PV}.tar.gz"
-SRC_URI[md5sum] = "38d362869f1da5516f0f927db4d606c3"
-SRC_URI[sha256sum] = "aea4e783f220bf26ba2139ccd866a0ee5005fa03af5e08c41fbc939118263919"
+SRC_URI[md5sum] = "ac8b21012035c04fd1ec8a9ae6934264"
+SRC_URI[sha256sum] = "5fe093302432ef05086ca2ee429c789b7bf843e166d482d166e56859b08bef55"
 
 inherit autotools pkgconfig
 
