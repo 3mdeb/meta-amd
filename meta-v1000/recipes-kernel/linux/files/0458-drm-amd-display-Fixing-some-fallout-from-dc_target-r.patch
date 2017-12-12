@@ -1,0 +1,256 @@
+From cefd75d8df75ef9871cd7bc212e229734aa21fff Mon Sep 17 00:00:00 2001
+From: Leon Elazar <leon.elazar@amd.com>
+Date: Wed, 11 Jan 2017 14:33:36 -0500
+Subject: [PATCH 0458/2094] drm/amd/display: Fixing some fallout from dc_target
+ removal
+
+Also avoid allocating memory dce110_set_output_transfer_func
+if not needed
+
+Change-Id: Ica29ab36d1bb47451550e2f6ee0cdf8617c44a48
+Signed-off-by: Leon Elazar <leon.elazar@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_stream.c    |  6 +++--
+ drivers/gpu/drm/amd/display/dc/dce/dce_opp.c       |  7 +++++
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    | 30 +++++-----------------
+ .../amd/display/dc/dce110/dce110_opp_regamma_v.c   |  7 +++++
+ .../gpu/drm/amd/display/dc/dce110/dce110_opp_v.c   |  6 ++++-
+ .../gpu/drm/amd/display/dc/dce110/dce110_opp_v.h   |  4 +++
+ .../drm/amd/display/dc/dce110/dce110_resource.c    | 17 +++++++++---
+ drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h  |  1 -
+ drivers/gpu/drm/amd/display/dc/inc/hw/opp.h        |  1 +
+ 9 files changed, 49 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+index bc1f387..47816c5 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+@@ -192,7 +192,8 @@ bool dc_stream_set_cursor_attributes(
+ 	for (i = 0; i < MAX_PIPES; i++) {
+ 		struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[i];
+ 
+-		if (pipe_ctx->stream == stream) {
++		if ((pipe_ctx->stream == stream) &&
++			(pipe_ctx->ipp != NULL)) {
+ 			struct input_pixel_processor *ipp = pipe_ctx->ipp;
+ 
+ 			if (ipp->funcs->ipp_cursor_set_attributes(
+@@ -231,7 +232,8 @@ bool dc_stream_set_cursor_position(
+ 	for (i = 0; i < MAX_PIPES; i++) {
+ 		struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[i];
+ 
+-		if (pipe_ctx->stream == stream) {
++		if ((pipe_ctx->stream == stream) &&
++				(pipe_ctx->ipp != NULL)) {
+ 			struct input_pixel_processor *ipp = pipe_ctx->ipp;
+ 			struct dc_cursor_mi_param param = {
+ 				.pixel_clk_khz = dc_stream->timing.pix_clk_khz,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c b/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c
+index 167f523..061de9e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c
+@@ -973,6 +973,10 @@ bool dce110_opp_construct(struct dce110_opp *opp110,
+ 
+ 	opp110->base.inst = inst;
+ 
++	opp110->base.regamma_params = dm_alloc(sizeof(struct pwl_params));
++	if (opp110->base.regamma_params == NULL)
++		return false;
++
+ 	opp110->regs = regs;
+ 	opp110->opp_shift = opp_shift;
+ 	opp110->opp_mask = opp_mask;
+@@ -982,6 +986,9 @@ bool dce110_opp_construct(struct dce110_opp *opp110,
+ 
+ void dce110_opp_destroy(struct output_pixel_processor **opp)
+ {
++	dm_free((*opp)->regamma_params);
++	(*opp)->regamma_params = NULL;
++
+ 	dm_free(FROM_DCE11_OPP(*opp));
+ 	*opp = NULL;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 6e70cf7..1a9ba12 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -721,43 +721,27 @@ static bool dce110_set_output_transfer_func(
+ 	const struct core_stream *stream)
+ {
+ 	struct output_pixel_processor *opp = pipe_ctx->opp;
+-	const struct core_gamma *ramp = NULL;
+-	struct pwl_params *regamma_params;
+-	bool result = false;
+-
+-	if (surface->public.gamma_correction)
+-		ramp = DC_GAMMA_TO_CORE(surface->public.gamma_correction);
+-
+-	regamma_params = dm_alloc(sizeof(struct pwl_params));
+-	if (regamma_params == NULL)
+-		goto regamma_alloc_fail;
+-
+-	regamma_params->hw_points_num = GAMMA_HW_POINTS_NUM;
+ 
+ 	opp->funcs->opp_power_on_regamma_lut(opp, true);
++	opp->regamma_params->hw_points_num = GAMMA_HW_POINTS_NUM;
+ 
+ 	if (stream->public.out_transfer_func &&
+-			stream->public.out_transfer_func->type ==
++		stream->public.out_transfer_func->type ==
+ 			TF_TYPE_PREDEFINED &&
+-			stream->public.out_transfer_func->tf ==
++		stream->public.out_transfer_func->tf ==
+ 			TRANSFER_FUNCTION_SRGB) {
+ 		opp->funcs->opp_set_regamma_mode(opp, OPP_REGAMMA_SRGB);
+ 	} else if (dce110_translate_regamma_to_hw_format(
+-			stream->public.out_transfer_func, regamma_params)) {
+-		opp->funcs->opp_program_regamma_pwl(opp, regamma_params);
+-		opp->funcs->opp_set_regamma_mode(opp, OPP_REGAMMA_USER);
++				stream->public.out_transfer_func, opp->regamma_params)) {
++			opp->funcs->opp_program_regamma_pwl(opp, opp->regamma_params);
++			opp->funcs->opp_set_regamma_mode(opp, OPP_REGAMMA_USER);
+ 	} else {
+ 		opp->funcs->opp_set_regamma_mode(opp, OPP_REGAMMA_BYPASS);
+ 	}
+ 
+ 	opp->funcs->opp_power_on_regamma_lut(opp, false);
+ 
+-	result = true;
+-
+-	dm_free(regamma_params);
+-
+-regamma_alloc_fail:
+-	return result;
++	return true;
+ }
+ 
+ static enum dc_status bios_parser_crtc_source_select(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_regamma_v.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_regamma_v.c
+index 8164aa6..876445f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_regamma_v.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_regamma_v.c
+@@ -548,3 +548,10 @@ void dce110_opp_power_on_regamma_lut_v(
+ 
+ 	dm_write_reg(opp->ctx, mmDCFEV_MEM_PWR_CTRL, value);
+ }
++
++void dce110_opp_set_regamma_mode_v(
++	struct output_pixel_processor *opp,
++	enum opp_regamma mode)
++{
++	// TODO: need to implement the function
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_v.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_v.c
+index 0a9b384..95b3d2e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_v.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_v.c
+@@ -42,7 +42,7 @@ static const struct opp_funcs funcs = {
+ 		.opp_set_csc_default = dce110_opp_v_set_csc_default,
+ 		.opp_set_csc_adjustment = dce110_opp_v_set_csc_adjustment,
+ 		.opp_set_dyn_expansion = dce110_opp_set_dyn_expansion,
+-		.opp_set_regamma_mode = dce110_opp_set_regamma_mode,
++		.opp_set_regamma_mode = dce110_opp_set_regamma_mode_v,
+ 		.opp_destroy = dce110_opp_destroy,
+ 		.opp_program_fmt = dce110_opp_program_fmt,
+ 		.opp_program_bit_depth_reduction =
+@@ -56,6 +56,10 @@ bool dce110_opp_v_construct(struct dce110_opp *opp110,
+ 
+ 	opp110->base.ctx = ctx;
+ 
++	opp110->base.regamma_params = dm_alloc(sizeof(struct pwl_params));
++	if (opp110->base.regamma_params == NULL)
++		return false;
++
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_v.h b/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_v.h
+index ac59377..cb26c51 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_v.h
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_v.h
+@@ -49,4 +49,8 @@ void dce110_opp_power_on_regamma_lut_v(
+ 	struct output_pixel_processor *opp,
+ 	bool power_on);
+ 
++void dce110_opp_set_regamma_mode_v(
++	struct output_pixel_processor *opp,
++	enum opp_regamma mode);
++
+ #endif /* __DC_OPP_DCE110_V_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+index cfbb4ef..82cddb6 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+@@ -1114,14 +1114,22 @@ static const struct resource_funcs dce110_res_pool_funcs = {
+ 			dce110_resource_build_bit_depth_reduction_params
+ };
+ 
+-static void underlay_create(struct dc_context *ctx, struct resource_pool *pool)
++static bool underlay_create(struct dc_context *ctx, struct resource_pool *pool)
+ {
+ 	struct dce110_timing_generator *dce110_tgv = dm_alloc(sizeof (*dce110_tgv));
+ 	struct dce_transform *dce110_xfmv = dm_alloc(sizeof (*dce110_xfmv));
+ 	struct dce110_mem_input *dce110_miv = dm_alloc(sizeof (*dce110_miv));
+ 	struct dce110_opp *dce110_oppv = dm_alloc(sizeof (*dce110_oppv));
+ 
+-	dce110_opp_v_construct(dce110_oppv, ctx);
++	if ((dce110_tgv == NULL) ||
++		(dce110_xfmv == NULL) ||
++		(dce110_miv == NULL) ||
++		(dce110_oppv == NULL))
++			return false;
++
++	if (!dce110_opp_v_construct(dce110_oppv, ctx))
++		return false;
++
+ 	dce110_timing_generator_v_construct(dce110_tgv, ctx);
+ 	dce110_mem_input_v_construct(dce110_miv, ctx);
+ 	dce110_transform_v_construct(dce110_xfmv, ctx);
+@@ -1135,6 +1143,8 @@ static void underlay_create(struct dc_context *ctx, struct resource_pool *pool)
+ 	/* update the public caps to indicate an underlay is available */
+ 	ctx->dc->caps.max_slave_planes = 1;
+ 	ctx->dc->caps.max_slave_planes = 1;
++
++	return true;
+ }
+ 
+ static void bw_calcs_data_update_from_pplib(struct core_dc *dc)
+@@ -1334,7 +1344,8 @@ static bool construct(
+ 		}
+ 	}
+ 
+-	underlay_create(ctx, &pool->base);
++	if (!underlay_create(ctx, &pool->base))
++		goto res_create_fail;
+ 
+ 	if (!resource_construct(num_virtual_links, dc, &pool->base,
+ 			&res_create_funcs))
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h b/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h
+index 3b0e616..b8735b2 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h
+@@ -65,7 +65,6 @@ struct pwl_result_data {
+ };
+ 
+ struct pwl_params {
+-	uint32_t *data;
+ 	struct gamma_curve arr_curve_points[16];
+ 	struct curve_points arr_points[3];
+ 	struct pwl_result_data rgb_resulted[256 + 3];
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
+index bef5e2c..a10c4e2 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
+@@ -202,6 +202,7 @@ enum opp_regamma {
+ struct output_pixel_processor {
+ 	struct dc_context *ctx;
+ 	uint32_t inst;
++	struct pwl_params *regamma_params;
+ 	const struct opp_funcs *funcs;
+ };
+ 
+-- 
+2.7.4
+

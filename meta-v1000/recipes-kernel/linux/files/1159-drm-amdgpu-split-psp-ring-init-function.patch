@@ -1,0 +1,255 @@
+From 93748771df12050301efd8448547c8f0b1dd7702 Mon Sep 17 00:00:00 2001
+From: Huang Rui <ray.huang@amd.com>
+Date: Tue, 21 Mar 2017 18:36:57 +0800
+Subject: [PATCH 1159/2094] drm/amdgpu: split psp ring init function
+
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c | 115 ++++++++++++++++++++------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h |   3 +
+ drivers/gpu/drm/amd/amdgpu/psp_v3_1.c   |  11 ++-
+ drivers/gpu/drm/amd/amdgpu/psp_v3_1.h   |   2 +
+ 4 files changed, 87 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index ea56160..0d20dc3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -55,6 +55,7 @@ static int psp_sw_init(void *handle)
+ 		psp->bootloader_load_sos = psp_v3_1_bootloader_load_sos;
+ 		psp->prep_cmd_buf = psp_v3_1_prep_cmd_buf;
+ 		psp->ring_init = psp_v3_1_ring_init;
++		psp->ring_create = psp_v3_1_ring_create;
+ 		psp->cmd_submit = psp_v3_1_cmd_submit;
+ 		psp->compare_sram_data = psp_v3_1_compare_sram_data;
+ 		psp->smu_reload_quirk = psp_v3_1_smu_reload_quirk;
+@@ -246,18 +247,79 @@ static int psp_asd_load(struct psp_context *psp)
+ 	return ret;
+ }
+ 
+-static int psp_load_fw(struct amdgpu_device *adev)
++static int psp_hw_start(struct psp_context *psp)
+ {
+ 	int ret;
+-	struct psp_gfx_cmd_resp *cmd;
+-	int i;
++
++	ret = psp_bootloader_load_sysdrv(psp);
++	if (ret)
++		return ret;
++
++	ret = psp_bootloader_load_sos(psp);
++	if (ret)
++		return ret;
++
++	ret = psp_ring_create(psp, PSP_RING_TYPE__KM);
++	if (ret)
++		return ret;
++
++	ret = psp_tmr_load(psp);
++	if (ret)
++		return ret;
++
++	ret = psp_asd_load(psp);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int psp_np_fw_load(struct psp_context *psp)
++{
++	int i, ret;
+ 	struct amdgpu_firmware_info *ucode;
++	struct amdgpu_device* adev = psp->adev;
++
++	for (i = 0; i < adev->firmware.max_ucodes; i++) {
++		ucode = &adev->firmware.ucode[i];
++		if (!ucode->fw)
++			continue;
++
++		if (ucode->ucode_id == AMDGPU_UCODE_ID_SMC &&
++		    psp_smu_reload_quirk(psp))
++			continue;
++
++		ret = psp_prep_cmd_buf(ucode, psp->cmd);
++		if (ret)
++			return ret;
++
++		ret = psp_cmd_submit_buf(psp, ucode, psp->cmd,
++					 psp->fence_buf_mc_addr, i + 3);
++		if (ret)
++			return ret;
++
++#if 0
++		/* check if firmware loaded sucessfully */
++		if (!amdgpu_psp_check_fw_loading_status(adev, i))
++			return -EINVAL;
++#endif
++	}
++
++	return 0;
++}
++
++static int psp_load_fw(struct amdgpu_device *adev)
++{
++	int ret;
+ 	struct psp_context *psp = &adev->psp;
++	struct psp_gfx_cmd_resp *cmd;
+ 
+ 	cmd = kzalloc(sizeof(struct psp_gfx_cmd_resp), GFP_KERNEL);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
++	psp->cmd = cmd;
++
+ 	ret = amdgpu_bo_create_kernel(adev, PSP_1_MEG, PSP_1_MEG,
+ 				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &psp->fw_pri_bo,
+@@ -266,18 +328,6 @@ static int psp_load_fw(struct amdgpu_device *adev)
+ 	if (ret)
+ 		goto failed;
+ 
+-	ret = psp_bootloader_load_sysdrv(psp);
+-	if (ret)
+-		goto failed_mem1;
+-
+-	ret = psp_bootloader_load_sos(psp);
+-	if (ret)
+-		goto failed_mem1;
+-
+-	ret = psp_ring_init(psp, PSP_RING_TYPE__KM);
+-	if (ret)
+-		goto failed_mem1;
+-
+ 	ret = amdgpu_bo_create_kernel(adev, PSP_FENCE_BUFFER_SIZE, PAGE_SIZE,
+ 				      AMDGPU_GEM_DOMAIN_VRAM,
+ 				      &psp->fence_buf_bo,
+@@ -288,11 +338,11 @@ static int psp_load_fw(struct amdgpu_device *adev)
+ 
+ 	memset(psp->fence_buf, 0, PSP_FENCE_BUFFER_SIZE);
+ 
+-	ret = psp_tmr_init(psp);
++	ret = psp_ring_init(psp, PSP_RING_TYPE__KM);
+ 	if (ret)
+-		goto failed_mem;
++		goto failed_mem1;
+ 
+-	ret = psp_tmr_load(psp);
++	ret = psp_tmr_init(psp);
+ 	if (ret)
+ 		goto failed_mem;
+ 
+@@ -300,34 +350,13 @@ static int psp_load_fw(struct amdgpu_device *adev)
+ 	if (ret)
+ 		goto failed_mem;
+ 
+-	ret = psp_asd_load(psp);
++	ret = psp_hw_start(psp);
+ 	if (ret)
+ 		goto failed_mem;
+ 
+-	for (i = 0; i < adev->firmware.max_ucodes; i++) {
+-		ucode = &adev->firmware.ucode[i];
+-		if (!ucode->fw)
+-			continue;
+-
+-		if (ucode->ucode_id == AMDGPU_UCODE_ID_SMC &&
+-		    psp_smu_reload_quirk(psp))
+-			continue;
+-
+-		ret = psp_prep_cmd_buf(ucode, cmd);
+-		if (ret)
+-			goto failed_mem;
+-
+-		ret = psp_cmd_submit_buf(psp, ucode, cmd,
+-					 psp->fence_buf_mc_addr, i + 3);
+-		if (ret)
+-			goto failed_mem;
+-
+-#if 0
+-		/* check if firmware loaded sucessfully */
+-		if (!amdgpu_psp_check_fw_loading_status(adev, i))
+-			return -EINVAL;
+-#endif
+-	}
++	ret = psp_np_fw_load(psp);
++	if (ret)
++		goto failed_mem;
+ 
+ 	amdgpu_bo_free_kernel(&psp->fence_buf_bo,
+ 			      &psp->fence_buf_mc_addr, &psp->fence_buf);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+index 1f1f057..28faba5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+@@ -57,6 +57,7 @@ struct psp_context
+ {
+ 	struct amdgpu_device            *adev;
+ 	struct psp_ring                 km_ring;
++	struct psp_gfx_cmd_resp		*cmd;
+ 
+ 	int (*init_microcode)(struct psp_context *psp);
+ 	int (*bootloader_load_sysdrv)(struct psp_context *psp);
+@@ -64,6 +65,7 @@ struct psp_context
+ 	int (*prep_cmd_buf)(struct amdgpu_firmware_info *ucode,
+ 			    struct psp_gfx_cmd_resp *cmd);
+ 	int (*ring_init)(struct psp_context *psp, enum psp_ring_type ring_type);
++	int (*ring_create)(struct psp_context *psp, enum psp_ring_type ring_type);
+ 	int (*cmd_submit)(struct psp_context *psp, struct amdgpu_firmware_info *ucode,
+ 			  uint64_t cmd_buf_mc_addr, uint64_t fence_mc_addr, int index);
+ 	bool (*compare_sram_data)(struct psp_context *psp,
+@@ -113,6 +115,7 @@ struct amdgpu_psp_funcs {
+ 
+ #define psp_prep_cmd_buf(ucode, type) (psp)->prep_cmd_buf((ucode), (type))
+ #define psp_ring_init(psp, type) (psp)->ring_init((psp), (type))
++#define psp_ring_create(psp, type) (psp)->ring_create((psp), (type))
+ #define psp_cmd_submit(psp, ucode, cmd_mc, fence_mc, index) \
+ 		(psp)->cmd_submit((psp), (ucode), (cmd_mc), (fence_mc), (index))
+ #define psp_compare_sram_data(psp, ucode, type) \
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
+index aae6b65..d351583 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
+@@ -268,7 +268,6 @@ int psp_v3_1_prep_cmd_buf(struct amdgpu_firmware_info *ucode, struct psp_gfx_cmd
+ int psp_v3_1_ring_init(struct psp_context *psp, enum psp_ring_type ring_type)
+ {
+ 	int ret = 0;
+-	unsigned int psp_ring_reg = 0;
+ 	struct psp_ring *ring;
+ 	struct amdgpu_device *adev = psp->adev;
+ 
+@@ -288,6 +287,16 @@ int psp_v3_1_ring_init(struct psp_context *psp, enum psp_ring_type ring_type)
+ 		return ret;
+ 	}
+ 
++	return 0;
++}
++
++int psp_v3_1_ring_create(struct psp_context *psp, enum psp_ring_type ring_type)
++{
++	int ret = 0;
++	unsigned int psp_ring_reg = 0;
++	struct psp_ring *ring = &psp->km_ring;
++	struct amdgpu_device *adev = psp->adev;
++
+ 	/* Write low address of the ring to C2PMSG_69 */
+ 	psp_ring_reg = lower_32_bits(ring->ring_mem_mc_addr);
+ 	WREG32(SOC15_REG_OFFSET(MP0, 0, mmMP0_SMN_C2PMSG_69), psp_ring_reg);
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h
+index e82eff7..5230d278 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h
+@@ -39,6 +39,8 @@ extern int psp_v3_1_prep_cmd_buf(struct amdgpu_firmware_info *ucode,
+ 				 struct psp_gfx_cmd_resp *cmd);
+ extern int psp_v3_1_ring_init(struct psp_context *psp,
+ 			      enum psp_ring_type ring_type);
++extern int psp_v3_1_ring_create(struct psp_context *psp,
++				enum psp_ring_type ring_type);
+ extern int psp_v3_1_cmd_submit(struct psp_context *psp,
+ 			       struct amdgpu_firmware_info *ucode,
+ 			       uint64_t cmd_buf_mc_addr, uint64_t fence_mc_addr,
+-- 
+2.7.4
+

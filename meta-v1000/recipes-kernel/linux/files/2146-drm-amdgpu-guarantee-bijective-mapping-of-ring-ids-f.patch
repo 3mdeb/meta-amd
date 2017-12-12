@@ -1,0 +1,138 @@
+From fd13f049ca03dc23d7147b572e9698e185fe3912 Mon Sep 17 00:00:00 2001
+From: Andres Rodriguez <andresx7@gmail.com>
+Date: Fri, 17 Mar 2017 14:30:15 -0400
+Subject: [PATCH 2146/2500] drm/amdgpu: guarantee bijective mapping of ring ids
+ for LRU v3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Depending on usage patterns, the current LRU policy may create a
+non-injective mapping between userspace ring ids and kernel rings.
+
+This behaviour is undesired as apps that attempt to fill all HW blocks
+would be unable to reach some of them.
+
+This change forces the LRU policy to create bijective mappings only.
+
+v2: compress ring_blacklist
+v3: simplify amdgpu_ring_is_blacklisted() logic
+
+Signed-off-by: Andres Rodriguez <andresx7@gmail.com>
+Reviewed-by: Nicolai Hähnle <nicolai.haehnle@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_queue_mgr.c | 16 +++++++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c      | 33 +++++++++++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h      |  4 ++--
+ 3 files changed, 42 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_queue_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_queue_mgr.c
+index 4073f07..9a14c27 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_queue_mgr.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_queue_mgr.c
+@@ -124,10 +124,22 @@ static int amdgpu_lru_map(struct amdgpu_device *adev,
+ 			  int user_ring,
+ 			  struct amdgpu_ring **out_ring)
+ {
+-	int r;
++	int r, i, j;
+ 	int ring_type = amdgpu_hw_ip_to_ring_type(mapper->hw_ip);
++	int ring_blacklist[AMDGPU_MAX_RINGS];
++	struct amdgpu_ring *ring;
+ 
+-	r = amdgpu_ring_lru_get(adev, ring_type, out_ring);
++	/* 0 is a valid ring index, so initialize to -1 */
++	memset(ring_blacklist, 0xff, sizeof(ring_blacklist));
++
++	for (i = 0, j = 0; i < AMDGPU_MAX_RINGS; i++) {
++		ring = mapper->queue_map[i];
++		if (ring)
++			ring_blacklist[j++] = ring->idx;
++	}
++
++	r = amdgpu_ring_lru_get(adev, ring_type, ring_blacklist,
++				j, out_ring);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index d4db690..ca9ebd2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -338,19 +338,34 @@ static void amdgpu_ring_lru_touch_locked(struct amdgpu_device *adev,
+ 	list_move_tail(&ring->lru_list, &adev->ring_lru_list);
+ }
+ 
++static bool amdgpu_ring_is_blacklisted(struct amdgpu_ring *ring,
++				       int *blacklist, int num_blacklist)
++{
++	int i;
++
++	for (i = 0; i < num_blacklist; i++) {
++		if (ring->idx == blacklist[i])
++			return true;
++	}
++
++	return false;
++}
++
+ /**
+  * amdgpu_ring_lru_get - get the least recently used ring for a HW IP block
+  *
+  * @adev: amdgpu_device pointer
+  * @type: amdgpu_ring_type enum
++ * @blacklist: blacklisted ring ids array
++ * @num_blacklist: number of entries in @blacklist
+  * @ring: output ring
+  *
+  * Retrieve the amdgpu_ring structure for the least recently used ring of
+  * a specific IP block (all asics).
+  * Returns 0 on success, error on failure.
+  */
+-int amdgpu_ring_lru_get(struct amdgpu_device *adev, int type,
+-			struct amdgpu_ring **ring)
++int amdgpu_ring_lru_get(struct amdgpu_device *adev, int type, int *blacklist,
++			int num_blacklist, struct amdgpu_ring **ring)
+ {
+ 	struct amdgpu_ring *entry;
+ 
+@@ -359,11 +374,15 @@ int amdgpu_ring_lru_get(struct amdgpu_device *adev, int type,
+ 	*ring = NULL;
+ 	spin_lock(&adev->ring_lru_list_lock);
+ 	list_for_each_entry(entry, &adev->ring_lru_list, lru_list) {
+-		if (entry->funcs->type == type) {
+-			*ring = entry;
+-			amdgpu_ring_lru_touch_locked(adev, *ring);
+-			break;
+-		}
++		if (entry->funcs->type != type)
++			continue;
++
++		if (amdgpu_ring_is_blacklisted(entry, blacklist, num_blacklist))
++			continue;
++
++		*ring = entry;
++		amdgpu_ring_lru_touch_locked(adev, *ring);
++		break;
+ 	}
+ 	spin_unlock(&adev->ring_lru_list_lock);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+index b1be01c..12a30a1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -202,8 +202,8 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 		     unsigned ring_size, struct amdgpu_irq_src *irq_src,
+ 		     unsigned irq_type);
+ void amdgpu_ring_fini(struct amdgpu_ring *ring);
+-int amdgpu_ring_lru_get(struct amdgpu_device *adev, int hw_ip,
+-			struct amdgpu_ring **ring);
++int amdgpu_ring_lru_get(struct amdgpu_device *adev, int type, int *blacklist,
++			int num_blacklist, struct amdgpu_ring **ring);
+ void amdgpu_ring_lru_touch(struct amdgpu_device *adev, struct amdgpu_ring *ring);
+ static inline void amdgpu_ring_clear_ring(struct amdgpu_ring *ring)
+ {
+-- 
+2.7.4
+

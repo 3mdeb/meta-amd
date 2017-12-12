@@ -1,0 +1,162 @@
+From 908ffe98677256a5a4a0e7292c7f7872a569f4a7 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Fri, 15 Jul 2016 18:37:05 -0400
+Subject: [PATCH 1823/2094] drm/amdgpu: Make SDMA phase quantum configurable
+
+Set a configurable SDMA phase quantum when enabling SDMA context
+switching. The default value significantly reduces SDMA latency
+in page table updates when user-mode SDMA queues have concurrent
+activity, compared to the initial HW setting.
+
+Change-Id: Id99c52e893d0358374ea9a3fbc2181f0c60b1b42
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu.h
+	drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c   | 32 +++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c  | 32 +++++++++++++++++++++++++++++++-
+ 4 files changed, 67 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index d02c7f9..072f60b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -105,6 +105,7 @@ extern unsigned amdgpu_pcie_gen_cap;
+ extern unsigned amdgpu_pcie_lane_cap;
+ extern unsigned amdgpu_cg_mask;
+ extern unsigned amdgpu_pg_mask;
++extern unsigned amdgpu_sdma_phase_quantum;
+ extern char *amdgpu_disable_cu;
+ extern char *amdgpu_virtual_display;
+ extern unsigned amdgpu_pp_feature_mask;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index cd87ca4..f23320d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -106,6 +106,7 @@ unsigned amdgpu_pcie_gen_cap = 0;
+ unsigned amdgpu_pcie_lane_cap = 0;
+ unsigned amdgpu_cg_mask = 0xffffffff;
+ unsigned amdgpu_pg_mask = 0xffffffff;
++unsigned amdgpu_sdma_phase_quantum = 32;
+ char *amdgpu_disable_cu = NULL;
+ char *amdgpu_virtual_display = NULL;
+ unsigned amdgpu_pp_feature_mask = 0xffffffff;
+@@ -221,6 +222,9 @@ module_param_named(cg_mask, amdgpu_cg_mask, uint, 0444);
+ MODULE_PARM_DESC(pg_mask, "Powergating flags mask (0 = disable power gating)");
+ module_param_named(pg_mask, amdgpu_pg_mask, uint, 0444);
+ 
++MODULE_PARM_DESC(sdma_phase_quantum, "SDMA context switch phase quantum (x 1K GPU clock cycles, 0 = no change (default 32))");
++module_param_named(sdma_phase_quantum, amdgpu_sdma_phase_quantum, uint, 0444);
++
+ MODULE_PARM_DESC(disable_cu, "Disable CUs (se.sh.cu,...)");
+ module_param_named(disable_cu, amdgpu_disable_cu, charp, 0444);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 4199627..d3c6c01 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -351,14 +351,44 @@ static void cik_sdma_rlc_stop(struct amdgpu_device *adev)
+  */
+ static void cik_ctx_switch_enable(struct amdgpu_device *adev, bool enable)
+ {
+-	u32 f32_cntl;
++	u32 f32_cntl, phase_quantum = 0;
+ 	int i;
+ 
++	if (amdgpu_sdma_phase_quantum) {
++		unsigned value = amdgpu_sdma_phase_quantum;
++		unsigned unit = 0;
++
++		while (value > (SDMA0_PHASE0_QUANTUM__VALUE_MASK >>
++				SDMA0_PHASE0_QUANTUM__VALUE__SHIFT)) {
++			value = (value + 1) >> 1;
++			unit++;
++		}
++		if (unit > (SDMA0_PHASE0_QUANTUM__UNIT_MASK >>
++			    SDMA0_PHASE0_QUANTUM__UNIT__SHIFT)) {
++			value = (SDMA0_PHASE0_QUANTUM__VALUE_MASK >>
++				 SDMA0_PHASE0_QUANTUM__VALUE__SHIFT);
++			unit = (SDMA0_PHASE0_QUANTUM__UNIT_MASK >>
++				SDMA0_PHASE0_QUANTUM__UNIT__SHIFT);
++			WARN_ONCE(1,
++			"clamping sdma_phase_quantum to %uK clock cycles\n",
++				  value << unit);
++		}
++		phase_quantum =
++			value << SDMA0_PHASE0_QUANTUM__VALUE__SHIFT |
++			unit  << SDMA0_PHASE0_QUANTUM__UNIT__SHIFT;
++	}
++
+ 	for (i = 0; i < adev->sdma.num_instances; i++) {
+ 		f32_cntl = RREG32(mmSDMA0_CNTL + sdma_offsets[i]);
+ 		if (enable) {
+ 			f32_cntl = REG_SET_FIELD(f32_cntl, SDMA0_CNTL,
+ 					AUTO_CTXSW_ENABLE, 1);
++			if (amdgpu_sdma_phase_quantum) {
++				WREG32(mmSDMA0_PHASE0_QUANTUM + sdma_offsets[i],
++				       phase_quantum);
++				WREG32(mmSDMA0_PHASE1_QUANTUM + sdma_offsets[i],
++				       phase_quantum);
++			}
+ 		} else {
+ 			f32_cntl = REG_SET_FIELD(f32_cntl, SDMA0_CNTL,
+ 					AUTO_CTXSW_ENABLE, 0);
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index e3e0fd4..4493c83 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -551,9 +551,33 @@ static void sdma_v3_0_rlc_stop(struct amdgpu_device *adev)
+  */
+ static void sdma_v3_0_ctx_switch_enable(struct amdgpu_device *adev, bool enable)
+ {
+-	u32 f32_cntl;
++	u32 f32_cntl, phase_quantum = 0;
+ 	int i;
+ 
++	if (amdgpu_sdma_phase_quantum) {
++		unsigned value = amdgpu_sdma_phase_quantum;
++		unsigned unit = 0;
++
++		while (value > (SDMA0_PHASE0_QUANTUM__VALUE_MASK >>
++				SDMA0_PHASE0_QUANTUM__VALUE__SHIFT)) {
++			value = (value + 1) >> 1;
++			unit++;
++		}
++		if (unit > (SDMA0_PHASE0_QUANTUM__UNIT_MASK >>
++			    SDMA0_PHASE0_QUANTUM__UNIT__SHIFT)) {
++			value = (SDMA0_PHASE0_QUANTUM__VALUE_MASK >>
++				 SDMA0_PHASE0_QUANTUM__VALUE__SHIFT);
++			unit = (SDMA0_PHASE0_QUANTUM__UNIT_MASK >>
++				SDMA0_PHASE0_QUANTUM__UNIT__SHIFT);
++			WARN_ONCE(1,
++			"clamping sdma_phase_quantum to %uK clock cycles\n",
++				  value << unit);
++		}
++		phase_quantum =
++			value << SDMA0_PHASE0_QUANTUM__VALUE__SHIFT |
++			unit  << SDMA0_PHASE0_QUANTUM__UNIT__SHIFT;
++	}
++
+ 	for (i = 0; i < adev->sdma.num_instances; i++) {
+ 		f32_cntl = RREG32(mmSDMA0_CNTL + sdma_offsets[i]);
+ 		if (enable) {
+@@ -561,6 +585,12 @@ static void sdma_v3_0_ctx_switch_enable(struct amdgpu_device *adev, bool enable)
+ 					AUTO_CTXSW_ENABLE, 1);
+ 			f32_cntl = REG_SET_FIELD(f32_cntl, SDMA0_CNTL,
+ 					ATC_L1_ENABLE, 1);
++			if (amdgpu_sdma_phase_quantum) {
++				WREG32(mmSDMA0_PHASE0_QUANTUM + sdma_offsets[i],
++				       phase_quantum);
++				WREG32(mmSDMA0_PHASE1_QUANTUM + sdma_offsets[i],
++				       phase_quantum);
++			}
+ 		} else {
+ 			f32_cntl = REG_SET_FIELD(f32_cntl, SDMA0_CNTL,
+ 					AUTO_CTXSW_ENABLE, 0);
+-- 
+2.7.4
+

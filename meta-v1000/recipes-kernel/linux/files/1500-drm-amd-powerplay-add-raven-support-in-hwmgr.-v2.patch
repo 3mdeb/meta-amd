@@ -1,0 +1,1437 @@
+From 483656fd7bf1edf84d380a0d26534bb33a26bc86 Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Mon, 6 Mar 2017 19:15:15 +0800
+Subject: [PATCH 1500/2094] drm/amd/powerplay: add raven support in hwmgr. (v2)
+
+hwmgr handles the GPU power state management.
+
+v2: squash in updates (Alex)
+
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/powerplay/eventmgr/eventmgr.c  |   4 +-
+ drivers/gpu/drm/amd/powerplay/hwmgr/Makefile       |   2 +-
+ drivers/gpu/drm/amd/powerplay/hwmgr/hwmgr.c        |   9 +
+ .../gpu/drm/amd/powerplay/hwmgr/processpptables.c  |   4 +
+ drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.c     | 974 +++++++++++++++++++++
+ drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.h     | 295 +++++++
+ drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h  |   3 +-
+ drivers/gpu/drm/amd/powerplay/inc/hwmgr.h          |  18 +-
+ 8 files changed, 1291 insertions(+), 18 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.c
+ create mode 100644 drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.h
+
+diff --git a/drivers/gpu/drm/amd/powerplay/eventmgr/eventmgr.c b/drivers/gpu/drm/amd/powerplay/eventmgr/eventmgr.c
+index 781e53d..3e3ca03 100644
+--- a/drivers/gpu/drm/amd/powerplay/eventmgr/eventmgr.c
++++ b/drivers/gpu/drm/amd/powerplay/eventmgr/eventmgr.c
+@@ -42,8 +42,8 @@ static int pem_init(struct pp_eventmgr *eventmgr)
+ 	/* Call initialization event */
+ 	result = pem_handle_event(eventmgr, AMD_PP_EVENT_INITIALIZE, &event_data);
+ 
+-	if (0 != result)
+-		return result;
++	/* if (0 != result)
++		return result; */
+ 
+ 	/* Register interrupt callback functions */
+ 	result = pem_register_interrupts(eventmgr);
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/Makefile b/drivers/gpu/drm/amd/powerplay/hwmgr/Makefile
+index 27db2b7..d9bab85 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/Makefile
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/Makefile
+@@ -9,7 +9,7 @@ HARDWARE_MGR = hwmgr.o processpptables.o functiontables.o \
+ 		smu7_hwmgr.o smu7_powertune.o smu7_thermal.o \
+ 		smu7_clockpowergating.o \
+ 		vega10_processpptables.o vega10_hwmgr.o vega10_powertune.o \
+-		vega10_thermal.o
++		vega10_thermal.o rv_hwmgr.o
+ 
+ 
+ AMD_PP_HWMGR = $(addprefix $(AMD_PP_PATH)/hwmgr/,$(HARDWARE_MGR))
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/hwmgr.c b/drivers/gpu/drm/amd/powerplay/hwmgr/hwmgr.c
+index ff4ae3d..27fe108 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/hwmgr.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/hwmgr.c
+@@ -115,6 +115,15 @@ int hwmgr_early_init(struct pp_instance *handle)
+ 			return -EINVAL;
+ 		}
+ 		break;
++	case AMDGPU_FAMILY_RV:
++		switch (hwmgr->chip_id) {
++		case CHIP_RAVEN:
++			rv_init_function_pointers(hwmgr);
++			break;
++		default:
++			return -EINVAL;
++		}
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.c b/drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.c
+index ed6c934..7138cf9 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/processpptables.c
+@@ -1015,6 +1015,10 @@ static int init_overdrive_limits(struct pp_hwmgr *hwmgr,
+ 	hwmgr->platform_descriptor.overdriveLimit.memoryClock = 0;
+ 	hwmgr->platform_descriptor.minOverdriveVDDC = 0;
+ 	hwmgr->platform_descriptor.maxOverdriveVDDC = 0;
++	hwmgr->platform_descriptor.overdriveVDDCStep = 0;
++
++	if (hwmgr->chip_id == CHIP_RAVEN)
++		return 0;
+ 
+ 	/* We assume here that fw_info is unchanged if this call fails.*/
+ 	fw_info = cgs_atom_get_data_table(hwmgr->device,
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.c b/drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.c
+new file mode 100644
+index 0000000..fe7082a
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.c
+@@ -0,0 +1,974 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#include "pp_debug.h"
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include "atom-types.h"
++#include "atombios.h"
++#include "processpptables.h"
++#include "cgs_common.h"
++#include "smumgr.h"
++#include "hwmgr.h"
++#include "hardwaremanager.h"
++#include "rv_ppsmc.h"
++#include "rv_hwmgr.h"
++#include "power_state.h"
++#include "rv_smumgr.h"
++
++#define RAVEN_MAX_DEEPSLEEP_DIVIDER_ID     5
++#define RAVEN_MINIMUM_ENGINE_CLOCK         800   //8Mhz, the low boundary of engine clock allowed on this chip
++#define SCLK_MIN_DIV_INTV_SHIFT         12
++#define RAVEN_DISPCLK_BYPASS_THRESHOLD     10000 //100mhz
++#define SMC_RAM_END                     0x40000
++
++
++static const unsigned long PhwRaven_Magic = (unsigned long) PHM_Cz_Magic;
++
++struct phm_vq_budgeting_record rv_vqtable[] = {
++	/* _TBD
++	 * CUs, SSP low, SSP High, Min Sclk Low, Min Sclk, High, AWD/non-AWD, DCLK, ECLK, Sustainable Sclk, Sustainable CUs */
++	{ 8, 0, 45, 0, 0, VQ_DisplayConfig_NoneAWD, 80000, 120000, 4, 0 },
++};
++
++static struct rv_power_state *cast_rv_ps(struct pp_hw_power_state *hw_ps)
++{
++	if (PhwRaven_Magic != hw_ps->magic)
++		return NULL;
++
++	return (struct rv_power_state *)hw_ps;
++}
++
++static const struct rv_power_state *cast_const_rv_ps(
++				const struct pp_hw_power_state *hw_ps)
++{
++	if (PhwRaven_Magic != hw_ps->magic)
++		return NULL;
++
++	return (struct rv_power_state *)hw_ps;
++}
++
++static int rv_init_vq_budget_table(struct pp_hwmgr *hwmgr)
++{
++	uint32_t table_size, i;
++	struct phm_vq_budgeting_table *ptable;
++	uint32_t num_entries = (sizeof(rv_vqtable) / sizeof(*rv_vqtable));
++
++	if (hwmgr->dyn_state.vq_budgeting_table != NULL)
++		return 0;
++
++	table_size = sizeof(struct phm_vq_budgeting_table) +
++			sizeof(struct phm_vq_budgeting_record) * (num_entries - 1);
++
++	ptable = kzalloc(table_size, GFP_KERNEL);
++	if (NULL == ptable)
++		return -ENOMEM;
++
++	ptable->numEntries = (uint8_t) num_entries;
++
++	for (i = 0; i < ptable->numEntries; i++) {
++		ptable->entries[i].ulCUs = rv_vqtable[i].ulCUs;
++		ptable->entries[i].ulSustainableSOCPowerLimitLow = rv_vqtable[i].ulSustainableSOCPowerLimitLow;
++		ptable->entries[i].ulSustainableSOCPowerLimitHigh = rv_vqtable[i].ulSustainableSOCPowerLimitHigh;
++		ptable->entries[i].ulMinSclkLow = rv_vqtable[i].ulMinSclkLow;
++		ptable->entries[i].ulMinSclkHigh = rv_vqtable[i].ulMinSclkHigh;
++		ptable->entries[i].ucDispConfig = rv_vqtable[i].ucDispConfig;
++		ptable->entries[i].ulDClk = rv_vqtable[i].ulDClk;
++		ptable->entries[i].ulEClk = rv_vqtable[i].ulEClk;
++		ptable->entries[i].ulSustainableSclk = rv_vqtable[i].ulSustainableSclk;
++		ptable->entries[i].ulSustainableCUs = rv_vqtable[i].ulSustainableCUs;
++	}
++
++	hwmgr->dyn_state.vq_budgeting_table = ptable;
++
++	return 0;
++}
++
++static int rv_initialize_dpm_defaults(struct pp_hwmgr *hwmgr)
++{
++	struct rv_hwmgr *rv_hwmgr = (struct rv_hwmgr *)(hwmgr->backend);
++	struct cgs_system_info sys_info = {0};
++	int result;
++
++	rv_hwmgr->ddi_power_gating_disabled = 0;
++	rv_hwmgr->bapm_enabled = 1;
++	rv_hwmgr->dce_slow_sclk_threshold = 30000;
++	rv_hwmgr->disable_driver_thermal_policy = 1;
++	rv_hwmgr->thermal_auto_throttling_treshold = 0;
++	rv_hwmgr->is_nb_dpm_enabled = 1;
++	rv_hwmgr->dpm_flags = 1;
++	rv_hwmgr->disable_smu_acp_s3_handshake = 1;
++	rv_hwmgr->disable_notify_smu_vpu_recovery = 0;
++	rv_hwmgr->gfx_off_controled_by_driver = false;
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps,
++					PHM_PlatformCaps_DynamicM3Arbiter);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps,
++					PHM_PlatformCaps_UVDPowerGating);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps,
++					PHM_PlatformCaps_UVDDynamicPowerGating);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps,
++					PHM_PlatformCaps_VCEPowerGating);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps,
++					PHM_PlatformCaps_SamuPowerGating);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps,
++					PHM_PlatformCaps_ACP);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps,
++					PHM_PlatformCaps_SclkDeepSleep);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps,
++				PHM_PlatformCaps_GFXDynamicMGPowerGating);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps,
++				PHM_PlatformCaps_SclkThrottleLowNotification);
++
++	phm_cap_unset(hwmgr->platform_descriptor.platformCaps,
++				PHM_PlatformCaps_DisableVoltageIsland);
++
++	phm_cap_set(hwmgr->platform_descriptor.platformCaps,
++					PHM_PlatformCaps_DynamicUVDState);
++
++	sys_info.size = sizeof(struct cgs_system_info);
++	sys_info.info_id = CGS_SYSTEM_INFO_PG_FLAGS;
++	result = cgs_query_system_info(hwmgr->device, &sys_info);
++	if (!result) {
++		if (sys_info.value & AMD_PG_SUPPORT_GFX_DMG)
++			phm_cap_set(hwmgr->platform_descriptor.platformCaps,
++				      PHM_PlatformCaps_GFXDynamicMGPowerGating);
++	}
++
++	return 0;
++}
++
++static int rv_construct_max_power_limits_table(struct pp_hwmgr *hwmgr,
++			struct phm_clock_and_voltage_limits *table)
++{
++	return 0;
++}
++
++static int rv_init_dynamic_state_adjustment_rule_settings(
++							struct pp_hwmgr *hwmgr)
++{
++	uint32_t table_size =
++		sizeof(struct phm_clock_voltage_dependency_table) +
++		(7 * sizeof(struct phm_clock_voltage_dependency_record));
++
++	struct phm_clock_voltage_dependency_table *table_clk_vlt =
++					kzalloc(table_size, GFP_KERNEL);
++
++	if (NULL == table_clk_vlt) {
++		pr_err("Can not allocate memory!\n");
++		return -ENOMEM;
++	}
++
++	table_clk_vlt->count = 8;
++	table_clk_vlt->entries[0].clk = PP_DAL_POWERLEVEL_0;
++	table_clk_vlt->entries[0].v = 0;
++	table_clk_vlt->entries[1].clk = PP_DAL_POWERLEVEL_1;
++	table_clk_vlt->entries[1].v = 1;
++	table_clk_vlt->entries[2].clk = PP_DAL_POWERLEVEL_2;
++	table_clk_vlt->entries[2].v = 2;
++	table_clk_vlt->entries[3].clk = PP_DAL_POWERLEVEL_3;
++	table_clk_vlt->entries[3].v = 3;
++	table_clk_vlt->entries[4].clk = PP_DAL_POWERLEVEL_4;
++	table_clk_vlt->entries[4].v = 4;
++	table_clk_vlt->entries[5].clk = PP_DAL_POWERLEVEL_5;
++	table_clk_vlt->entries[5].v = 5;
++	table_clk_vlt->entries[6].clk = PP_DAL_POWERLEVEL_6;
++	table_clk_vlt->entries[6].v = 6;
++	table_clk_vlt->entries[7].clk = PP_DAL_POWERLEVEL_7;
++	table_clk_vlt->entries[7].v = 7;
++	hwmgr->dyn_state.vddc_dep_on_dal_pwrl = table_clk_vlt;
++
++	return 0;
++}
++
++static int rv_get_system_info_data(struct pp_hwmgr *hwmgr)
++{
++	struct rv_hwmgr *rv_data = (struct rv_hwmgr *)hwmgr->backend;
++
++	rv_data->sys_info.htc_hyst_lmt = 5;
++	rv_data->sys_info.htc_tmp_lmt = 203;
++
++	if (rv_data->thermal_auto_throttling_treshold == 0)
++		 rv_data->thermal_auto_throttling_treshold = 203;
++
++	rv_construct_max_power_limits_table (hwmgr,
++				    &hwmgr->dyn_state.max_clock_voltage_on_ac);
++
++	rv_init_dynamic_state_adjustment_rule_settings(hwmgr);
++
++	return 0;
++}
++
++static int rv_construct_boot_state(struct pp_hwmgr *hwmgr)
++{
++	return 0;
++}
++
++static int rv_tf_set_isp_clock_limit(struct pp_hwmgr *hwmgr, void *input,
++				void *output, void *storage, int result)
++{
++	return 0;
++}
++
++static int rv_tf_set_num_active_display(struct pp_hwmgr *hwmgr, void *input,
++				void *output, void *storage, int result)
++{
++	uint32_t  num_of_active_displays = 0;
++	struct cgs_display_info info = {0};
++
++	cgs_get_active_displays_info(hwmgr->device, &info);
++	num_of_active_displays = info.display_count;
++
++	smum_send_msg_to_smc_with_parameter(hwmgr->smumgr,
++				PPSMC_MSG_SetDisplayCount,
++				num_of_active_displays);
++	return 0;
++}
++
++static const struct phm_master_table_item rv_set_power_state_list[] = {
++	{ NULL, rv_tf_set_isp_clock_limit },
++	{ NULL, rv_tf_set_num_active_display },
++	{ }
++};
++
++static const struct phm_master_table_header rv_set_power_state_master = {
++	0,
++	PHM_MasterTableFlag_None,
++	rv_set_power_state_list
++};
++
++static int rv_tf_init_power_gate_state(struct pp_hwmgr *hwmgr, void *input,
++				void *output, void *storage, int result)
++{
++	struct rv_hwmgr *rv_data = (struct rv_hwmgr *)(hwmgr->backend);
++
++	rv_data->vcn_power_gated = true;
++	rv_data->isp_tileA_power_gated = true;
++	rv_data->isp_tileB_power_gated = true;
++
++	return 0;
++}
++
++static const struct phm_master_table_item rv_setup_asic_list[] = {
++	{ .tableFunction = rv_tf_init_power_gate_state },
++	{ }
++};
++
++static const struct phm_master_table_header rv_setup_asic_master = {
++	0,
++	PHM_MasterTableFlag_None,
++	rv_setup_asic_list
++};
++
++static int rv_tf_reset_cc6_data(struct pp_hwmgr *hwmgr,
++					void *input, void *output,
++					void *storage, int result)
++{
++	struct rv_hwmgr *rv_data = (struct rv_hwmgr *)(hwmgr->backend);
++
++	rv_data->separation_time = 0;
++	rv_data->cc6_disable = false;
++	rv_data->pstate_disable = false;
++	rv_data->cc6_setting_changed = false;
++
++	return 0;
++}
++
++static const struct phm_master_table_item rv_power_down_asic_list[] = {
++	{ .tableFunction = rv_tf_reset_cc6_data },
++	{ }
++};
++
++static const struct phm_master_table_header rv_power_down_asic_master = {
++	0,
++	PHM_MasterTableFlag_None,
++	rv_power_down_asic_list
++};
++
++
++static int rv_tf_disable_gfx_off(struct pp_hwmgr *hwmgr,
++						void *input, void *output,
++						void *storage, int result)
++{
++	struct rv_hwmgr *rv_data = (struct rv_hwmgr *)(hwmgr->backend);
++
++	if (rv_data->gfx_off_controled_by_driver)
++		smum_send_msg_to_smc(hwmgr->smumgr,
++						PPSMC_MSG_DisableGfxOff);
++
++	return 0;
++}
++
++static const struct phm_master_table_item rv_disable_dpm_list[] = {
++	{NULL, rv_tf_disable_gfx_off},
++	{ },
++};
++
++
++static const struct phm_master_table_header rv_disable_dpm_master = {
++	0,
++	PHM_MasterTableFlag_None,
++	rv_disable_dpm_list
++};
++
++static int rv_tf_enable_gfx_off(struct pp_hwmgr *hwmgr,
++						void *input, void *output,
++						void *storage, int result)
++{
++	struct rv_hwmgr *rv_data = (struct rv_hwmgr *)(hwmgr->backend);
++
++	if (rv_data->gfx_off_controled_by_driver)
++		smum_send_msg_to_smc(hwmgr->smumgr,
++						PPSMC_MSG_EnableGfxOff);
++
++	return 0;
++}
++
++static const struct phm_master_table_item rv_enable_dpm_list[] = {
++	{NULL, rv_tf_enable_gfx_off},
++	{ },
++};
++
++static const struct phm_master_table_header rv_enable_dpm_master = {
++	0,
++	PHM_MasterTableFlag_None,
++	rv_enable_dpm_list
++};
++
++static int rv_apply_state_adjust_rules(struct pp_hwmgr *hwmgr,
++				struct pp_power_state  *prequest_ps,
++			const struct pp_power_state *pcurrent_ps)
++{
++	return 0;
++}
++
++/* temporary hardcoded clock voltage breakdown tables */
++DpmClock_t VddDcfClk[]= {
++	{ 300, 2600},
++	{ 600, 3200},
++	{ 600, 3600},
++};
++
++DpmClock_t VddSocClk[]= {
++	{ 478, 2600},
++	{ 722, 3200},
++	{ 722, 3600},
++};
++
++DpmClock_t VddFClk[]= {
++	{ 400, 2600},
++	{1200, 3200},
++	{1200, 3600},
++};
++
++DpmClock_t VddDispClk[]= {
++	{ 435, 2600},
++	{ 661, 3200},
++	{1086, 3600},
++};
++
++DpmClock_t VddDppClk[]= {
++	{ 435, 2600},
++	{ 661, 3200},
++	{ 661, 3600},
++};
++
++DpmClock_t VddPhyClk[]= {
++	{ 540, 2600},
++	{ 810, 3200},
++	{ 810, 3600},
++};
++
++static int rv_get_clock_voltage_dependency_table(struct pp_hwmgr *hwmgr,
++			struct rv_voltage_dependency_table **pptable,
++			uint32_t num_entry, DpmClock_t *pclk_dependency_table)
++{
++	uint32_t table_size, i;
++	struct rv_voltage_dependency_table *ptable;
++
++	table_size = sizeof(uint32_t) + sizeof(struct rv_voltage_dependency_table) * num_entry;
++	ptable = kzalloc(table_size, GFP_KERNEL);
++
++	if (NULL == ptable)
++		return -ENOMEM;
++
++	ptable->count = num_entry;
++
++	for (i = 0; i < ptable->count; i++) {
++		ptable->entries[i].clk         = pclk_dependency_table->Freq * 100;
++		ptable->entries[i].vol         = pclk_dependency_table->Vol;
++		pclk_dependency_table++;
++	}
++
++	*pptable = ptable;
++
++	return 0;
++}
++
++
++static int rv_populate_clock_table(struct pp_hwmgr *hwmgr)
++{
++	int result;
++
++	struct rv_hwmgr *rv_data = (struct rv_hwmgr *)(hwmgr->backend);
++	DpmClocks_t  *table = &(rv_data->clock_table);
++	struct rv_clock_voltage_information *pinfo = &(rv_data->clock_vol_info);
++
++	result = rv_copy_table_from_smc(hwmgr->smumgr, (uint8_t *)table, CLOCKTABLE);
++
++	PP_ASSERT_WITH_CODE((0 == result),
++			"Attempt to copy clock table from smc failed",
++			return result);
++
++	if (0 == result && table->DcefClocks[0].Freq != 0) {
++		rv_get_clock_voltage_dependency_table(hwmgr, &pinfo->vdd_dep_on_dcefclk,
++						NUM_DCEFCLK_DPM_LEVELS,
++						&rv_data->clock_table.DcefClocks[0]);
++		rv_get_clock_voltage_dependency_table(hwmgr, &pinfo->vdd_dep_on_socclk,
++						NUM_SOCCLK_DPM_LEVELS,
++						&rv_data->clock_table.SocClocks[0]);
++		rv_get_clock_voltage_dependency_table(hwmgr, &pinfo->vdd_dep_on_fclk,
++						NUM_FCLK_DPM_LEVELS,
++						&rv_data->clock_table.FClocks[0]);
++		rv_get_clock_voltage_dependency_table(hwmgr, &pinfo->vdd_dep_on_mclk,
++						NUM_MEMCLK_DPM_LEVELS,
++						&rv_data->clock_table.MemClocks[0]);
++	} else {
++		rv_get_clock_voltage_dependency_table(hwmgr, &pinfo->vdd_dep_on_dcefclk,
++						sizeof(VddDcfClk)/sizeof(*VddDcfClk), &VddDcfClk[0]);
++		rv_get_clock_voltage_dependency_table(hwmgr, &pinfo->vdd_dep_on_socclk,
++						sizeof(VddSocClk)/sizeof(*VddSocClk), &VddSocClk[0]);
++		rv_get_clock_voltage_dependency_table(hwmgr, &pinfo->vdd_dep_on_fclk,
++						sizeof(VddFClk)/sizeof(*VddFClk), &VddFClk[0]);
++	}
++	rv_get_clock_voltage_dependency_table(hwmgr, &pinfo->vdd_dep_on_dispclk,
++					sizeof(VddDispClk)/sizeof(*VddDispClk), &VddDispClk[0]);
++	rv_get_clock_voltage_dependency_table(hwmgr, &pinfo->vdd_dep_on_dppclk,
++					sizeof(VddDppClk)/sizeof(*VddDppClk), &VddDppClk[0]);
++	rv_get_clock_voltage_dependency_table(hwmgr, &pinfo->vdd_dep_on_phyclk,
++					sizeof(VddPhyClk)/sizeof(*VddPhyClk), &VddPhyClk[0]);
++
++	return 0;
++}
++
++static int rv_hwmgr_backend_init(struct pp_hwmgr *hwmgr)
++{
++	int result = 0;
++	struct rv_hwmgr *data;
++
++	data = kzalloc(sizeof(struct rv_hwmgr), GFP_KERNEL);
++	if (data == NULL)
++		return -ENOMEM;
++
++	hwmgr->backend = data;
++
++	result = rv_initialize_dpm_defaults(hwmgr);
++	if (result != 0) {
++		pr_err("rv_initialize_dpm_defaults failed\n");
++		return result;
++	}
++
++	rv_populate_clock_table(hwmgr);
++
++	result = rv_get_system_info_data(hwmgr);
++	if (result != 0) {
++		pr_err("rv_get_system_info_data failed\n");
++		return result;
++	}
++
++	rv_construct_boot_state(hwmgr);
++
++	result = phm_construct_table(hwmgr, &rv_setup_asic_master,
++				&(hwmgr->setup_asic));
++	if (result != 0) {
++		pr_err("Fail to construct setup ASIC\n");
++		return result;
++	}
++
++	result = phm_construct_table(hwmgr, &rv_power_down_asic_master,
++				&(hwmgr->power_down_asic));
++	if (result != 0) {
++		pr_err("Fail to construct power down ASIC\n");
++		return result;
++	}
++
++	result = phm_construct_table(hwmgr, &rv_set_power_state_master,
++				&(hwmgr->set_power_state));
++	if (result != 0) {
++		pr_err("Fail to construct set_power_state\n");
++		return result;
++	}
++
++	result = phm_construct_table(hwmgr, &rv_disable_dpm_master,
++				&(hwmgr->disable_dynamic_state_management));
++	if (result != 0) {
++		pr_err("Fail to disable_dynamic_state\n");
++		return result;
++	}
++	result = phm_construct_table(hwmgr, &rv_enable_dpm_master,
++				&(hwmgr->enable_dynamic_state_management));
++	if (result != 0) {
++		pr_err("Fail to enable_dynamic_state\n");
++		return result;
++	}
++
++	hwmgr->platform_descriptor.hardwareActivityPerformanceLevels =
++						RAVEN_MAX_HARDWARE_POWERLEVELS;
++
++	hwmgr->platform_descriptor.hardwarePerformanceLevels =
++						RAVEN_MAX_HARDWARE_POWERLEVELS;
++
++	hwmgr->platform_descriptor.vbiosInterruptId = 0;
++
++	hwmgr->platform_descriptor.clockStep.engineClock = 500;
++
++	hwmgr->platform_descriptor.clockStep.memoryClock = 500;
++
++	hwmgr->platform_descriptor.minimumClocksReductionPercentage = 50;
++
++	rv_init_vq_budget_table(hwmgr);
++	return result;
++}
++
++static int rv_hwmgr_backend_fini(struct pp_hwmgr *hwmgr)
++{
++	struct rv_hwmgr *rv_data = (struct rv_hwmgr *)(hwmgr->backend);
++	struct rv_clock_voltage_information *pinfo = &(rv_data->clock_vol_info);
++
++	phm_destroy_table(hwmgr, &(hwmgr->set_power_state));
++	phm_destroy_table(hwmgr, &(hwmgr->enable_dynamic_state_management));
++	phm_destroy_table(hwmgr, &(hwmgr->disable_dynamic_state_management));
++	phm_destroy_table(hwmgr, &(hwmgr->power_down_asic));
++	phm_destroy_table(hwmgr, &(hwmgr->setup_asic));
++
++	if (pinfo->vdd_dep_on_dcefclk) {
++		kfree(pinfo->vdd_dep_on_dcefclk);
++		pinfo->vdd_dep_on_dcefclk = NULL;
++	}
++	if (pinfo->vdd_dep_on_socclk) {
++		kfree(pinfo->vdd_dep_on_socclk);
++		pinfo->vdd_dep_on_socclk = NULL;
++	}
++	if (pinfo->vdd_dep_on_fclk) {
++		kfree(pinfo->vdd_dep_on_fclk);
++		pinfo->vdd_dep_on_fclk = NULL;
++	}
++	if (pinfo->vdd_dep_on_dispclk) {
++		kfree(pinfo->vdd_dep_on_dispclk);
++		pinfo->vdd_dep_on_dispclk = NULL;
++	}
++	if (pinfo->vdd_dep_on_dppclk) {
++		kfree(pinfo->vdd_dep_on_dppclk);
++		pinfo->vdd_dep_on_dppclk = NULL;
++	}
++	if (pinfo->vdd_dep_on_phyclk) {
++		kfree(pinfo->vdd_dep_on_phyclk);
++		pinfo->vdd_dep_on_phyclk = NULL;
++	}
++
++	kfree(hwmgr->backend);
++	hwmgr->backend = NULL;
++
++	return 0;
++}
++
++static int rv_dpm_force_dpm_level(struct pp_hwmgr *hwmgr,
++				enum amd_dpm_forced_level level)
++{
++	return 0;
++}
++
++static int rv_dpm_get_mclk(struct pp_hwmgr *hwmgr, bool low)
++{
++	return 0;
++}
++
++static int rv_dpm_get_sclk(struct pp_hwmgr *hwmgr, bool low)
++{
++	return 0;
++}
++
++static int rv_dpm_patch_boot_state(struct pp_hwmgr *hwmgr,
++					struct pp_hw_power_state *hw_ps)
++{
++	return 0;
++}
++
++static int rv_dpm_get_pp_table_entry_callback(
++						     struct pp_hwmgr *hwmgr,
++					   struct pp_hw_power_state *hw_ps,
++							  unsigned int index,
++						     const void *clock_info)
++{
++	struct rv_power_state *rv_ps = cast_rv_ps(hw_ps);
++
++	const ATOM_PPLIB_CZ_CLOCK_INFO *rv_clock_info = clock_info;
++
++	struct phm_clock_voltage_dependency_table *table =
++				    hwmgr->dyn_state.vddc_dependency_on_sclk;
++	uint8_t clock_info_index = rv_clock_info->index;
++
++	if (clock_info_index > (uint8_t)(hwmgr->platform_descriptor.hardwareActivityPerformanceLevels - 1))
++		clock_info_index = (uint8_t)(hwmgr->platform_descriptor.hardwareActivityPerformanceLevels - 1);
++
++	rv_ps->levels[index].engine_clock = table->entries[clock_info_index].clk;
++	rv_ps->levels[index].vddc_index = (uint8_t)table->entries[clock_info_index].v;
++
++	rv_ps->level = index + 1;
++
++	if (phm_cap_enabled(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_SclkDeepSleep)) {
++		rv_ps->levels[index].ds_divider_index = 5;
++		rv_ps->levels[index].ss_divider_index = 5;
++	}
++
++	return 0;
++}
++
++static int rv_dpm_get_num_of_pp_table_entries(struct pp_hwmgr *hwmgr)
++{
++	int result;
++	unsigned long ret = 0;
++
++	result = pp_tables_get_num_of_entries(hwmgr, &ret);
++
++	return result ? 0 : ret;
++}
++
++static int rv_dpm_get_pp_table_entry(struct pp_hwmgr *hwmgr,
++		    unsigned long entry, struct pp_power_state *ps)
++{
++	int result;
++	struct rv_power_state *rv_ps;
++
++	ps->hardware.magic = PhwRaven_Magic;
++
++	rv_ps = cast_rv_ps(&(ps->hardware));
++
++	result = pp_tables_get_entry(hwmgr, entry, ps,
++			rv_dpm_get_pp_table_entry_callback);
++
++	rv_ps->uvd_clocks.vclk = ps->uvd_clocks.VCLK;
++	rv_ps->uvd_clocks.dclk = ps->uvd_clocks.DCLK;
++
++	return result;
++}
++
++static int rv_get_power_state_size(struct pp_hwmgr *hwmgr)
++{
++	return sizeof(struct rv_power_state);
++}
++
++static int rv_set_cpu_power_state(struct pp_hwmgr *hwmgr)
++{
++	return 0;
++}
++
++
++static int rv_store_cc6_data(struct pp_hwmgr *hwmgr, uint32_t separation_time,
++			bool cc6_disable, bool pstate_disable, bool pstate_switch_disable)
++{
++	return 0;
++}
++
++static int rv_get_dal_power_level(struct pp_hwmgr *hwmgr,
++		struct amd_pp_simple_clock_info *info)
++{
++	return -EINVAL;
++}
++
++static int rv_force_clock_level(struct pp_hwmgr *hwmgr,
++		enum pp_clock_type type, uint32_t mask)
++{
++	return 0;
++}
++
++static int rv_print_clock_levels(struct pp_hwmgr *hwmgr,
++		enum pp_clock_type type, char *buf)
++{
++	return 0;
++}
++
++static int rv_get_performance_level(struct pp_hwmgr *hwmgr, const struct pp_hw_power_state *state,
++				PHM_PerformanceLevelDesignation designation, uint32_t index,
++				PHM_PerformanceLevel *level)
++{
++	const struct rv_power_state *ps;
++	struct rv_hwmgr *data;
++	uint32_t level_index;
++	uint32_t i;
++
++	if (level == NULL || hwmgr == NULL || state == NULL)
++		return -EINVAL;
++
++	data = (struct rv_hwmgr *)(hwmgr->backend);
++	ps = cast_const_rv_ps(state);
++
++	level_index = index > ps->level - 1 ? ps->level - 1 : index;
++	level->coreClock = ps->levels[level_index].engine_clock;
++
++	if (designation == PHM_PerformanceLevelDesignation_PowerContainment) {
++		for (i = 1; i < ps->level; i++) {
++			if (ps->levels[i].engine_clock > data->dce_slow_sclk_threshold) {
++				level->coreClock = ps->levels[i].engine_clock;
++				break;
++			}
++		}
++	}
++
++	level->nonLocalMemoryFreq = 0;
++	level->nonLocalMemoryWidth = 0;
++
++	return 0;
++}
++
++static int rv_get_current_shallow_sleep_clocks(struct pp_hwmgr *hwmgr,
++	const struct pp_hw_power_state *state, struct pp_clock_info *clock_info)
++{
++	const struct rv_power_state *ps = cast_const_rv_ps(state);
++
++	clock_info->min_eng_clk = ps->levels[0].engine_clock / (1 << (ps->levels[0].ss_divider_index));
++	clock_info->max_eng_clk = ps->levels[ps->level - 1].engine_clock / (1 << (ps->levels[ps->level - 1].ss_divider_index));
++
++	return 0;
++}
++
++#define MEM_FREQ_LOW_LATENCY        25000
++#define MEM_FREQ_HIGH_LATENCY       80000
++#define MEM_LATENCY_HIGH            245
++#define MEM_LATENCY_LOW             35
++#define MEM_LATENCY_ERR             0xFFFF
++
++
++static uint32_t rv_get_mem_latency(struct pp_hwmgr *hwmgr,
++		uint32_t clock)
++{
++	if (clock >= MEM_FREQ_LOW_LATENCY &&
++			clock < MEM_FREQ_HIGH_LATENCY)
++		return MEM_LATENCY_HIGH;
++	else if (clock >= MEM_FREQ_HIGH_LATENCY)
++		return MEM_LATENCY_LOW;
++	else
++		return MEM_LATENCY_ERR;
++}
++
++static void rv_get_memclocks(struct pp_hwmgr *hwmgr,
++		struct pp_clock_levels_with_latency *clocks)
++{
++	struct rv_hwmgr *rv_data = (struct rv_hwmgr *)(hwmgr->backend);
++	struct rv_clock_voltage_information *pinfo = &(rv_data->clock_vol_info);
++	struct rv_voltage_dependency_table *pmclk_table;
++	uint32_t i;
++
++	pmclk_table = pinfo->vdd_dep_on_mclk;
++	clocks->num_levels = 0;
++
++	for (i = 0; i < pmclk_table->count; i++) {
++		if (pmclk_table->entries[i].clk) {
++			clocks->data[clocks->num_levels].clocks_in_khz =
++						pmclk_table->entries[i].clk;
++			clocks->data[clocks->num_levels].latency_in_us =
++						rv_get_mem_latency(hwmgr,
++						pmclk_table->entries[i].clk);
++			clocks->num_levels++;
++		}
++	}
++}
++
++static void rv_get_dcefclocks(struct pp_hwmgr *hwmgr,
++		struct pp_clock_levels_with_latency *clocks)
++{
++	struct rv_hwmgr *rv_data = (struct rv_hwmgr *)(hwmgr->backend);
++	struct rv_clock_voltage_information *pinfo = &(rv_data->clock_vol_info);
++	struct rv_voltage_dependency_table *pdcef_table;
++	uint32_t i;
++
++	pdcef_table = pinfo->vdd_dep_on_dcefclk;
++	for (i = 0; i < pdcef_table->count; i++) {
++		clocks->data[i].clocks_in_khz = pdcef_table->entries[i].clk;
++		clocks->data[i].latency_in_us = 0;
++	}
++	clocks->num_levels = pdcef_table->count;
++}
++
++static void rv_get_socclocks(struct pp_hwmgr *hwmgr,
++		struct pp_clock_levels_with_latency *clocks)
++{
++	struct rv_hwmgr *rv_data = (struct rv_hwmgr *)(hwmgr->backend);
++	struct rv_clock_voltage_information *pinfo = &(rv_data->clock_vol_info);
++	struct rv_voltage_dependency_table *psoc_table;
++	uint32_t i;
++
++	psoc_table = pinfo->vdd_dep_on_socclk;
++
++	for (i = 0; i < psoc_table->count; i++) {
++		clocks->data[i].clocks_in_khz = psoc_table->entries[i].clk;
++		clocks->data[i].latency_in_us = 0;
++	}
++	clocks->num_levels = psoc_table->count;
++}
++
++static int rv_get_clock_by_type_with_latency(struct pp_hwmgr *hwmgr,
++		enum amd_pp_clock_type type,
++		struct pp_clock_levels_with_latency *clocks)
++{
++	switch (type) {
++	case amd_pp_mem_clock:
++		rv_get_memclocks(hwmgr, clocks);
++		break;
++	case amd_pp_dcef_clock:
++		rv_get_dcefclocks(hwmgr, clocks);
++		break;
++	case amd_pp_soc_clock:
++		rv_get_socclocks(hwmgr, clocks);
++		break;
++	default:
++		return -1;
++	}
++
++	return 0;
++}
++
++static int rv_get_clock_by_type_with_voltage(struct pp_hwmgr *hwmgr,
++		enum amd_pp_clock_type type,
++		struct pp_clock_levels_with_voltage *clocks)
++{
++	uint32_t i;
++	struct rv_hwmgr *rv_data = (struct rv_hwmgr *)(hwmgr->backend);
++	struct rv_clock_voltage_information *pinfo = &(rv_data->clock_vol_info);
++	struct rv_voltage_dependency_table *pclk_vol_table;
++
++	switch (type) {
++	case amd_pp_mem_clock:
++		pclk_vol_table = pinfo->vdd_dep_on_mclk;
++		break;
++	case amd_pp_dcef_clock:
++		pclk_vol_table = pinfo->vdd_dep_on_dcefclk;
++		break;
++	case amd_pp_disp_clock:
++		pclk_vol_table = pinfo->vdd_dep_on_dispclk;
++		break;
++	case amd_pp_phy_clock:
++		pclk_vol_table = pinfo->vdd_dep_on_phyclk;
++		break;
++	case amd_pp_dpp_clock:
++		pclk_vol_table = pinfo->vdd_dep_on_dppclk;
++	default:
++		return -EINVAL;
++	}
++
++	if (pclk_vol_table->count == 0)
++		return -EINVAL;
++
++	for (i = 0; i < pclk_vol_table->count; i++) {
++		clocks->data[i].clocks_in_khz = pclk_vol_table->entries[i].clk;
++		clocks->data[i].voltage_in_mv = pclk_vol_table->entries[i].vol;
++		clocks->num_levels++;
++	}
++
++	clocks->num_levels = pclk_vol_table->count;
++
++	return 0;
++}
++
++int rv_display_clock_voltage_request(struct pp_hwmgr *hwmgr,
++		struct pp_display_clock_request *clock_req)
++{
++	int result = 0;
++	enum amd_pp_clock_type clk_type = clock_req->clock_type;
++	uint32_t clk_freq = clock_req->clock_freq_in_khz / 100;
++	PPSMC_Msg        msg;
++
++	switch (clk_type) {
++	case amd_pp_dcef_clock:
++		msg =  PPSMC_MSG_SetHardMinDcefclkByFreq;
++		break;
++	case amd_pp_soc_clock:
++		 msg = PPSMC_MSG_SetHardMinSocclkByFreq;
++		break;
++	case amd_pp_mem_clock:
++		msg = PPSMC_MSG_SetHardMinFclkByFreq;
++		break;
++	default:
++		pr_info("[DisplayClockVoltageRequest]Invalid Clock Type!");
++		return -EINVAL;
++	}
++
++	result = smum_send_msg_to_smc_with_parameter(hwmgr->smumgr, msg,
++							clk_freq);
++
++	return result;
++}
++
++static int rv_get_max_high_clocks(struct pp_hwmgr *hwmgr, struct amd_pp_simple_clock_info *clocks)
++{
++	return -EINVAL;
++}
++
++static int rv_read_sensor(struct pp_hwmgr *hwmgr, int idx,
++			  void *value, int *size)
++{
++	return -EINVAL;
++}
++
++static const struct pp_hwmgr_func rv_hwmgr_funcs = {
++	.backend_init = rv_hwmgr_backend_init,
++	.backend_fini = rv_hwmgr_backend_fini,
++	.asic_setup = NULL,
++	.apply_state_adjust_rules = rv_apply_state_adjust_rules,
++	.force_dpm_level = rv_dpm_force_dpm_level,
++	.get_power_state_size = rv_get_power_state_size,
++	.powerdown_uvd = NULL,
++	.powergate_uvd = NULL,
++	.powergate_vce = NULL,
++	.get_mclk = rv_dpm_get_mclk,
++	.get_sclk = rv_dpm_get_sclk,
++	.patch_boot_state = rv_dpm_patch_boot_state,
++	.get_pp_table_entry = rv_dpm_get_pp_table_entry,
++	.get_num_of_pp_table_entries = rv_dpm_get_num_of_pp_table_entries,
++	.set_cpu_power_state = rv_set_cpu_power_state,
++	.store_cc6_data = rv_store_cc6_data,
++	.force_clock_level = rv_force_clock_level,
++	.print_clock_levels = rv_print_clock_levels,
++	.get_dal_power_level = rv_get_dal_power_level,
++	.get_performance_level = rv_get_performance_level,
++	.get_current_shallow_sleep_clocks = rv_get_current_shallow_sleep_clocks,
++	.get_clock_by_type_with_latency = rv_get_clock_by_type_with_latency,
++	.get_clock_by_type_with_voltage = rv_get_clock_by_type_with_voltage,
++	.get_max_high_clocks = rv_get_max_high_clocks,
++	.read_sensor = rv_read_sensor,
++};
++
++int rv_init_function_pointers(struct pp_hwmgr *hwmgr)
++{
++	hwmgr->hwmgr_func = &rv_hwmgr_funcs;
++	hwmgr->pptable_func = &pptable_funcs;
++	return 0;
++}
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.h b/drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.h
+new file mode 100644
+index 0000000..6733691
+--- /dev/null
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.h
+@@ -0,0 +1,295 @@
++/*
++ * Copyright 2017 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef RAVEN_HWMGR_H
++#define RAVEN_HWMGR_H
++
++#include "hwmgr.h"
++#include "rv_inc.h"
++#include "smu10_driver_if.h"
++#include "rv_ppsmc.h"
++
++
++#define RAVEN_MAX_HARDWARE_POWERLEVELS               8
++#define PHMRAVEN_DYNCLK_NUMBER_OF_TREND_COEFFICIENTS   15
++
++#define DPMFlags_SCLK_Enabled                     0x00000001
++#define DPMFlags_UVD_Enabled                      0x00000002
++#define DPMFlags_VCE_Enabled                      0x00000004
++#define DPMFlags_ACP_Enabled                      0x00000008
++#define DPMFlags_ForceHighestValid                0x40000000
++
++/* Do not change the following, it is also defined in SMU8.h */
++#define SMU_EnabledFeatureScoreboard_AcpDpmOn     0x00000001
++#define SMU_EnabledFeatureScoreboard_SclkDpmOn    0x00200000
++#define SMU_EnabledFeatureScoreboard_UvdDpmOn     0x01000000
++#define SMU_EnabledFeatureScoreboard_VceDpmOn     0x02000000
++
++#define SMU_PHYID_SHIFT      8
++
++#define RAVEN_PCIE_POWERGATING_TARGET_GFX            0
++#define RAVEN_PCIE_POWERGATING_TARGET_DDI            1
++#define RAVEN_PCIE_POWERGATING_TARGET_PLLCASCADE     2
++#define RAVEN_PCIE_POWERGATING_TARGET_PHY            3
++
++enum VQ_TYPE {
++	CLOCK_TYPE_DCLK = 0L,
++	CLOCK_TYPE_ECLK,
++	CLOCK_TYPE_SCLK,
++	CLOCK_TYPE_CCLK,
++	VQ_GFX_CU
++};
++
++#define SUSTAINABLE_SCLK_MASK  0x00ffffff
++#define SUSTAINABLE_SCLK_SHIFT 0
++#define SUSTAINABLE_CU_MASK    0xff000000
++#define SUSTAINABLE_CU_SHIFT   24
++
++struct rv_dpm_entry {
++	uint32_t soft_min_clk;
++	uint32_t hard_min_clk;
++	uint32_t soft_max_clk;
++	uint32_t hard_max_clk;
++};
++
++struct rv_power_level {
++	uint32_t engine_clock;
++	uint8_t vddc_index;
++	uint8_t ds_divider_index;
++	uint8_t ss_divider_index;
++	uint8_t allow_gnb_slow;
++	uint8_t force_nbp_state;
++	uint8_t display_wm;
++	uint8_t vce_wm;
++	uint8_t num_simd_to_powerdown;
++	uint8_t hysteresis_up;
++	uint8_t rsv[3];
++};
++
++/*used for the nbpsFlags field in rv_power state*/
++#define RAVEN_POWERSTATE_FLAGS_NBPS_FORCEHIGH (1<<0)
++#define RAVEN_POWERSTATE_FLAGS_NBPS_LOCKTOHIGH (1<<1)
++#define RAVEN_POWERSTATE_FLAGS_NBPS_LOCKTOLOW (1<<2)
++
++#define RAVEN_POWERSTATE_FLAGS_BAPM_DISABLE    (1<<0)
++
++struct rv_uvd_clocks {
++	uint32_t vclk;
++	uint32_t dclk;
++	uint32_t vclk_low_divider;
++	uint32_t vclk_high_divider;
++	uint32_t dclk_low_divider;
++	uint32_t dclk_high_divider;
++};
++
++struct pp_disable_nbpslo_flags {
++	union {
++		struct {
++			uint32_t entry : 1;
++			uint32_t display : 1;
++			uint32_t driver: 1;
++			uint32_t vce : 1;
++			uint32_t uvd : 1;
++			uint32_t acp : 1;
++			uint32_t reserved: 26;
++		} bits;
++		uint32_t u32All;
++	};
++};
++
++
++enum rv_pstate_previous_action {
++	DO_NOTHING = 1,
++	FORCE_HIGH,
++	CANCEL_FORCE_HIGH
++};
++
++struct rv_power_state {
++	unsigned int magic;
++	uint32_t level;
++	struct rv_uvd_clocks uvd_clocks;
++	uint32_t evclk;
++	uint32_t ecclk;
++	uint32_t samclk;
++	uint32_t acpclk;
++	bool need_dfs_bypass;
++
++	uint32_t nbps_flags;
++	uint32_t bapm_flags;
++	uint8_t dpm0_pg_nbps_low;
++	uint8_t dpm0_pg_nbps_high;
++	uint8_t dpm_x_nbps_low;
++	uint8_t dpm_x_nbps_high;
++
++	enum rv_pstate_previous_action action;
++
++	struct rv_power_level levels[RAVEN_MAX_HARDWARE_POWERLEVELS];
++	struct pp_disable_nbpslo_flags nbpslo_flags;
++};
++
++#define RAVEN_NUM_NBPSTATES        4
++#define RAVEN_NUM_NBPMEMORYCLOCK   2
++
++
++struct rv_display_phy_info_entry {
++	uint8_t                   phy_present;
++	uint8_t                   active_lane_mapping;
++	uint8_t                   display_config_type;
++	uint8_t                   active_num_of_lanes;
++};
++
++#define RAVEN_MAX_DISPLAYPHY_IDS       10
++
++struct rv_display_phy_info {
++	bool                         display_phy_access_initialized;
++	struct rv_display_phy_info_entry  entries[RAVEN_MAX_DISPLAYPHY_IDS];
++};
++
++#define MAX_DISPLAY_CLOCK_LEVEL 8
++
++struct rv_system_info{
++	uint8_t                      htc_tmp_lmt;
++	uint8_t                      htc_hyst_lmt;
++};
++
++#define MAX_REGULAR_DPM_NUMBER 8
++
++struct rv_mclk_latency_entries {
++	uint32_t  frequency;
++	uint32_t  latency;
++};
++
++struct rv_mclk_latency_table {
++	uint32_t  count;
++	struct rv_mclk_latency_entries  entries[MAX_REGULAR_DPM_NUMBER];
++};
++
++struct rv_clock_voltage_dependency_record {
++	uint32_t clk;
++	uint32_t vol;
++};
++
++
++struct rv_voltage_dependency_table {
++	uint32_t count;
++	struct rv_clock_voltage_dependency_record entries[1];
++};
++
++struct rv_clock_voltage_information {
++	struct rv_voltage_dependency_table    *vdd_dep_on_dcefclk;
++	struct rv_voltage_dependency_table    *vdd_dep_on_socclk;
++	struct rv_voltage_dependency_table    *vdd_dep_on_fclk;
++	struct rv_voltage_dependency_table    *vdd_dep_on_mclk;
++	struct rv_voltage_dependency_table    *vdd_dep_on_dispclk;
++	struct rv_voltage_dependency_table    *vdd_dep_on_dppclk;
++	struct rv_voltage_dependency_table    *vdd_dep_on_phyclk;
++};
++
++struct rv_hwmgr {
++	uint32_t disable_driver_thermal_policy;
++	uint32_t thermal_auto_throttling_treshold;
++	struct rv_system_info sys_info;
++	struct rv_mclk_latency_table mclk_latency_table;
++
++	uint32_t ddi_power_gating_disabled;
++
++	struct rv_display_phy_info_entry            display_phy_info;
++	uint32_t dce_slow_sclk_threshold;
++
++	bool disp_clk_bypass;
++	bool disp_clk_bypass_pending;
++	uint32_t bapm_enabled;
++
++	bool video_start;
++	bool battery_state;
++
++	uint32_t is_nb_dpm_enabled;
++	uint32_t is_voltage_island_enabled;
++	uint32_t disable_smu_acp_s3_handshake;
++	uint32_t disable_notify_smu_vpu_recovery;
++	bool                           in_vpu_recovery;
++	bool pg_acp_init;
++	uint8_t disp_config;
++
++	/* PowerTune */
++	uint32_t power_containment_features;
++	bool cac_enabled;
++	bool disable_uvd_power_tune_feature;
++	bool enable_bapm_feature;
++	bool enable_tdc_limit_feature;
++
++
++	/* SMC SRAM Address of firmware header tables */
++	uint32_t sram_end;
++	uint32_t dpm_table_start;
++	uint32_t soft_regs_start;
++
++	/* start of SMU7_Fusion_DpmTable */
++
++	uint8_t uvd_level_count;
++	uint8_t vce_level_count;
++	uint8_t acp_level_count;
++	uint8_t samu_level_count;
++
++	uint32_t fps_high_threshold;
++	uint32_t fps_low_threshold;
++
++	uint32_t dpm_flags;
++	struct rv_dpm_entry sclk_dpm;
++	struct rv_dpm_entry uvd_dpm;
++	struct rv_dpm_entry vce_dpm;
++	struct rv_dpm_entry acp_dpm;
++	bool acp_power_up_no_dsp;
++
++	uint32_t max_sclk_level;
++	uint32_t num_of_clk_entries;
++
++	/* CPU Power State */
++	uint32_t                          separation_time;
++	bool                              cc6_disable;
++	bool                              pstate_disable;
++	bool                              cc6_setting_changed;
++
++	uint32_t                             ulTotalActiveCUs;
++
++	bool                           isp_tileA_power_gated;
++	bool                           isp_tileB_power_gated;
++	uint32_t                       isp_actual_hard_min_freq;
++	uint32_t                       soc_actual_hard_min_freq;
++
++	bool                           vcn_power_gated;
++	bool                           vcn_dpg_mode;
++
++	bool                           gfx_off_controled_by_driver;
++	Watermarks_t                      water_marks_table;
++	struct rv_clock_voltage_information   clock_vol_info;
++	DpmClocks_t                       clock_table;
++
++	uint32_t active_process_mask;
++};
++
++struct pp_hwmgr;
++
++int rv_init_function_pointers(struct pp_hwmgr *hwmgr);
++
++#endif
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+index 4e39f35..a62948b8 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+@@ -273,7 +273,8 @@ enum amd_pp_clock_type {
+ 	amd_pp_dcef_clock,
+ 	amd_pp_soc_clock,
+ 	amd_pp_pixel_clock,
+-	amd_pp_phy_clock
++	amd_pp_phy_clock,
++	amd_pp_dpp_clock
+ };
+ 
+ #define MAX_NUM_CLOCKS 16
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+index 19187a9..e5c3d28 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+@@ -609,17 +609,6 @@ struct phm_ppt_v2_information {
+ 	uint8_t  uc_dcef_dpm_voltage_mode;
+ };
+ 
+-struct phm_ppt_v3_information {
+-	struct phm_ppt_v1_clock_voltage_dependency_table *vdd_dep_on_sclk;
+-	struct phm_ppt_v1_clock_voltage_dependency_table *vdd_dep_on_mclk;
+-	struct phm_ppt_v1_clock_voltage_dependency_table *vdd_dep_on_socclk;
+-	struct phm_ppt_v1_clock_voltage_dependency_table *vdd_dep_on_dcefclk;
+-	struct phm_ppt_v1_clock_voltage_dependency_table *vdd_dep_on_pixclk;
+-	struct phm_ppt_v1_clock_voltage_dependency_table *vdd_dep_on_dispclk;
+-	struct phm_ppt_v1_clock_voltage_dependency_table *vdd_dep_on_phyclk;
+-};
+-
+-
+ struct phm_dynamic_state_info {
+ 	struct phm_clock_voltage_dependency_table *vddc_dependency_on_sclk;
+ 	struct phm_clock_voltage_dependency_table *vddci_dependency_on_mclk;
+@@ -635,7 +624,7 @@ struct phm_dynamic_state_info {
+ 	uint32_t                                  vddc_vddci_delta;
+ 	uint32_t                                  min_vddc_for_pcie_gen2;
+ 	struct phm_cac_leakage_table              *cac_leakage_table;
+-	struct phm_phase_shedding_limits_table	  *vddc_phase_shed_limits_table;
++	struct phm_phase_shedding_limits_table  *vddc_phase_shed_limits_table;
+ 
+ 	struct phm_vce_clock_voltage_dependency_table
+ 					    *vce_clock_voltage_dependency_table;
+@@ -648,8 +637,8 @@ struct phm_dynamic_state_info {
+ 
+ 	struct phm_ppm_table                          *ppm_parameter_table;
+ 	struct phm_cac_tdp_table                      *cac_dtp_table;
+-	struct phm_clock_voltage_dependency_table	  *vdd_gfx_dependency_on_sclk;
+-	struct phm_vq_budgeting_table				  *vq_budgeting_table;
++	struct phm_clock_voltage_dependency_table	*vdd_gfx_dependency_on_sclk;
++	struct phm_vq_budgeting_table				*vq_budgeting_table;
+ };
+ 
+ struct pp_fan_info {
+@@ -832,6 +821,7 @@ extern void phm_apply_dal_min_voltage_request(struct pp_hwmgr *hwmgr);
+ 
+ extern int smu7_init_function_pointers(struct pp_hwmgr *hwmgr);
+ extern int vega10_hwmgr_init(struct pp_hwmgr *hwmgr);
++extern int rv_init_function_pointers(struct pp_hwmgr *hwmgr);
+ 
+ extern int phm_get_voltage_evv_on_sclk(struct pp_hwmgr *hwmgr, uint8_t voltage_type,
+ 				uint32_t sclk, uint16_t id, uint16_t *voltage);
+-- 
+2.7.4
+

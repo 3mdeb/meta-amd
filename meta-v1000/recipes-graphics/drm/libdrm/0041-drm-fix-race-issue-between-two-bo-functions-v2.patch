@@ -1,0 +1,83 @@
+From ce2f6104799cca43993e831c889ded27af877a25 Mon Sep 17 00:00:00 2001
+From: Monk Liu <monk.liu@amd.com>
+Date: Mon, 7 Aug 2017 22:27:10 +0800
+Subject: [PATCH 41/46] drm:fix race issue between two bo functions(v2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+there is race issue between two threads on amdgpu_bo_reference and
+amdgpu_bo_import, this patch tends to fix it by moving the
+pthread_mutex_lock out of bo_free_internal and move to bo_reference
+to cover the update_reference part.
+
+The mutex_unlock in bo_import should also cover bo refcount
+increasement.
+
+Change-Id: I1f65eacf74cd28cc0d3a71ef2f7a19b890d63c29
+Signed-off-by: Monk Liu <monk.liu@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Acked-by: Qiang Yu <Qiang.Yu@amd.com>
+---
+ amdgpu/amdgpu_bo.c       |  5 +----
+ amdgpu/amdgpu_internal.h | 13 +++++++++++--
+ 2 files changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/amdgpu/amdgpu_bo.c b/amdgpu/amdgpu_bo.c
+index 76126a2..09028c7 100644
+--- a/amdgpu/amdgpu_bo.c
++++ b/amdgpu/amdgpu_bo.c
+@@ -57,14 +57,12 @@ static void amdgpu_close_kms_handle(amdgpu_device_handle dev,
+ drm_private void amdgpu_bo_free_internal(amdgpu_bo_handle bo)
+ {
+ 	/* Remove the buffer from the hash tables. */
+-	pthread_mutex_lock(&bo->dev->bo_table_mutex);
+ 	util_hash_table_remove(bo->dev->bo_handles,
+ 			       (void*)(uintptr_t)bo->handle);
+ 	if (bo->flink_name) {
+ 		util_hash_table_remove(bo->dev->bo_flink_names,
+ 				       (void*)(uintptr_t)bo->flink_name);
+ 	}
+-	pthread_mutex_unlock(&bo->dev->bo_table_mutex);
+ 
+ 	/* Release CPU access. */
+ 	if (bo->cpu_map_count > 0) {
+@@ -344,10 +342,9 @@ int amdgpu_bo_import(amdgpu_device_handle dev,
+ 	}
+ 
+ 	if (bo) {
+-		pthread_mutex_unlock(&dev->bo_table_mutex);
+-
+ 		/* The buffer already exists, just bump the refcount. */
+ 		atomic_inc(&bo->refcount);
++		pthread_mutex_unlock(&dev->bo_table_mutex);
+ 
+ 		output->buf_handle = bo;
+ 		output->alloc_size = bo->alloc_size;
+diff --git a/amdgpu/amdgpu_internal.h b/amdgpu/amdgpu_internal.h
+index b39f47a..d7a3d50 100644
+--- a/amdgpu/amdgpu_internal.h
++++ b/amdgpu/amdgpu_internal.h
+@@ -238,8 +238,17 @@ static inline bool update_references(atomic_t *dst, atomic_t *src)
+ static inline void amdgpu_bo_reference(struct amdgpu_bo **dst,
+ 					struct amdgpu_bo *src)
+ {
+-	if (update_references(&(*dst)->refcount, &src->refcount))
+-		amdgpu_bo_free_internal(*dst);
++	pthread_mutex_t *mlock;
++	struct amdgpu_bo* bo = *dst;
++
++	assert(bo != NULL);
++	mlock = &bo->dev->bo_table_mutex;
++	pthread_mutex_lock(mlock);
++
++	if (update_references(&bo->refcount, src ? &src->refcount : NULL))
++		amdgpu_bo_free_internal(bo);
++
++	pthread_mutex_unlock(mlock);
+ 	*dst = src;
+ }
+ 
+-- 
+2.7.4
+

@@ -1,0 +1,172 @@
+From 1555e514a7253b9e9f99d7639e10f311858e9125 Mon Sep 17 00:00:00 2001
+From: Alex Xie <AlexBin.Xie@amd.com>
+Date: Thu, 1 Jun 2017 09:42:59 -0400
+Subject: [PATCH 2151/2500] drm/amdgpu: Move compute vm bug logic to
+ amdgpu_vm.c
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+  In review, Christian would like to keep the logic
+  inside amdgpu_vm.c with a cost of slightly slower.
+  The loop is still optimized out with this patch.
+
+v2: remove the if statement. Now it is not slower.
+
+Signed-off-by: Alex Xie <AlexBin.Xie@amd.com>
+Reviewed-by: Christian König <christian.koeng@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c   | 32 -------------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h   |  5 ----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c     | 38 ++++++++++++++++++++++++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h     |  1 +
+ 5 files changed, 39 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index bdd8f60..ca442e0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2255,6 +2255,8 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 
+ 	adev->accel_working = true;
+ 
++	amdgpu_vm_check_compute_bug(adev);
++
+ 	/* Initialize the buffer migration limit. */
+ 	if (amdgpu_moverate >= 0)
+ 		max_MBps = amdgpu_moverate;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index ca9ebd2..3e3c8a1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -155,36 +155,6 @@ void amdgpu_ring_undo(struct amdgpu_ring *ring)
+ }
+ 
+ /**
+- * amdgpu_ring_check_compute_vm_bug - check whether this ring has compute vm bug
+- *
+- * @adev: amdgpu_device pointer
+- * @ring: amdgpu_ring structure holding ring information
+- */
+-static void amdgpu_ring_check_compute_vm_bug(struct amdgpu_device *adev,
+-					struct amdgpu_ring *ring)
+-{
+-	const struct amdgpu_ip_block *ip_block;
+-
+-	ring->has_compute_vm_bug = false;
+-
+-	if (ring->funcs->type != AMDGPU_RING_TYPE_COMPUTE)
+-		/* only compute rings */
+-		return;
+-
+-	ip_block = amdgpu_get_ip_block(adev, AMD_IP_BLOCK_TYPE_GFX);
+-	if (!ip_block)
+-		return;
+-
+-	/* Compute ring has a VM bug for GFX version < 7.
+-           And compute ring has a VM bug for GFX 8 MEC firmware version < 673.*/
+-	if (ip_block->version->major <= 7) {
+-		ring->has_compute_vm_bug = true;
+-	} else if (ip_block->version->major == 8)
+-		if (adev->gfx.mec_fw_version < 673)
+-			ring->has_compute_vm_bug = true;
+-}
+-
+-/**
+  * amdgpu_ring_init - init driver ring struct.
+  *
+  * @adev: amdgpu_device pointer
+@@ -292,8 +262,6 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 		DRM_ERROR("Failed to register debugfs file for rings !\n");
+ 	}
+ 
+-	amdgpu_ring_check_compute_vm_bug(adev, ring);
+-
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+index 12a30a1..d0e29d6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -213,9 +213,4 @@ static inline void amdgpu_ring_clear_ring(struct amdgpu_ring *ring)
+ 
+ }
+ 
+-static inline bool amdgpu_ring_has_compute_vm_bug(struct amdgpu_ring *ring)
+-{
+-	return ring->has_compute_vm_bug;
+-}
+-
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 7a82e7c..1bc44ab 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -656,6 +656,41 @@ static int amdgpu_vm_alloc_reserved_vmid(struct amdgpu_device *adev,
+ 	return r;
+ }
+ 
++/**
++ * amdgpu_vm_check_compute_bug - check whether asic has compute vm bug
++ *
++ * @adev: amdgpu_device pointer
++ */
++void amdgpu_vm_check_compute_bug(struct amdgpu_device *adev)
++{
++	const struct amdgpu_ip_block *ip_block;
++	bool has_compute_vm_bug;
++	struct amdgpu_ring *ring;
++	int i;
++
++	has_compute_vm_bug = false;
++
++	ip_block = amdgpu_get_ip_block(adev, AMD_IP_BLOCK_TYPE_GFX);
++	if (ip_block) {
++		/* Compute has a VM bug for GFX version < 7.
++		   Compute has a VM bug for GFX 8 MEC firmware version < 673.*/
++		if (ip_block->version->major <= 7)
++			has_compute_vm_bug = true;
++		else if (ip_block->version->major == 8)
++			if (adev->gfx.mec_fw_version < 673)
++				has_compute_vm_bug = true;
++	}
++
++	for (i = 0; i < adev->num_rings; i++) {
++		ring = adev->rings[i];
++		if (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE)
++			/* only compute rings */
++			ring->has_compute_vm_bug = has_compute_vm_bug;
++		else
++			ring->has_compute_vm_bug = false;
++	}
++}
++
+ bool amdgpu_vm_need_pipeline_sync(struct amdgpu_ring *ring,
+ 				  struct amdgpu_job *job)
+ {
+@@ -664,8 +699,7 @@ bool amdgpu_vm_need_pipeline_sync(struct amdgpu_ring *ring,
+ 	struct amdgpu_vm_id_manager *id_mgr = &adev->vm_manager.id_mgr[vmhub];
+ 	struct amdgpu_vm_id *id;
+ 	bool gds_switch_needed;
+-	bool vm_flush_needed = job->vm_needs_flush ||
+-		amdgpu_ring_has_compute_vm_bug(ring);
++	bool vm_flush_needed = job->vm_needs_flush || ring->has_compute_vm_bug;
+ 
+ 	if (job->vm_id == 0)
+ 		return false;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index a6b4208..6df1d36 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -252,5 +252,6 @@ void amdgpu_vm_adjust_size(struct amdgpu_device *adev, uint64_t vm_size);
+ int amdgpu_vm_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
+ bool amdgpu_vm_need_pipeline_sync(struct amdgpu_ring *ring,
+ 				  struct amdgpu_job *job);
++void amdgpu_vm_check_compute_bug(struct amdgpu_device *adev);
+ 
+ #endif
+-- 
+2.7.4
+

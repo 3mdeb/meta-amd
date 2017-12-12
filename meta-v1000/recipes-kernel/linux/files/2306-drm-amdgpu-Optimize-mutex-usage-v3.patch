@@ -1,0 +1,129 @@
+From 22662bdd351b3c008365b8810e02a7bec13b127e Mon Sep 17 00:00:00 2001
+From: Alex Xie <AlexBin.Xie@amd.com>
+Date: Fri, 16 Jun 2017 09:07:29 -0400
+Subject: [PATCH 2306/2500] drm/amdgpu: Optimize mutex usage (v3)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In original function amdgpu_bo_list_get, the waiting
+for result->lock can be quite long while mutex
+bo_list_lock was holding. It can make other tasks
+waiting for bo_list_lock for long period.
+
+Secondly, this patch allows several tasks(readers of idr)
+to proceed at the same time.
+
+v2: use rcu and kref (Dave Airlie and Christian König)
+v3: update v1 commit message (Michel Dänzer)
+
+Signed-off-by: Alex Xie <AlexBin.Xie@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
+
+Change-Id: I7249ec3bb96db2e0a88726ed438b6c6130c2ce71
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h         |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c | 38 +++++++++++++++++++++--------
+ 2 files changed, 30 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 874d73d..54eb8b7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -896,6 +896,8 @@ struct amdgpu_fpriv {
+ 
+ struct amdgpu_bo_list {
+ 	struct mutex lock;
++	struct rcu_head rhead;
++	struct kref refcount;
+ 	struct amdgpu_bo *gds_obj;
+ 	struct amdgpu_bo *gws_obj;
+ 	struct amdgpu_bo *oa_obj;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
+index 49f54ef..d382429 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
+@@ -41,6 +41,20 @@ static int amdgpu_bo_list_set(struct amdgpu_device *adev,
+ 				     struct drm_amdgpu_bo_list_entry *info,
+ 				     unsigned num_entries);
+ 
++static void amdgpu_bo_list_release_rcu(struct kref *ref)
++{
++	unsigned i;
++	struct amdgpu_bo_list *list = container_of(ref, struct amdgpu_bo_list,
++						   refcount);
++
++	for (i = 0; i < list->num_entries; ++i)
++		amdgpu_bo_unref(&list->array[i].robj);
++
++	mutex_destroy(&list->lock);
++	drm_free_large(list->array);
++	kfree_rcu(list, rhead);
++}
++
+ static int amdgpu_bo_list_create(struct amdgpu_device *adev,
+ 				 struct drm_file *filp,
+ 				 struct drm_amdgpu_bo_list_entry *info,
+@@ -57,7 +71,7 @@ static int amdgpu_bo_list_create(struct amdgpu_device *adev,
+ 
+ 	/* initialize bo list*/
+ 	mutex_init(&list->lock);
+-
++	kref_init(&list->refcount);
+ 	r = amdgpu_bo_list_set(adev, filp, list, info, num_entries);
+ 	if (r) {
+ 		kfree(list);
+@@ -83,14 +97,11 @@ static void amdgpu_bo_list_destroy(struct amdgpu_fpriv *fpriv, int id)
+ 
+ 	mutex_lock(&fpriv->bo_list_lock);
+ 	list = idr_find(&fpriv->bo_list_handles, id);
++	mutex_unlock(&fpriv->bo_list_lock);
+ 	if (list) {
+-		mutex_lock(&list->lock);
+ 		idr_remove(&fpriv->bo_list_handles, id);
+-		mutex_unlock(&list->lock);
+-		amdgpu_bo_list_free(list);
++		kref_put(&list->refcount, amdgpu_bo_list_release_rcu);
+ 	}
+-
+-	mutex_unlock(&fpriv->bo_list_lock);
+ }
+ 
+ static int amdgpu_bo_list_set(struct amdgpu_device *adev,
+@@ -185,11 +196,17 @@ amdgpu_bo_list_get(struct amdgpu_fpriv *fpriv, int id)
+ {
+ 	struct amdgpu_bo_list *result;
+ 
+-	mutex_lock(&fpriv->bo_list_lock);
++	rcu_read_lock();
+ 	result = idr_find(&fpriv->bo_list_handles, id);
+-	if (result)
+-		mutex_lock(&result->lock);
+-	mutex_unlock(&fpriv->bo_list_lock);
++
++	if (result) {
++		if (kref_get_unless_zero(&result->refcount))
++			mutex_lock(&result->lock);
++		else
++			result = NULL;
++	}
++	rcu_read_unlock();
++
+ 	return result;
+ }
+ 
+@@ -227,6 +244,7 @@ void amdgpu_bo_list_get_list(struct amdgpu_bo_list *list,
+ void amdgpu_bo_list_put(struct amdgpu_bo_list *list)
+ {
+ 	mutex_unlock(&list->lock);
++	kref_put(&list->refcount, amdgpu_bo_list_release_rcu);
+ }
+ 
+ void amdgpu_bo_list_free(struct amdgpu_bo_list *list)
+-- 
+2.7.4
+

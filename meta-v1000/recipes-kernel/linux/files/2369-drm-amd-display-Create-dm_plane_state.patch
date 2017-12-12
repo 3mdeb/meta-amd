@@ -1,0 +1,173 @@
+From de9c9c3692eb037318384cec688755af89f747a6 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Thu, 22 Jun 2017 17:37:22 -0400
+Subject: [PATCH 2369/2500] drm/amd/display: Create dm_plane_state.
+
+Hook up dc_surface creation/destruction to dm_plane_state.
+Rename amdgpu_drm_plane_state to dm_plane_state and do
+minor cleanups.
+
+Change-Id: Iefc51cf6d453a50c35e031c72e718a73bbc9a82d
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Reviewed-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h           | 14 ++--
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_types.c    | 80 ++++++++++++++++------
+ 2 files changed, 68 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+index 5da521a..e3deb84 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+@@ -58,6 +58,8 @@ struct amdgpu_hpd;
+ #define to_amdgpu_framebuffer(x) container_of(x, struct amdgpu_framebuffer, base)
+ #define to_amdgpu_plane(x)	container_of(x, struct amdgpu_plane, base)
+ 
++#define to_dm_plane_state(x)	container_of(x, struct dm_plane_state, base);
++
+ #define AMDGPU_MAX_HPD_PINS 6
+ #define AMDGPU_MAX_CRTCS 6
+ #define AMDGPU_MAX_PLANES 6
+@@ -444,16 +446,18 @@ struct amdgpu_crtc {
+ 	struct drm_pending_vblank_event *event;
+ };
+ 
+-struct amdgpu_drm_plane_state {
++/* TODO rename to dc_plane_state */
++struct  dc_surface;
++
++struct dm_plane_state {
+ 	struct drm_plane_state base;
+-	unsigned int h_ratio;
+-	unsigned int v_ratio;
++	struct  dc_surface* dc_surface;
+ };
+ 
+-static inline struct amdgpu_drm_plane_state *
++static inline struct dm_plane_state *
+ to_amdgpu_plane_state(struct drm_plane_state *state)
+ {
+-	return container_of(state, struct amdgpu_drm_plane_state, base);
++	return container_of(state, struct dm_plane_state, base);
+ }
+ 
+ struct amdgpu_plane {
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+index 50e4531..fa8ed23 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+@@ -1515,45 +1515,82 @@ const struct drm_encoder_helper_funcs amdgpu_dm_encoder_helper_funcs = {
+ 
+ static void dm_drm_plane_reset(struct drm_plane *plane)
+ {
+-	struct amdgpu_drm_plane_state *amdgpu_state;
++	struct dm_plane_state *amdgpu_state = NULL;
++	struct amdgpu_device *adev = plane->dev->dev_private;
+ 
+-	if (plane->state) {
+-		amdgpu_state = to_amdgpu_plane_state(plane->state);
+-		if (amdgpu_state->base.fb)
+-			drm_framebuffer_unreference(amdgpu_state->base.fb);
+-		kfree(amdgpu_state);
+-		plane->state = NULL;
+-	}
++	if (plane->state)
++		plane->funcs->atomic_destroy_state(plane, plane->state);
+ 
+ 	amdgpu_state = kzalloc(sizeof(*amdgpu_state), GFP_KERNEL);
++
+ 	if (amdgpu_state) {
+ 		plane->state = &amdgpu_state->base;
+ 		plane->state->plane = plane;
++		plane->state->rotation = DRM_ROTATE_0;
++
++		amdgpu_state->dc_surface = dc_create_surface(adev->dm.dc);
++		WARN_ON(!amdgpu_state->dc_surface);
+ 	}
++	else
++		WARN_ON(1);
+ }
+ 
+ static struct drm_plane_state *
+ dm_drm_plane_duplicate_state(struct drm_plane *plane)
+ {
+-	struct amdgpu_drm_plane_state *amdgpu_state;
+-	struct amdgpu_drm_plane_state *copy;
++	struct dm_plane_state *dm_plane_state, *old_dm_plane_state;
++	struct amdgpu_device *adev = plane->dev->dev_private;
+ 
+-	amdgpu_state = to_amdgpu_plane_state(plane->state);
+-	copy = kzalloc(sizeof(*amdgpu_state), GFP_KERNEL);
+-	if (!copy)
++	old_dm_plane_state = to_dm_plane_state(plane->state);
++	dm_plane_state = kzalloc(sizeof(*dm_plane_state), GFP_KERNEL);
++	if (!dm_plane_state)
+ 		return NULL;
+ 
+-	__drm_atomic_helper_plane_duplicate_state(plane, &copy->base);
+-	return &copy->base;
++	if (old_dm_plane_state->dc_surface) {
++		struct dc_surface *dc_surface = dc_create_surface(adev->dm.dc);
++		if (WARN_ON(!dc_surface))
++			return NULL;
++
++		__drm_atomic_helper_plane_duplicate_state(plane, &dm_plane_state->base);
++
++		memcpy(dc_surface, old_dm_plane_state->dc_surface, sizeof(*dc_surface));
++
++		if (old_dm_plane_state->dc_surface->gamma_correction)
++			dc_gamma_retain(dc_surface->gamma_correction);
++
++		if (old_dm_plane_state->dc_surface->in_transfer_func)
++			dc_transfer_func_retain(dc_surface->in_transfer_func);
++
++		dm_plane_state->dc_surface = dc_surface;
++
++		/*TODO Check for inferred values to be reset */
++	}
++	else {
++		WARN_ON(1);
++		return NULL;
++	}
++
++	return &dm_plane_state->base;
+ }
+ 
+-static void dm_drm_plane_destroy_state(struct drm_plane *plane,
+-					   struct drm_plane_state *old_state)
++void dm_drm_plane_destroy_state(struct drm_plane *plane,
++					   struct drm_plane_state *state)
+ {
+-	struct amdgpu_drm_plane_state *old_amdgpu_state =
+-					to_amdgpu_plane_state(old_state);
+-	__drm_atomic_helper_plane_destroy_state(old_state);
+-	kfree(old_amdgpu_state);
++	struct dm_plane_state *dm_plane_state = to_dm_plane_state(state);
++
++	if (dm_plane_state->dc_surface) {
++		struct dc_surface *dc_surface = dm_plane_state->dc_surface;
++
++		if (dc_surface->gamma_correction)
++			dc_gamma_release(&dc_surface->gamma_correction);
++
++		if (dc_surface->in_transfer_func)
++			dc_transfer_func_release(dc_surface->in_transfer_func);
++
++		dc_surface_release(dc_surface);
++	}
++
++	drm_atomic_helper_plane_destroy_state(plane, state);
+ }
+ 
+ static const struct drm_plane_funcs dm_plane_funcs = {
+@@ -2567,6 +2604,7 @@ static void amdgpu_dm_commit_surfaces(struct drm_atomic_state *state,
+ 		for (i = 0; i < planes_count; i++)
+ 			dc_surface_release(dc_surfaces_constructed[i]);
+ 	} else {
++
+ 		/*TODO BUG Here should go disable planes on CRTC. */
+ 	}
+ }
+-- 
+2.7.4
+

@@ -1,0 +1,441 @@
+From 465ce2bec299abb586e8a86dc809436e4325d513 Mon Sep 17 00:00:00 2001
+From: Shirish S <shirish.s@amd.com>
+Date: Thu, 16 Mar 2017 15:26:56 +0530
+Subject: [PATCH 1101/2094] drm/amd/display: decouple per-crtc-plane model
+
+Current design has per-crtc-plane model.
+As a result, for asic's that support underlay,
+are unable to expose it to user space for modesetting.
+
+To enable this, the drm driver intialisation now runs
+for number of surfaces instead of stream/crtc.
+
+This patch plumbs surface capabilities to drm framework
+so that it can be effectively used by user space.
+
+Tests: (On Chromium OS for Stoney Only)
+* 'modetest -p'  now shows additional plane
+  with YUV capabilities in case of CZ and ST.
+* 'plane_test' fails with below error:
+  [drm:amdgpu_dm_connector_atomic_set_property [amdgpu]] *ERROR* Unsupported screen depth 0
+  as ther is no support for YUYV
+* Checked multimonitor display works fine
+
+Change-Id: Ibc112d1c7f76539b530b4e11862bb57f2e480121
+Signed-off-by: Shirish S <shirish.s@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h           |  8 +++
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c  | 67 ++++++++++++++-----
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_types.c    | 75 +++++++++++++++-------
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_types.h    |  5 +-
+ drivers/gpu/drm/amd/display/dc/dc.h                |  1 +
+ .../drm/amd/display/dc/dce100/dce100_resource.c    |  2 +
+ .../drm/amd/display/dc/dce110/dce110_resource.c    |  2 +
+ .../drm/amd/display/dc/dce112/dce112_resource.c    |  2 +
+ .../drm/amd/display/dc/dce120/dce120_resource.c    |  2 +
+ .../gpu/drm/amd/display/dc/dce80/dce80_resource.c  |  2 +
+ 10 files changed, 127 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+index 3148412..da3b125 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+@@ -59,6 +59,7 @@ struct amdgpu_hpd;
+ 
+ #define AMDGPU_MAX_HPD_PINS 6
+ #define AMDGPU_MAX_CRTCS 6
++#define AMDGPU_MAX_PLANES 6
+ #define AMDGPU_MAX_AFMT_BLOCKS 9
+ 
+ enum amdgpu_rmx_type {
+@@ -338,6 +339,7 @@ struct amdgpu_mode_info {
+ 	struct card_info *atom_card_info;
+ 	bool mode_config_initialized;
+ 	struct amdgpu_crtc *crtcs[AMDGPU_MAX_CRTCS];
++	struct amdgpu_plane *planes[AMDGPU_MAX_PLANES];
+ 	struct amdgpu_afmt *afmt[AMDGPU_MAX_AFMT_BLOCKS];
+ 	/* DVI-I properties */
+ 	struct drm_property *coherent_mode_property;
+@@ -371,6 +373,7 @@ struct amdgpu_mode_info {
+ 	int			num_dig; /* number of dig blocks */
+ 	int			disp_priority;
+ 	const struct amdgpu_display_funcs *funcs;
++	enum drm_plane_type *plane_type;
+ };
+ 
+ #define AMDGPU_MAX_BL_LEVEL 0xFF
+@@ -452,6 +455,11 @@ struct amdgpu_crtc {
+ 	struct drm_pending_vblank_event *event;
+ };
+ 
++struct amdgpu_plane {
++	struct drm_plane base;
++	enum drm_plane_type plane_type;
++};
++
+ struct amdgpu_encoder_atom_dig {
+ 	bool linkb;
+ 	/* atom dig */
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index ed7ca67..1863595 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -55,6 +55,28 @@
+ 
+ #include "modules/inc/mod_freesync.h"
+ 
++static enum drm_plane_type dm_surfaces_type_default[AMDGPU_MAX_PLANES] = {
++	DRM_PLANE_TYPE_PRIMARY,
++	DRM_PLANE_TYPE_PRIMARY,
++	DRM_PLANE_TYPE_PRIMARY,
++	DRM_PLANE_TYPE_PRIMARY,
++	DRM_PLANE_TYPE_PRIMARY,
++	DRM_PLANE_TYPE_PRIMARY,
++};
++
++static enum drm_plane_type dm_surfaces_type_carizzo[AMDGPU_MAX_PLANES] = {
++	DRM_PLANE_TYPE_PRIMARY,
++	DRM_PLANE_TYPE_PRIMARY,
++	DRM_PLANE_TYPE_PRIMARY,
++	DRM_PLANE_TYPE_OVERLAY,/* YUV Capable Underlay */
++};
++
++static enum drm_plane_type dm_surfaces_type_stoney[AMDGPU_MAX_PLANES] = {
++	DRM_PLANE_TYPE_PRIMARY,
++	DRM_PLANE_TYPE_PRIMARY,
++	DRM_PLANE_TYPE_OVERLAY, /* YUV Capable Underlay */
++};
++
+ /*
+  * dm_vblank_get_counter
+  *
+@@ -1057,30 +1079,34 @@ int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
+ 	uint32_t i;
+ 	struct amdgpu_connector *aconnector;
+ 	struct amdgpu_encoder *aencoder;
+-	struct amdgpu_crtc *acrtc;
++	struct amdgpu_mode_info *mode_info = &adev->mode_info;
+ 	uint32_t link_cnt;
+ 
+ 	link_cnt = dm->dc->caps.max_links;
+-
+ 	if (amdgpu_dm_mode_config_init(dm->adev)) {
+ 		DRM_ERROR("DM: Failed to initialize mode config\n");
+-		return -1;
++		goto fail;
+ 	}
+ 
+-	for (i = 0; i < dm->dc->caps.max_streams; i++) {
+-		acrtc = kzalloc(sizeof(struct amdgpu_crtc), GFP_KERNEL);
+-		if (!acrtc)
+-			goto fail;
++	for (i = 0; i < dm->dc->caps.max_surfaces; i++) {
++		mode_info->planes[i] = kzalloc(sizeof(struct amdgpu_plane),
++								 GFP_KERNEL);
++		if (!mode_info->planes[i]) {
++			DRM_ERROR("KMS: Failed to allocate surface\n");
++			goto fail_free_planes;
++		}
++		mode_info->planes[i]->plane_type = mode_info->plane_type[i];
++		if (amdgpu_dm_plane_init(dm, mode_info->planes[i], 1)) {
++			DRM_ERROR("KMS: Failed to initialize plane\n");
++			goto fail_free_planes;
++		}
++	}
+ 
+-		if (amdgpu_dm_crtc_init(
+-			dm,
+-			acrtc,
+-			i)) {
++	for (i = 0; i < dm->dc->caps.max_streams; i++)
++		if (amdgpu_dm_crtc_init(dm, &mode_info->planes[i]->base, i)) {
+ 			DRM_ERROR("KMS: Failed to initialize crtc\n");
+-			kfree(acrtc);
+-			goto fail;
++			goto fail_free_planes;
+ 		}
+-	}
+ 
+ 	dm->display_indexes_num = dm->dc->caps.max_streams;
+ 
+@@ -1131,12 +1157,12 @@ int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
+ 	case CHIP_VEGA10:
+ 		if (dce110_register_irq_handlers(dm->adev)) {
+ 			DRM_ERROR("DM: Failed to initialize IRQ\n");
+-			return -1;
++			goto fail_free_encoder;
+ 		}
+ 		break;
+ 	default:
+ 		DRM_ERROR("Usupported ASIC type: 0x%X\n", adev->asic_type);
+-		return -1;
++		goto fail_free_encoder;
+ 	}
+ 
+ 	drm_mode_config_reset(dm->ddev);
+@@ -1146,6 +1172,9 @@ int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
+ 	kfree(aencoder);
+ fail_free_connector:
+ 	kfree(aconnector);
++fail_free_planes:
++	for (i = 0; i < dm->dc->caps.max_surfaces; i++)
++		kfree(mode_info->planes[i]);
+ fail:
+ 	return -1;
+ }
+@@ -1537,6 +1566,7 @@ static int dm_early_init(void *handle)
+ 		adev->mode_info.num_crtc = 6;
+ 		adev->mode_info.num_hpd = 6;
+ 		adev->mode_info.num_dig = 6;
++		adev->mode_info.plane_type = dm_surfaces_type_default;
+ #ifdef CONFIG_DRM_AMDGPU_CIK
+ 		if (adev->mode_info.funcs == NULL)
+ 			adev->mode_info.funcs = &dm_dce_v8_0_display_funcs;
+@@ -1547,6 +1577,7 @@ static int dm_early_init(void *handle)
+ 		adev->mode_info.num_crtc = 6;
+ 		adev->mode_info.num_hpd = 6;
+ 		adev->mode_info.num_dig = 7;
++		adev->mode_info.plane_type = dm_surfaces_type_default;
+ 		if (adev->mode_info.funcs == NULL)
+ 			adev->mode_info.funcs = &dm_dce_v10_0_display_funcs;
+ 		break;
+@@ -1554,6 +1585,7 @@ static int dm_early_init(void *handle)
+ 		adev->mode_info.num_crtc = 3;
+ 		adev->mode_info.num_hpd = 6;
+ 		adev->mode_info.num_dig = 9;
++		adev->mode_info.plane_type = dm_surfaces_type_carizzo;
+ 		if (adev->mode_info.funcs == NULL)
+ 			adev->mode_info.funcs = &dm_dce_v11_0_display_funcs;
+ 		break;
+@@ -1561,6 +1593,7 @@ static int dm_early_init(void *handle)
+ 		adev->mode_info.num_crtc = 2;
+ 		adev->mode_info.num_hpd = 6;
+ 		adev->mode_info.num_dig = 9;
++		adev->mode_info.plane_type = dm_surfaces_type_stoney;
+ 		if (adev->mode_info.funcs == NULL)
+ 			adev->mode_info.funcs = &dm_dce_v11_0_display_funcs;
+ 		break;
+@@ -1569,6 +1602,7 @@ static int dm_early_init(void *handle)
+ 		adev->mode_info.num_crtc = 5;
+ 		adev->mode_info.num_hpd = 5;
+ 		adev->mode_info.num_dig = 5;
++		adev->mode_info.plane_type = dm_surfaces_type_default;
+ 		if (adev->mode_info.funcs == NULL)
+ 			adev->mode_info.funcs = &dm_dce_v11_0_display_funcs;
+ 		break;
+@@ -1576,6 +1610,7 @@ static int dm_early_init(void *handle)
+ 		adev->mode_info.num_crtc = 6;
+ 		adev->mode_info.num_hpd = 6;
+ 		adev->mode_info.num_dig = 6;
++		adev->mode_info.plane_type = dm_surfaces_type_default;
+ 		if (adev->mode_info.funcs == NULL)
+ 			adev->mode_info.funcs = &dm_dce_v11_0_display_funcs;
+ 		break;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+index 929a4c8..2655da3 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+@@ -1610,6 +1610,8 @@ const struct drm_encoder_helper_funcs amdgpu_dm_encoder_helper_funcs = {
+ };
+ 
+ static const struct drm_plane_funcs dm_plane_funcs = {
++	.update_plane   = drm_atomic_helper_update_plane,
++	.disable_plane  = drm_atomic_helper_disable_plane,
+ 	.reset = drm_atomic_helper_plane_reset,
+ 	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
+ 	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state
+@@ -1741,37 +1743,67 @@ static uint32_t rgb_formats[] = {
+ 	DRM_FORMAT_ABGR2101010,
+ };
+ 
+-int amdgpu_dm_crtc_init(struct amdgpu_display_manager *dm,
+-			struct amdgpu_crtc *acrtc,
+-			uint32_t crtc_index)
++static uint32_t yuv_formats[] = {
++	DRM_FORMAT_YUYV,
++	DRM_FORMAT_YVYU,
++	DRM_FORMAT_UYVY,
++	DRM_FORMAT_VYUY,
++};
++
++int amdgpu_dm_plane_init(struct amdgpu_display_manager *dm,
++			struct amdgpu_plane *aplane,
++			unsigned long possible_crtcs)
+ {
+-	int res = -ENOMEM;
++	int res = -EPERM;
+ 
+-	struct drm_plane *primary_plane =
+-		kzalloc(sizeof(*primary_plane), GFP_KERNEL);
++	switch (aplane->plane_type) {
++	case DRM_PLANE_TYPE_PRIMARY:
++		aplane->base.format_default = true;
+ 
+-	if (!primary_plane)
+-		goto fail_plane;
++		res = drm_universal_plane_init(
++				dm->adev->ddev,
++				&aplane->base,
++				possible_crtcs,
++				&dm_plane_funcs,
++				rgb_formats,
++				ARRAY_SIZE(rgb_formats),
++				aplane->plane_type, NULL);
++		break;
++	case DRM_PLANE_TYPE_OVERLAY:
++		res = drm_universal_plane_init(
++				dm->adev->ddev,
++				&aplane->base,
++				possible_crtcs,
++				&dm_plane_funcs,
++				yuv_formats,
++				ARRAY_SIZE(yuv_formats),
++				aplane->plane_type, NULL);
++		break;
++	case DRM_PLANE_TYPE_CURSOR:
++		DRM_ERROR("KMS: Cursor plane not implemented.");
++		break;
++	}
+ 
+-	primary_plane->format_default = true;
++	drm_plane_helper_add(&aplane->base, &dm_plane_helper_funcs);
+ 
+-	res = drm_universal_plane_init(
+-		dm->adev->ddev,
+-		primary_plane,
+-		0,
+-		&dm_plane_funcs,
+-		rgb_formats,
+-		ARRAY_SIZE(rgb_formats),
+-		DRM_PLANE_TYPE_PRIMARY, NULL);
++	return res;
++}
+ 
+-	primary_plane->crtc = &acrtc->base;
++int amdgpu_dm_crtc_init(struct amdgpu_display_manager *dm,
++			struct drm_plane *plane,
++			uint32_t crtc_index)
++{
++	struct amdgpu_crtc *acrtc;
++	int res = -ENOMEM;
+ 
+-	drm_plane_helper_add(primary_plane, &dm_plane_helper_funcs);
++	acrtc = kzalloc(sizeof(struct amdgpu_crtc), GFP_KERNEL);
++	if (!acrtc)
++		goto fail;
+ 
+ 	res = drm_crtc_init_with_planes(
+ 			dm->ddev,
+ 			&acrtc->base,
+-			primary_plane,
++			plane,
+ 			NULL,
+ 			&amdgpu_dm_crtc_funcs, NULL);
+ 
+@@ -1791,8 +1823,7 @@ int amdgpu_dm_crtc_init(struct amdgpu_display_manager *dm,
+ 
+ 	return 0;
+ fail:
+-	kfree(primary_plane);
+-fail_plane:
++	kfree(acrtc);
+ 	acrtc->crtc_id = -1;
+ 	return res;
+ }
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.h
+index 1bbeb87..ab6d51d 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.h
+@@ -34,8 +34,11 @@ struct dc_validation_set;
+ struct dc_surface;
+ 
+ /*TODO Jodan Hersen use the one in amdgpu_dm*/
++int amdgpu_dm_plane_init(struct amdgpu_display_manager *dm,
++			struct amdgpu_plane *aplane,
++			unsigned long possible_crtcs);
+ int amdgpu_dm_crtc_init(struct amdgpu_display_manager *dm,
+-			struct amdgpu_crtc *amdgpu_crtc,
++			struct drm_plane *plane,
+ 			uint32_t link_index);
+ int amdgpu_dm_connector_init(struct amdgpu_display_manager *dm,
+ 			struct amdgpu_connector *amdgpu_connector,
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 0731045..9dd8b2a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -45,6 +45,7 @@ struct dc_caps {
+ 	uint32_t max_links;
+ 	uint32_t max_audios;
+ 	uint32_t max_slave_planes;
++	uint32_t max_surfaces;
+ 	uint32_t max_downscale_ratio;
+ 	uint32_t i2c_speed_in_khz;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+index b6f77f8..d1685df 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+@@ -1035,6 +1035,8 @@ static bool construct(
+ 		}
+ 	}
+ 
++	dc->public.caps.max_surfaces =  pool->base.pipe_count;
++
+ 	if (!resource_construct(num_virtual_links, dc, &pool->base,
+ 			&res_create_funcs))
+ 		goto res_create_fail;
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+index e300203..065a298 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+@@ -1455,6 +1455,8 @@ static bool construct(
+ 	if (!dce110_hw_sequencer_construct(dc))
+ 		goto res_create_fail;
+ 
++	dc->public.caps.max_surfaces =  pool->base.pipe_count;
++
+ 	bw_calcs_init(&dc->bw_dceip, &dc->bw_vbios, dc->ctx->asic_id);
+ 
+ 	bw_calcs_data_update_from_pplib(dc);
+diff --git a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+index 32aa1b5..ece3ec7 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+@@ -1409,6 +1409,8 @@ static bool construct(
+ 			  &res_create_funcs))
+ 		goto res_create_fail;
+ 
++	dc->public.caps.max_surfaces =  pool->base.pipe_count;
++
+ 	/* Create hardware sequencer */
+ 	if (!dce112_hw_sequencer_construct(dc))
+ 		goto res_create_fail;
+diff --git a/drivers/gpu/drm/amd/display/dc/dce120/dce120_resource.c b/drivers/gpu/drm/amd/display/dc/dce120/dce120_resource.c
+index efa5888..f677a77 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce120/dce120_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce120/dce120_resource.c
+@@ -1060,6 +1060,8 @@ static bool construct(
+ 	if (!dce120_hw_sequencer_create(dc))
+ 		goto controller_create_fail;
+ 
++	dc->public.caps.max_surfaces =  pool->base.pipe_count;
++
+ 	bw_calcs_init(&dc->bw_dceip, &dc->bw_vbios, dc->ctx->asic_id);
+ 
+ 	bw_calcs_data_update_from_pplib(dc);
+diff --git a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+index a3e8182..752e0e7 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+@@ -1043,6 +1043,8 @@ static bool construct(
+ 		}
+ 	}
+ 
++	dc->public.caps.max_surfaces =  pool->base.pipe_count;
++
+ 	if (!resource_construct(num_virtual_links, dc, &pool->base,
+ 			&res_create_funcs))
+ 		goto res_create_fail;
+-- 
+2.7.4
+

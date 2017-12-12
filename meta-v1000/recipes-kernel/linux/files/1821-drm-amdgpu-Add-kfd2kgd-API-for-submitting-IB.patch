@@ -1,0 +1,154 @@
+From 95ec319a7b64b4cb66af2f5a17cc35b528f3b00a Mon Sep 17 00:00:00 2001
+From: Amber Lin <Amber.Lin@amd.com>
+Date: Fri, 8 Jul 2016 15:53:47 -0400
+Subject: [PATCH 1821/2094] drm/amdgpu: Add kfd2kgd API for submitting IB
+
+This interface allows KFD to submit IB to a specific engine and VMID.
+
+BUG: SWDEV-93847
+
+Signed-off-by: Amber Lin <Amber.Lin@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c        | 55 +++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h        |  3 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c |  3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c |  3 +-
+ drivers/gpu/drm/amd/include/kgd_kfd_interface.h   |  7 ++-
+ 5 files changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index 4813325..3dd9f74 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -248,6 +248,61 @@ void amdgpu_amdkfd_cancel_restore_mem(struct amdgpu_device *adev,
+ 		cancel_delayed_work_sync(&mem->data2.work);
+ }
+ 
++int amdgpu_amdkfd_submit_ib(struct kgd_dev *kgd, enum kgd_engine_type engine,
++				uint32_t vmid, uint64_t gpu_addr,
++				uint32_t *ib_cmd, uint32_t ib_len)
++{
++	struct amdgpu_device *adev = (struct amdgpu_device *)kgd;
++	struct amdgpu_job *job;
++	struct amdgpu_ib *ib;
++	struct amdgpu_ring *ring;
++	struct fence *f = NULL;
++	int ret;
++
++	switch (engine) {
++	case KGD_ENGINE_MEC1:
++		ring = &adev->gfx.compute_ring[0];
++		break;
++	case KGD_ENGINE_SDMA1:
++		ring = &adev->sdma.instance[0].ring;
++		break;
++	case KGD_ENGINE_SDMA2:
++		ring = &adev->sdma.instance[1].ring;
++		break;
++	default:
++		pr_err("Invalid engine in IB submission: %d\n", engine);
++		ret = -EINVAL;
++		goto err;
++	}
++
++	ret = amdgpu_job_alloc(adev, 1, &job, NULL);
++	if (ret)
++		goto err;
++
++	ib = &job->ibs[0];
++	memset(ib, 0, sizeof(struct amdgpu_ib));
++
++	ib->gpu_addr = gpu_addr;
++	ib->ptr = ib_cmd;
++	ib->length_dw = ib_len;
++	/* This works for NO_HWS. TODO: need to handle without knowing VMID */
++	job->vm_id = vmid;
++
++	ret = amdgpu_ib_schedule(ring, 1, ib, NULL, job, &f);
++	if (ret) {
++		DRM_ERROR("amdgpu: failed to schedule IB.\n");
++		goto err_ib_sched;
++	}
++
++	ret = fence_wait(f, false);
++
++err_ib_sched:
++	fence_put(f);
++	amdgpu_job_free(job);
++err:
++	return ret;
++}
++
+ u32 pool_to_domain(enum kgd_memory_pool p)
+ {
+ 	switch (p) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 2da7b5e..61d4bf1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -88,6 +88,9 @@ int amdgpu_amdkfd_schedule_restore_mem(struct amdgpu_device *adev,
+ 				       unsigned long delay);
+ void amdgpu_amdkfd_cancel_restore_mem(struct amdgpu_device *adev,
+ 				      struct kgd_mem *mem);
++int amdgpu_amdkfd_submit_ib(struct kgd_dev *kgd, enum kgd_engine_type engine,
++				uint32_t vmid, uint64_t gpu_addr,
++				uint32_t *ib_cmd, uint32_t ib_len);
+ 
+ struct kfd2kgd_calls *amdgpu_amdkfd_gfx_7_get_functions(void);
+ struct kfd2kgd_calls *amdgpu_amdkfd_gfx_8_0_get_functions(void);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+index 0c3c352..9e19492 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
+@@ -198,7 +198,8 @@ static const struct kfd2kgd_calls kfd2kgd = {
+ 	.unpin_put_sg_table_bo = amdgpu_amdkfd_gpuvm_unpin_put_sg_table,
+ 	.get_dmabuf_info = amdgpu_amdkfd_get_dmabuf_info,
+ 	.import_dmabuf = amdgpu_amdkfd_gpuvm_import_dmabuf,
+-	.get_vm_fault_info = amdgpu_amdkfd_gpuvm_get_vm_fault_info
++	.get_vm_fault_info = amdgpu_amdkfd_gpuvm_get_vm_fault_info,
++	.submit_ib = amdgpu_amdkfd_submit_ib
+ };
+ 
+ struct kfd2kgd_calls *amdgpu_amdkfd_gfx_7_get_functions()
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+index 2c5d776..674bcf0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+@@ -180,7 +180,8 @@ static const struct kfd2kgd_calls kfd2kgd = {
+ 	.unpin_put_sg_table_bo = amdgpu_amdkfd_gpuvm_unpin_put_sg_table,
+ 	.get_dmabuf_info = amdgpu_amdkfd_get_dmabuf_info,
+ 	.import_dmabuf = amdgpu_amdkfd_gpuvm_import_dmabuf,
+-	.get_vm_fault_info = amdgpu_amdkfd_gpuvm_get_vm_fault_info
++	.get_vm_fault_info = amdgpu_amdkfd_gpuvm_get_vm_fault_info,
++	.submit_ib = amdgpu_amdkfd_submit_ib
+ };
+ 
+ struct kfd2kgd_calls *amdgpu_amdkfd_gfx_8_0_get_functions()
+diff --git a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+index ff6dcbe..1b2b092 100644
+--- a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+@@ -202,6 +202,9 @@ struct kgd2kfd_shared_resources {
+  * @import_dmabuf: Imports a DMA buffer, creating a new kgd_mem object
+  * Supports only DMA buffers created by GPU driver on the same GPU
+  *
++ * @submit_ib: Submits an IB to the engine specified by inserting the IB to
++ * the corresonded ring (ring type).
++ *
+  * This structure contains function pointers to services that the kgd driver
+  * provides to amdkfd driver.
+  *
+@@ -335,7 +338,9 @@ struct kfd2kgd_calls {
+ 
+ 	int (*get_vm_fault_info)(struct kgd_dev *kgd,
+ 			struct kfd_vm_fault_info *info);
+-
++	int (*submit_ib)(struct kgd_dev *kgd, enum kgd_engine_type engine,
++			uint32_t vmid, uint64_t gpu_addr,
++			uint32_t *ib_cmd, uint32_t ib_len);
+ };
+ 
+ /**
+-- 
+2.7.4
+

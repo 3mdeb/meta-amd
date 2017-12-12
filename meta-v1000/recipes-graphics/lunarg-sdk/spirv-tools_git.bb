@@ -14,8 +14,8 @@ S = "${WORKDIR}/git"
 SPIRV_HEADERS_LOCATION = "${S}/external/spirv-headers"
 HEADERS_VERSION = "1.1"
 
-SRCREV_spirv-tools = "7fe8a57a5bd72094e91f9f93e51dac2f2461dcb4"
-SRCREV_spirv-headers = "6c08995e6e7b94129e6086c78198c77111f2f262"
+SRCREV_spirv-tools = "5834719fc17d4735fce0102738b87b70255cfd5f"
+SRCREV_spirv-headers = "061097878467b8e040fbf153a837d844ef9f9f96"
 SRC_URI = "git://github.com/KhronosGroup/SPIRV-Tools;protocol=http;name=spirv-tools \
            git://github.com/KhronosGroup/SPIRV-Headers;name=spirv-headers;destsuffix=${SPIRV_HEADERS_LOCATION} \
            file://0001-obey-CMAKE_INSTALL_LIBDIR.patch \

@@ -1,0 +1,397 @@
+From 15ea9d32c2d0e7aeaf01859db9b8398acd11c447 Mon Sep 17 00:00:00 2001
+From: Vitaly Prosyak <vitaly.prosyak@amd.com>
+Date: Wed, 7 Jun 2017 12:23:59 -0500
+Subject: [PATCH 2274/2500] drm/amd/display: RV stereo support
+
+HDMI frame pack and DP frame alternate in band
+
+Change-Id: I643614508abc3b93bf841ccf5f070b9566919f23
+Signed-off-by: Vitaly Prosyak <vitaly.prosyak@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/dc.h                |  21 ++-
+ .../amd/display/dc/dcn10/dcn10_timing_generator.c  | 184 ++++++++++-----------
+ .../amd/display/dc/dcn10/dcn10_timing_generator.h  |   5 +
+ .../drm/amd/display/dc/inc/hw/timing_generator.h   |  12 ++
+ drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h  |   4 +
+ 5 files changed, 124 insertions(+), 102 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 0a5ac0f..db2cb8f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -361,6 +361,7 @@ struct dc_surface_status {
+ 	struct dc_plane_address requested_address;
+ 	struct dc_plane_address current_address;
+ 	bool is_flip_pending;
++	bool is_right_eye;
+ };
+ 
+ /*
+@@ -488,7 +489,7 @@ struct dc_stream {
+ 	const struct dc_transfer_func *out_transfer_func;
+ 	struct colorspace_transform gamut_remap_matrix;
+ 	struct csc_transform csc_color_matrix;
+-
++	enum view_3d_format view_format;
+ 	/* TODO: custom INFO packets */
+ 	/* TODO: ABM info (DMCU) */
+ 	/* TODO: PSR info */
+@@ -603,6 +604,15 @@ bool dc_commit_streams(
+ 		struct dc *dc,
+ 		const struct dc_stream *streams[],
+ 		uint8_t stream_count);
++/*
++ * Enable stereo when commit_streams is not required,
++ * for example, frame alternate.
++ */
++bool dc_enable_stereo(
++	struct dc *dc,
++	struct validate_context *context,
++	const struct dc_stream *streams[],
++	uint8_t stream_count);
+ 
+ /**
+  * Create a new default stream for the requested sink
+@@ -789,6 +799,14 @@ struct dc_container_id {
+ 	unsigned short productCode;
+ };
+ 
++struct stereo_3d_features {
++	bool supported			;
++	bool allTimings			;
++	bool cloneMode			;
++	bool scaling			;
++	bool singleFrameSWPacked;
++};
++
+ /*
+  * The sink structure contains EDID and other display device properties
+  */
+@@ -800,6 +818,7 @@ struct dc_sink {
+ 	uint32_t dongle_max_pix_clk;
+ 	bool converter_disable_audio;
+ 	void *priv;
++	struct stereo_3d_features features_3d[TIMING_3D_FORMAT_MAX];
+ };
+ 
+ void dc_sink_retain(const struct dc_sink *sink);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.c
+index c5a636c..bc3934d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.c
+@@ -78,112 +78,22 @@ static void dcn10_program_global_sync(
+ 			VREADY_OFFSET, tg->dlg_otg_param.vready_offset);
+ }
+ 
+-struct crtc_stereo_flags {
+-	uint8_t PROGRAM_STEREO         :1;
+-	uint8_t PROGRAM_POLARITY       :1;
+-	uint8_t RIGHT_EYE_POLARITY     :1;
+-	uint8_t FRAME_PACKED           :1;
+-	uint8_t DISABLE_STEREO_DP_SYNC :1;
+-};
+-
+-static void dcn10_enable_stereo(struct timing_generator *tg,
+-		const struct crtc_stereo_flags *flags,
+-		const struct dc_crtc_timing *timing)
+-{
+-	struct dcn10_timing_generator *tgn10 = DCN10TG_FROM_TG(tg);
+-
+-	uint32_t active_width = timing->h_addressable;
+-	uint32_t space1_size = timing->v_total - timing->v_addressable;
+-
+-	if (flags) {
+-		uint32_t stereo_en = flags->FRAME_PACKED == 0 ? 1 : 0;
+-
+-		if (flags->PROGRAM_STEREO)
+-			REG_UPDATE_3(OTG_STEREO_CONTROL,
+-					OTG_STEREO_EN, stereo_en,
+-					OTG_STEREO_SYNC_OUTPUT_LINE_NUM, 0,
+-					OTG_STEREO_SYNC_OUTPUT_POLARITY, 0);
+-
+-		if (flags->PROGRAM_POLARITY)
+-			REG_UPDATE(OTG_STEREO_CONTROL,
+-					OTG_STEREO_EYE_FLAG_POLARITY,
+-					flags->RIGHT_EYE_POLARITY == 0 ? 0:1);
+-
+-		if (flags->DISABLE_STEREO_DP_SYNC)
+-			REG_UPDATE(OTG_STEREO_CONTROL,
+-					OTG_DISABLE_STEREOSYNC_OUTPUT_FOR_DP, 1);
+-
+-		if (flags->PROGRAM_STEREO && flags->FRAME_PACKED)
+-			REG_UPDATE_3(OTG_3D_STRUCTURE_CONTROL,
+-					OTG_3D_STRUCTURE_EN, 1,
+-					OTG_3D_STRUCTURE_V_UPDATE_MODE, 1,
+-					OTG_3D_STRUCTURE_STEREO_SEL_OVR, 1);
+-
+-	}
+-
+-	REG_UPDATE(OPPBUF_CONTROL,
+-			OPPBUF_ACTIVE_WIDTH, active_width);
+-
+-	REG_UPDATE(OPPBUF_3D_PARAMETERS_0,
+-			OPPBUF_3D_VACT_SPACE1_SIZE, space1_size);
+-
+-	return;
+-}
+-
+ static void dcn10_disable_stereo(struct timing_generator *tg)
+ {
+ 	struct dcn10_timing_generator *tgn10 = DCN10TG_FROM_TG(tg);
+ 
+ 	REG_SET(OTG_STEREO_CONTROL, 0,
+-			OTG_STEREO_EN, 0);
++		OTG_STEREO_EN, 0);
+ 
+ 	REG_SET_3(OTG_3D_STRUCTURE_CONTROL, 0,
+-			OTG_3D_STRUCTURE_EN, 0,
+-			OTG_3D_STRUCTURE_V_UPDATE_MODE, 0,
+-			OTG_3D_STRUCTURE_STEREO_SEL_OVR, 0);
++		OTG_3D_STRUCTURE_EN, 0,
++		OTG_3D_STRUCTURE_V_UPDATE_MODE, 0,
++		OTG_3D_STRUCTURE_STEREO_SEL_OVR, 0);
+ 
+ 	REG_UPDATE(OPPBUF_CONTROL,
+-			OPPBUF_ACTIVE_WIDTH, 0);
++		OPPBUF_ACTIVE_WIDTH, 0);
+ 	REG_UPDATE(OPPBUF_3D_PARAMETERS_0,
+-			OPPBUF_3D_VACT_SPACE1_SIZE, 0);
+-	return;
+-}
+-
+-static bool is_frame_alternate_stereo(enum dc_timing_3d_format fmt)
+-{
+-	bool ret = false;
+-	if (fmt == TIMING_3D_FORMAT_FRAME_ALTERNATE ||
+-		fmt == TIMING_3D_FORMAT_INBAND_FA ||
+-		fmt == TIMING_3D_FORMAT_DP_HDMI_INBAND_FA ||
+-		fmt == TIMING_3D_FORMAT_SIDEBAND_FA)
+-		ret = true;
+-	return ret;
+-}
+-
+-static void dcn10_do_stereo(struct timing_generator *tg,
+-		const struct dc_crtc_timing *dc_crtc_timing)
+-{
+-	struct crtc_stereo_flags stereo_flags = {0};
+-	if (dc_crtc_timing->timing_3d_format == TIMING_3D_FORMAT_NONE ||
+-		dc_crtc_timing->timing_3d_format == TIMING_3D_FORMAT_SIDE_BY_SIDE ||
+-		dc_crtc_timing->timing_3d_format == TIMING_3D_FORMAT_TOP_AND_BOTTOM)
+-		dcn10_disable_stereo(tg);
+-	else {
+-		stereo_flags.PROGRAM_STEREO = 1;
+-		stereo_flags.PROGRAM_POLARITY = 1;
+-		stereo_flags.DISABLE_STEREO_DP_SYNC = 0;
+-		stereo_flags.RIGHT_EYE_POLARITY =
+-				dc_crtc_timing->flags.RIGHT_EYE_3D_POLARITY;
+-		if (dc_crtc_timing->timing_3d_format ==
+-				TIMING_3D_FORMAT_HW_FRAME_PACKING)
+-			stereo_flags.FRAME_PACKED = 1;
+-
+-		if (is_frame_alternate_stereo(
+-				dc_crtc_timing->timing_3d_format) ||
+-				dc_crtc_timing->timing_3d_format ==
+-					TIMING_3D_FORMAT_HW_FRAME_PACKING)
+-			dcn10_enable_stereo(tg, &stereo_flags, dc_crtc_timing);
+-	}
++		OPPBUF_3D_VACT_SPACE1_SIZE, 0);
+ }
+ 
+ /**
+@@ -361,9 +271,8 @@ static void tg_program_timing_generator(
+ 	REG_UPDATE(OTG_H_TIMING_CNTL,
+ 			OTG_H_TIMING_DIV_BY2, h_div_2);
+ 
+-	/* Enable crtc stereo frame pack tested... todo more
+-	 */
+-	dcn10_do_stereo(tg, &patched_crtc_timing);
++	dcn10_disable_stereo( tg);
++
+ }
+ 
+ /** tg_program_blanking
+@@ -605,7 +514,8 @@ static bool tg_validate_timing(
+ 		timing->timing_3d_format != TIMING_3D_FORMAT_HW_FRAME_PACKING &&
+ 		timing->timing_3d_format != TIMING_3D_FORMAT_TOP_AND_BOTTOM &&
+ 		timing->timing_3d_format != TIMING_3D_FORMAT_SIDE_BY_SIDE &&
+-		timing->timing_3d_format != TIMING_3D_FORMAT_FRAME_ALTERNATE)
++		timing->timing_3d_format != TIMING_3D_FORMAT_FRAME_ALTERNATE &&
++		timing->timing_3d_format != TIMING_3D_FORMAT_INBAND_FA)
+ 		return false;
+ 
+ 	/* Temporarily blocking interlacing mode until it's supported */
+@@ -1145,6 +1055,76 @@ void dcn10_timing_generator_get_crtc_scanoutpos(
+ 	*v_position = position.vertical_count;
+ }
+ 
++
++
++static void dcn10_enable_stereo(struct timing_generator *tg,
++	const struct dc_crtc_timing *timing, struct crtc_stereo_flags *flags)
++{
++	struct dcn10_timing_generator *tgn10 = DCN10TG_FROM_TG(tg);
++
++	uint32_t active_width = timing->h_addressable;
++	uint32_t space1_size = timing->v_total - timing->v_addressable;
++
++	if (flags) {
++		uint32_t stereo_en;
++		stereo_en = flags->FRAME_PACKED == 0 ? 1 : 0;
++
++		if (flags->PROGRAM_STEREO)
++			REG_UPDATE_3(OTG_STEREO_CONTROL,
++				OTG_STEREO_EN, stereo_en,
++				OTG_STEREO_SYNC_OUTPUT_LINE_NUM, 0,
++				OTG_STEREO_SYNC_OUTPUT_POLARITY, 0);
++
++		if (flags->PROGRAM_POLARITY)
++			REG_UPDATE(OTG_STEREO_CONTROL,
++				OTG_STEREO_EYE_FLAG_POLARITY,
++				flags->RIGHT_EYE_POLARITY == 0 ? 0 : 1);
++
++		if (flags->DISABLE_STEREO_DP_SYNC)
++			REG_UPDATE(OTG_STEREO_CONTROL,
++				OTG_DISABLE_STEREOSYNC_OUTPUT_FOR_DP, 1);
++
++		if (flags->PROGRAM_STEREO && flags->FRAME_PACKED)
++			REG_UPDATE_3(OTG_3D_STRUCTURE_CONTROL,
++				OTG_3D_STRUCTURE_EN, 1,
++				OTG_3D_STRUCTURE_V_UPDATE_MODE, 1,
++				OTG_3D_STRUCTURE_STEREO_SEL_OVR, 1);
++
++	}
++
++	REG_UPDATE(OPPBUF_CONTROL,
++		OPPBUF_ACTIVE_WIDTH, active_width);
++
++	REG_UPDATE(OPPBUF_3D_PARAMETERS_0,
++		OPPBUF_3D_VACT_SPACE1_SIZE, space1_size);
++}
++
++static void dcn10_program_stereo(struct timing_generator *tg,
++	const struct dc_crtc_timing *timing, struct crtc_stereo_flags *flags)
++{
++	if (flags->PROGRAM_STEREO)
++		dcn10_enable_stereo(tg, timing, flags);
++	else
++		dcn10_disable_stereo(tg);
++}
++
++
++static bool dcn10_is_stereo_left_eye(struct timing_generator *tg)
++{
++	bool ret = false;
++	uint32_t left_eye = 0;
++	struct dcn10_timing_generator *tgn10 = DCN10TG_FROM_TG(tg);
++
++	REG_GET(OTG_STEREO_STATUS,
++		OTG_STEREO_CURRENT_EYE, &left_eye);
++	if (left_eye == 1)
++		ret = true;
++	else
++		ret = false;
++
++	return ret;
++}
++
+ static struct timing_generator_funcs dcn10_tg_funcs = {
+ 		.validate_timing = tg_validate_timing,
+ 		.program_timing = tg_program_timing,
+@@ -1183,7 +1163,9 @@ static struct timing_generator_funcs dcn10_tg_funcs = {
+ 		.enable_optc_clock = enable_optc_clock,
+ 		.set_drr = dcn10_timing_generator_set_drr,
+ 		.set_static_screen_control = set_static_screen_control,
+-		.set_test_pattern = dcn10_timing_generator_set_test_pattern
++		.set_test_pattern = dcn10_timing_generator_set_test_pattern,
++		.program_stereo = dcn10_program_stereo,
++		.is_stereo_left_eye = dcn10_is_stereo_left_eye
+ };
+ 
+ void dcn10_timing_generator_init(struct dcn10_timing_generator *tgn10)
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.h b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.h
+index 85a763a..c880fa5 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.h
+@@ -51,6 +51,7 @@
+ 	SRI(OTG_CONTROL, OTG, inst),\
+ 	SRI(OTG_STEREO_CONTROL, OTG, inst),\
+ 	SRI(OTG_3D_STRUCTURE_CONTROL, OTG, inst),\
++	SRI(OTG_STEREO_STATUS, OTG, inst),\
+ 	SRI(OTG_V_TOTAL_MAX, OTG, inst),\
+ 	SRI(OTG_V_TOTAL_MIN, OTG, inst),\
+ 	SRI(OTG_V_TOTAL_CONTROL, OTG, inst),\
+@@ -96,6 +97,7 @@ struct dcn_tg_registers {
+ 	uint32_t OTG_CONTROL;
+ 	uint32_t OTG_STEREO_CONTROL;
+ 	uint32_t OTG_3D_STRUCTURE_CONTROL;
++	uint32_t OTG_STEREO_STATUS;
+ 	uint32_t OTG_V_TOTAL_MAX;
+ 	uint32_t OTG_V_TOTAL_MIN;
+ 	uint32_t OTG_V_TOTAL_CONTROL;
+@@ -157,6 +159,8 @@ struct dcn_tg_registers {
+ 	SF(OTG0_OTG_STEREO_CONTROL, OTG_STEREO_SYNC_OUTPUT_POLARITY, mask_sh),\
+ 	SF(OTG0_OTG_STEREO_CONTROL, OTG_STEREO_EYE_FLAG_POLARITY, mask_sh),\
+ 	SF(OTG0_OTG_STEREO_CONTROL, OTG_DISABLE_STEREOSYNC_OUTPUT_FOR_DP, mask_sh),\
++	SF(OTG0_OTG_STEREO_CONTROL, OTG_DISABLE_STEREOSYNC_OUTPUT_FOR_DP, mask_sh),\
++	SF(OTG0_OTG_STEREO_STATUS, OTG_STEREO_CURRENT_EYE, mask_sh),\
+ 	SF(OTG0_OTG_3D_STRUCTURE_CONTROL, OTG_3D_STRUCTURE_EN, mask_sh),\
+ 	SF(OTG0_OTG_3D_STRUCTURE_CONTROL, OTG_3D_STRUCTURE_V_UPDATE_MODE, mask_sh),\
+ 	SF(OTG0_OTG_3D_STRUCTURE_CONTROL, OTG_3D_STRUCTURE_STEREO_SEL_OVR, mask_sh),\
+@@ -243,6 +247,7 @@ struct dcn_tg_registers {
+ 	type OTG_STEREO_SYNC_OUTPUT_LINE_NUM;\
+ 	type OTG_STEREO_SYNC_OUTPUT_POLARITY;\
+ 	type OTG_STEREO_EYE_FLAG_POLARITY;\
++	type OTG_STEREO_CURRENT_EYE;\
+ 	type OTG_DISABLE_STEREOSYNC_OUTPUT_FOR_DP;\
+ 	type OTG_3D_STRUCTURE_EN;\
+ 	type OTG_3D_STRUCTURE_V_UPDATE_MODE;\
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+index 9f130af..2b72d1d 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+@@ -100,6 +100,15 @@ struct _dlg_otg_param {
+ 	enum signal_type signal;
+ };
+ #endif
++
++struct crtc_stereo_flags {
++	uint8_t PROGRAM_STEREO         : 1;
++	uint8_t PROGRAM_POLARITY       : 1;
++	uint8_t RIGHT_EYE_POLARITY     : 1;
++	uint8_t FRAME_PACKED           : 1;
++	uint8_t DISABLE_STEREO_DP_SYNC : 1;
++};
++
+ struct timing_generator {
+ 	const struct timing_generator_funcs *funcs;
+ 	struct dc_bios *bp;
+@@ -171,6 +180,9 @@ struct timing_generator_funcs {
+ 	void (*program_global_sync)(struct timing_generator *tg);
+ 	void (*enable_optc_clock)(struct timing_generator *tg, bool enable);
+ #endif
++	void (*program_stereo)(struct timing_generator *tg,
++		const struct dc_crtc_timing *timing, struct crtc_stereo_flags *flags);
++	bool (*is_stereo_left_eye)(struct timing_generator *tg);
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index 6f8733e..5288481 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -143,6 +143,10 @@ struct hw_sequencer_funcs {
+ 			struct pipe_ctx *pipe_ctx,
+ 			struct validate_context *context,
+ 			struct core_dc *dc);
++
++	void (*setup_stereo)(
++			struct pipe_ctx *pipe_ctx,
++			struct core_dc *dc);
+ };
+ 
+ void color_space_to_black_color(
+-- 
+2.7.4
+

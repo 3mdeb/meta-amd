@@ -1,0 +1,120 @@
+From 32601775a334028960b11d6c7ffe53cc439a1048 Mon Sep 17 00:00:00 2001
+From: Amy Zhang <Amy.Zhang@amd.com>
+Date: Fri, 12 May 2017 15:54:29 -0400
+Subject: [PATCH 1667/2094] drm/amd/display: Disable ABM when eDP is disabled
+
+- Add immediate ABM disable when eDP is disabled
+- Fix purple screen when ABM is mistakenly enabled
+on non eDP display
+
+Signed-off-by: Amy Zhang <Amy.Zhang@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c | 16 ++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/dc.h           |  2 ++
+ drivers/gpu/drm/amd/display/dc/dce/dce_abm.c  | 21 +++++++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/inc/hw/abm.h   |  1 +
+ 4 files changed, 40 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index ffc0eea..5997764 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -1415,6 +1415,22 @@ bool dc_link_set_backlight_level(const struct dc_link *dc_link, uint32_t level,
+ 	return true;
+ }
+ 
++
++bool dc_link_set_abm_disable(const struct dc_link *dc_link)
++{
++	struct core_link *link = DC_LINK_TO_CORE(dc_link);
++	struct core_dc *core_dc = DC_TO_CORE(link->ctx->dc);
++	struct abm *abm = core_dc->res_pool->abm;
++
++	if ((abm == NULL) || (abm->funcs->set_backlight_level == NULL))
++		return false;
++
++	abm->funcs->set_abm_immediate_disable(abm);
++
++	return true;
++}
++
++
+ bool dc_link_set_psr_enable(const struct dc_link *dc_link, bool enable)
+ {
+ 	struct core_link *link = DC_LINK_TO_CORE(dc_link);
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 96b7e89..d45a1a4 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -714,6 +714,8 @@ const struct graphics_object_id dc_get_link_id_at_index(
+ bool dc_link_set_backlight_level(const struct dc_link *dc_link, uint32_t level,
+ 		uint32_t frame_ramp, const struct dc_stream *stream);
+ 
++bool dc_link_set_abm_disable(const struct dc_link *dc_link);
++
+ bool dc_link_set_psr_enable(const struct dc_link *dc_link, bool enable);
+ 
+ bool dc_link_setup_psr(const struct dc_link *dc_link,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c b/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c
+index cefffe1..b4fa782 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c
+@@ -49,6 +49,8 @@
+ #define MCP_ABM_PIPE_SET 0x66
+ #define MCP_BL_SET 0x67
+ 
++#define MCP_DISABLE_ABM_IMMEDIATELY 255
++
+ struct abm_backlight_registers {
+ 	unsigned int BL_PWM_CNTL;
+ 	unsigned int BL_PWM_CNTL2;
+@@ -315,6 +317,24 @@ static bool dce_abm_set_level(struct abm *abm, uint32_t level)
+ 	return true;
+ }
+ 
++static bool dce_abm_immediate_disable(struct abm *abm)
++{
++	struct dce_abm *abm_dce = TO_DCE_ABM(abm);
++
++	REG_WAIT(MASTER_COMM_CNTL_REG, MASTER_COMM_INTERRUPT, 0,
++			100, 800);
++
++	/* setDMCUParam_ABMLevel */
++	REG_UPDATE_2(MASTER_COMM_CMD_REG,
++			MASTER_COMM_CMD_REG_BYTE0, MCP_ABM_LEVEL_SET,
++			MASTER_COMM_CMD_REG_BYTE2, MCP_DISABLE_ABM_IMMEDIATELY);
++
++	/* notifyDMCUMsg */
++	REG_UPDATE(MASTER_COMM_CNTL_REG, MASTER_COMM_INTERRUPT, 1);
++
++	return true;
++}
++
+ static bool dce_abm_init_backlight(struct abm *abm)
+ {
+ 	struct dce_abm *abm_dce = TO_DCE_ABM(abm);
+@@ -414,6 +434,7 @@ static const struct abm_funcs dce_funcs = {
+ 	.init_backlight = dce_abm_init_backlight,
+ 	.set_backlight_level = dce_abm_set_backlight_level,
+ 	.get_current_backlight_8_bit = dce_abm_get_current_backlight_8_bit,
++	.set_abm_immediate_disable = dce_abm_immediate_disable,
+ 	.is_dmcu_initialized = is_dmcu_initialized
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h b/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
+index da465b3..c93b9b9 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
+@@ -35,6 +35,7 @@ struct abm {
+ struct abm_funcs {
+ 	void (*abm_init)(struct abm *abm);
+ 	bool (*set_abm_level)(struct abm *abm, unsigned int abm_level);
++	bool (*set_abm_immediate_disable)(struct abm *abm);
+ 	bool (*init_backlight)(struct abm *abm);
+ 	bool (*set_backlight_level)(struct abm *abm,
+ 			unsigned int backlight_level,
+-- 
+2.7.4
+

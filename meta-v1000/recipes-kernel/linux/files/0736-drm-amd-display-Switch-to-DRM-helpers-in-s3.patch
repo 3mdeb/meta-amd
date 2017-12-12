@@ -1,0 +1,304 @@
+From 02ed7e2d9cc06e9e949a81aad7b805badde7f03b Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Tue, 17 Jan 2017 00:26:03 -0500
+Subject: [PATCH 0736/2094] drm/amd/display: Switch to DRM helpers in s3.
+
+Change-Id: I50db672b5b1f2eed7933863a2e901466dcb636d0
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Reviewed-by: Jordan Lazare <Jordan.Lazare@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 157 ++--------------------
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |   5 +
+ drivers/gpu/drm/amd/display/dc/core/dc.c          |   8 +-
+ drivers/gpu/drm/amd/display/dc/dc.h               |   3 +-
+ drivers/gpu/drm/amd/display/dc/inc/core_dc.h      |   4 -
+ 5 files changed, 21 insertions(+), 156 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 201c97e..fa4eaf5 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -457,28 +457,17 @@ static int dm_suspend(void *handle)
+ 	struct amdgpu_device *adev = handle;
+ 	struct amdgpu_display_manager *dm = &adev->dm;
+ 	int ret = 0;
+-	struct drm_crtc *crtc;
+ 
+ 	s3_handle_mst(adev->ddev, true);
+ 
+-	/* flash all pending vblank events and turn interrupt off
+-	 * before disabling CRTCs. They will be enabled back in
+-	 * dm_display_resume
+-	 */
+-	drm_modeset_lock_all(adev->ddev);
+-	list_for_each_entry(crtc, &adev->ddev->mode_config.crtc_list, head) {
+-		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+-		if (acrtc->stream)
+-				drm_crtc_vblank_off(crtc);
+-	}
+-	drm_modeset_unlock_all(adev->ddev);
+-
+ 	amdgpu_dm_irq_suspend(adev);
+ 
++	adev->dm.cached_state = drm_atomic_helper_suspend(adev->ddev);
++
+ 	dc_set_power_state(
+ 		dm->dc,
+-		DC_ACPI_CM_POWER_STATE_D3,
+-		DC_VIDEO_POWER_SUSPEND);
++		DC_ACPI_CM_POWER_STATE_D3
++		);
+ 
+ 	return ret;
+ }
+@@ -510,120 +499,6 @@ struct amdgpu_connector *amdgpu_dm_find_first_crct_matching_connector(
+ 	return NULL;
+ }
+ 
+-static int dm_display_resume(struct drm_device *ddev)
+-{
+-	int ret = 0;
+-	struct drm_connector *connector;
+-
+-	struct drm_atomic_state *state = drm_atomic_state_alloc(ddev);
+-	struct drm_plane *plane;
+-	struct drm_crtc *crtc;
+-	struct amdgpu_connector *aconnector;
+-	struct drm_connector_state *conn_state;
+-
+-	if (!state)
+-		return ENOMEM;
+-
+-	state->acquire_ctx = ddev->mode_config.acquire_ctx;
+-
+-	/* Construct an atomic state to restore previous display setting */
+-
+-	/*
+-	 * Attach connectors to drm_atomic_state
+-	 * Should be done in the first place in order to make connectors
+-	 * available in state during crtc state processing. It is used for
+-	 * making decision if crtc should be disabled in case sink got
+-	 * disconnected.
+-	 *
+-	 * Connectors state crtc with NULL dc_sink should be cleared, because it
+-	 * will fail validation during commit
+-	 */
+-	list_for_each_entry(connector, &ddev->mode_config.connector_list, head) {
+-		aconnector = to_amdgpu_connector(connector);
+-		conn_state = drm_atomic_get_connector_state(state, connector);
+-
+-		ret = PTR_ERR_OR_ZERO(conn_state);
+-		if (ret)
+-			goto err;
+-	}
+-
+-	/* Attach crtcs to drm_atomic_state*/
+-	list_for_each_entry(crtc, &ddev->mode_config.crtc_list, head) {
+-		struct drm_crtc_state *crtc_state =
+-			drm_atomic_get_crtc_state(state, crtc);
+-
+-		ret = PTR_ERR_OR_ZERO(crtc_state);
+-		if (ret)
+-			goto err;
+-
+-		/* force a restore */
+-		crtc_state->mode_changed = true;
+-	}
+-
+-
+-	/* Attach planes to drm_atomic_state */
+-	list_for_each_entry(plane, &ddev->mode_config.plane_list, head) {
+-
+-		struct drm_crtc *crtc;
+-		struct drm_gem_object *obj;
+-		struct drm_framebuffer *fb;
+-		struct amdgpu_framebuffer *afb;
+-		struct amdgpu_bo *rbo;
+-		int r;
+-		struct drm_plane_state *plane_state = drm_atomic_get_plane_state(state, plane);
+-
+-		ret = PTR_ERR_OR_ZERO(plane_state);
+-		if (ret)
+-			goto err;
+-
+-		crtc = plane_state->crtc;
+-		fb = plane_state->fb;
+-
+-		if (!crtc || !crtc->state || !crtc->state->active)
+-			continue;
+-
+-		if (!fb) {
+-			DRM_DEBUG_KMS("No FB bound\n");
+-			return 0;
+-		}
+-
+-		/*
+-		 * Pin back the front buffers, cursor buffer was already pinned
+-		 * back in amdgpu_resume_kms
+-		 */
+-
+-		afb = to_amdgpu_framebuffer(fb);
+-
+-		obj = afb->obj;
+-		rbo = gem_to_amdgpu_bo(obj);
+-		r = amdgpu_bo_reserve(rbo, false);
+-		if (unlikely(r != 0))
+-		       return r;
+-
+-		r = amdgpu_bo_pin(rbo, AMDGPU_GEM_DOMAIN_VRAM, NULL);
+-
+-		amdgpu_bo_unreserve(rbo);
+-
+-		if (unlikely(r != 0)) {
+-			DRM_ERROR("Failed to pin framebuffer\n");
+-			return r;
+-		}
+-
+-	}
+-
+-
+-	/* Call commit internally with the state we just constructed */
+-	ret = drm_atomic_commit(state);
+-	if (!ret)
+-		return 0;
+-
+-err:
+-	DRM_ERROR("Restoring old state failed with %i\n", ret);
+-	drm_atomic_state_free(state);
+-
+-	return ret;
+-}
+-
+ static int dm_resume(void *handle)
+ {
+ 	struct amdgpu_device *adev = handle;
+@@ -632,8 +507,8 @@ static int dm_resume(void *handle)
+ 	/* power on hardware */
+ 	dc_set_power_state(
+ 		dm->dc,
+-		DC_ACPI_CM_POWER_STATE_D0,
+-		DC_VIDEO_POWER_ON);
++		DC_ACPI_CM_POWER_STATE_D0
++		);
+ 
+ 	return 0;
+ }
+@@ -644,8 +519,10 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev )
+ 	struct amdgpu_display_manager *dm = &adev->dm;
+ 	struct amdgpu_connector *aconnector;
+ 	struct drm_connector *connector;
+-	int ret = 0;
+ 	struct drm_crtc *crtc;
++	struct drm_crtc_state *crtc_state;
++	int ret = 0;
++	int i;
+ 
+ 	/* program HPD filter */
+ 	dc_resume(dm->dc);
+@@ -659,14 +536,6 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev )
+ 	 */
+ 	amdgpu_dm_irq_resume_early(adev);
+ 
+-	drm_modeset_lock_all(ddev);
+-	list_for_each_entry(crtc, &ddev->mode_config.crtc_list, head) {
+-		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+-		if (acrtc->stream)
+-				drm_crtc_vblank_on(crtc);
+-	}
+-	drm_modeset_unlock_all(ddev);
+-
+ 	/* Do detection*/
+ 	list_for_each_entry(connector,
+ 			&ddev->mode_config.connector_list, head) {
+@@ -684,9 +553,11 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev )
+ 		amdgpu_dm_update_connector_after_detect(aconnector);
+ 	}
+ 
+-	drm_modeset_lock_all(ddev);
+-	ret = dm_display_resume(ddev);
+-	drm_modeset_unlock_all(ddev);
++	/* Force mode set in atomic comit */
++	for_each_crtc_in_state(adev->dm.cached_state, crtc, crtc_state, i)
++			crtc_state->active_changed = true;
++
++	ret = drm_atomic_helper_resume(ddev, adev->dm.cached_state);
+ 
+ 	amdgpu_dm_irq_resume(adev);
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index d6ebba0..ee69179 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -128,6 +128,11 @@ struct amdgpu_display_manager {
+ 	struct work_struct mst_hotplug_work;
+ 
+ 	struct mod_freesync *freesync_module;
++
++	/**
++	 * Caches device atomic state for suspend/resume
++	 */
++	struct drm_atomic_state *cached_state;
+ };
+ 
+ /* basic init/fini API */
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index a39b998..edcb731 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1589,21 +1589,15 @@ void dc_interrupt_ack(struct dc *dc, enum dc_irq_source src)
+ 
+ void dc_set_power_state(
+ 	struct dc *dc,
+-	enum dc_acpi_cm_power_state power_state,
+-	enum dc_video_power_state video_power_state)
++	enum dc_acpi_cm_power_state power_state)
+ {
+ 	struct core_dc *core_dc = DC_TO_CORE(dc);
+ 
+-	core_dc->previous_power_state = core_dc->current_power_state;
+-	core_dc->current_power_state = video_power_state;
+-
+ 	switch (power_state) {
+ 	case DC_ACPI_CM_POWER_STATE_D0:
+ 		core_dc->hwss.init_hw(core_dc);
+ 		break;
+ 	default:
+-		/* NULL means "reset/release all DC streams" */
+-		dc_commit_streams(dc, NULL, 0);
+ 
+ 		core_dc->hwss.power_down(core_dc);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 69ae94b..e2c2a0b 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -705,8 +705,7 @@ enum dc_irq_source dc_get_hpd_irq_source_at_index(
+ 
+ void dc_set_power_state(
+ 		struct dc *dc,
+-		enum dc_acpi_cm_power_state power_state,
+-		enum dc_video_power_state video_power_state);
++		enum dc_acpi_cm_power_state power_state);
+ void dc_resume(const struct dc *dc);
+ 
+ /*******************************************************************************
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_dc.h b/drivers/gpu/drm/amd/display/dc/inc/core_dc.h
+index 7a6444d..8d87f49 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_dc.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_dc.h
+@@ -26,10 +26,6 @@ struct core_dc {
+ 	struct validate_context *scratch_val_ctx;
+ 	struct resource_pool *res_pool;
+ 
+-	/*Power State*/
+-	enum dc_video_power_state previous_power_state;
+-	enum dc_video_power_state current_power_state;
+-
+ 	/* Display Engine Clock levels */
+ 	struct dm_pp_clock_levels sclk_lvls;
+ 
+-- 
+2.7.4
+

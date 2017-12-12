@@ -1,0 +1,1997 @@
+From 085ae637a14c035e44bee18f096e0cb43549e20e Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Tue, 29 Nov 2016 17:22:27 -0500
+Subject: [PATCH 0204/2094] drm/amd/display: remove dead display clock code
+
+Change-Id: I6484f68e32d4ffef4f17984f956b30b1ef91b874
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ .../display/dc/gpu/dce110/display_clock_dce110.c   | 468 +-------------------
+ .../display/dc/gpu/dce110/display_clock_dce110.h   |   1 -
+ .../display/dc/gpu/dce112/display_clock_dce112.c   | 477 +--------------------
+ .../display/dc/gpu/dce112/display_clock_dce112.h   |  18 -
+ .../amd/display/dc/gpu/dce80/display_clock_dce80.c | 476 +-------------------
+ .../amd/display/dc/gpu/dce80/display_clock_dce80.h |   1 -
+ drivers/gpu/drm/amd/display/dc/gpu/display_clock.c | 122 ------
+ drivers/gpu/drm/amd/display/dc/gpu/display_clock.h |  28 --
+ .../amd/display/include/display_clock_interface.h  |  85 ----
+ 9 files changed, 29 insertions(+), 1647 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/gpu/dce110/display_clock_dce110.c b/drivers/gpu/drm/amd/display/dc/gpu/dce110/display_clock_dce110.c
+index 1bc39f1..cc13afa 100644
+--- a/drivers/gpu/drm/amd/display/dc/gpu/dce110/display_clock_dce110.c
++++ b/drivers/gpu/drm/amd/display/dc/gpu/dce110/display_clock_dce110.c
+@@ -268,404 +268,6 @@ static void destroy(struct display_clock **base)
+ 	*base = NULL;
+ }
+ 
+-static uint32_t get_validation_clock(struct display_clock *dc)
+-{
+-	uint32_t clk = 0;
+-	struct display_clock_dce110 *disp_clk = DCLCK110_FROM_BASE(dc);
+-
+-	switch (disp_clk->max_clks_state) {
+-	case CLOCKS_STATE_ULTRA_LOW:
+-		/*Currently not supported, it has 0 in table entry*/
+-	case CLOCKS_STATE_LOW:
+-		clk = max_clks_by_state[CLOCKS_STATE_LOW].
+-						display_clk_khz;
+-		break;
+-
+-	case CLOCKS_STATE_NOMINAL:
+-		clk = max_clks_by_state[CLOCKS_STATE_NOMINAL].
+-						display_clk_khz;
+-		break;
+-
+-	case CLOCKS_STATE_PERFORMANCE:
+-		clk = max_clks_by_state[CLOCKS_STATE_PERFORMANCE].
+-						display_clk_khz;
+-		break;
+-
+-	case CLOCKS_STATE_INVALID:
+-	default:
+-		/*Invalid Clocks State*/
+-		dm_logger_write(dc->ctx->logger, LOG_WARNING,
+-				"Invalid clock state");
+-		/* just return the display engine clock for
+-		 * lowest supported state*/
+-		clk = max_clks_by_state[CLOCKS_STATE_LOW].
+-						display_clk_khz;
+-		break;
+-	}
+-	return clk;
+-}
+-
+-static struct fixed32_32 get_deep_color_factor(struct min_clock_params *params)
+-{
+-	/* DeepColorFactor = IF (HDMI = True, bpp / 24, 1)*/
+-	struct fixed32_32 deep_color_factor = dal_fixed32_32_from_int(1);
+-
+-	if (params->signal_type != SIGNAL_TYPE_HDMI_TYPE_A)
+-		return deep_color_factor;
+-
+-	switch (params->deep_color_depth) {
+-	case COLOR_DEPTH_101010:
+-		/*deep color ratio for 30bpp is 30/24 = 1.25*/
+-		deep_color_factor = dal_fixed32_32_from_fraction(30, 24);
+-		break;
+-
+-	case COLOR_DEPTH_121212:
+-		/* deep color ratio for 36bpp is 36/24 = 1.5*/
+-		deep_color_factor = dal_fixed32_32_from_fraction(36, 24);
+-		break;
+-
+-	case COLOR_DEPTH_161616:
+-		/* deep color ratio for 48bpp is 48/24 = 2.0 */
+-		deep_color_factor = dal_fixed32_32_from_fraction(48, 24);
+-		break;
+-	default:
+-		break;
+-	}
+-	return deep_color_factor;
+-}
+-
+-static struct fixed32_32 get_scaler_efficiency(
+-	struct dc_context *ctx,
+-	struct min_clock_params *params)
+-{
+-	struct fixed32_32 scaler_efficiency = dal_fixed32_32_from_int(3);
+-
+-	if (params->scaler_efficiency == V_SCALER_EFFICIENCY_LB18BPP) {
+-		scaler_efficiency =
+-			dal_fixed32_32_add(
+-				dal_fixed32_32_from_fraction(35555, 10000),
+-				dal_fixed32_32_from_fraction(
+-					55556,
+-					100000 * 10000));
+-	} else if (params->scaler_efficiency == V_SCALER_EFFICIENCY_LB24BPP) {
+-		scaler_efficiency =
+-			dal_fixed32_32_add(
+-				dal_fixed32_32_from_fraction(34285, 10000),
+-				dal_fixed32_32_from_fraction(
+-					71429,
+-					100000 * 10000));
+-	} else if (params->scaler_efficiency == V_SCALER_EFFICIENCY_LB30BPP)
+-		scaler_efficiency = dal_fixed32_32_from_fraction(32, 10);
+-
+-	return scaler_efficiency;
+-}
+-
+-static struct fixed32_32 get_lb_lines_in_per_line_out(
+-		struct min_clock_params *params,
+-		struct fixed32_32 v_scale_ratio)
+-{
+-	struct fixed32_32 two = dal_fixed32_32_from_int(2);
+-	struct fixed32_32 four = dal_fixed32_32_from_int(4);
+-	struct fixed32_32 f4_to_3 = dal_fixed32_32_from_fraction(4, 3);
+-	struct fixed32_32 f6_to_4 = dal_fixed32_32_from_fraction(6, 4);
+-
+-	if (params->line_buffer_prefetch_enabled)
+-		return dal_fixed32_32_max(v_scale_ratio, dal_fixed32_32_one);
+-	else if (dal_fixed32_32_le(v_scale_ratio, dal_fixed32_32_one))
+-		return dal_fixed32_32_one;
+-	else if (dal_fixed32_32_le(v_scale_ratio, f4_to_3))
+-		return f4_to_3;
+-	else if (dal_fixed32_32_le(v_scale_ratio, f6_to_4))
+-		return f6_to_4;
+-	else if (dal_fixed32_32_le(v_scale_ratio, two))
+-		return two;
+-	else if (dal_fixed32_32_le(v_scale_ratio, dal_fixed32_32_from_int(3)))
+-		return four;
+-	else
+-		return dal_fixed32_32_zero;
+-}
+-
+-static uint32_t get_actual_required_display_clk(
+-	struct display_clock_dce110 *disp_clk,
+-	uint32_t target_clk_khz)
+-{
+-	uint32_t disp_clk_khz = target_clk_khz;
+-	uint32_t div = INVALID_DIVIDER;
+-	uint32_t did = INVALID_DID;
+-	uint32_t scaled_vco =
+-		disp_clk->dentist_vco_freq_khz * DIVIDER_RANGE_SCALE_FACTOR;
+-
+-	ASSERT_CRITICAL(!!disp_clk_khz);
+-
+-	if (disp_clk_khz)
+-		div = scaled_vco / disp_clk_khz;
+-
+-	did = dal_divider_range_get_did(divider_ranges, DIVIDER_RANGE_MAX, div);
+-
+-	if (did != INVALID_DID) {
+-		div = dal_divider_range_get_divider(
+-			divider_ranges, DIVIDER_RANGE_MAX, did);
+-
+-		if ((div != INVALID_DIVIDER) &&
+-			(did > DIVIDER_RANGE_01_BASE_DIVIDER_ID))
+-			if (disp_clk_khz > (scaled_vco / div))
+-				div = dal_divider_range_get_divider(
+-					divider_ranges, DIVIDER_RANGE_MAX,
+-					did - 1);
+-
+-		if (div != INVALID_DIVIDER)
+-			disp_clk_khz = scaled_vco / div;
+-
+-	}
+-	/* We need to add 10KHz to this value because the accuracy in VBIOS is
+-	 in 10KHz units. So we need to always round the last digit up in order
+-	 to reach the next div level.*/
+-	return disp_clk_khz + 10;
+-}
+-
+-static uint32_t calc_single_display_min_clks(
+-	struct display_clock *base,
+-	struct min_clock_params *params,
+-	bool set_clk)
+-{
+-	struct fixed32_32 h_scale_ratio = dal_fixed32_32_one;
+-	struct fixed32_32 v_scale_ratio = dal_fixed32_32_one;
+-	uint32_t pix_clk_khz = 0;
+-	uint32_t lb_source_width = 0;
+-	struct fixed32_32 deep_color_factor;
+-	struct fixed32_32 scaler_efficiency;
+-	struct fixed32_32 v_filter_init;
+-	uint32_t v_filter_init_trunc;
+-	uint32_t num_lines_at_frame_start = 3;
+-	struct fixed32_32 v_filter_init_ceil;
+-	struct fixed32_32 lines_per_lines_out_at_frame_start;
+-	struct fixed32_32 lb_lines_in_per_line_out; /* in middle of the frame*/
+-	uint32_t src_wdth_rnd_to_chunks;
+-	struct fixed32_32 scaling_coeff;
+-	struct fixed32_32 h_blank_granularity_factor =
+-			dal_fixed32_32_one;
+-	struct fixed32_32 fx_disp_clk_mhz;
+-	struct fixed32_32 line_time;
+-	struct fixed32_32 disp_pipe_pix_throughput;
+-	struct fixed32_32 fx_alt_disp_clk_mhz;
+-	uint32_t disp_clk_khz;
+-	uint32_t alt_disp_clk_khz;
+-	struct display_clock_dce110 *disp_clk_110 = DCLCK110_FROM_BASE(base);
+-	uint32_t max_clk_khz = get_validation_clock(base);
+-	bool panning_allowed = false; /* TODO: receive this value from AS */
+-
+-	if (params == NULL) {
+-		dm_logger_write(base->ctx->logger, LOG_WARNING,
+-				"Invalid input parameter in %s",
+-				__func__);
+-		return 0;
+-	}
+-
+-	deep_color_factor = get_deep_color_factor(params);
+-	scaler_efficiency = get_scaler_efficiency(base->ctx, params);
+-	pix_clk_khz = params->requested_pixel_clock;
+-	lb_source_width = params->source_view.width;
+-
+-	if (0 != params->dest_view.height && 0 != params->dest_view.width) {
+-
+-		h_scale_ratio = dal_fixed32_32_from_fraction(
+-			params->source_view.width,
+-			params->dest_view.width);
+-		v_scale_ratio = dal_fixed32_32_from_fraction(
+-			params->source_view.height,
+-			params->dest_view.height);
+-	} else {
+-		dm_logger_write(base->ctx->logger, LOG_WARNING,
+-				"Destination height or width is 0!\n");
+-	}
+-
+-	v_filter_init =
+-		dal_fixed32_32_add(
+-			v_scale_ratio,
+-			dal_fixed32_32_add_int(
+-				dal_fixed32_32_div_int(
+-					dal_fixed32_32_mul_int(
+-						v_scale_ratio,
+-						params->timing_info.INTERLACED),
+-					2),
+-				params->scaling_info.v_taps + 1));
+-	v_filter_init = dal_fixed32_32_div_int(v_filter_init, 2);
+-
+-	v_filter_init_trunc = dal_fixed32_32_floor(v_filter_init);
+-
+-	v_filter_init_ceil = dal_fixed32_32_from_fraction(
+-						v_filter_init_trunc, 2);
+-	v_filter_init_ceil = dal_fixed32_32_from_int(
+-		dal_fixed32_32_ceil(v_filter_init_ceil));
+-	v_filter_init_ceil = dal_fixed32_32_mul_int(v_filter_init_ceil, 2);
+-
+-	lines_per_lines_out_at_frame_start =
+-			dal_fixed32_32_div_int(v_filter_init_ceil,
+-					num_lines_at_frame_start);
+-	lb_lines_in_per_line_out =
+-			get_lb_lines_in_per_line_out(params, v_scale_ratio);
+-
+-	if (panning_allowed)
+-		src_wdth_rnd_to_chunks =
+-			((lb_source_width - 1) / 128) * 128 + 256;
+-	else
+-		src_wdth_rnd_to_chunks =
+-			((lb_source_width + 127) / 128) * 128;
+-
+-	scaling_coeff =
+-		dal_fixed32_32_div(
+-			dal_fixed32_32_from_int(params->scaling_info.v_taps),
+-			scaler_efficiency);
+-
+-	if (dal_fixed32_32_le(h_scale_ratio, dal_fixed32_32_one))
+-		scaling_coeff = dal_fixed32_32_max(
+-			dal_fixed32_32_from_int(
+-				dal_fixed32_32_ceil(
+-					dal_fixed32_32_from_fraction(
+-						params->scaling_info.h_taps,
+-						4))),
+-			dal_fixed32_32_max(
+-				dal_fixed32_32_mul(
+-					scaling_coeff,
+-					h_scale_ratio),
+-				dal_fixed32_32_one));
+-
+-	if (!params->line_buffer_prefetch_enabled &&
+-		dal_fixed32_32_floor(lb_lines_in_per_line_out) != 2 &&
+-		dal_fixed32_32_floor(lb_lines_in_per_line_out) != 4) {
+-		uint32_t line_total_pixel =
+-			params->timing_info.h_total + lb_source_width - 256;
+-		h_blank_granularity_factor = dal_fixed32_32_div(
+-			dal_fixed32_32_from_int(params->timing_info.h_total),
+-			dal_fixed32_32_div(
+-			dal_fixed32_32_from_fraction(
+-				line_total_pixel, 2),
+-				h_scale_ratio));
+-	}
+-
+-	/* Calculate display clock with ramping. Ramping factor is 1.1*/
+-	fx_disp_clk_mhz =
+-		dal_fixed32_32_div_int(
+-			dal_fixed32_32_mul_int(scaling_coeff, 11),
+-			10);
+-	line_time = dal_fixed32_32_from_fraction(
+-			params->timing_info.h_total * 1000, pix_clk_khz);
+-
+-	disp_pipe_pix_throughput = dal_fixed32_32_mul(
+-			lb_lines_in_per_line_out, h_blank_granularity_factor);
+-	disp_pipe_pix_throughput = dal_fixed32_32_max(
+-			disp_pipe_pix_throughput,
+-			lines_per_lines_out_at_frame_start);
+-	disp_pipe_pix_throughput = dal_fixed32_32_div(dal_fixed32_32_mul_int(
+-			disp_pipe_pix_throughput, src_wdth_rnd_to_chunks),
+-			line_time);
+-
+-	if (0 != params->timing_info.h_total) {
+-		fx_disp_clk_mhz =
+-			dal_fixed32_32_max(
+-				dal_fixed32_32_div_int(
+-					dal_fixed32_32_mul_int(
+-						scaling_coeff, pix_clk_khz),
+-						1000),
+-				disp_pipe_pix_throughput);
+-		fx_disp_clk_mhz =
+-			dal_fixed32_32_mul(
+-				fx_disp_clk_mhz,
+-				dal_fixed32_32_from_fraction(11, 10));
+-	}
+-
+-	fx_disp_clk_mhz = dal_fixed32_32_max(fx_disp_clk_mhz,
+-		dal_fixed32_32_mul(deep_color_factor,
+-		dal_fixed32_32_from_fraction(11, 10)));
+-
+-	/* Calculate display clock without ramping */
+-	fx_alt_disp_clk_mhz = scaling_coeff;
+-
+-	if (0 != params->timing_info.h_total) {
+-		fx_alt_disp_clk_mhz = dal_fixed32_32_max(
+-				dal_fixed32_32_div_int(dal_fixed32_32_mul_int(
+-						scaling_coeff, pix_clk_khz),
+-						1000),
+-				dal_fixed32_32_div_int(dal_fixed32_32_mul_int(
+-						disp_pipe_pix_throughput, 105),
+-						100));
+-	}
+-
+-	if (set_clk && disp_clk_110->ss_on_gpu_pll &&
+-			disp_clk_110->gpu_pll_ss_divider)
+-		fx_alt_disp_clk_mhz = dal_fixed32_32_mul(fx_alt_disp_clk_mhz,
+-				dal_fixed32_32_add_int(
+-				dal_fixed32_32_div_int(
+-				dal_fixed32_32_div_int(
+-				dal_fixed32_32_from_fraction(
+-				disp_clk_110->gpu_pll_ss_percentage,
+-				disp_clk_110->gpu_pll_ss_divider), 100),
+-				2),
+-				1));
+-
+-	/* convert to integer */
+-	disp_clk_khz = dal_fixed32_32_round(
+-			dal_fixed32_32_mul_int(fx_disp_clk_mhz, 1000));
+-	alt_disp_clk_khz = dal_fixed32_32_round(
+-			dal_fixed32_32_mul_int(fx_alt_disp_clk_mhz, 1000));
+-
+-	if ((disp_clk_khz > max_clk_khz) && (alt_disp_clk_khz <= max_clk_khz))
+-		disp_clk_khz = alt_disp_clk_khz;
+-
+-	if (set_clk) { /* only compensate clock if we are going to set it.*/
+-		disp_clk_khz = get_actual_required_display_clk(
+-			disp_clk_110, disp_clk_khz);
+-	}
+-
+-	disp_clk_khz = disp_clk_khz > max_clk_khz ? max_clk_khz : disp_clk_khz;
+-
+-	return disp_clk_khz;
+-}
+-
+-static uint32_t calculate_min_clock(
+-	struct display_clock *base,
+-	uint32_t path_num,
+-	struct min_clock_params *params)
+-{
+-	uint32_t i;
+-	uint32_t validation_clk_khz =
+-			get_validation_clock(base);
+-	uint32_t min_clk_khz = validation_clk_khz;
+-	uint32_t max_clk_khz = 0;
+-	struct display_clock_dce110 *dc = DCLCK110_FROM_BASE(base);
+-
+-	if (dc->use_max_disp_clk)
+-		return min_clk_khz;
+-
+-	if (params != NULL) {
+-		uint32_t disp_clk_khz = 0;
+-
+-		for (i = 0; i < path_num; ++i) {
+-
+-			disp_clk_khz = calc_single_display_min_clks(
+-							base, params, true);
+-
+-			/* update the max required clock found*/
+-			if (disp_clk_khz > max_clk_khz)
+-				max_clk_khz = disp_clk_khz;
+-
+-			params++;
+-		}
+-	}
+-
+-	min_clk_khz = max_clk_khz;
+-
+-	if (min_clk_khz > validation_clk_khz)
+-		min_clk_khz = validation_clk_khz;
+-	else if (min_clk_khz < base->min_display_clk_threshold_khz)
+-		min_clk_khz = base->min_display_clk_threshold_khz;
+-
+-	if (dc->use_max_disp_clk)
+-		min_clk_khz = get_validation_clock(base);
+-
+-	return min_clk_khz;
+-}
+-
+ static bool display_clock_integrated_info_construct(
+ 	struct display_clock_dce110 *disp_clk)
+ {
+@@ -741,38 +343,6 @@ static bool display_clock_integrated_info_construct(
+ 	return true;
+ }
+ 
+-static uint32_t get_clock(struct display_clock *dc)
+-{
+-	uint32_t disp_clock = get_validation_clock(dc);
+-	uint32_t target_div = INVALID_DIVIDER;
+-	uint32_t addr = mmDENTIST_DISPCLK_CNTL;
+-	uint32_t value = 0;
+-	uint32_t field = 0;
+-	struct display_clock_dce110 *disp_clk = DCLCK110_FROM_BASE(dc);
+-
+-	if (disp_clk->dfs_bypass_enabled && disp_clk->dfs_bypass_disp_clk)
+-		return disp_clk->dfs_bypass_disp_clk;
+-
+-	/* Read the mmDENTIST_DISPCLK_CNTL to get the currently programmed
+-	 DID DENTIST_DISPCLK_WDIVIDER.*/
+-	value = dm_read_reg(dc->ctx, addr);
+-	field = get_reg_field_value(
+-			value, DENTIST_DISPCLK_CNTL, DENTIST_DISPCLK_WDIVIDER);
+-
+-	/* Convert DENTIST_DISPCLK_WDIVIDER to actual divider*/
+-	target_div = dal_divider_range_get_divider(
+-		divider_ranges,
+-		DIVIDER_RANGE_MAX,
+-		field);
+-
+-	if (target_div != INVALID_DIVIDER)
+-		/* Calculate the current DFS clock in KHz.
+-		 Should be okay up to 42.9 THz before overflowing.*/
+-		disp_clock = (DIVIDER_RANGE_SCALE_FACTOR
+-			* disp_clk->dentist_vco_freq_khz) / target_div;
+-	return disp_clock;
+-}
+-
+ static enum clocks_state get_required_clocks_state(
+ 		struct display_clock *dc,
+ 		struct state_dependent_clocks *req_clocks)
+@@ -882,44 +452,15 @@ static void set_clock(
+ 	psr_wait_loop(base->ctx, requested_clk_khz);
+ }
+ 
+-static void set_clock_state(
+-	struct display_clock *dc,
+-	struct display_clock_state clk_state)
+-{
+-	struct display_clock_dce110 *disp_clk = DCLCK110_FROM_BASE(dc);
+-
+-	disp_clk->clock_state = clk_state;
+-}
+-
+-static struct display_clock_state get_clock_state(
+-	struct display_clock *dc)
+-{
+-	struct display_clock_dce110 *disp_clk = DCLCK110_FROM_BASE(dc);
+-
+-	return disp_clk->clock_state;
+-}
+-
+-static uint32_t get_dfs_bypass_threshold(struct display_clock *dc)
+-{
+-	return DCE110_DFS_BYPASS_THRESHOLD_KHZ;
+-}
+ 
+ static const struct display_clock_funcs funcs = {
+ 	.destroy = destroy,
+-	.calculate_min_clock = calculate_min_clock,
+-	.get_clock = get_clock,
+-	.get_clock_state = get_clock_state,
+-	.get_dfs_bypass_threshold = get_dfs_bypass_threshold,
+ 	.get_dp_ref_clk_frequency = get_dp_ref_clk_frequency,
+ 	.get_min_clocks_state = get_min_clocks_state,
+ 	.get_required_clocks_state = get_required_clocks_state,
+-	.get_validation_clock = get_validation_clock,
+ 	.set_clock = set_clock,
+-	.set_clock_state = set_clock_state,
+-	.set_dp_ref_clock_source = NULL,
+ 	.set_min_clocks_state = set_min_clocks_state,
+-	.store_max_clocks_state = store_max_clocks_state,
+-	.validate = NULL,
++	.store_max_clocks_state = store_max_clocks_state
+ };
+ 
+ static bool dal_display_clock_dce110_construct(
+@@ -929,8 +470,11 @@ static bool dal_display_clock_dce110_construct(
+ 	struct display_clock *dc_base = &dc110->disp_clk_base;
+ 	struct dc_bios *bp = ctx->dc_bios;
+ 
+-	if (!dal_display_clock_construct_base(dc_base, ctx))
+-		return false;
++	dc_base->ctx = ctx;
++	dc_base->id = CLOCK_SOURCE_ID_DCPLL;
++	dc_base->min_display_clk_threshold_khz = 0;
++
++	dc_base->cur_min_clks_state = CLOCKS_STATE_INVALID;
+ 
+ 	dc_base->funcs = &funcs;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/gpu/dce110/display_clock_dce110.h b/drivers/gpu/drm/amd/display/dc/gpu/dce110/display_clock_dce110.h
+index 0cdc7b5..88b4bdd 100644
+--- a/drivers/gpu/drm/amd/display/dc/gpu/dce110/display_clock_dce110.h
++++ b/drivers/gpu/drm/amd/display/dc/gpu/dce110/display_clock_dce110.h
+@@ -44,7 +44,6 @@ struct display_clock_dce110 {
+ 	/* Cache the display clock returned by VBIOS if DFS-bypass is enabled.
+ 	 * This is basically "Crystal Frequency In KHz" (XTALIN) frequency */
+ 	uint32_t dfs_bypass_disp_clk;
+-	struct display_clock_state clock_state;
+ };
+ 
+ #define DCLCK110_FROM_BASE(dc_base) \
+diff --git a/drivers/gpu/drm/amd/display/dc/gpu/dce112/display_clock_dce112.c b/drivers/gpu/drm/amd/display/dc/gpu/dce112/display_clock_dce112.c
+index 9b7c975..bf04426 100644
+--- a/drivers/gpu/drm/amd/display/dc/gpu/dce112/display_clock_dce112.c
++++ b/drivers/gpu/drm/amd/display/dc/gpu/dce112/display_clock_dce112.c
+@@ -242,406 +242,6 @@ void dispclk_dce112_destroy(struct display_clock **base)
+ 	*base = NULL;
+ }
+ 
+-uint32_t dispclk_dce112_get_validation_clock(struct display_clock *dc)
+-{
+-	uint32_t clk = 0;
+-	struct display_clock_dce112 *disp_clk = DCLCK112_FROM_BASE(dc);
+-
+-	switch (disp_clk->max_clks_state) {
+-	case CLOCKS_STATE_ULTRA_LOW:
+-		clk = (disp_clk->max_clks_by_state + CLOCKS_STATE_ULTRA_LOW)->
+-			display_clk_khz;
+-
+-	case CLOCKS_STATE_LOW:
+-		clk = (disp_clk->max_clks_by_state + CLOCKS_STATE_LOW)->
+-			display_clk_khz;
+-		break;
+-
+-	case CLOCKS_STATE_NOMINAL:
+-		clk = (disp_clk->max_clks_by_state + CLOCKS_STATE_NOMINAL)->
+-			display_clk_khz;
+-		break;
+-
+-	case CLOCKS_STATE_PERFORMANCE:
+-		clk = (disp_clk->max_clks_by_state + CLOCKS_STATE_PERFORMANCE)->
+-			display_clk_khz;
+-		break;
+-
+-	case CLOCKS_STATE_INVALID:
+-	default:
+-		/*Invalid Clocks State*/
+-		dm_logger_write(dc->ctx->logger, LOG_WARNING,
+-				"Invalid clock state");
+-		/* just return the display engine clock for
+-		 * lowest supported state*/
+-		clk = (disp_clk->max_clks_by_state + CLOCKS_STATE_LOW)->
+-				display_clk_khz;
+-		break;
+-	}
+-	return clk;
+-}
+-
+-static struct fixed32_32 get_deep_color_factor(struct min_clock_params *params)
+-{
+-	/* DeepColorFactor = IF (HDMI = True, bpp / 24, 1)*/
+-	struct fixed32_32 deep_color_factor = dal_fixed32_32_from_int(1);
+-
+-	if (params->signal_type != SIGNAL_TYPE_HDMI_TYPE_A)
+-		return deep_color_factor;
+-
+-	switch (params->deep_color_depth) {
+-	case COLOR_DEPTH_101010:
+-		/*deep color ratio for 30bpp is 30/24 = 1.25*/
+-		deep_color_factor = dal_fixed32_32_from_fraction(30, 24);
+-		break;
+-
+-	case COLOR_DEPTH_121212:
+-		/* deep color ratio for 36bpp is 36/24 = 1.5*/
+-		deep_color_factor = dal_fixed32_32_from_fraction(36, 24);
+-		break;
+-
+-	case COLOR_DEPTH_161616:
+-		/* deep color ratio for 48bpp is 48/24 = 2.0 */
+-		deep_color_factor = dal_fixed32_32_from_fraction(48, 24);
+-		break;
+-	default:
+-		break;
+-	}
+-	return deep_color_factor;
+-}
+-
+-static struct fixed32_32 get_scaler_efficiency(
+-	struct dc_context *ctx,
+-	struct min_clock_params *params)
+-{
+-	struct fixed32_32 scaler_efficiency = dal_fixed32_32_from_int(3);
+-
+-	if (params->scaler_efficiency == V_SCALER_EFFICIENCY_LB18BPP) {
+-		scaler_efficiency =
+-			dal_fixed32_32_add(
+-				dal_fixed32_32_from_fraction(35555, 10000),
+-				dal_fixed32_32_from_fraction(
+-					55556,
+-					100000 * 10000));
+-	} else if (params->scaler_efficiency == V_SCALER_EFFICIENCY_LB24BPP) {
+-		scaler_efficiency =
+-			dal_fixed32_32_add(
+-				dal_fixed32_32_from_fraction(34285, 10000),
+-				dal_fixed32_32_from_fraction(
+-					71429,
+-					100000 * 10000));
+-	} else if (params->scaler_efficiency == V_SCALER_EFFICIENCY_LB30BPP)
+-		scaler_efficiency = dal_fixed32_32_from_fraction(32, 10);
+-
+-	return scaler_efficiency;
+-}
+-
+-static struct fixed32_32 get_lb_lines_in_per_line_out(
+-		struct min_clock_params *params,
+-		struct fixed32_32 v_scale_ratio)
+-{
+-	struct fixed32_32 two = dal_fixed32_32_from_int(2);
+-	struct fixed32_32 four = dal_fixed32_32_from_int(4);
+-	struct fixed32_32 f4_to_3 = dal_fixed32_32_from_fraction(4, 3);
+-	struct fixed32_32 f6_to_4 = dal_fixed32_32_from_fraction(6, 4);
+-
+-	if (params->line_buffer_prefetch_enabled)
+-		return dal_fixed32_32_max(v_scale_ratio, dal_fixed32_32_one);
+-	else if (dal_fixed32_32_le(v_scale_ratio, dal_fixed32_32_one))
+-		return dal_fixed32_32_one;
+-	else if (dal_fixed32_32_le(v_scale_ratio, f4_to_3))
+-		return f4_to_3;
+-	else if (dal_fixed32_32_le(v_scale_ratio, f6_to_4))
+-		return f6_to_4;
+-	else if (dal_fixed32_32_le(v_scale_ratio, two))
+-		return two;
+-	else if (dal_fixed32_32_le(v_scale_ratio, dal_fixed32_32_from_int(3)))
+-		return four;
+-	else
+-		return dal_fixed32_32_zero;
+-}
+-
+-static uint32_t get_actual_required_display_clk(
+-	struct display_clock_dce112 *disp_clk,
+-	uint32_t target_clk_khz)
+-{
+-	uint32_t disp_clk_khz = target_clk_khz;
+-	uint32_t div = INVALID_DIVIDER;
+-	uint32_t did = INVALID_DID;
+-	uint32_t scaled_vco =
+-		disp_clk->dentist_vco_freq_khz * DIVIDER_RANGE_SCALE_FACTOR;
+-
+-	ASSERT_CRITICAL(!!disp_clk_khz);
+-
+-	if (disp_clk_khz)
+-		div = scaled_vco / disp_clk_khz;
+-
+-	did = dal_divider_range_get_did(divider_ranges, DIVIDER_RANGE_MAX, div);
+-
+-	if (did != INVALID_DID) {
+-		div = dal_divider_range_get_divider(
+-			divider_ranges, DIVIDER_RANGE_MAX, did);
+-
+-		if ((div != INVALID_DIVIDER) &&
+-			(did > DIVIDER_RANGE_01_BASE_DIVIDER_ID))
+-			if (disp_clk_khz > (scaled_vco / div))
+-				div = dal_divider_range_get_divider(
+-					divider_ranges, DIVIDER_RANGE_MAX,
+-					did - 1);
+-
+-		if (div != INVALID_DIVIDER)
+-			disp_clk_khz = scaled_vco / div;
+-
+-	}
+-	/* We need to add 10KHz to this value because the accuracy in VBIOS is
+-	 in 10KHz units. So we need to always round the last digit up in order
+-	 to reach the next div level.*/
+-	return disp_clk_khz + 10;
+-}
+-
+-static uint32_t calc_single_display_min_clks(
+-	struct display_clock *base,
+-	struct min_clock_params *params,
+-	bool set_clk)
+-{
+-	struct fixed32_32 h_scale_ratio = dal_fixed32_32_one;
+-	struct fixed32_32 v_scale_ratio = dal_fixed32_32_one;
+-	uint32_t pix_clk_khz = 0;
+-	uint32_t lb_source_width = 0;
+-	struct fixed32_32 deep_color_factor;
+-	struct fixed32_32 scaler_efficiency;
+-	struct fixed32_32 v_filter_init;
+-	uint32_t v_filter_init_trunc;
+-	uint32_t num_lines_at_frame_start = 3;
+-	struct fixed32_32 v_filter_init_ceil;
+-	struct fixed32_32 lines_per_lines_out_at_frame_start;
+-	struct fixed32_32 lb_lines_in_per_line_out; /* in middle of the frame*/
+-	uint32_t src_wdth_rnd_to_chunks;
+-	struct fixed32_32 scaling_coeff;
+-	struct fixed32_32 h_blank_granularity_factor =
+-			dal_fixed32_32_one;
+-	struct fixed32_32 fx_disp_clk_mhz;
+-	struct fixed32_32 line_time;
+-	struct fixed32_32 disp_pipe_pix_throughput;
+-	struct fixed32_32 fx_alt_disp_clk_mhz;
+-	uint32_t disp_clk_khz;
+-	uint32_t alt_disp_clk_khz;
+-	struct display_clock_dce112 *disp_clk_110 = DCLCK112_FROM_BASE(base);
+-	uint32_t max_clk_khz = dispclk_dce112_get_validation_clock(base);
+-	bool panning_allowed = false; /* TODO: receive this value from AS */
+-
+-	if (params == NULL) {
+-		dm_logger_write(base->ctx->logger, LOG_WARNING,
+-				"Invalid input parameter in %s",
+-				__func__);
+-		return 0;
+-	}
+-
+-	deep_color_factor = get_deep_color_factor(params);
+-	scaler_efficiency = get_scaler_efficiency(base->ctx, params);
+-	pix_clk_khz = params->requested_pixel_clock;
+-	lb_source_width = params->source_view.width;
+-
+-	if (0 != params->dest_view.height && 0 != params->dest_view.width) {
+-
+-		h_scale_ratio = dal_fixed32_32_from_fraction(
+-			params->source_view.width,
+-			params->dest_view.width);
+-		v_scale_ratio = dal_fixed32_32_from_fraction(
+-			params->source_view.height,
+-			params->dest_view.height);
+-	} else {
+-		dm_logger_write(base->ctx->logger, LOG_WARNING,
+-				"Destination height or width is 0!\n");
+-	}
+-
+-	v_filter_init =
+-		dal_fixed32_32_add(
+-			v_scale_ratio,
+-			dal_fixed32_32_add_int(
+-				dal_fixed32_32_div_int(
+-					dal_fixed32_32_mul_int(
+-						v_scale_ratio,
+-						params->timing_info.INTERLACED),
+-					2),
+-				params->scaling_info.v_taps + 1));
+-	v_filter_init = dal_fixed32_32_div_int(v_filter_init, 2);
+-
+-	v_filter_init_trunc = dal_fixed32_32_floor(v_filter_init);
+-
+-	v_filter_init_ceil = dal_fixed32_32_from_fraction(
+-						v_filter_init_trunc, 2);
+-	v_filter_init_ceil = dal_fixed32_32_from_int(
+-		dal_fixed32_32_ceil(v_filter_init_ceil));
+-	v_filter_init_ceil = dal_fixed32_32_mul_int(v_filter_init_ceil, 2);
+-
+-	lines_per_lines_out_at_frame_start =
+-			dal_fixed32_32_div_int(v_filter_init_ceil,
+-					num_lines_at_frame_start);
+-	lb_lines_in_per_line_out =
+-			get_lb_lines_in_per_line_out(params, v_scale_ratio);
+-
+-	if (panning_allowed)
+-		src_wdth_rnd_to_chunks =
+-			((lb_source_width - 1) / 128) * 128 + 256;
+-	else
+-		src_wdth_rnd_to_chunks =
+-			((lb_source_width + 127) / 128) * 128;
+-
+-	scaling_coeff =
+-		dal_fixed32_32_div(
+-			dal_fixed32_32_from_int(params->scaling_info.v_taps),
+-			scaler_efficiency);
+-
+-	if (dal_fixed32_32_le(h_scale_ratio, dal_fixed32_32_one))
+-		scaling_coeff = dal_fixed32_32_max(
+-			dal_fixed32_32_from_int(
+-				dal_fixed32_32_ceil(
+-					dal_fixed32_32_from_fraction(
+-						params->scaling_info.h_taps,
+-						4))),
+-			dal_fixed32_32_max(
+-				dal_fixed32_32_mul(
+-					scaling_coeff,
+-					h_scale_ratio),
+-				dal_fixed32_32_one));
+-
+-	if (!params->line_buffer_prefetch_enabled &&
+-		dal_fixed32_32_floor(lb_lines_in_per_line_out) != 2 &&
+-		dal_fixed32_32_floor(lb_lines_in_per_line_out) != 4) {
+-		uint32_t line_total_pixel =
+-			params->timing_info.h_total + lb_source_width - 256;
+-		h_blank_granularity_factor = dal_fixed32_32_div(
+-			dal_fixed32_32_from_int(params->timing_info.h_total),
+-			dal_fixed32_32_div(
+-			dal_fixed32_32_from_fraction(
+-				line_total_pixel, 2),
+-				h_scale_ratio));
+-	}
+-
+-	/* Calculate display clock with ramping. Ramping factor is 1.1*/
+-	fx_disp_clk_mhz =
+-		dal_fixed32_32_div_int(
+-			dal_fixed32_32_mul_int(scaling_coeff, 11),
+-			10);
+-	line_time = dal_fixed32_32_from_fraction(
+-			params->timing_info.h_total * 1000, pix_clk_khz);
+-
+-	disp_pipe_pix_throughput = dal_fixed32_32_mul(
+-			lb_lines_in_per_line_out, h_blank_granularity_factor);
+-	disp_pipe_pix_throughput = dal_fixed32_32_max(
+-			disp_pipe_pix_throughput,
+-			lines_per_lines_out_at_frame_start);
+-	disp_pipe_pix_throughput = dal_fixed32_32_div(dal_fixed32_32_mul_int(
+-			disp_pipe_pix_throughput, src_wdth_rnd_to_chunks),
+-			line_time);
+-
+-	if (0 != params->timing_info.h_total) {
+-		fx_disp_clk_mhz =
+-			dal_fixed32_32_max(
+-				dal_fixed32_32_div_int(
+-					dal_fixed32_32_mul_int(
+-						scaling_coeff, pix_clk_khz),
+-						1000),
+-				disp_pipe_pix_throughput);
+-		fx_disp_clk_mhz =
+-			dal_fixed32_32_mul(
+-				fx_disp_clk_mhz,
+-				dal_fixed32_32_from_fraction(11, 10));
+-	}
+-
+-	fx_disp_clk_mhz = dal_fixed32_32_max(fx_disp_clk_mhz,
+-		dal_fixed32_32_mul(deep_color_factor,
+-		dal_fixed32_32_from_fraction(11, 10)));
+-
+-	/* Calculate display clock without ramping */
+-	fx_alt_disp_clk_mhz = scaling_coeff;
+-
+-	if (0 != params->timing_info.h_total) {
+-		fx_alt_disp_clk_mhz = dal_fixed32_32_max(
+-				dal_fixed32_32_div_int(dal_fixed32_32_mul_int(
+-						scaling_coeff, pix_clk_khz),
+-						1000),
+-				dal_fixed32_32_div_int(dal_fixed32_32_mul_int(
+-						disp_pipe_pix_throughput, 105),
+-						100));
+-	}
+-
+-	if (set_clk && disp_clk_110->ss_on_gpu_pll &&
+-			disp_clk_110->gpu_pll_ss_divider)
+-		fx_alt_disp_clk_mhz = dal_fixed32_32_mul(fx_alt_disp_clk_mhz,
+-				dal_fixed32_32_add_int(
+-				dal_fixed32_32_div_int(
+-				dal_fixed32_32_div_int(
+-				dal_fixed32_32_from_fraction(
+-				disp_clk_110->gpu_pll_ss_percentage,
+-				disp_clk_110->gpu_pll_ss_divider), 100),
+-				2),
+-				1));
+-
+-	/* convert to integer */
+-	disp_clk_khz = dal_fixed32_32_round(
+-			dal_fixed32_32_mul_int(fx_disp_clk_mhz, 1000));
+-	alt_disp_clk_khz = dal_fixed32_32_round(
+-			dal_fixed32_32_mul_int(fx_alt_disp_clk_mhz, 1000));
+-
+-	if ((disp_clk_khz > max_clk_khz) && (alt_disp_clk_khz <= max_clk_khz))
+-		disp_clk_khz = alt_disp_clk_khz;
+-
+-	if (set_clk) { /* only compensate clock if we are going to set it.*/
+-		disp_clk_khz = get_actual_required_display_clk(
+-			disp_clk_110, disp_clk_khz);
+-	}
+-
+-	disp_clk_khz = disp_clk_khz > max_clk_khz ? max_clk_khz : disp_clk_khz;
+-
+-	return disp_clk_khz;
+-}
+-
+-uint32_t dispclk_dce112_calculate_min_clock(
+-	struct display_clock *base,
+-	uint32_t path_num,
+-	struct min_clock_params *params)
+-{
+-	uint32_t i;
+-	uint32_t validation_clk_khz =
+-			dispclk_dce112_get_validation_clock(base);
+-	uint32_t min_clk_khz = validation_clk_khz;
+-	uint32_t max_clk_khz = 0;
+-	struct display_clock_dce112 *dc = DCLCK112_FROM_BASE(base);
+-
+-	if (dc->use_max_disp_clk)
+-		return min_clk_khz;
+-
+-	if (params != NULL) {
+-		uint32_t disp_clk_khz = 0;
+-
+-		for (i = 0; i < path_num; ++i) {
+-
+-			disp_clk_khz = calc_single_display_min_clks(
+-							base, params, true);
+-
+-			/* update the max required clock found*/
+-			if (disp_clk_khz > max_clk_khz)
+-				max_clk_khz = disp_clk_khz;
+-
+-			params++;
+-		}
+-	}
+-
+-	min_clk_khz = max_clk_khz;
+-
+-	if (min_clk_khz > validation_clk_khz)
+-		min_clk_khz = validation_clk_khz;
+-	else if (min_clk_khz < base->min_display_clk_threshold_khz)
+-		min_clk_khz = base->min_display_clk_threshold_khz;
+-
+-	if (dc->use_max_disp_clk)
+-		min_clk_khz = dispclk_dce112_get_validation_clock(base);
+-
+-	return min_clk_khz;
+-}
+-
+ static bool display_clock_integrated_info_construct(
+ 	struct display_clock_dce112 *disp_clk)
+ {
+@@ -655,8 +255,6 @@ static bool display_clock_integrated_info_construct(
+ 	if (disp_clk->dentist_vco_freq_khz == 0)
+ 		disp_clk->dentist_vco_freq_khz = 3600000;
+ 
+-	disp_clk->crystal_freq_khz = 100000;
+-
+ 	base->min_display_clk_threshold_khz =
+ 		disp_clk->dentist_vco_freq_khz / 64;
+ 
+@@ -698,35 +296,6 @@ static bool display_clock_integrated_info_construct(
+ 	return true;
+ }
+ 
+-static uint32_t get_clock(struct display_clock *dc)
+-{
+-	uint32_t disp_clock = dispclk_dce112_get_validation_clock(dc);
+-	uint32_t target_div = INVALID_DIVIDER;
+-	uint32_t addr = mmDENTIST_DISPCLK_CNTL;
+-	uint32_t value = 0;
+-	uint32_t field = 0;
+-	struct display_clock_dce112 *disp_clk = DCLCK112_FROM_BASE(dc);
+-
+-	/* Read the mmDENTIST_DISPCLK_CNTL to get the currently programmed
+-	 DID DENTIST_DISPCLK_WDIVIDER.*/
+-	value = dm_read_reg(dc->ctx, addr);
+-	field = get_reg_field_value(
+-			value, DENTIST_DISPCLK_CNTL, DENTIST_DISPCLK_WDIVIDER);
+-
+-	/* Convert DENTIST_DISPCLK_WDIVIDER to actual divider*/
+-	target_div = dal_divider_range_get_divider(
+-		divider_ranges,
+-		DIVIDER_RANGE_MAX,
+-		field);
+-
+-	if (target_div != INVALID_DIVIDER)
+-		/* Calculate the current DFS clock in KHz.
+-		 Should be okay up to 42.9 THz before overflowing.*/
+-		disp_clock = (DIVIDER_RANGE_SCALE_FACTOR
+-			* disp_clk->dentist_vco_freq_khz) / target_div;
+-	return disp_clock;
+-}
+-
+ enum clocks_state dispclk_dce112_get_required_clocks_state(
+ 	struct display_clock *dc,
+ 	struct state_dependent_clocks *req_clocks)
+@@ -797,45 +366,14 @@ void dispclk_dce112_set_clock(
+ 	bp->funcs->set_dce_clock(bp, &dce_clk_params);
+ }
+ 
+-void dispclk_dce112_set_clock_state(
+-	struct display_clock *dc,
+-	struct display_clock_state clk_state)
+-{
+-	struct display_clock_dce112 *disp_clk = DCLCK112_FROM_BASE(dc);
+-
+-	disp_clk->clock_state = clk_state;
+-}
+-
+-struct display_clock_state dispclk_dce112_get_clock_state(
+-	struct display_clock *dc)
+-{
+-	struct display_clock_dce112 *disp_clk = DCLCK112_FROM_BASE(dc);
+-
+-	return disp_clk->clock_state;
+-}
+-
+-uint32_t dispclk_dce112_get_dfs_bypass_threshold(
+-	struct display_clock *dc)
+-{
+-	return dce112_DFS_BYPASS_THRESHOLD_KHZ;
+-}
+-
+ static const struct display_clock_funcs funcs = {
+ 	.destroy = dispclk_dce112_destroy,
+-	.calculate_min_clock = dispclk_dce112_calculate_min_clock,
+-	.get_clock = get_clock,
+-	.get_clock_state = dispclk_dce112_get_clock_state,
+-	.get_dfs_bypass_threshold = dispclk_dce112_get_dfs_bypass_threshold,
+ 	.get_dp_ref_clk_frequency = get_dp_ref_clk_frequency,
+ 	.get_min_clocks_state = dispclk_dce112_get_min_clocks_state,
+ 	.get_required_clocks_state = dispclk_dce112_get_required_clocks_state,
+-	.get_validation_clock = dispclk_dce112_get_validation_clock,
+ 	.set_clock = dispclk_dce112_set_clock,
+-	.set_clock_state = dispclk_dce112_set_clock_state,
+-	.set_dp_ref_clock_source = NULL,
+ 	.set_min_clocks_state = dispclk_dce112_set_min_clocks_state,
+ 	.store_max_clocks_state = dispclk_dce112_store_max_clocks_state,
+-	.validate = NULL,
+ };
+ 
+ bool dal_display_clock_dce112_construct(
+@@ -844,11 +382,11 @@ bool dal_display_clock_dce112_construct(
+ {
+ 	struct display_clock *dc_base = &dc112->disp_clk_base;
+ 
+-	/*if (NULL == as)
+-		return false;*/
++	dc_base->ctx = ctx;
++	dc_base->id = CLOCK_SOURCE_ID_DCPLL;
++	dc_base->min_display_clk_threshold_khz = 0;
+ 
+-	if (!dal_display_clock_construct_base(dc_base, ctx))
+-		return false;
++	dc_base->cur_min_clks_state = CLOCKS_STATE_INVALID;
+ 
+ 	dc_base->funcs = &funcs;
+ 
+@@ -870,12 +408,7 @@ bool dal_display_clock_dce112_construct(
+ 	dc112->max_clks_state = CLOCKS_STATE_NOMINAL;
+ 
+ 	dc112->disp_clk_base.min_display_clk_threshold_khz =
+-			dc112->crystal_freq_khz;
+-
+-	if (dc112->disp_clk_base.min_display_clk_threshold_khz <
+-			(dc112->dentist_vco_freq_khz / 62))
+-		dc112->disp_clk_base.min_display_clk_threshold_khz =
+-				(dc112->dentist_vco_freq_khz / 62);
++			(dc112->dentist_vco_freq_khz / 62);
+ 
+ 	dal_divider_range_construct(
+ 		&divider_ranges[DIVIDER_RANGE_01],
+diff --git a/drivers/gpu/drm/amd/display/dc/gpu/dce112/display_clock_dce112.h b/drivers/gpu/drm/amd/display/dc/gpu/dce112/display_clock_dce112.h
+index 937e179..5ab3118 100644
+--- a/drivers/gpu/drm/amd/display/dc/gpu/dce112/display_clock_dce112.h
++++ b/drivers/gpu/drm/amd/display/dc/gpu/dce112/display_clock_dce112.h
+@@ -45,7 +45,6 @@ struct display_clock_dce112 {
+ 	/* Cache the display clock returned by VBIOS if DFS-bypass is enabled.
+ 	 * This is basically "Crystal Frequency In KHz" (XTALIN) frequency */
+ 	uint32_t dfs_bypass_disp_clk;
+-	struct display_clock_state clock_state;
+ 	struct state_dependent_clocks *max_clks_by_state;
+ 
+ };
+@@ -75,17 +74,6 @@ bool dal_display_clock_dce112_construct(
+ 
+ void dispclk_dce112_destroy(struct display_clock **base);
+ 
+-uint32_t dispclk_dce112_calculate_min_clock(
+-	struct display_clock *base,
+-	uint32_t path_num,
+-	struct min_clock_params *params);
+-
+-struct display_clock_state dispclk_dce112_get_clock_state(
+-	struct display_clock *dc);
+-
+-uint32_t dispclk_dce112_get_dfs_bypass_threshold(
+-	struct display_clock *dc);
+-
+ enum clocks_state dispclk_dce112_get_min_clocks_state(
+ 	struct display_clock *base);
+ 
+@@ -93,16 +81,10 @@ enum clocks_state dispclk_dce112_get_required_clocks_state(
+ 	struct display_clock *dc,
+ 	struct state_dependent_clocks *req_clocks);
+ 
+-uint32_t dispclk_dce112_get_validation_clock(struct display_clock *dc);
+-
+ void dispclk_dce112_set_clock(
+ 	struct display_clock *base,
+ 	uint32_t requested_clk_khz);
+ 
+-void dispclk_dce112_set_clock_state(
+-	struct display_clock *dc,
+-	struct display_clock_state clk_state);
+-
+ bool dispclk_dce112_set_min_clocks_state(
+ 	struct display_clock *base,
+ 	enum clocks_state clocks_state);
+diff --git a/drivers/gpu/drm/amd/display/dc/gpu/dce80/display_clock_dce80.c b/drivers/gpu/drm/amd/display/dc/gpu/dce80/display_clock_dce80.c
+index eedcfd6..89ee8bd 100644
+--- a/drivers/gpu/drm/amd/display/dc/gpu/dce80/display_clock_dce80.c
++++ b/drivers/gpu/drm/amd/display/dc/gpu/dce80/display_clock_dce80.c
+@@ -90,380 +90,6 @@ static struct divider_range divider_ranges[DIVIDER_RANGE_MAX];
+ #define FROM_DISPLAY_CLOCK(base) \
+ 	container_of(base, struct display_clock_dce80, disp_clk)
+ 
+-static struct fixed32_32 get_deep_color_factor(struct min_clock_params *params)
+-{
+-	/* DeepColorFactor = IF (HDMI = True, bpp / 24, 1)*/
+-	struct fixed32_32 deep_color_factor = dal_fixed32_32_from_int(1);
+-
+-	if (params->signal_type != SIGNAL_TYPE_HDMI_TYPE_A)
+-		return deep_color_factor;
+-
+-	switch (params->deep_color_depth) {
+-	case COLOR_DEPTH_101010:
+-		/*deep color ratio for 30bpp is 30/24 = 1.25*/
+-		deep_color_factor = dal_fixed32_32_from_fraction(30, 24);
+-		break;
+-
+-	case COLOR_DEPTH_121212:
+-		/* deep color ratio for 36bpp is 36/24 = 1.5*/
+-		deep_color_factor = dal_fixed32_32_from_fraction(36, 24);
+-		break;
+-
+-	case COLOR_DEPTH_161616:
+-		/* deep color ratio for 48bpp is 48/24 = 2.0 */
+-		deep_color_factor = dal_fixed32_32_from_fraction(48, 24);
+-		break;
+-	default:
+-		break;
+-	}
+-	return deep_color_factor;
+-}
+-
+-static uint32_t get_scaler_efficiency(struct min_clock_params *params)
+-{
+-	uint32_t scaler_efficiency = 3;
+-
+-	switch (params->scaler_efficiency) {
+-	case V_SCALER_EFFICIENCY_LB18BPP:
+-	case V_SCALER_EFFICIENCY_LB24BPP:
+-		scaler_efficiency = 4;
+-		break;
+-
+-	case V_SCALER_EFFICIENCY_LB30BPP:
+-	case V_SCALER_EFFICIENCY_LB36BPP:
+-		scaler_efficiency = 3;
+-		break;
+-
+-	default:
+-		break;
+-	}
+-
+-	return scaler_efficiency;
+-}
+-
+-static uint32_t get_actual_required_display_clk(
+-	struct display_clock_dce80 *disp_clk,
+-	uint32_t  target_clk_khz)
+-{
+-	uint32_t disp_clk_khz = target_clk_khz;
+-	uint32_t div = INVALID_DIVIDER;
+-	uint32_t did = INVALID_DID;
+-	uint32_t scaled_vco =
+-		disp_clk->dentist_vco_freq_khz * DIVIDER_RANGE_SCALE_FACTOR;
+-
+-	ASSERT(disp_clk_khz);
+-
+-	if (disp_clk_khz)
+-		div = scaled_vco / disp_clk_khz;
+-
+-	did = dal_divider_range_get_did(divider_ranges, DIVIDER_RANGE_MAX, div);
+-
+-	if (did != INVALID_DID) {
+-		div = dal_divider_range_get_divider(
+-			divider_ranges, DIVIDER_RANGE_MAX, did);
+-
+-		if ((div != INVALID_DIVIDER) &&
+-			(did > DIVIDER_RANGE_01_BASE_DIVIDER_ID))
+-			if (disp_clk_khz > (scaled_vco / div))
+-				div = dal_divider_range_get_divider(
+-					divider_ranges, DIVIDER_RANGE_MAX,
+-					did - 1);
+-
+-		if (div != INVALID_DIVIDER)
+-			disp_clk_khz = scaled_vco / div;
+-
+-	}
+-	/* We need to add 10KHz to this value because the accuracy in VBIOS is
+-	 in 10KHz units. So we need to always round the last digit up in order
+-	 to reach the next div level.*/
+-	return disp_clk_khz + 10;
+-}
+-
+-static uint32_t get_validation_clock(struct display_clock *dc)
+-{
+-	uint32_t clk = 0;
+-	struct display_clock_dce80 *disp_clk = FROM_DISPLAY_CLOCK(dc);
+-
+-	switch (disp_clk->max_clks_state) {
+-	case CLOCKS_STATE_ULTRA_LOW:
+-		/*Currently not supported, it has 0 in table entry*/
+-	case CLOCKS_STATE_LOW:
+-		clk = max_clks_by_state[CLOCKS_STATE_LOW].
+-						display_clk_khz;
+-		break;
+-
+-	case CLOCKS_STATE_NOMINAL:
+-		clk = max_clks_by_state[CLOCKS_STATE_NOMINAL].
+-						display_clk_khz;
+-		break;
+-
+-	case CLOCKS_STATE_PERFORMANCE:
+-		clk = max_clks_by_state[CLOCKS_STATE_PERFORMANCE].
+-						display_clk_khz;
+-		break;
+-
+-	case CLOCKS_STATE_INVALID:
+-	default:
+-		/*Invalid Clocks State*/
+-		BREAK_TO_DEBUGGER();
+-		/* just return the display engine clock for
+-		 * lowest supported state*/
+-		clk = max_clks_by_state[CLOCKS_STATE_LOW].
+-						display_clk_khz;
+-		break;
+-	}
+-	return clk;
+-}
+-
+-static uint32_t calc_single_display_min_clks(
+-	struct display_clock *base,
+-	struct min_clock_params *params,
+-	bool set_clk)
+-{
+-	struct fixed32_32 h_scale = dal_fixed32_32_from_int(1);
+-	struct fixed32_32 v_scale = dal_fixed32_32_from_int(1);
+-	uint32_t pix_clk_khz = params->requested_pixel_clock;
+-	uint32_t line_total = params->timing_info.h_total;
+-	uint32_t max_clk_khz = get_validation_clock(base);
+-	struct fixed32_32 deep_color_factor = get_deep_color_factor(params);
+-	uint32_t scaler_efficiency = get_scaler_efficiency(params);
+-	struct fixed32_32 v_filter_init;
+-	uint32_t v_filter_init_trunc;
+-	struct fixed32_32 v_filter_init_ceil;
+-	struct fixed32_32 src_lines_per_dst_line;
+-	uint32_t src_wdth_rnd_to_chunks;
+-	struct fixed32_32 scaling_coeff;
+-	struct fixed32_32 fx_disp_clk_khz;
+-	struct fixed32_32 fx_alt_disp_clk_khz;
+-	uint32_t disp_clk_khz;
+-	uint32_t alt_disp_clk_khz;
+-	struct display_clock_dce80 *dc = FROM_DISPLAY_CLOCK(base);
+-
+-	if (0 != params->dest_view.height && 0 != params->dest_view.width) {
+-
+-		h_scale = dal_fixed32_32_from_fraction(
+-			params->source_view.width,
+-			params->dest_view.width);
+-		v_scale = dal_fixed32_32_from_fraction(
+-			params->source_view.height,
+-			params->dest_view.height);
+-	}
+-
+-	v_filter_init = dal_fixed32_32_from_fraction(
+-		params->scaling_info.v_taps, 2u);
+-	v_filter_init = dal_fixed32_32_add(v_filter_init,
+-		dal_fixed32_32_div_int(v_scale, 2));
+-	v_filter_init = dal_fixed32_32_add(v_filter_init,
+-		dal_fixed32_32_from_fraction(15, 10));
+-
+-	v_filter_init_trunc = dal_fixed32_32_floor(v_filter_init);
+-
+-	v_filter_init_ceil = dal_fixed32_32_from_fraction(
+-						v_filter_init_trunc, 2);
+-	v_filter_init_ceil = dal_fixed32_32_from_int(
+-		dal_fixed32_32_ceil(v_filter_init_ceil));
+-	v_filter_init_ceil = dal_fixed32_32_mul_int(v_filter_init_ceil, 2);
+-	v_filter_init_ceil = dal_fixed32_32_div_int(v_filter_init_ceil, 3);
+-	v_filter_init_ceil = dal_fixed32_32_from_int(
+-		dal_fixed32_32_ceil(v_filter_init_ceil));
+-
+-	src_lines_per_dst_line = dal_fixed32_32_max(
+-		dal_fixed32_32_from_int(dal_fixed32_32_ceil(v_scale)),
+-		v_filter_init_ceil);
+-
+-	src_wdth_rnd_to_chunks =
+-		((params->source_view.width - 1) / 128) * 128 + 256;
+-
+-	scaling_coeff = dal_fixed32_32_max(
+-		dal_fixed32_32_from_fraction(params->scaling_info.h_taps, 4),
+-		dal_fixed32_32_mul(
+-			dal_fixed32_32_from_fraction(
+-				params->scaling_info.v_taps,
+-				scaler_efficiency),
+-					h_scale));
+-
+-	scaling_coeff = dal_fixed32_32_max(scaling_coeff, h_scale);
+-
+-	fx_disp_clk_khz = dal_fixed32_32_mul(
+-		scaling_coeff, dal_fixed32_32_from_fraction(11, 10));
+-	if (0 != line_total) {
+-		struct fixed32_32 d_clk = dal_fixed32_32_mul_int(
+-			src_lines_per_dst_line, src_wdth_rnd_to_chunks);
+-		d_clk = dal_fixed32_32_div_int(d_clk, line_total);
+-		d_clk = dal_fixed32_32_mul(d_clk,
+-				dal_fixed32_32_from_fraction(11, 10));
+-		fx_disp_clk_khz = dal_fixed32_32_max(fx_disp_clk_khz, d_clk);
+-	}
+-
+-	fx_disp_clk_khz = dal_fixed32_32_max(fx_disp_clk_khz,
+-		dal_fixed32_32_mul(deep_color_factor,
+-		dal_fixed32_32_from_fraction(11, 10)));
+-
+-	fx_disp_clk_khz = dal_fixed32_32_mul_int(fx_disp_clk_khz, pix_clk_khz);
+-	fx_disp_clk_khz = dal_fixed32_32_mul(fx_disp_clk_khz,
+-		dal_fixed32_32_from_fraction(1005, 1000));
+-
+-	fx_alt_disp_clk_khz = scaling_coeff;
+-
+-	if (0 != line_total) {
+-		struct fixed32_32 d_clk = dal_fixed32_32_mul_int(
+-			src_lines_per_dst_line, src_wdth_rnd_to_chunks);
+-		d_clk = dal_fixed32_32_div_int(d_clk, line_total);
+-		d_clk = dal_fixed32_32_mul(d_clk,
+-			dal_fixed32_32_from_fraction(105, 100));
+-		fx_alt_disp_clk_khz = dal_fixed32_32_max(
+-			fx_alt_disp_clk_khz, d_clk);
+-	}
+-	fx_alt_disp_clk_khz = dal_fixed32_32_max(
+-		fx_alt_disp_clk_khz, fx_alt_disp_clk_khz);
+-
+-	fx_alt_disp_clk_khz = dal_fixed32_32_mul_int(
+-		fx_alt_disp_clk_khz, pix_clk_khz);
+-
+-	/* convert to integer*/
+-	disp_clk_khz = dal_fixed32_32_floor(fx_disp_clk_khz);
+-	alt_disp_clk_khz = dal_fixed32_32_floor(fx_alt_disp_clk_khz);
+-
+-	if (set_clk) { /* only compensate clock if we are going to set it.*/
+-		disp_clk_khz = get_actual_required_display_clk(
+-			dc, disp_clk_khz);
+-		alt_disp_clk_khz = get_actual_required_display_clk(
+-			dc, alt_disp_clk_khz);
+-	}
+-
+-	if ((disp_clk_khz > max_clk_khz) && (alt_disp_clk_khz <= max_clk_khz))
+-		disp_clk_khz = alt_disp_clk_khz;
+-
+-	return disp_clk_khz;
+-
+-}
+-
+-static uint32_t calc_cursor_bw_for_min_clks(struct min_clock_params *params)
+-{
+-
+-	struct fixed32_32 v_scale = dal_fixed32_32_from_int(1);
+-	struct fixed32_32 v_filter_ceiling;
+-	struct fixed32_32 src_lines_per_dst_line;
+-	struct fixed32_32 cursor_bw;
+-
+-	/*  DCE8 Mode Support and Mode Set Architecture Specification Rev 1.3
+-	 6.3.3	Cursor data Throughput requirement on DISPCLK
+-	 The MCIF to DCP cursor data return throughput is one pixel per DISPCLK
+-	  shared among the display heads.
+-	 If (Total Cursor Bandwidth in pixels for All heads> DISPCLK)
+-	 The mode is not supported
+-	 Cursor Bandwidth in Pixels = Cursor Width *
+-	 (SourceLinesPerDestinationLine / Line Time)
+-	 Assuming that Cursor Width = 128
+-	 */
+-	/*In the hardware doc they mention an Interlace Factor
+-	  It is not used here because we have already used it when
+-	  calculating destination view*/
+-	if (0 != params->dest_view.height)
+-		v_scale = dal_fixed32_32_from_fraction(
+-			params->source_view.height,
+-			params->dest_view.height);
+-
+-	{
+-	/*Do: Vertical Filter Init = 0.5 + VTAPS/2 + VSR/2 * Interlace Factor*/
+-	/*Interlace Factor is included in verticalScaleRatio*/
+-	struct fixed32_32 v_filter = dal_fixed32_32_add(
+-		dal_fixed32_32_from_fraction(params->scaling_info.v_taps, 2),
+-		dal_fixed32_32_div_int(v_scale, 2));
+-	/*Do : Ceiling (Vertical Filter Init, 2)/3 )*/
+-	v_filter_ceiling = dal_fixed32_32_div_int(v_filter, 2);
+-	v_filter_ceiling = dal_fixed32_32_mul_int(
+-		dal_fixed32_32_from_int(dal_fixed32_32_ceil(v_filter_ceiling)),
+-							2);
+-	v_filter_ceiling = dal_fixed32_32_div_int(v_filter_ceiling, 3);
+-	}
+-	/*Do : MAX( CeilCeiling (VSR), Ceiling (Vertical Filter Init, 2)/3 )*/
+-	/*Do : SourceLinesPerDestinationLine =
+-	 * MAX( Ceiling (VSR), Ceiling (Vertical Filter Init, 2)/3 )*/
+-	src_lines_per_dst_line = dal_fixed32_32_max(v_scale, v_filter_ceiling);
+-
+-	if ((params->requested_pixel_clock != 0) &&
+-		(params->timing_info.h_total != 0)) {
+-		/* pixelClock is in units of KHz.  Calc lineTime in us*/
+-		struct fixed32_32 inv_line_time = dal_fixed32_32_from_fraction(
+-			params->requested_pixel_clock,
+-			params->timing_info.h_total);
+-		cursor_bw = dal_fixed32_32_mul(
+-			dal_fixed32_32_mul_int(inv_line_time, 128),
+-						src_lines_per_dst_line);
+-	}
+-
+-	/* convert to integer*/
+-	return dal_fixed32_32_floor(cursor_bw);
+-}
+-
+-static bool validate(
+-	struct display_clock *dc,
+-	struct min_clock_params *params)
+-{
+-	uint32_t max_clk_khz = get_validation_clock(dc);
+-	uint32_t req_clk_khz;
+-
+-	if (params == NULL)
+-		return false;
+-
+-	req_clk_khz = calc_single_display_min_clks(dc, params, false);
+-
+-	return (req_clk_khz <= max_clk_khz);
+-}
+-
+-static uint32_t calculate_min_clock(
+-	struct display_clock *dc,
+-	uint32_t path_num,
+-	struct min_clock_params *params)
+-{
+-	uint32_t i;
+-	uint32_t validation_clk_khz = get_validation_clock(dc);
+-	uint32_t min_clk_khz = validation_clk_khz;
+-	uint32_t max_clk_khz = 0;
+-	uint32_t total_cursor_bw = 0;
+-	struct display_clock_dce80 *disp_clk = FROM_DISPLAY_CLOCK(dc);
+-
+-	if (disp_clk->use_max_disp_clk)
+-		return min_clk_khz;
+-
+-	if (params != NULL) {
+-		uint32_t disp_clk_khz = 0;
+-
+-		for (i = 0; i < path_num; ++i) {
+-			disp_clk_khz = calc_single_display_min_clks(
+-				dc, params, true);
+-
+-			/* update the max required clock found*/
+-			if (disp_clk_khz > max_clk_khz)
+-				max_clk_khz = disp_clk_khz;
+-
+-			disp_clk_khz = calc_cursor_bw_for_min_clks(params);
+-
+-			total_cursor_bw += disp_clk_khz;
+-
+-			params++;
+-
+-		}
+-	}
+-
+-	max_clk_khz = (total_cursor_bw > max_clk_khz) ? total_cursor_bw :
+-								max_clk_khz;
+-
+-	min_clk_khz = max_clk_khz;
+-
+-	/*"Cursor data Throughput requirement on DISPCLK is now a factor,
+-	 *  need to change the code */
+-	ASSERT(total_cursor_bw < validation_clk_khz);
+-
+-	if (min_clk_khz > validation_clk_khz)
+-		min_clk_khz = validation_clk_khz;
+-	else if (min_clk_khz < dc->min_display_clk_threshold_khz)
+-		min_clk_khz = dc->min_display_clk_threshold_khz;
+-
+-	return min_clk_khz;
+-}
+-
+ static void set_clock(
+ 	struct display_clock *dc,
+ 	uint32_t requested_clk_khz)
+@@ -493,54 +119,6 @@ static void set_clock(
+ 		disp_clk->cur_min_clks_state = CLOCKS_STATE_NOMINAL;
+ }
+ 
+-static uint32_t get_clock(struct display_clock *dc)
+-{
+-	uint32_t disp_clock = get_validation_clock(dc);
+-	uint32_t target_div = INVALID_DIVIDER;
+-	uint32_t addr = mmDENTIST_DISPCLK_CNTL;
+-	uint32_t value = 0;
+-	uint32_t field = 0;
+-	struct display_clock_dce80 *disp_clk = FROM_DISPLAY_CLOCK(dc);
+-
+-	if (disp_clk->dfs_bypass_enabled && disp_clk->dfs_bypass_disp_clk)
+-		return disp_clk->dfs_bypass_disp_clk;
+-
+-	/* Read the mmDENTIST_DISPCLK_CNTL to get the currently programmed
+-	 DID DENTIST_DISPCLK_WDIVIDER.*/
+-	value = dm_read_reg(dc->ctx, addr);
+-	field = get_reg_field_value(
+-			value, DENTIST_DISPCLK_CNTL, DENTIST_DISPCLK_WDIVIDER);
+-
+-	/* Convert DENTIST_DISPCLK_WDIVIDER to actual divider*/
+-	target_div = dal_divider_range_get_divider(
+-		divider_ranges,
+-		DIVIDER_RANGE_MAX,
+-		field);
+-
+-	if (target_div != INVALID_DIVIDER)
+-		/* Calculate the current DFS clock in KHz.
+-		 Should be okay up to 42.9 THz before overflowing.*/
+-		disp_clock = (DIVIDER_RANGE_SCALE_FACTOR
+-			* disp_clk->dentist_vco_freq_khz) / target_div;
+-	return disp_clock;
+-}
+-
+-static void set_clock_state(
+-	struct display_clock *dc,
+-	struct display_clock_state clk_state)
+-{
+-	struct display_clock_dce80 *disp_clk = FROM_DISPLAY_CLOCK(dc);
+-
+-	disp_clk->clock_state = clk_state;
+-}
+-static struct display_clock_state get_clock_state(
+-	struct display_clock *dc)
+-{
+-	struct display_clock_dce80 *disp_clk = FROM_DISPLAY_CLOCK(dc);
+-
+-	return disp_clk->clock_state;
+-}
+-
+ static enum clocks_state get_min_clocks_state(struct display_clock *dc)
+ {
+ 	struct display_clock_dce80 *disp_clk = FROM_DISPLAY_CLOCK(dc);
+@@ -818,11 +396,6 @@ static bool display_clock_integrated_info_construct(
+ 	return true;
+ }
+ 
+-static uint32_t get_dfs_bypass_threshold(struct display_clock *dc)
+-{
+-	return DCE80_DFS_BYPASS_THRESHOLD_KHZ;
+-}
+-
+ static void destroy(struct display_clock **dc)
+ {
+ 	struct display_clock_dce80 *disp_clk;
+@@ -833,32 +406,34 @@ static void destroy(struct display_clock **dc)
+ }
+ 
+ static const struct display_clock_funcs funcs = {
+-	.calculate_min_clock = calculate_min_clock,
+ 	.destroy = destroy,
+-	.get_clock = get_clock,
+-	.get_clock_state = get_clock_state,
+-	.get_dfs_bypass_threshold = get_dfs_bypass_threshold,
+ 	.get_dp_ref_clk_frequency = get_dp_ref_clk_frequency,
+ 	.get_min_clocks_state = get_min_clocks_state,
+ 	.get_required_clocks_state = get_required_clocks_state,
+-	.get_validation_clock = get_validation_clock,
+ 	.set_clock = set_clock,
+-	.set_clock_state = set_clock_state,
+-	.set_dp_ref_clock_source =
+-		dal_display_clock_base_set_dp_ref_clock_source,
+ 	.set_min_clocks_state = set_min_clocks_state,
+-	.store_max_clocks_state = store_max_clocks_state,
+-	.validate = validate,
++	.store_max_clocks_state = store_max_clocks_state
+ };
+ 
+-static bool display_clock_construct(
+-	struct dc_context *ctx,
+-	struct display_clock_dce80 *disp_clk)
++
++struct display_clock *dal_display_clock_dce80_create(
++	struct dc_context *ctx)
+ {
+-	struct display_clock *dc_base = &disp_clk->disp_clk;
++	struct display_clock_dce80 *disp_clk;
++	struct display_clock *dc_base;
+ 
+-	if (!dal_display_clock_construct_base(dc_base, ctx))
+-		return false;
++	disp_clk = dm_alloc(sizeof(struct display_clock_dce80));
++
++	if (disp_clk == NULL)
++		return NULL;
++
++	dc_base = &disp_clk->disp_clk;
++
++	dc_base->ctx = ctx;
++	dc_base->id = CLOCK_SOURCE_ID_DCPLL;
++	dc_base->min_display_clk_threshold_khz = 0;
++
++	dc_base->cur_min_clks_state = CLOCKS_STATE_INVALID;
+ 
+ 	dc_base->funcs = &funcs;
+ 	/*
+@@ -912,21 +487,6 @@ static bool display_clock_construct(
+ 		DIVIDER_RANGE_03_STEP_SIZE,
+ 		DIVIDER_RANGE_03_BASE_DIVIDER_ID,
+ 		DIVIDER_RANGE_MAX_DIVIDER_ID);
+-	return true;
+-}
+-
+-struct display_clock *dal_display_clock_dce80_create(
+-	struct dc_context *ctx)
+-{
+-	struct display_clock_dce80 *disp_clk;
+-
+-	disp_clk = dm_alloc(sizeof(struct display_clock_dce80));
+-
+-	if (disp_clk == NULL)
+-		return NULL;
+-
+-	if (display_clock_construct(ctx, disp_clk))
+-		return &disp_clk->disp_clk;
+ 
+ 	dm_free(disp_clk);
+ 	return NULL;
+diff --git a/drivers/gpu/drm/amd/display/dc/gpu/dce80/display_clock_dce80.h b/drivers/gpu/drm/amd/display/dc/gpu/dce80/display_clock_dce80.h
+index 944dd03..c675f1e 100644
+--- a/drivers/gpu/drm/amd/display/dc/gpu/dce80/display_clock_dce80.h
++++ b/drivers/gpu/drm/amd/display/dc/gpu/dce80/display_clock_dce80.h
+@@ -48,7 +48,6 @@ struct display_clock_dce80 {
+ 	 * This is basically "Crystal Frequency In KHz" (XTALIN) frequency */
+ 	uint32_t dfs_bypass_disp_clk;
+ 	bool use_max_disp_clk;
+-	struct display_clock_state clock_state;
+ };
+ 
+ struct display_clock *dal_display_clock_dce80_create(
+diff --git a/drivers/gpu/drm/amd/display/dc/gpu/display_clock.c b/drivers/gpu/drm/amd/display/dc/gpu/display_clock.c
+index bcc0a51..73d9827 100644
+--- a/drivers/gpu/drm/amd/display/dc/gpu/display_clock.c
++++ b/drivers/gpu/drm/amd/display/dc/gpu/display_clock.c
+@@ -26,49 +26,6 @@
+ #include "dm_services.h"
+ #include "display_clock.h"
+ 
+-void dal_display_clock_base_set_dp_ref_clock_source(
+-	struct display_clock *disp_clk,
+-	enum clock_source_id clk_src)
+-{/*must be implemented in derived*/
+-
+-}
+-
+-void dal_display_clock_base_set_clock_state(struct display_clock *disp_clk,
+-	struct display_clock_state clk_state)
+-{
+-	/*Implemented only in DCE81*/
+-}
+-struct display_clock_state dal_display_clock_base_get_clock_state(
+-	struct display_clock *disp_clk)
+-{
+-	/*Implemented only in DCE81*/
+-	struct display_clock_state state = {0};
+-	return state;
+-}
+-uint32_t dal_display_clock_base_get_dfs_bypass_threshold(
+-	struct display_clock *disp_clk)
+-{
+-	/*Implemented only in DCE81*/
+-	return 0;
+-}
+-
+-bool dal_display_clock_construct_base(
+-	struct display_clock *base,
+-	struct dc_context *ctx)
+-{
+-	base->ctx = ctx;
+-	base->id = CLOCK_SOURCE_ID_DCPLL;
+-	base->min_display_clk_threshold_khz = 0;
+-
+-/* Initially set current min clocks state to invalid since we
+- * cannot make any assumption about PPLIB's initial state. This will be updated
+- * by HWSS via SetMinClocksState() on first mode set prior to programming
+- * state dependent clocks.*/
+-	base->cur_min_clks_state = CLOCKS_STATE_INVALID;
+-
+-	return true;
+-}
+-
+ void dal_display_clock_destroy(struct display_clock **disp_clk)
+ {
+ 	if (!disp_clk || !*disp_clk) {
+@@ -81,26 +38,6 @@ void dal_display_clock_destroy(struct display_clock **disp_clk)
+ 	*disp_clk = NULL;
+ }
+ 
+-bool dal_display_clock_validate(
+-	struct display_clock *disp_clk,
+-	struct min_clock_params *params)
+-{
+-	return disp_clk->funcs->validate(disp_clk, params);
+-}
+-
+-uint32_t dal_display_clock_calculate_min_clock(
+-	struct display_clock *disp_clk,
+-	uint32_t path_num,
+-	struct min_clock_params *params)
+-{
+-	return disp_clk->funcs->calculate_min_clock(disp_clk, path_num, params);
+-}
+-
+-uint32_t dal_display_clock_get_validation_clock(struct display_clock *disp_clk)
+-{
+-	return disp_clk->funcs->get_validation_clock(disp_clk);
+-}
+-
+ void dal_display_clock_set_clock(
+ 	struct display_clock *disp_clk,
+ 	uint32_t requested_clock_khz)
+@@ -108,11 +45,6 @@ void dal_display_clock_set_clock(
+ 	disp_clk->funcs->set_clock(disp_clk, requested_clock_khz);
+ }
+ 
+-uint32_t dal_display_clock_get_clock(struct display_clock *disp_clk)
+-{
+-	return disp_clk->funcs->get_clock(disp_clk);
+-}
+-
+ bool dal_display_clock_get_min_clocks_state(
+ 	struct display_clock *disp_clk,
+ 	enum clocks_state *clocks_state)
+@@ -154,35 +86,6 @@ uint32_t dal_display_clock_get_dp_ref_clk_frequency(
+ 	return disp_clk->funcs->get_dp_ref_clk_frequency(disp_clk);
+ }
+ 
+-/*the second parameter of "switchreferenceclock" is
+- * a dummy argument for all pre dce 6.0 versions*/
+-
+-void dal_display_clock_switch_reference_clock(
+-	struct display_clock *disp_clk,
+-	bool use_external_ref_clk,
+-	uint32_t requested_clk_khz)
+-{
+-	/* TODO: requires Asic Control*/
+-	/*
+-	struct ac_pixel_clk_params params;
+-	struct asic_control *ac =
+-		dal_adapter_service_get_asic_control(disp_clk->as);
+-	dc_service_memset(&params, 0, sizeof(struct ac_pixel_clk_params));
+-
+-	params.tgt_pixel_clk_khz = requested_clk_khz;
+-	params.flags.SET_EXTERNAL_REF_DIV_SRC = use_external_ref_clk;
+-	params.pll_id = disp_clk->id;
+-	dal_asic_control_program_display_engine_pll(ac, &params);
+-	*/
+-}
+-
+-void dal_display_clock_set_dp_ref_clock_source(
+-	struct display_clock *disp_clk,
+-	enum clock_source_id clk_src)
+-{
+-	disp_clk->funcs->set_dp_ref_clock_source(disp_clk, clk_src);
+-}
+-
+ void dal_display_clock_store_max_clocks_state(
+ 	struct display_clock *disp_clk,
+ 	enum clocks_state max_clocks_state)
+@@ -190,28 +93,3 @@ void dal_display_clock_store_max_clocks_state(
+ 	disp_clk->funcs->store_max_clocks_state(disp_clk, max_clocks_state);
+ }
+ 
+-void dal_display_clock_set_clock_state(
+-	struct display_clock *disp_clk,
+-	struct display_clock_state clk_state)
+-{
+-	disp_clk->funcs->set_clock_state(disp_clk, clk_state);
+-}
+-
+-struct display_clock_state dal_display_clock_get_clock_state(
+-	struct display_clock *disp_clk)
+-{
+-	return disp_clk->funcs->get_clock_state(disp_clk);
+-}
+-
+-uint32_t dal_display_clock_get_dfs_bypass_threshold(
+-	struct display_clock *disp_clk)
+-{
+-	return disp_clk->funcs->get_dfs_bypass_threshold(disp_clk);
+-}
+-
+-void dal_display_clock_invalid_clock_state(
+-	struct display_clock *disp_clk)
+-{
+-	disp_clk->cur_min_clks_state = CLOCKS_STATE_INVALID;
+-}
+-
+diff --git a/drivers/gpu/drm/amd/display/dc/gpu/display_clock.h b/drivers/gpu/drm/amd/display/dc/gpu/display_clock.h
+index 663580d..4db8442 100644
+--- a/drivers/gpu/drm/amd/display/dc/gpu/display_clock.h
++++ b/drivers/gpu/drm/amd/display/dc/gpu/display_clock.h
+@@ -30,14 +30,8 @@
+ 
+ struct display_clock_funcs {
+ 	void (*destroy)(struct display_clock **to_destroy);
+-	bool (*validate)(struct display_clock *disp_clk,
+-		struct min_clock_params *params);
+-	uint32_t (*calculate_min_clock)(struct display_clock *disp_clk,
+-		uint32_t path_num, struct min_clock_params *params);
+-	uint32_t (*get_validation_clock)(struct display_clock *disp_clk);
+ 	void (*set_clock)(struct display_clock *disp_clk,
+ 		uint32_t requested_clock_khz);
+-	uint32_t (*get_clock)(struct display_clock *disp_clk);
+ 	enum clocks_state (*get_min_clocks_state)(
+ 		struct display_clock *disp_clk);
+ 	enum clocks_state (*get_required_clocks_state)(
+@@ -46,15 +40,8 @@ struct display_clock_funcs {
+ 	bool (*set_min_clocks_state)(struct display_clock *disp_clk,
+ 		enum clocks_state clocks_state);
+ 	uint32_t (*get_dp_ref_clk_frequency)(struct display_clock *disp_clk);
+-	void (*set_dp_ref_clock_source)(struct display_clock *disp_clk,
+-		enum clock_source_id clk_src);
+ 	void (*store_max_clocks_state)(struct display_clock *disp_clk,
+ 		enum clocks_state max_clocks_state);
+-	void (*set_clock_state)(struct display_clock *disp_clk,
+-		struct display_clock_state clk_state);
+-	struct display_clock_state (*get_clock_state)(
+-		struct display_clock *disp_clk);
+-	uint32_t (*get_dfs_bypass_threshold)(struct display_clock *disp_clk);
+ 
+ };
+ 
+@@ -66,21 +53,6 @@ struct display_clock {
+ 
+ 	enum clocks_state cur_min_clks_state;
+ };
+-void dal_display_clock_base_set_dp_ref_clock_source(
+-	struct display_clock *disp_clk,
+-	enum clock_source_id clk_src);
+-struct display_clock_state dal_display_clock_base_get_clock_state(
+-	struct display_clock *disp_clk);
+-uint32_t dal_display_clock_base_get_dfs_bypass_threshold(
+-	struct display_clock *disp_clk);
+-void dal_display_clock_base_set_clock_state(struct display_clock *disp_clk,
+-	struct display_clock_state clk_state);
+-bool dal_display_clock_construct_base(
+-	struct display_clock *base,
+-	struct dc_context *ctx);
+-
+-uint32_t dal_display_clock_get_validation_clock(struct display_clock *disp_clk);
+-
+ void dal_display_clock_store_max_clocks_state(
+ 	struct display_clock *disp_clk,
+ 	enum clocks_state max_clocks_state);
+diff --git a/drivers/gpu/drm/amd/display/include/display_clock_interface.h b/drivers/gpu/drm/amd/display/include/display_clock_interface.h
+index 2006fa2..ef519a2 100644
+--- a/drivers/gpu/drm/amd/display/include/display_clock_interface.h
++++ b/drivers/gpu/drm/amd/display/include/display_clock_interface.h
+@@ -30,60 +30,6 @@
+ #include "grph_object_defs.h"
+ #include "signal_types.h"
+ 
+-/* Timing related information*/
+-struct dc_timing_params {
+-	uint32_t INTERLACED:1;
+-	uint32_t HCOUNT_BY_TWO:1;
+-	uint32_t PIXEL_REPETITION:4; /*< values 1 to 10 supported*/
+-	uint32_t PREFETCH:1;
+-
+-	uint32_t h_total;
+-	uint32_t h_addressable;
+-	uint32_t h_sync_width;
+-};
+-
+-/* Scaling related information*/
+-struct dc_scaling_params {
+-	uint32_t h_overscan_right;
+-	uint32_t h_overscan_left;
+-	uint32_t h_taps;
+-	uint32_t v_taps;
+-};
+-
+-/* VScalerEfficiency */
+-enum v_scaler_efficiency {
+-	V_SCALER_EFFICIENCY_LB36BPP = 0,
+-	V_SCALER_EFFICIENCY_LB30BPP = 1,
+-	V_SCALER_EFFICIENCY_LB24BPP = 2,
+-	V_SCALER_EFFICIENCY_LB18BPP = 3
+-};
+-
+-/* Parameters required for minimum Engine
+- * and minimum Display clock calculations*/
+-struct min_clock_params {
+-	uint32_t id;
+-	uint32_t requested_pixel_clock; /* in KHz */
+-	uint32_t actual_pixel_clock; /* in KHz */
+-	struct view source_view;
+-	struct view dest_view;
+-	struct dc_timing_params timing_info;
+-	struct dc_scaling_params scaling_info;
+-	enum signal_type signal_type;
+-	enum dc_color_depth deep_color_depth;
+-	enum v_scaler_efficiency scaler_efficiency;
+-	bool line_buffer_prefetch_enabled;
+-};
+-
+-/* Result of Minimum System and Display clock calculations.
+- * Minimum System clock and Display clock, source and path to be used
+- * for Display clock*/
+-struct minimum_clocks_calculation_result {
+-	uint32_t min_sclk_khz;
+-	uint32_t min_dclk_khz;
+-	uint32_t min_mclk_khz;
+-	uint32_t min_deep_sleep_sclk;
+-};
+-
+ /* Enumeration of all clocks states */
+ enum clocks_state {
+ 	CLOCKS_STATE_INVALID = 0,
+@@ -110,10 +56,6 @@ struct state_dependent_clocks {
+ 	uint32_t pixel_clk_khz;
+ };
+ 
+-struct display_clock_state {
+-	uint32_t DFS_BYPASS_ACTIVE:1;
+-};
+-
+ struct display_clock;
+ 
+ struct display_clock *dal_display_clock_dce112_create(
+@@ -126,18 +68,9 @@ struct display_clock *dal_display_clock_dce80_create(
+ 	struct dc_context *ctx);
+ 
+ void dal_display_clock_destroy(struct display_clock **to_destroy);
+-bool dal_display_clock_validate(
+-	struct display_clock *disp_clk,
+-	struct min_clock_params *params);
+-uint32_t dal_display_clock_calculate_min_clock(
+-	struct display_clock *disp_clk,
+-	uint32_t path_num,
+-	struct min_clock_params *params);
+-uint32_t dal_display_clock_get_validation_clock(struct display_clock *disp_clk);
+ void dal_display_clock_set_clock(
+ 	struct display_clock *disp_clk,
+ 	uint32_t requested_clock_khz);
+-uint32_t dal_display_clock_get_clock(struct display_clock *disp_clk);
+ bool dal_display_clock_get_min_clocks_state(
+ 	struct display_clock *disp_clk,
+ 	enum clocks_state *clocks_state);
+@@ -150,26 +83,8 @@ bool dal_display_clock_set_min_clocks_state(
+ 	enum clocks_state clocks_state);
+ uint32_t dal_display_clock_get_dp_ref_clk_frequency(
+ 	struct display_clock *disp_clk);
+-/*the second parameter of "switchreferenceclock" is
+- * a dummy argument for all pre dce 6.0 versions*/
+-void dal_display_clock_switch_reference_clock(
+-	struct display_clock *disp_clk,
+-	bool use_external_ref_clk,
+-	uint32_t requested_clock_khz);
+-void dal_display_clock_set_dp_ref_clock_source(
+-	struct display_clock *disp_clk,
+-	enum clock_source_id clk_src);
+ void dal_display_clock_store_max_clocks_state(
+ 	struct display_clock *disp_clk,
+ 	enum clocks_state max_clocks_state);
+-void dal_display_clock_set_clock_state(
+-	struct display_clock *disp_clk,
+-	struct display_clock_state clk_state);
+-struct display_clock_state dal_display_clock_get_clock_state(
+-	struct display_clock *disp_clk);
+-uint32_t dal_display_clock_get_dfs_bypass_threshold(
+-	struct display_clock *disp_clk);
+-void dal_display_clock_invalid_clock_state(
+-	struct display_clock *disp_clk);
+ 
+ #endif /* __DISPLAY_CLOCK_INTERFACE_H__ */
+-- 
+2.7.4
+

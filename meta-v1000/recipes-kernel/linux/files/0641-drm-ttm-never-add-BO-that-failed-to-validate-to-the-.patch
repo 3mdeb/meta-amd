@@ -1,0 +1,66 @@
+From 1920b7de91b668f19d75af63ca7466e7a48b475a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Nicolai=20H=C3=A4hnle?= <nicolai.haehnle@amd.com>
+Date: Tue, 14 Feb 2017 09:37:12 +0100
+Subject: [PATCH 0641/2094] drm/ttm: never add BO that failed to validate to
+ the LRU list
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fixes a potential race condition in amdgpu that looks as follows:
+
+Task 1: attempt ttm_bo_init, but ttm_bo_validate fails
+Task 1: add BO to global list anyway
+Task 2: grabs hold of the BO, waits on its reservation lock
+Task 1: releases its reference of the BO; never gives up the
+        reservation lock
+
+The patch "drm/amdgpu: fix a potential deadlock in
+amdgpu_bo_create_restricted()" attempts to fix that by releasing
+the reservation lock in amdgpu code; unfortunately, it introduces
+a use-after-free when this race _doesn't_ happen.
+
+This patch should fix the race properly by never adding the BO
+to the global list in the first place.
+
+Cc: zhoucm1 <david1.zhou@amd.com>
+Signed-off-by: Nicolai Hähnle <nicolai.haehnle@amd.com>
+Tested-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/ttm/ttm_bo.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index da019a3..fe21e72 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -1214,18 +1214,20 @@ int ttm_bo_init(struct ttm_bo_device *bdev,
+ 	if (likely(!ret))
+ 		ret = ttm_bo_validate(bo, placement, interruptible, false);
+ 
+-	if (!resv) {
++	if (!resv)
+ 		ttm_bo_unreserve(bo);
+ 
+-	} else if (!(bo->mem.placement & TTM_PL_FLAG_NO_EVICT)) {
++	if (unlikely(ret)) {
++		ttm_bo_unref(&bo);
++		return ret;
++	}
++
++	if (resv && !(bo->mem.placement & TTM_PL_FLAG_NO_EVICT)) {
+ 		spin_lock(&bo->glob->lru_lock);
+ 		ttm_bo_add_to_lru(bo);
+ 		spin_unlock(&bo->glob->lru_lock);
+ 	}
+ 
+-	if (unlikely(ret))
+-		ttm_bo_unref(&bo);
+-
+ 	return ret;
+ }
+ EXPORT_SYMBOL(ttm_bo_init);
+-- 
+2.7.4
+

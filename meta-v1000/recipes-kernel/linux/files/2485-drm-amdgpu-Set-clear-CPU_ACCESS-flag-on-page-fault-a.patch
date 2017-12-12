@@ -1,0 +1,112 @@
+From 2abe6ac1a0eb598111e3c8fe6e808401bcc362f4 Mon Sep 17 00:00:00 2001
+From: John Brooks <john@fastquake.com>
+Date: Fri, 30 Jun 2017 11:31:08 -0400
+Subject: [PATCH 2485/2500] drm/amdgpu: Set/clear CPU_ACCESS flag on page fault
+ and move to VRAM
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a BO is moved to VRAM, clear AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED.
+This allows it to potentially later move to invisible VRAM if the CPU
+does not access it again.
+
+Setting the CPU_ACCESS flag in amdgpu_bo_fault_reserve_notify() also means
+that we can remove the loop to restrict lpfn to the end of visible VRAM,
+because amdgpu_ttm_placement_init() will do it for us.
+
+v3 [Michel Dänzer]
+* Use AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED instead of a new flag
+  (Christian König)
+* Clear flag in amdgpu_bo_move instead of amdgpu_move_ram_vram
+  (Christian)
+* Explicitly mention amdgpu_bo_fault_reserve_notify in amdgpu_bo_move
+* Also clear flag in amdgpu_bo_create_restricted
+
+Suggested-by: Michel Dänzer <michel.daenzer@amd.com>
+Signed-off-by: John Brooks <john@fastquake.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Michel Dänzer <michel.daenzer@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+
+Change-Id: Icd1e22ad6a4412dd2a4a640bb1b6349d591784f7
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 20 ++++++++++----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    |  9 +++++++++
+ 2 files changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index c1700ce..6fdadff 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -482,6 +482,10 @@ int amdgpu_bo_create_restricted(struct amdgpu_device *adev,
+ 		amdgpu_bo_unreserve(bo);
+ 	}
+ 
++	/* Treat CPU_ACCESS_REQUIRED only as a hint if given by UMD */
++	if (type == ttm_bo_type_device)
++		bo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
++
+ 	return 0;
+ 
+ fail_unreserve:
+@@ -995,13 +999,17 @@ int amdgpu_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->bdev);
+ 	struct amdgpu_bo *abo;
+-	unsigned long offset, size, lpfn;
+-	int i, r;
++	unsigned long offset, size;
++	int r;
+ 
+ 	if (!amdgpu_ttm_bo_is_amdgpu_bo(bo))
+ 		return 0;
+ 
+ 	abo = container_of(bo, struct amdgpu_bo, tbo);
++
++	/* Remember that this BO was accessed by the CPU */
++	abo->flags |= AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
++
+ 	if (bo->mem.mem_type != TTM_PL_VRAM)
+ 		return 0;
+ 
+@@ -1017,14 +1025,6 @@ int amdgpu_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
+ 	/* hurrah the memory is not visible ! */
+ 	atomic64_inc(&adev->num_vram_cpu_page_faults);
+ 	amdgpu_ttm_placement_from_domain(abo, AMDGPU_GEM_DOMAIN_VRAM);
+-	lpfn =	adev->mc.visible_vram_size >> PAGE_SHIFT;
+-	for (i = 0; i < abo->placement.num_placement; i++) {
+-		/* Force into visible VRAM */
+-		if ((abo->placements[i].flags & TTM_PL_FLAG_VRAM) &&
+-		    (!abo->placements[i].lpfn ||
+-		     abo->placements[i].lpfn > lpfn))
+-			abo->placements[i].lpfn = lpfn;
+-	}
+ 	r = ttm_bo_validate(bo, &abo->placement, false, false);
+ 	if (unlikely(r == -ENOMEM)) {
+ 		amdgpu_ttm_placement_from_domain(abo, AMDGPU_GEM_DOMAIN_GTT);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 56ade59..fc85d7c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -546,6 +546,15 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo,
+ 		}
+ 	}
+ 
++	if (bo->type == ttm_bo_type_device &&
++	    new_mem->mem_type == TTM_PL_VRAM &&
++	    old_mem->mem_type != TTM_PL_VRAM) {
++		/* amdgpu_bo_fault_reserve_notify will re-set this if the CPU
++		 * accesses the BO after it's moved.
++		 */
++		abo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
++	}
++
+ 	/* update statistics */
+ 	atomic64_add((u64)bo->num_pages << PAGE_SHIFT, &adev->num_bytes_moved);
+ 	return 0;
+-- 
+2.7.4
+

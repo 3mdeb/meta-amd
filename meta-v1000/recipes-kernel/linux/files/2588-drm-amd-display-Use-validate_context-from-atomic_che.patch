@@ -1,0 +1,243 @@
+From 29202b0273f1c94b0c9797d6c64a14be820245d7 Mon Sep 17 00:00:00 2001
+From: Harry Wentland <harry.wentland@amd.com>
+Date: Wed, 28 Jun 2017 13:23:04 -0400
+Subject: [PATCH 2588/2831] drm/amd/display: Use validate_context from
+ atomic_check in commit
+
+Change-Id: Ida1fba58e640e14f81a626309e8906f9d526ee75
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_types.c    | 18 ++++--
+ drivers/gpu/drm/amd/display/dc/core/dc.c           | 71 +++++++---------------
+ drivers/gpu/drm/amd/display/dc/core/dc_stream.c    |  6 +-
+ drivers/gpu/drm/amd/display/dc/dc.h                |  5 +-
+ 4 files changed, 40 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+index 4ad2520..5dc9d3a 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+@@ -2751,6 +2751,7 @@ void amdgpu_dm_atomic_commit_tail(
+ 					new_stream = dm_state->set[j].stream;
+ 					break;
+ 				}
++
+ 			/*
+ 			 * this loop saves set mode crtcs
+ 			 * we needed to enable vblanks once all
+@@ -2809,7 +2810,6 @@ void amdgpu_dm_atomic_commit_tail(
+ 			dm_error("%s: Failed to update stream scaling!\n", __func__);
+ 	}
+ 
+-
+ 	/*
+ 	 * Add streams after required streams from new and replaced streams
+ 	 * are removed from freesync module
+@@ -2837,15 +2837,19 @@ void amdgpu_dm_atomic_commit_tail(
+ 	}
+ 
+ 	/* DC is optimized not to do anything if 'streams' didn't change. */
+-	WARN_ON(!dc_commit_validation_set(dm->dc, dm_state->set,
+-					  dm_state->set_count));
++	WARN_ON(!dc_commit_context(dm->dc, dm_state->context));
+ 
+ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
+ 		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 
+-		if (acrtc->stream != NULL)
+-			acrtc->otg_inst =
+-				dc_stream_get_status(acrtc->stream)->primary_otg_inst;
++		if (acrtc->stream != NULL) {
++			const struct dc_stream_status *status = dc_stream_get_status(acrtc->stream);
++
++			if (!status)
++				DC_ERR("got no status for stream %p on acrtc%p\n", acrtc->stream, acrtc);
++			else
++				acrtc->otg_inst = status->primary_otg_inst;
++		}
+ 	}
+ 
+ 	for (i = 0; i < new_crtcs_count; i++) {
+@@ -3028,6 +3032,7 @@ static uint32_t update_in_val_sets_stream(
+ 	} else {
+ 		/* update. relase old stream */
+ 		dc_stream_release(old_stream);
++
+ 	}
+ 
+ 	return set_count;
+@@ -3208,6 +3213,7 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 						__func__, acrtc->base.base.id);
+ 				break;
+ 			}
++			new_stream->priv = acrtc;
+ 
+ 			new_streams[new_stream_count] = new_stream;
+ 			dm_state->set_count = update_in_val_sets_stream(
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 8817fca..3a0606a 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -841,18 +841,17 @@ static void program_timing_sync(
+ 	}
+ }
+ 
+-static bool set_changed(
++static bool context_changed(
+ 		struct core_dc *dc,
+-		const struct dc_validation_set set[],
+-		uint8_t set_count)
++		struct validate_context *context)
+ {
+ 	uint8_t i;
+ 
+-	if (set_count != dc->current_context->stream_count)
++	if (context->stream_count != dc->current_context->stream_count)
+ 		return true;
+ 
+ 	for (i = 0; i < dc->current_context->stream_count; i++) {
+-		if (&dc->current_context->streams[i]->public != set[i].stream)
++		if (&dc->current_context->streams[i]->public != &context->streams[i]->public)
+ 			return true;
+ 	}
+ 
+@@ -915,55 +914,37 @@ bool dc_enable_stereo(
+ }
+ 
+ /* TODO operate on validation set (or something like it) */
+-bool dc_commit_validation_set(
+-	const struct dc *dc,
+-	const struct dc_validation_set set[],
+-	uint8_t set_count)
++bool dc_commit_context(struct dc *dc, struct validate_context *context)
+ {
+ 	struct core_dc *core_dc = DC_TO_CORE(dc);
+ 	struct dc_bios *dcb = core_dc->ctx->dc_bios;
+ 	enum dc_status result = DC_ERROR_UNEXPECTED;
+-	struct validate_context *context;
+ 	struct pipe_ctx *pipe;
+ 	int i, j, k, l;
+ 
+-	/* TODO check validation set changed */
+-	if (false == set_changed(core_dc, set, set_count))
++	if (!context)
++		dm_logger_write(core_dc->ctx->logger, LOG_ERROR,
++				"%s: dc_commit_context with no context!\n",
++				__func__);
++
++	if (false == context_changed(core_dc, context))
+ 		return DC_OK;
+ 
+ 	dm_logger_write(core_dc->ctx->logger, LOG_DC, "%s: %d streams\n",
+-				__func__, set_count);
+-
+-	for (i = 0; i < set_count; i++)
+-		dc_stream_log(set[i].stream,
+-			      core_dc->ctx->logger,
+-			      LOG_DC);
++				__func__, context->stream_count);
+ 
+-	context = dm_alloc(sizeof(struct validate_context));
+-	if (context == NULL)
+-		goto context_alloc_fail;
++	for (i = 0; i < context->stream_count; i++) {
++		const struct dc_stream *stream = &context->streams[i]->public;
+ 
+-	/* TODO no need for validation. just rebuild context */
+-	/* TODO check context is created deterministically */
+-	result = core_dc->res_pool->funcs->validate_with_context(core_dc, set,
+-								 set_count,
+-								 context,
+-								 core_dc->current_context);
+-	if (result != DC_OK) {
+-		dm_logger_write(core_dc->ctx->logger, LOG_ERROR,
+-					"%s: Context validation failed! dc_status:%d\n",
+-					__func__,
+-					result);
+-		BREAK_TO_DEBUGGER();
+-		dc_resource_validate_ctx_destruct(context);
+-		goto fail;
++		dc_stream_log(stream,
++				core_dc->ctx->logger,
++				LOG_DC);
+ 	}
+ 
+ 	if (!dcb->funcs->is_accelerated_mode(dcb))
+ 		core_dc->hwss.enable_accelerated_mode(core_dc);
+ 
+-	if (result == DC_OK)
+-		result = core_dc->hwss.apply_ctx_to_hw(core_dc, context);
++	result = core_dc->hwss.apply_ctx_to_hw(core_dc, context);
+ 
+ 	program_timing_sync(core_dc, context);
+ 
+@@ -1000,17 +981,8 @@ bool dc_commit_validation_set(
+ 				context->streams[i]->public.timing.pix_clk_khz);
+ 	}
+ 
+-	dc_resource_validate_ctx_destruct(core_dc->current_context);
+-	dm_free(core_dc->current_context);
+-
+-	core_dc->current_context = context;
+-
+-	return (result == DC_OK);
+-
+-fail:
+-	dm_free(context);
++	dc_resource_validate_ctx_copy_construct(context, core_dc->current_context);
+ 
+-context_alloc_fail:
+ 	return (result == DC_OK);
+ }
+ 
+@@ -1631,7 +1603,10 @@ void dc_update_surfaces_and_stream(struct dc *dc,
+ 			if (update_type == UPDATE_TYPE_FAST)
+ 				continue;
+ 
+-			if (srf_updates[i].in_transfer_func)
++			/* TODO find out why check is false */
++			/* TODO with this still not programming some color stuff... panel is dark-ish */
++			/*if (is_new_pipe_surface ||
++					srf_updates[i].in_transfer_func)*/
+ 				core_dc->hwss.set_input_transfer_func(
+ 						pipe_ctx, pipe_ctx->surface);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+index 4ba446d..ead7b63 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+@@ -164,9 +164,11 @@ const struct dc_stream_status *dc_stream_get_status(
+ 	struct core_stream *stream = DC_STREAM_TO_CORE(dc_stream);
+ 	struct core_dc *dc = DC_TO_CORE(stream->ctx->dc);
+ 
+-	for (i = 0; i < dc->current_context->stream_count; i++)
+-		if (stream == dc->current_context->streams[i])
++	for (i = 0; i < dc->current_context->stream_count; i++) {
++		if (stream == dc->current_context->streams[i]) {
+ 			return &dc->current_context->stream_status[i];
++		}
++	}
+ 
+ 	return NULL;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 7edfd11..fe11ae9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -602,10 +602,7 @@ void dc_resource_validate_ctx_destruct(struct validate_context *context);
+  *   Phy, Encoder, Timing Generator are programmed and enabled.
+  *   New streams are enabled with blank stream; no memory read.
+  */
+-bool dc_commit_validation_set(
+-		const struct dc *dc,
+-		const struct dc_validation_set set[],
+-		uint8_t set_count);
++bool dc_commit_context(struct dc *dc, struct validate_context *context);
+ 
+ /*
+  * Set up streams and links associated to drive sinks
+-- 
+2.7.4
+

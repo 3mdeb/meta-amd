@@ -1,0 +1,245 @@
+From 7dc1d0098c52387c12503924268fd2ceb3c46e0a Mon Sep 17 00:00:00 2001
+From: ozeng <oak.zeng@amd.com>
+Date: Tue, 7 Feb 2017 15:40:14 -0600
+Subject: [PATCH 1946/2094] drm/amdkfd: CP queue priority controls
+
+Translate queue priority into pipe priority and SPI priority and write
+to memory queue descriptors. The priority values are used to perform
+queue and pipe arbitration.
+
+Change-Id: Icfef4c024d1d99a2b631f27dc7bf703ab366ad6c
+Signed-off-by: Oak Zeng <Oak.Zeng@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c     | 40 ++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h     |  3 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c | 21 +++++++++----
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c  | 16 ++++++++--
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h            | 18 +++++++++++
+ 5 files changed, 88 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c
+index 99c2535..5a5dd2a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c
+@@ -23,6 +23,46 @@
+ 
+ #include "kfd_priv.h"
+ 
++/* Mapping queue priority to pipe priority, indexed by queue priority */
++int pipe_priority_map[] = {
++	KFD_PIPE_PRIORITY_CS_LOW,
++	KFD_PIPE_PRIORITY_CS_LOW,
++	KFD_PIPE_PRIORITY_CS_LOW,
++	KFD_PIPE_PRIORITY_CS_LOW,
++	KFD_PIPE_PRIORITY_CS_LOW,
++	KFD_PIPE_PRIORITY_CS_LOW,
++	KFD_PIPE_PRIORITY_CS_LOW,
++	KFD_PIPE_PRIORITY_CS_MEDIUM,
++	KFD_PIPE_PRIORITY_CS_MEDIUM,
++	KFD_PIPE_PRIORITY_CS_MEDIUM,
++	KFD_PIPE_PRIORITY_CS_MEDIUM,
++	KFD_PIPE_PRIORITY_CS_HIGH,
++	KFD_PIPE_PRIORITY_CS_HIGH,
++	KFD_PIPE_PRIORITY_CS_HIGH,
++	KFD_PIPE_PRIORITY_CS_HIGH,
++	KFD_PIPE_PRIORITY_CS_HIGH
++};
++
++/* Mapping queue priority to SPI priority, indexed by queue priority */
++int spi_priority_map[] = {
++	KFD_SPI_PRIORITY_EXTRA_LOW,
++	KFD_SPI_PRIORITY_EXTRA_LOW,
++	KFD_SPI_PRIORITY_EXTRA_LOW,
++	KFD_SPI_PRIORITY_EXTRA_LOW,
++	KFD_SPI_PRIORITY_LOW,
++	KFD_SPI_PRIORITY_LOW,
++	KFD_SPI_PRIORITY_LOW,
++	KFD_SPI_PRIORITY_LOW,
++	KFD_SPI_PRIORITY_MEDIUM,
++	KFD_SPI_PRIORITY_MEDIUM,
++	KFD_SPI_PRIORITY_MEDIUM,
++	KFD_SPI_PRIORITY_MEDIUM,
++	KFD_SPI_PRIORITY_HIGH,
++	KFD_SPI_PRIORITY_HIGH,
++	KFD_SPI_PRIORITY_HIGH,
++	KFD_SPI_PRIORITY_HIGH
++};
++
+ struct mqd_manager *mqd_manager_init(enum KFD_MQD_TYPE type,
+ 					struct kfd_dev *dev)
+ {
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+index 8972bcf..6f33b79 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+@@ -59,7 +59,8 @@
+  * per KFD_MQD_TYPE for each device.
+  *
+  */
+-
++extern int pipe_priority_map[];
++extern int spi_priority_map[];
+ struct mqd_manager {
+ 	int	(*init_mqd)(struct mqd_manager *mm, void **mqd,
+ 			struct kfd_mem_obj **mqd_mem_obj, uint64_t *gart_addr,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+index 43a0aa3..85c184f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -28,6 +28,7 @@
+ #include "cik_regs.h"
+ #include "cik_structs.h"
+ #include "oss/oss_2_4_sh_mask.h"
++#include "asic_reg/gca/gfx_7_2_sh_mask.h"
+ 
+ #define AQL_ENABLE 1
+ 
+@@ -93,6 +94,16 @@ static void update_cu_mask(struct mqd_manager *mm, void *mqd,
+ 		m->compute_static_thread_mgmt_se3);
+ }
+ 
++static void set_priority(struct cik_mqd *m, struct queue_properties *q)
++{
++	m->cp_hqd_pipe_priority = pipe_priority_map[q->priority];
++	m->cp_hqd_queue_priority = q->priority;
++	m->compute_pgm_rsrc1 = (m->compute_pgm_rsrc1 &
++				(~COMPUTE_PGM_RSRC1__PRIORITY_MASK)) |
++				(spi_priority_map[q->priority] <<
++				COMPUTE_PGM_RSRC1__PRIORITY__SHIFT);
++}
++
+ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 		struct kfd_mem_obj **mqd_mem_obj, uint64_t *gart_addr,
+ 		struct queue_properties *q)
+@@ -101,8 +112,6 @@ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 	struct cik_mqd *m;
+ 	int retval;
+ 
+-	BUG_ON(!mm || !q || !mqd);
+-
+ 	pr_debug("kfd: In func %s\n", __func__);
+ 
+ 	retval = kfd_gtt_sa_allocate(mm->dev, sizeof(struct cik_mqd),
+@@ -147,8 +156,7 @@ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 	 * 1 = CS_MEDIUM (typically between HP3D and GFX
+ 	 * 2 = CS_HIGH (typically above HP3D)
+ 	 */
+-	m->cp_hqd_pipe_priority = 1;
+-	m->cp_hqd_queue_priority = 15;
++	set_priority(m, q);
+ 
+ 	if (q->format == KFD_QUEUE_FORMAT_AQL)
+ 		m->cp_hqd_iq_rptr = AQL_ENABLE;
+@@ -264,6 +272,7 @@ static int __update_mqd(struct mqd_manager *mm, void *mqd,
+ 	}
+ 
+ 	update_cu_mask(mm, mqd, q);
++	set_priority(m, q);
+ 
+ 	m->cp_hqd_active = 0;
+ 	q->is_active = false;
+@@ -425,8 +434,7 @@ static int init_mqd_hiq(struct mqd_manager *mm, void **mqd,
+ 	 * 1 = CS_MEDIUM (typically between HP3D and GFX
+ 	 * 2 = CS_HIGH (typically above HP3D)
+ 	 */
+-	m->cp_hqd_pipe_priority = 1;
+-	m->cp_hqd_queue_priority = 15;
++	set_priority(m, q);
+ 
+ 	*mqd = m;
+ 	if (gart_addr)
+@@ -476,6 +484,7 @@ static int update_mqd_hiq(struct mqd_manager *mm, void *mqd,
+ 		q->is_active = true;
+ 	}
+ 
++	set_priority(m, q);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+index 2d06221..39eaeb0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -29,6 +29,7 @@
+ #include "asic_reg/gca/gfx_8_0_sh_mask.h"
+ #include "asic_reg/gca/gfx_8_0_enum.h"
+ #include "oss/oss_3_0_sh_mask.h"
++
+ #define CP_MQD_CONTROL__PRIV_STATE__SHIFT 0x8
+ 
+ static inline struct vi_mqd *get_mqd(void *mqd)
+@@ -93,6 +94,16 @@ static void update_cu_mask(struct mqd_manager *mm, void *mqd,
+ 		m->compute_static_thread_mgmt_se3);
+ }
+ 
++static void set_priority(struct vi_mqd *m, struct queue_properties *q)
++{
++	m->cp_hqd_pipe_priority = pipe_priority_map[q->priority];
++	m->cp_hqd_queue_priority = q->priority;
++	m->compute_pgm_rsrc1 = (m->compute_pgm_rsrc1 &
++				(~COMPUTE_PGM_RSRC1__PRIORITY_MASK)) |
++				(spi_priority_map[q->priority] <<
++				COMPUTE_PGM_RSRC1__PRIORITY__SHIFT);
++}
++
+ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 			struct kfd_mem_obj **mqd_mem_obj, uint64_t *gart_addr,
+ 			struct queue_properties *q)
+@@ -131,9 +142,7 @@ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 			1 << CP_HQD_QUANTUM__QUANTUM_SCALE__SHIFT |
+ 			10 << CP_HQD_QUANTUM__QUANTUM_DURATION__SHIFT;
+ 
+-	m->cp_hqd_pipe_priority = 1;
+-	m->cp_hqd_queue_priority = 15;
+-
++	set_priority(m, q);
+ 	m->cp_hqd_eop_rptr = 1 << CP_HQD_EOP_RPTR__INIT_FETCHER__SHIFT;
+ 
+ 	if (q->format == KFD_QUEUE_FORMAT_AQL)
+@@ -250,6 +259,7 @@ static int __update_mqd(struct mqd_manager *mm, void *mqd,
+ 			mtype << CP_HQD_CTX_SAVE_CONTROL__MTYPE__SHIFT;
+ 
+ 	update_cu_mask(mm, mqd, q);
++	set_priority(m, q);
+ 
+ 	m->cp_hqd_active = 0;
+ 	q->is_active = false;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index de34698..122e9e4 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -352,6 +352,11 @@ enum kfd_queue_format {
+ 	KFD_QUEUE_FORMAT_AQL
+ };
+ 
++enum KFD_QUEUE_PRIORITY {
++	KFD_QUEUE_PRIORITY_MINIMUM = 0,
++	KFD_QUEUE_PRIORITY_MAXIMUM = 15
++};
++
+ /**
+  * struct queue_properties
+  *
+@@ -487,6 +492,19 @@ enum KFD_MQD_TYPE {
+ 	KFD_MQD_TYPE_MAX
+ };
+ 
++enum KFD_PIPE_PRIORITY {
++	KFD_PIPE_PRIORITY_CS_LOW = 0,
++	KFD_PIPE_PRIORITY_CS_MEDIUM,
++	KFD_PIPE_PRIORITY_CS_HIGH
++};
++
++enum KFD_SPI_PRIORITY {
++	KFD_SPI_PRIORITY_EXTRA_LOW = 0,
++	KFD_SPI_PRIORITY_LOW,
++	KFD_SPI_PRIORITY_MEDIUM,
++	KFD_SPI_PRIORITY_HIGH
++};
++
+ struct scheduling_resources {
+ 	unsigned int vmid_mask;
+ 	enum kfd_queue_type type;
+-- 
+2.7.4
+

@@ -1,0 +1,226 @@
+From 0dccf62bcd6cf1f87dd44a2e389c5c9598e3fb4c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 10 May 2017 20:06:58 +0200
+Subject: [PATCH 1560/2094] drm/amdgpu: fix fundamental suspend/resume issue
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reinitializing the VM manager during suspend/resume is a very very bad
+idea since all the VMs are still active and kicking.
+
+This can lead to random VM faults after resume when new processes
+become the same client ID assigned.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Cc: stable@vger.kernel.org
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 22 +++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c  | 15 ++-------------
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c  | 15 ++-------------
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c  | 15 ++-------------
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c  | 16 ++--------------
+ 6 files changed, 30 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index de8b31d..7a96d52b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -815,6 +815,7 @@ void amdgpu_vm_reset_id(struct amdgpu_device *adev, unsigned vmhub,
+ 	struct amdgpu_vm_id_manager *id_mgr = &adev->vm_manager.id_mgr[vmhub];
+ 	struct amdgpu_vm_id *id = &id_mgr->ids[vmid];
+ 
++	atomic64_set(&id->owner, 0);
+ 	id->gds_base = 0;
+ 	id->gds_size = 0;
+ 	id->gws_base = 0;
+@@ -824,6 +825,26 @@ void amdgpu_vm_reset_id(struct amdgpu_device *adev, unsigned vmhub,
+ }
+ 
+ /**
++ * amdgpu_vm_reset_all_id - reset VMID to zero
++ *
++ * @adev: amdgpu device structure
++ *
++ * Reset VMID to force flush on next use
++ */
++void amdgpu_vm_reset_all_ids(struct amdgpu_device *adev)
++{
++	unsigned i, j;
++
++	for (i = 0; i < AMDGPU_MAX_VMHUBS; ++i) {
++		struct amdgpu_vm_id_manager *id_mgr =
++			&adev->vm_manager.id_mgr[i];
++
++		for (j = 1; j < id_mgr->num_ids; ++j)
++			amdgpu_vm_reset_id(adev, i, j);
++	}
++}
++
++/**
+  * amdgpu_vm_bo_find - find the bo_va for a specific vm & bo
+  *
+  * @vm: requested vm
+@@ -2418,7 +2439,6 @@ void amdgpu_vm_manager_init(struct amdgpu_device *adev)
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; ++i)
+ 		adev->vm_manager.seqno[i] = 0;
+ 
+-
+ 	atomic_set(&adev->vm_manager.vm_pte_next_ring, 0);
+ 	atomic64_set(&adev->vm_manager.client_counter, 0);
+ 	spin_lock_init(&adev->vm_manager.prt_lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 673d05c..27546df 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -209,6 +209,7 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ int amdgpu_vm_flush(struct amdgpu_ring *ring, struct amdgpu_job *job);
+ void amdgpu_vm_reset_id(struct amdgpu_device *adev, unsigned vmhub,
+ 			unsigned vmid);
++void amdgpu_vm_reset_all_ids(struct amdgpu_device *adev);
+ int amdgpu_vm_update_directories(struct amdgpu_device *adev,
+ 				 struct amdgpu_vm *vm);
+ int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+index a572979..d860939 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+@@ -950,10 +950,6 @@ static int gmc_v6_0_suspend(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (adev->vm_manager.enabled) {
+-		gmc_v6_0_vm_fini(adev);
+-		adev->vm_manager.enabled = false;
+-	}
+ 	gmc_v6_0_hw_fini(adev);
+ 
+ 	return 0;
+@@ -968,16 +964,9 @@ static int gmc_v6_0_resume(void *handle)
+ 	if (r)
+ 		return r;
+ 
+-	if (!adev->vm_manager.enabled) {
+-		r = gmc_v6_0_vm_init(adev);
+-		if (r) {
+-			dev_err(adev->dev, "vm manager initialization failed (%d).\n", r);
+-			return r;
+-		}
+-		adev->vm_manager.enabled = true;
+-	}
++	amdgpu_vm_reset_all_ids(adev);
+ 
+-	return r;
++	return 0;
+ }
+ 
+ static bool gmc_v6_0_is_idle(void *handle)
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index a9083a1..2750e5c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -1117,10 +1117,6 @@ static int gmc_v7_0_suspend(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (adev->vm_manager.enabled) {
+-		gmc_v7_0_vm_fini(adev);
+-		adev->vm_manager.enabled = false;
+-	}
+ 	gmc_v7_0_hw_fini(adev);
+ 
+ 	return 0;
+@@ -1135,16 +1131,9 @@ static int gmc_v7_0_resume(void *handle)
+ 	if (r)
+ 		return r;
+ 
+-	if (!adev->vm_manager.enabled) {
+-		r = gmc_v7_0_vm_init(adev);
+-		if (r) {
+-			dev_err(adev->dev, "vm manager initialization failed (%d).\n", r);
+-			return r;
+-		}
+-		adev->vm_manager.enabled = true;
+-	}
++	amdgpu_vm_reset_all_ids(adev);
+ 
+-	return r;
++	return 0;
+ }
+ 
+ static bool gmc_v7_0_is_idle(void *handle)
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index 4ac9978..f56b408 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -1209,10 +1209,6 @@ static int gmc_v8_0_suspend(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (adev->vm_manager.enabled) {
+-		gmc_v8_0_vm_fini(adev);
+-		adev->vm_manager.enabled = false;
+-	}
+ 	gmc_v8_0_hw_fini(adev);
+ 
+ 	return 0;
+@@ -1227,16 +1223,9 @@ static int gmc_v8_0_resume(void *handle)
+ 	if (r)
+ 		return r;
+ 
+-	if (!adev->vm_manager.enabled) {
+-		r = gmc_v8_0_vm_init(adev);
+-		if (r) {
+-			dev_err(adev->dev, "vm manager initialization failed (%d).\n", r);
+-			return r;
+-		}
+-		adev->vm_manager.enabled = true;
+-	}
++	amdgpu_vm_reset_all_ids(adev);
+ 
+-	return r;
++	return 0;
+ }
+ 
+ static bool gmc_v8_0_is_idle(void *handle)
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 627d442..1bc8292 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -808,10 +808,6 @@ static int gmc_v9_0_suspend(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+-	if (adev->vm_manager.enabled) {
+-		gmc_v9_0_vm_fini(adev);
+-		adev->vm_manager.enabled = false;
+-	}
+ 	gmc_v9_0_hw_fini(adev);
+ 
+ 	return 0;
+@@ -826,17 +822,9 @@ static int gmc_v9_0_resume(void *handle)
+ 	if (r)
+ 		return r;
+ 
+-	if (!adev->vm_manager.enabled) {
+-		r = gmc_v9_0_vm_init(adev);
+-		if (r) {
+-			dev_err(adev->dev,
+-				"vm manager initialization failed (%d).\n", r);
+-			return r;
+-		}
+-		adev->vm_manager.enabled = true;
+-	}
++	amdgpu_vm_reset_all_ids(adev);
+ 
+-	return r;
++	return 0;
+ }
+ 
+ static bool gmc_v9_0_is_idle(void *handle)
+-- 
+2.7.4
+

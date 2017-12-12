@@ -1,0 +1,364 @@
+From 12d9dcd916a7aba3232c370ebf345a8dc84c342a Mon Sep 17 00:00:00 2001
+From: Ding Wang <Ding.Wang@amd.com>
+Date: Tue, 25 Apr 2017 10:03:27 -0400
+Subject: [PATCH 1375/2094] drm/amd/display: Add function to set dither option
+
+Signed-off-by: Ding Wang <Ding.Wang@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |  41 ++++++++
+ drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c   |   4 +-
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c  | 110 +++++++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/dc.h                |   3 +
+ .../drm/amd/display/dc/dce110/dce110_resource.c    |  48 +--------
+ .../drm/amd/display/dc/dce110/dce110_resource.h    |   4 -
+ .../drm/amd/display/dc/dce112/dce112_resource.c    |   2 +-
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h    |   4 -
+ drivers/gpu/drm/amd/display/dc/inc/resource.h      |   2 +
+ 9 files changed, 160 insertions(+), 58 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 3798663..738acf0 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -363,6 +363,44 @@ static void set_test_pattern(
+ 			cust_pattern_size);
+ }
+ 
++void set_dither_option(const struct dc_stream *dc_stream,
++		enum dc_dither_option option)
++{
++	struct core_stream *stream = DC_STREAM_TO_CORE(dc_stream);
++	struct bit_depth_reduction_params params;
++	struct core_link *core_link = DC_LINK_TO_CORE(stream->status.link);
++	struct pipe_ctx *pipes =
++			core_link->dc->current_context->res_ctx.pipe_ctx;
++
++	memset(&params, 0, sizeof(params));
++	if (!stream)
++		return;
++	if (option > DITHER_OPTION_MAX)
++		return;
++	if (option == DITHER_OPTION_DEFAULT) {
++		switch (stream->public.timing.display_color_depth) {
++		case COLOR_DEPTH_666:
++			stream->public.dither_option = DITHER_OPTION_SPATIAL6;
++			break;
++		case COLOR_DEPTH_888:
++			stream->public.dither_option = DITHER_OPTION_SPATIAL8;
++			break;
++		case COLOR_DEPTH_101010:
++			stream->public.dither_option = DITHER_OPTION_SPATIAL10;
++			break;
++		default:
++			option = DITHER_OPTION_DISABLE;
++		}
++	} else {
++		stream->public.dither_option = option;
++	}
++	resource_build_bit_depth_reduction_params(stream,
++				&params);
++	stream->bit_depth_params = params;
++	pipes->opp->funcs->
++		opp_program_bit_depth_reduction(pipes->opp, &params);
++}
++
+ static void allocate_dc_stream_funcs(struct core_dc *core_dc)
+ {
+ 	core_dc->public.stream_funcs.stream_update_scaling = stream_update_scaling;
+@@ -380,6 +418,9 @@ static void allocate_dc_stream_funcs(struct core_dc *core_dc)
+ 	core_dc->public.stream_funcs.set_gamut_remap =
+ 			set_gamut_remap;
+ 
++	core_dc->public.stream_funcs.set_dither_option =
++			set_dither_option;
++
+ 	core_dc->public.link_funcs.set_drive_settings =
+ 			set_drive_settings;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+index 4b9d3f1..a0d1927 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+@@ -11,6 +11,7 @@
+ #include "dpcd_defs.h"
+ 
+ #include "core_dc.h"
++#include "resource.h"
+ 
+ /* maximum pre emphasis level allowed for each voltage swing level*/
+ static const enum dc_pre_emphasis voltage_swing_to_pre_emphasis[] = {
+@@ -2245,8 +2246,7 @@ static void set_crtc_test_pattern(struct core_link *link,
+ 	case DP_TEST_PATTERN_VIDEO_MODE:
+ 	{
+ 		/* restore bitdepth reduction */
+-		link->dc->res_pool->funcs->
+-			build_bit_depth_reduction_params(pipe_ctx->stream,
++		resource_build_bit_depth_reduction_params(pipe_ctx->stream,
+ 					&params);
+ 		pipe_ctx->stream->bit_depth_params = params;
+ 		pipe_ctx->opp->funcs->
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 43e5758..2de86f8 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -2246,3 +2246,113 @@ bool pipe_need_reprogram(
+ 
+ 	return false;
+ }
++
++void resource_build_bit_depth_reduction_params(const struct core_stream *stream,
++		struct bit_depth_reduction_params *fmt_bit_depth)
++{
++	enum dc_dither_option option = stream->public.dither_option;
++	enum dc_pixel_encoding pixel_encoding =
++			stream->public.timing.pixel_encoding;
++
++	memset(fmt_bit_depth, 0, sizeof(*fmt_bit_depth));
++
++	if (option == DITHER_OPTION_DISABLE)
++		return;
++
++	if (option == DITHER_OPTION_TRUN6) {
++		fmt_bit_depth->flags.TRUNCATE_ENABLED = 1;
++		fmt_bit_depth->flags.TRUNCATE_DEPTH = 0;
++	} else if (option == DITHER_OPTION_TRUN8 ||
++			option == DITHER_OPTION_TRUN8_SPATIAL6 ||
++			option == DITHER_OPTION_TRUN8_FM6) {
++		fmt_bit_depth->flags.TRUNCATE_ENABLED = 1;
++		fmt_bit_depth->flags.TRUNCATE_DEPTH = 1;
++	} else if (option == DITHER_OPTION_TRUN10        ||
++			option == DITHER_OPTION_TRUN10_SPATIAL6   ||
++			option == DITHER_OPTION_TRUN10_SPATIAL8   ||
++			option == DITHER_OPTION_TRUN10_FM8     ||
++			option == DITHER_OPTION_TRUN10_FM6     ||
++			option == DITHER_OPTION_TRUN10_SPATIAL8_FM6) {
++		fmt_bit_depth->flags.TRUNCATE_ENABLED = 1;
++		fmt_bit_depth->flags.TRUNCATE_DEPTH = 2;
++	}
++
++	/* special case - Formatter can only reduce by 4 bits at most.
++	 * When reducing from 12 to 6 bits,
++	 * HW recommends we use trunc with round mode
++	 * (if we did nothing, trunc to 10 bits would be used)
++	 * note that any 12->10 bit reduction is ignored prior to DCE8,
++	 * as the input was 10 bits.
++	 */
++	if (option == DITHER_OPTION_SPATIAL6_FRAME_RANDOM ||
++			option == DITHER_OPTION_SPATIAL6 ||
++			option == DITHER_OPTION_FM6) {
++		fmt_bit_depth->flags.TRUNCATE_ENABLED = 1;
++		fmt_bit_depth->flags.TRUNCATE_DEPTH = 2;
++		fmt_bit_depth->flags.TRUNCATE_MODE = 1;
++	}
++
++	/* spatial dither
++	 * note that spatial modes 1-3 are never used
++	 */
++	if (option == DITHER_OPTION_SPATIAL6_FRAME_RANDOM            ||
++			option == DITHER_OPTION_SPATIAL6 ||
++			option == DITHER_OPTION_TRUN10_SPATIAL6      ||
++			option == DITHER_OPTION_TRUN8_SPATIAL6) {
++		fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 1;
++		fmt_bit_depth->flags.SPATIAL_DITHER_DEPTH = 0;
++		fmt_bit_depth->flags.HIGHPASS_RANDOM = 1;
++		fmt_bit_depth->flags.RGB_RANDOM =
++				(pixel_encoding == PIXEL_ENCODING_RGB) ? 1 : 0;
++	} else if (option == DITHER_OPTION_SPATIAL8_FRAME_RANDOM            ||
++			option == DITHER_OPTION_SPATIAL8 ||
++			option == DITHER_OPTION_SPATIAL8_FM6        ||
++			option == DITHER_OPTION_TRUN10_SPATIAL8      ||
++			option == DITHER_OPTION_TRUN10_SPATIAL8_FM6) {
++		fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 1;
++		fmt_bit_depth->flags.SPATIAL_DITHER_DEPTH = 1;
++		fmt_bit_depth->flags.HIGHPASS_RANDOM = 1;
++		fmt_bit_depth->flags.RGB_RANDOM =
++				(pixel_encoding == PIXEL_ENCODING_RGB) ? 1 : 0;
++	} else if (option == DITHER_OPTION_SPATIAL10_FRAME_RANDOM ||
++			option == DITHER_OPTION_SPATIAL10 ||
++			option == DITHER_OPTION_SPATIAL10_FM8 ||
++			option == DITHER_OPTION_SPATIAL10_FM6) {
++		fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 1;
++		fmt_bit_depth->flags.SPATIAL_DITHER_DEPTH = 2;
++		fmt_bit_depth->flags.HIGHPASS_RANDOM = 1;
++		fmt_bit_depth->flags.RGB_RANDOM =
++				(pixel_encoding == PIXEL_ENCODING_RGB) ? 1 : 0;
++	}
++
++	if (option == DITHER_OPTION_SPATIAL6 ||
++			option == DITHER_OPTION_SPATIAL8 ||
++			option == DITHER_OPTION_SPATIAL10) {
++		fmt_bit_depth->flags.FRAME_RANDOM = 0;
++	} else {
++		fmt_bit_depth->flags.FRAME_RANDOM = 1;
++	}
++
++	//////////////////////
++	//// temporal dither
++	//////////////////////
++	if (option == DITHER_OPTION_FM6           ||
++			option == DITHER_OPTION_SPATIAL8_FM6     ||
++			option == DITHER_OPTION_SPATIAL10_FM6     ||
++			option == DITHER_OPTION_TRUN10_FM6     ||
++			option == DITHER_OPTION_TRUN8_FM6      ||
++			option == DITHER_OPTION_TRUN10_SPATIAL8_FM6) {
++		fmt_bit_depth->flags.FRAME_MODULATION_ENABLED = 1;
++		fmt_bit_depth->flags.FRAME_MODULATION_DEPTH = 0;
++	} else if (option == DITHER_OPTION_FM8        ||
++			option == DITHER_OPTION_SPATIAL10_FM8  ||
++			option == DITHER_OPTION_TRUN10_FM8) {
++		fmt_bit_depth->flags.FRAME_MODULATION_ENABLED = 1;
++		fmt_bit_depth->flags.FRAME_MODULATION_DEPTH = 1;
++	} else if (option == DITHER_OPTION_FM10) {
++		fmt_bit_depth->flags.FRAME_MODULATION_ENABLED = 1;
++		fmt_bit_depth->flags.FRAME_MODULATION_DEPTH = 2;
++	}
++
++	fmt_bit_depth->pixel_encoding = pixel_encoding;
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index dd8902d..87675f0 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -122,6 +122,9 @@ struct dc_stream_funcs {
+ 			const struct dc_stream **stream,
+ 			int num_streams,
+ 			const struct dc_static_screen_events *events);
++
++	void (*set_dither_option)(const struct dc_stream *stream,
++			enum dc_dither_option option);
+ };
+ 
+ struct link_training_settings;
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+index 122f2d0..5b2b41e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+@@ -775,50 +775,6 @@ static void get_pixel_clock_parameters(
+ 	}
+ }
+ 
+-void dce110_resource_build_bit_depth_reduction_params(
+-		const struct core_stream *stream,
+-		struct bit_depth_reduction_params *fmt_bit_depth)
+-{
+-	memset(fmt_bit_depth, 0, sizeof(*fmt_bit_depth));
+-
+-	/*TODO: Need to un-hardcode, refer to function with same name
+-	 * in dal2 hw_sequencer*/
+-
+-	fmt_bit_depth->flags.TRUNCATE_ENABLED = 0;
+-	fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 0;
+-	fmt_bit_depth->flags.FRAME_MODULATION_ENABLED = 0;
+-
+-	/* Diagnostics need consistent CRC of the image, that means
+-	 * dithering should not be enabled for Diagnostics. */
+-	if (IS_DIAG_DC(stream->ctx->dce_environment) == false) {
+-		switch (stream->public.timing.display_color_depth) {
+-		case COLOR_DEPTH_666:
+-			fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 1;
+-			fmt_bit_depth->flags.SPATIAL_DITHER_DEPTH = 0;
+-		break;
+-		case COLOR_DEPTH_888:
+-			fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 1;
+-			fmt_bit_depth->flags.SPATIAL_DITHER_DEPTH = 1;
+-		break;
+-		case COLOR_DEPTH_101010:
+-			fmt_bit_depth->flags.SPATIAL_DITHER_ENABLED = 1;
+-			fmt_bit_depth->flags.SPATIAL_DITHER_DEPTH = 2;
+-		break;
+-		default:
+-		break;
+-		}
+-		fmt_bit_depth->flags.RGB_RANDOM = 1;
+-		fmt_bit_depth->flags.HIGHPASS_RANDOM = 1;
+-		fmt_bit_depth->flags.TRUNCATE_ENABLED = 1;
+-		fmt_bit_depth->flags.TRUNCATE_DEPTH = 2;
+-
+-		fmt_bit_depth->pixel_encoding =
+-				stream->public.timing.pixel_encoding;
+-	}
+-
+-	return;
+-}
+-
+ enum dc_status dce110_resource_build_pipe_hw_param(struct pipe_ctx *pipe_ctx)
+ {
+ 	get_pixel_clock_parameters(pipe_ctx, &pipe_ctx->pix_clk_params);
+@@ -826,7 +782,7 @@ enum dc_status dce110_resource_build_pipe_hw_param(struct pipe_ctx *pipe_ctx)
+ 		pipe_ctx->clock_source,
+ 		&pipe_ctx->pix_clk_params,
+ 		&pipe_ctx->pll_settings);
+-	dce110_resource_build_bit_depth_reduction_params(pipe_ctx->stream,
++	resource_build_bit_depth_reduction_params(pipe_ctx->stream,
+ 			&pipe_ctx->stream->bit_depth_params);
+ 	pipe_ctx->stream->clamping.pixel_encoding = pipe_ctx->stream->public.timing.pixel_encoding;
+ 
+@@ -1171,8 +1127,6 @@ static const struct resource_funcs dce110_res_pool_funcs = {
+ 	.validate_guaranteed = dce110_validate_guaranteed,
+ 	.validate_bandwidth = dce110_validate_bandwidth,
+ 	.acquire_idle_pipe_for_layer = dce110_acquire_underlay,
+-	.build_bit_depth_reduction_params =
+-			dce110_resource_build_bit_depth_reduction_params
+ };
+ 
+ static bool underlay_create(struct dc_context *ctx, struct resource_pool *pool)
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.h b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.h
+index 0c357fd..8e2e85d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.h
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.h
+@@ -40,10 +40,6 @@ struct dce110_resource_pool {
+ 
+ enum dc_status dce110_resource_build_pipe_hw_param(struct pipe_ctx *pipe_ctx);
+ 
+-void dce110_resource_build_bit_depth_reduction_params(
+-		const struct core_stream *stream,
+-		struct bit_depth_reduction_params *fmt_bit_depth);
+-
+ struct resource_pool *dce110_create_resource_pool(
+ 	uint8_t num_virtual_links,
+ 	struct core_dc *dc,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+index 4de51a8..18c1b89 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+@@ -1062,7 +1062,7 @@ static const struct resource_funcs dce112_res_pool_funcs = {
+ 	.link_enc_create = dce112_link_encoder_create,
+ 	.validate_with_context = dce112_validate_with_context,
+ 	.validate_guaranteed = dce112_validate_guaranteed,
+-	.validate_bandwidth = dce112_validate_bandwidth
++	.validate_bandwidth = dce112_validate_bandwidth,
+ };
+ 
+ static void bw_calcs_data_update_from_pplib(struct core_dc *dc)
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index f3fe850..9e5e0ba 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -214,10 +214,6 @@ struct resource_funcs {
+ 			struct validate_context *context,
+ 			const struct resource_pool *pool,
+ 			struct core_stream *stream);
+-
+-	void (*build_bit_depth_reduction_params)(
+-			const struct core_stream *stream,
+-			struct bit_depth_reduction_params *fmt_bit_depth);
+ };
+ 
+ struct audio_support{
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/resource.h b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+index 89d34be..4e07b9f 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+@@ -160,5 +160,7 @@ bool pipe_need_reprogram(
+ 		struct pipe_ctx *pipe_ctx_old,
+ 		struct pipe_ctx *pipe_ctx);
+ 
++void resource_build_bit_depth_reduction_params(const struct core_stream *stream,
++		struct bit_depth_reduction_params *fmt_bit_depth);
+ 
+ #endif /* DRIVERS_GPU_DRM_AMD_DC_DEV_DC_INC_RESOURCE_H_ */
+-- 
+2.7.4
+

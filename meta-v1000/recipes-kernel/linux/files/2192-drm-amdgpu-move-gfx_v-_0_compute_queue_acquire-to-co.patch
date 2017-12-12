@@ -1,0 +1,250 @@
+From 680bb16a735e3b918ca99d11eaf20ee2dc8e55e0 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Wed, 7 Jun 2017 11:05:26 -0400
+Subject: [PATCH 2192/2500] drm/amdgpu: move gfx_v*_0_compute_queue_acquire to
+ common code
+
+Same function was duplicated in all gfx IP files.
+
+Reviewed-by: Alex Xie <AlexBin.Xie@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c | 37 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h |  2 ++
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c   | 39 +--------------------------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c   | 39 +--------------------------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c   | 39 +--------------------------------
+ 5 files changed, 42 insertions(+), 114 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index 1994335..51a9708 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -108,3 +108,40 @@ void amdgpu_gfx_parse_disable_cu(unsigned *mask, unsigned max_se, unsigned max_s
+ 		p = next + 1;
+ 	}
+ }
++
++void amdgpu_gfx_compute_queue_acquire(struct amdgpu_device *adev)
++{
++	int i, queue, pipe, mec;
++
++	/* policy for amdgpu compute queue ownership */
++	for (i = 0; i < AMDGPU_MAX_COMPUTE_QUEUES; ++i) {
++		queue = i % adev->gfx.mec.num_queue_per_pipe;
++		pipe = (i / adev->gfx.mec.num_queue_per_pipe)
++			% adev->gfx.mec.num_pipe_per_mec;
++		mec = (i / adev->gfx.mec.num_queue_per_pipe)
++			/ adev->gfx.mec.num_pipe_per_mec;
++
++		/* we've run out of HW */
++		if (mec >= adev->gfx.mec.num_mec)
++			break;
++
++		if (adev->gfx.mec.num_mec > 1) {
++			/* policy: amdgpu owns the first two queues of the first MEC */
++			if (mec == 0 && queue < 2)
++				set_bit(i, adev->gfx.mec.queue_bitmap);
++		} else {
++			/* policy: amdgpu owns all queues in the first pipe */
++			if (mec == 0 && pipe == 0)
++				set_bit(i, adev->gfx.mec.queue_bitmap);
++		}
++	}
++
++	/* update the number of active compute rings */
++	adev->gfx.num_compute_rings =
++		bitmap_weight(adev->gfx.mec.queue_bitmap, AMDGPU_MAX_COMPUTE_QUEUES);
++
++	/* If you hit this case and edited the policy, you probably just
++	 * need to increase AMDGPU_MAX_COMPUTE_RINGS */
++	if (WARN_ON(adev->gfx.num_compute_rings > AMDGPU_MAX_COMPUTE_RINGS))
++		adev->gfx.num_compute_rings = AMDGPU_MAX_COMPUTE_RINGS;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
+index 2d846ef..9b9ea6e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
+@@ -30,6 +30,8 @@ void amdgpu_gfx_scratch_free(struct amdgpu_device *adev, uint32_t reg);
+ void amdgpu_gfx_parse_disable_cu(unsigned *mask, unsigned max_se,
+ 		unsigned max_sh);
+ 
++void amdgpu_gfx_compute_queue_acquire(struct amdgpu_device *adev);
++
+ /**
+  * amdgpu_gfx_create_bitmask - create a bitmask
+  *
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 220e6f2..381d8e2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2811,43 +2811,6 @@ static void gfx_v7_0_mec_fini(struct amdgpu_device *adev)
+ 	}
+ }
+ 
+-static void gfx_v7_0_compute_queue_acquire(struct amdgpu_device *adev)
+-{
+-	int i, queue, pipe, mec;
+-
+-	/* policy for amdgpu compute queue ownership */
+-	for (i = 0; i < AMDGPU_MAX_COMPUTE_QUEUES; ++i) {
+-		queue = i % adev->gfx.mec.num_queue_per_pipe;
+-		pipe = (i / adev->gfx.mec.num_queue_per_pipe)
+-			% adev->gfx.mec.num_pipe_per_mec;
+-		mec = (i / adev->gfx.mec.num_queue_per_pipe)
+-			/ adev->gfx.mec.num_pipe_per_mec;
+-
+-		/* we've run out of HW */
+-		if (mec >= adev->gfx.mec.num_mec)
+-			break;
+-
+-		if (adev->gfx.mec.num_mec > 1) {
+-			/* policy: amdgpu owns the first two queues of the first MEC */
+-			if (mec == 0 && queue < 2)
+-				set_bit(i, adev->gfx.mec.queue_bitmap);
+-		} else {
+-			/* policy: amdgpu owns all queues in the first pipe */
+-			if (mec == 0 && pipe == 0)
+-				set_bit(i, adev->gfx.mec.queue_bitmap);
+-		}
+-	}
+-
+-	/* update the number of active compute rings */
+-	adev->gfx.num_compute_rings =
+-		bitmap_weight(adev->gfx.mec.queue_bitmap, AMDGPU_MAX_COMPUTE_QUEUES);
+-
+-	/* If you hit this case and edited the policy, you probably just
+-	 * need to increase AMDGPU_MAX_COMPUTE_RINGS */
+-	if (WARN_ON(adev->gfx.num_compute_rings > AMDGPU_MAX_COMPUTE_RINGS))
+-		adev->gfx.num_compute_rings = AMDGPU_MAX_COMPUTE_RINGS;
+-}
+-
+ static int gfx_v7_0_mec_init(struct amdgpu_device *adev)
+ {
+ 	int r;
+@@ -2872,7 +2835,7 @@ static int gfx_v7_0_mec_init(struct amdgpu_device *adev)
+ 	adev->gfx.mec.num_queue_per_pipe = 8;
+ 
+ 	/* take ownership of the relevant compute queues */
+-	gfx_v7_0_compute_queue_acquire(adev);
++	amdgpu_gfx_compute_queue_acquire(adev);
+ 
+ 	/* allocate space for ALL pipes (even the ones we don't own) */
+ 	mec_hpd_size = adev->gfx.mec.num_mec * adev->gfx.mec.num_pipe_per_mec
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 2c53f30..1770dad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -1448,43 +1448,6 @@ static void gfx_v8_0_kiq_free_ring(struct amdgpu_ring *ring,
+ 	amdgpu_ring_fini(ring);
+ }
+ 
+-static void gfx_v8_0_compute_queue_acquire(struct amdgpu_device *adev)
+-{
+-	int i, queue, pipe, mec;
+-
+-	/* policy for amdgpu compute queue ownership */
+-	for (i = 0; i < AMDGPU_MAX_COMPUTE_QUEUES; ++i) {
+-		queue = i % adev->gfx.mec.num_queue_per_pipe;
+-		pipe = (i / adev->gfx.mec.num_queue_per_pipe)
+-			% adev->gfx.mec.num_pipe_per_mec;
+-		mec = (i / adev->gfx.mec.num_queue_per_pipe)
+-			/ adev->gfx.mec.num_pipe_per_mec;
+-
+-		/* we've run out of HW */
+-		if (mec >= adev->gfx.mec.num_mec)
+-			break;
+-
+-		if (adev->gfx.mec.num_mec > 1) {
+-			/* policy: amdgpu owns the first two queues of the first MEC */
+-			if (mec == 0 && queue < 2)
+-				set_bit(i, adev->gfx.mec.queue_bitmap);
+-		} else {
+-			/* policy: amdgpu owns all queues in the first pipe */
+-			if (mec == 0 && pipe == 0)
+-				set_bit(i, adev->gfx.mec.queue_bitmap);
+-		}
+-	}
+-
+-	/* update the number of active compute rings */
+-	adev->gfx.num_compute_rings =
+-		bitmap_weight(adev->gfx.mec.queue_bitmap, AMDGPU_MAX_COMPUTE_QUEUES);
+-
+-	/* If you hit this case and edited the policy, you probably just
+-	 * need to increase AMDGPU_MAX_COMPUTE_RINGS */
+-	if (WARN_ON(adev->gfx.num_compute_rings > AMDGPU_MAX_COMPUTE_RINGS))
+-		adev->gfx.num_compute_rings = AMDGPU_MAX_COMPUTE_RINGS;
+-}
+-
+ static int gfx_v8_0_mec_init(struct amdgpu_device *adev)
+ {
+ 	int r;
+@@ -1513,7 +1476,7 @@ static int gfx_v8_0_mec_init(struct amdgpu_device *adev)
+ 	adev->gfx.mec.num_queue_per_pipe = 8;
+ 
+ 	/* take ownership of the relevant compute queues */
+-	gfx_v8_0_compute_queue_acquire(adev);
++	amdgpu_gfx_compute_queue_acquire(adev);
+ 
+ 	mec_hpd_size = adev->gfx.num_compute_rings * GFX8_MEC_HPD_SIZE;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index 13e80fd..96e397f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -857,43 +857,6 @@ static void gfx_v9_0_mec_fini(struct amdgpu_device *adev)
+ 	}
+ }
+ 
+-static void gfx_v9_0_compute_queue_acquire(struct amdgpu_device *adev)
+-{
+-	int i, queue, pipe, mec;
+-
+-	/* policy for amdgpu compute queue ownership */
+-	for (i = 0; i < AMDGPU_MAX_COMPUTE_QUEUES; ++i) {
+-		queue = i % adev->gfx.mec.num_queue_per_pipe;
+-		pipe = (i / adev->gfx.mec.num_queue_per_pipe)
+-			% adev->gfx.mec.num_pipe_per_mec;
+-		mec = (i / adev->gfx.mec.num_queue_per_pipe)
+-			/ adev->gfx.mec.num_pipe_per_mec;
+-
+-		/* we've run out of HW */
+-		if (mec >= adev->gfx.mec.num_mec)
+-			break;
+-
+-		if (adev->gfx.mec.num_mec > 1) {
+-			/* policy: amdgpu owns the first two queues of the first MEC */
+-			if (mec == 0 && queue < 2)
+-				set_bit(i, adev->gfx.mec.queue_bitmap);
+-		} else {
+-			/* policy: amdgpu owns all queues in the first pipe */
+-			if (mec == 0 && pipe == 0)
+-				set_bit(i, adev->gfx.mec.queue_bitmap);
+-		}
+-	}
+-
+-	/* update the number of active compute rings */
+-	adev->gfx.num_compute_rings =
+-		bitmap_weight(adev->gfx.mec.queue_bitmap, AMDGPU_MAX_COMPUTE_QUEUES);
+-
+-	/* If you hit this case and edited the policy, you probably just
+-	 * need to increase AMDGPU_MAX_COMPUTE_RINGS */
+-	if (WARN_ON(adev->gfx.num_compute_rings > AMDGPU_MAX_COMPUTE_RINGS))
+-		adev->gfx.num_compute_rings = AMDGPU_MAX_COMPUTE_RINGS;
+-}
+-
+ static int gfx_v9_0_mec_init(struct amdgpu_device *adev)
+ {
+ 	int r;
+@@ -920,7 +883,7 @@ static int gfx_v9_0_mec_init(struct amdgpu_device *adev)
+ 	adev->gfx.mec.num_queue_per_pipe = 8;
+ 
+ 	/* take ownership of the relevant compute queues */
+-	gfx_v9_0_compute_queue_acquire(adev);
++	amdgpu_gfx_compute_queue_acquire(adev);
+ 	mec_hpd_size = adev->gfx.num_compute_rings * GFX9_MEC_HPD_SIZE;
+ 
+ 	if (adev->gfx.mec.hpd_eop_obj == NULL) {
+-- 
+2.7.4
+

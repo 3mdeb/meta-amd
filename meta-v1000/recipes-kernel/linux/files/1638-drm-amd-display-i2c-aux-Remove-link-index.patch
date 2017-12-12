@@ -1,0 +1,432 @@
+From 423c8abecbb833a84558f2f1f1bfc581fd27bec4 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Thu, 27 Apr 2017 10:40:48 -0400
+Subject: [PATCH 1638/2094] drm/amd/display: i2c/aux Remove link index.
+
+Link index is an unnecessery level of inderection when
+calling from kernel i2c/aux transfer into DAL.
+
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+---
+ .../amd/display/amdgpu_dm/amdgpu_dm_mst_types.c    | 38 +++++++++++-----------
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_types.c    | 22 +++++++++----
+ drivers/gpu/drm/amd/display/dc/core/dc.c           | 19 ++++-------
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c      | 28 ++++++++--------
+ drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c   |  4 +--
+ drivers/gpu/drm/amd/display/dc/dc.h                |  9 ++---
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h    |  1 -
+ 7 files changed, 58 insertions(+), 63 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+index 0e79ba9..8c767ef 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -33,6 +33,8 @@
+ #include "dc.h"
+ #include "dm_helpers.h"
+ 
++#include "dc_link_ddc.h"
++
+ /* #define TRACE_DPCD */
+ 
+ #ifdef TRACE_DPCD
+@@ -77,43 +79,41 @@ void log_dpcd(uint8_t type,
+ 
+ static ssize_t dm_dp_aux_transfer(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
+ {
+-	struct pci_dev *pdev = to_pci_dev(aux->dev);
+-	struct drm_device *drm_dev = pci_get_drvdata(pdev);
+-	struct amdgpu_device *adev = drm_dev->dev_private;
+-	struct dc *dc = adev->dm.dc;
+ 	enum i2c_mot_mode mot = (msg->request & DP_AUX_I2C_MOT) ? I2C_MOT_TRUE : I2C_MOT_FALSE;
+-	bool res;
++	enum ddc_result res;
+ 
+ 	switch (msg->request & ~DP_AUX_I2C_MOT) {
+ 	case DP_AUX_NATIVE_READ:
+-		res = dc_read_aux_dpcd(
+-				dc,
+-				TO_DM_AUX(aux)->link_index,
++		res = dal_ddc_service_read_dpcd_data(
++				TO_DM_AUX(aux)->ddc_service,
++				false,
++				I2C_MOT_UNDEF,
+ 				msg->address,
+ 				msg->buffer,
+ 				msg->size);
+ 		break;
+ 	case DP_AUX_NATIVE_WRITE:
+-		res = dc_write_aux_dpcd(
+-				dc,
+-				TO_DM_AUX(aux)->link_index,
++		res = dal_ddc_service_write_dpcd_data(
++				TO_DM_AUX(aux)->ddc_service,
++				false,
++				I2C_MOT_UNDEF,
+ 				msg->address,
+ 				msg->buffer,
+ 				msg->size);
+ 		break;
+ 	case DP_AUX_I2C_READ:
+-		res = dc_read_aux_i2c(
+-				dc,
+-				TO_DM_AUX(aux)->link_index,
++		res = dal_ddc_service_read_dpcd_data(
++				TO_DM_AUX(aux)->ddc_service,
++				true,
+ 				mot,
+ 				msg->address,
+ 				msg->buffer,
+ 				msg->size);
+ 		break;
+ 	case DP_AUX_I2C_WRITE:
+-		res = dc_write_aux_i2c(
+-				dc,
+-				TO_DM_AUX(aux)->link_index,
++		res = dal_ddc_service_write_dpcd_data(
++				TO_DM_AUX(aux)->ddc_service,
++				true,
+ 				mot,
+ 				msg->address,
+ 				msg->buffer,
+@@ -128,7 +128,7 @@ static ssize_t dm_dp_aux_transfer(struct drm_dp_aux *aux, struct drm_dp_aux_msg
+ 			msg->address,
+ 			msg->buffer,
+ 			msg->size,
+-			res);
++			r == DDC_RESULT_SUCESSFULL);
+ #endif
+ 
+ 	return msg->size;
+@@ -446,7 +446,7 @@ void amdgpu_dm_initialize_dp_connector(
+ 	aconnector->dm_dp_aux.aux.name = "dmdc";
+ 	aconnector->dm_dp_aux.aux.dev = dm->adev->dev;
+ 	aconnector->dm_dp_aux.aux.transfer = dm_dp_aux_transfer;
+-	aconnector->dm_dp_aux.link_index = aconnector->connector_id;
++	aconnector->dm_dp_aux.ddc_service = aconnector->dc_link->ddc;
+ 
+ 	drm_dp_aux_register(&aconnector->dm_dp_aux.aux);
+ 	aconnector->mst_mgr.cbs = &dm_mst_cbs;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+index 1d73234..d1fffa2 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+@@ -51,6 +51,8 @@
+ 
+ #include "modules/inc/mod_freesync.h"
+ 
++#include "i2caux_interface.h"
++
+ struct dm_connector_state {
+ 	struct drm_connector_state base;
+ 
+@@ -2181,6 +2183,7 @@ int amdgpu_dm_i2c_xfer(struct i2c_adapter *i2c_adap,
+ 		      struct i2c_msg *msgs, int num)
+ {
+ 	struct amdgpu_i2c_adapter *i2c = i2c_get_adapdata(i2c_adap);
++	struct ddc_service *ddc_service = i2c->ddc_service;
+ 	struct i2c_command cmd;
+ 	int i;
+ 	int result = -EIO;
+@@ -2201,11 +2204,13 @@ int amdgpu_dm_i2c_xfer(struct i2c_adapter *i2c_adap,
+ 		cmd.payloads[i].data = msgs[i].buf;
+ 	}
+ 
+-	if (dc_submit_i2c(i2c->dm->dc, i2c->link_index, &cmd))
++	if (dal_i2caux_submit_i2c_command(
++			ddc_service->ctx->i2caux,
++			ddc_service->ddc_pin,
++			&cmd))
+ 		result = num;
+ 
+ 	kfree(cmd.payloads);
+-
+ 	return result;
+ }
+ 
+@@ -2219,19 +2224,22 @@ static const struct i2c_algorithm amdgpu_dm_i2c_algo = {
+ 	.functionality = amdgpu_dm_i2c_func,
+ };
+ 
+-struct amdgpu_i2c_adapter *create_i2c(unsigned int link_index, struct amdgpu_display_manager *dm, int *res)
++static struct amdgpu_i2c_adapter *create_i2c(
++		struct ddc_service *ddc_service,
++		int link_index,
++		int *res)
+ {
++	struct amdgpu_device *adev = ddc_service->ctx->driver_context;
+ 	struct amdgpu_i2c_adapter *i2c;
+ 
+ 	i2c = kzalloc(sizeof (struct amdgpu_i2c_adapter), GFP_KERNEL);
+-	i2c->dm = dm;
+ 	i2c->base.owner = THIS_MODULE;
+ 	i2c->base.class = I2C_CLASS_DDC;
+-	i2c->base.dev.parent = &dm->adev->pdev->dev;
++	i2c->base.dev.parent = &adev->pdev->dev;
+ 	i2c->base.algo = &amdgpu_dm_i2c_algo;
+ 	snprintf(i2c->base.name, sizeof (i2c->base.name), "AMDGPU DM i2c hw bus %d", link_index);
+-	i2c->link_index = link_index;
+ 	i2c_set_adapdata(&i2c->base, i2c);
++	i2c->ddc_service = ddc_service;
+ 
+ 	return i2c;
+ }
+@@ -2253,7 +2261,7 @@ int amdgpu_dm_connector_init(
+ 
+ 	DRM_DEBUG_KMS("%s()\n", __func__);
+ 
+-	i2c = create_i2c(link->link_index, dm, &res);
++	i2c = create_i2c(link->ddc, link->link_index, &res);
+ 	aconnector->i2c = i2c;
+ 	res = i2c_add_adapter(&i2c->base);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 0891560..6855088 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1525,13 +1525,6 @@ const struct graphics_object_id dc_get_link_id_at_index(
+ 	return core_dc->links[link_index]->link_id;
+ }
+ 
+-const struct ddc_service *dc_get_ddc_at_index(
+-	struct dc *dc, uint32_t link_index)
+-{
+-	struct core_dc *core_dc = DC_TO_CORE(dc);
+-	return core_dc->links[link_index]->ddc;
+-}
+-
+ enum dc_irq_source dc_get_hpd_irq_source_at_index(
+ 	struct dc *dc, uint32_t link_index)
+ {
+@@ -1645,7 +1638,7 @@ bool dc_read_aux_dpcd(
+ 
+ 	struct core_link *link = core_dc->links[link_index];
+ 	enum ddc_result r = dal_ddc_service_read_dpcd_data(
+-			link->ddc,
++			link->public.ddc,
+ 			false,
+ 			I2C_MOT_UNDEF,
+ 			address,
+@@ -1665,7 +1658,7 @@ bool dc_write_aux_dpcd(
+ 	struct core_link *link = core_dc->links[link_index];
+ 
+ 	enum ddc_result r = dal_ddc_service_write_dpcd_data(
+-			link->ddc,
++			link->public.ddc,
+ 			false,
+ 			I2C_MOT_UNDEF,
+ 			address,
+@@ -1686,7 +1679,7 @@ bool dc_read_aux_i2c(
+ 
+ 		struct core_link *link = core_dc->links[link_index];
+ 		enum ddc_result r = dal_ddc_service_read_dpcd_data(
+-			link->ddc,
++			link->public.ddc,
+ 			true,
+ 			mot,
+ 			address,
+@@ -1707,7 +1700,7 @@ bool dc_write_aux_i2c(
+ 	struct core_link *link = core_dc->links[link_index];
+ 
+ 	enum ddc_result r = dal_ddc_service_write_dpcd_data(
+-			link->ddc,
++			link->public.ddc,
+ 			true,
+ 			mot,
+ 			address,
+@@ -1730,7 +1723,7 @@ bool dc_query_ddc_data(
+ 	struct core_link *link = core_dc->links[link_index];
+ 
+ 	bool result = dal_ddc_service_query_ddc_data(
+-			link->ddc,
++			link->public.ddc,
+ 			address,
+ 			write_buf,
+ 			write_size,
+@@ -1748,7 +1741,7 @@ bool dc_submit_i2c(
+ 	struct core_dc *core_dc = DC_TO_CORE(dc);
+ 
+ 	struct core_link *link = core_dc->links[link_index];
+-	struct ddc_service *ddc = link->ddc;
++	struct ddc_service *ddc = link->public.ddc;
+ 
+ 	return dal_i2caux_submit_i2c_command(
+ 		ddc->ctx->i2caux,
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index 95d042a..97cfd5b 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -66,8 +66,8 @@ static void destruct(struct core_link *link)
+ {
+ 	int i;
+ 
+-	if (link->ddc)
+-		dal_ddc_service_destroy(&link->ddc);
++	if (link->public.ddc)
++		dal_ddc_service_destroy(&link->public.ddc);
+ 
+ 	if(link->link_enc)
+ 		link->link_enc->funcs->destroy(&link->link_enc);
+@@ -320,7 +320,7 @@ static bool is_dp_sink_present(struct core_link *link)
+ 		((connector_id == CONNECTOR_ID_DISPLAY_PORT) ||
+ 		(connector_id == CONNECTOR_ID_EDP));
+ 
+-	ddc = dal_ddc_service_get_ddc_pin(link->ddc);
++	ddc = dal_ddc_service_get_ddc_pin(link->public.ddc);
+ 
+ 	if (!ddc) {
+ 		BREAK_TO_DEBUGGER();
+@@ -526,7 +526,7 @@ static void detect_dp(
+ 		}
+ 	} else {
+ 		/* DP passive dongles */
+-		sink_caps->signal = dp_passive_dongle_detection(link->ddc,
++		sink_caps->signal = dp_passive_dongle_detection(link->public.ddc,
+ 				sink_caps,
+ 				audio_support);
+ 	}
+@@ -629,11 +629,11 @@ bool dc_link_detect(const struct dc_link *dc_link, bool boot)
+ 				link->dpcd_sink_count = 1;
+ 
+ 		dal_ddc_service_set_transaction_type(
+-						link->ddc,
++						link->public.ddc,
+ 						sink_caps.transaction_type);
+ 
+ 		link->public.aux_mode = dal_ddc_service_is_in_aux_transaction_mode(
+-				link->ddc);
++				link->public.ddc);
+ 
+ 		sink_init_data.link = &link->public;
+ 		sink_init_data.sink_signal = sink_caps.signal;
+@@ -784,7 +784,7 @@ static enum channel_id get_ddc_line(struct core_link *link)
+ 	struct ddc *ddc;
+ 	enum channel_id channel = CHANNEL_ID_UNKNOWN;
+ 
+-	ddc = dal_ddc_service_get_ddc_pin(link->ddc);
++	ddc = dal_ddc_service_get_ddc_pin(link->public.ddc);
+ 
+ 	if (ddc) {
+ 		switch (dal_ddc_get_line(ddc)) {
+@@ -971,16 +971,16 @@ static bool construct(
+ 	ddc_service_init_data.ctx = link->ctx;
+ 	ddc_service_init_data.id = link->link_id;
+ 	ddc_service_init_data.link = link;
+-	link->ddc = dal_ddc_service_create(&ddc_service_init_data);
++	link->public.ddc = dal_ddc_service_create(&ddc_service_init_data);
+ 
+-	if (NULL == link->ddc) {
++	if (link->public.ddc == NULL) {
+ 		DC_ERROR("Failed to create ddc_service!\n");
+ 		goto ddc_create_fail;
+ 	}
+ 
+ 	link->public.ddc_hw_inst =
+ 		dal_ddc_get_line(
+-			dal_ddc_service_get_ddc_pin(link->ddc));
++			dal_ddc_service_get_ddc_pin(link->public.ddc));
+ 
+ 	enc_init_data.ctx = dc_ctx;
+ 	bp_funcs->get_src_obj(dc_ctx->dc_bios, link->link_id, 0, &enc_init_data.encoder);
+@@ -1049,7 +1049,7 @@ static bool construct(
+ device_tag_fail:
+ 	link->link_enc->funcs->destroy(&link->link_enc);
+ link_enc_create_fail:
+-	dal_ddc_service_destroy(&link->ddc);
++	dal_ddc_service_destroy(&link->public.ddc);
+ ddc_create_fail:
+ create_fail:
+ 
+@@ -1256,7 +1256,7 @@ static void enable_link_hdmi(struct pipe_ctx *pipe_ctx)
+ 
+ 	if (dc_is_hdmi_signal(pipe_ctx->stream->signal))
+ 		dal_ddc_service_write_scdc_data(
+-			stream->sink->link->ddc,
++			stream->sink->link->public.ddc,
+ 			stream->phy_pix_clk,
+ 			stream->public.timing.flags.LTE_340MCSC_SCRAMBLE);
+ 
+@@ -1276,7 +1276,7 @@ static void enable_link_hdmi(struct pipe_ctx *pipe_ctx)
+ 			stream->phy_pix_clk);
+ 
+ 	if (pipe_ctx->stream->signal == SIGNAL_TYPE_HDMI_TYPE_A)
+-		dal_ddc_service_read_scdc_data(link->ddc);
++		dal_ddc_service_read_scdc_data(link->public.ddc);
+ }
+ 
+ /****************************enable_link***********************************/
+@@ -1474,7 +1474,7 @@ bool dc_link_setup_psr(const struct dc_link *dc_link,
+ 			&psr_configuration.raw,
+ 			sizeof(psr_configuration.raw));
+ 
+-		psr_context.channel = link->ddc->ddc_pin->hw_info.ddc_channel;
++		psr_context.channel = link->public.ddc->ddc_pin->hw_info.ddc_channel;
+ 		psr_context.transmitterId = link->link_enc->transmitter;
+ 		psr_context.engineId = link->link_enc->preferred_engine;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+index a0d1927..98048fe 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+@@ -1913,7 +1913,7 @@ static void get_active_converter_info(
+ 	/* decode converter info*/
+ 	if (!ds_port.fields.PORT_PRESENT) {
+ 		link->dpcd_caps.dongle_type = DISPLAY_DONGLE_NONE;
+-		ddc_service_set_dongle_type(link->ddc,
++		ddc_service_set_dongle_type(link->public.ddc,
+ 				link->dpcd_caps.dongle_type);
+ 		return;
+ 	}
+@@ -1983,7 +1983,7 @@ static void get_active_converter_info(
+ 		}
+ 	}
+ 
+-	ddc_service_set_dongle_type(link->ddc, link->dpcd_caps.dongle_type);
++	ddc_service_set_dongle_type(link->public.ddc, link->dpcd_caps.dongle_type);
+ 
+ 	{
+ 		struct dp_device_vendor_id dp_id;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index f34c0c4..9bf9915 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -646,6 +646,8 @@ struct dc_link {
+ 
+ 	void *priv;
+ 	bool aux_mode;
++
++	struct ddc_service *ddc;
+ };
+ 
+ struct dpcd_caps {
+@@ -830,13 +832,6 @@ void dc_set_power_state(
+ 		enum dc_video_power_state video_power_state);
+ void dc_resume(const struct dc *dc);
+ 
+-/*******************************************************************************
+- * DDC Interfaces
+- ******************************************************************************/
+-
+-const struct ddc_service *dc_get_ddc_at_index(
+-		struct dc *dc, uint32_t link_index);
+-
+ /*
+  * DPCD access interfaces
+  */
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index c1273d6..fcda3c7 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -151,7 +151,6 @@ struct core_link {
+ 	struct dc_context *ctx; /* TODO: AUTO remove 'dal' when DC is complete*/
+ 
+ 	struct link_encoder *link_enc;
+-	struct ddc_service *ddc;
+ 	struct graphics_object_id link_id;
+ 	union ddi_channel_mapping ddi_channel_mapping;
+ 	struct connector_device_tag_info device_tag;
+-- 
+2.7.4
+

@@ -1,0 +1,150 @@
+From e109f3cb7c3e49dc3b519c8057d752ad099d1095 Mon Sep 17 00:00:00 2001
+From: Anthony Koo <Anthony.Koo@amd.com>
+Date: Thu, 3 Aug 2017 09:59:23 -0400
+Subject: [PATCH 2809/2831] drm/amd/display: implement DXGI Gamma Ramps
+
+Support for gamma correction ramp in Floating Point format
+
+Change-Id: I0d989080cc87059c9de3f4c3b1b48fbc7788bdfe
+Signed-off-by: Anthony Koo <anthony.koo@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 14 +++++++-------
+ drivers/gpu/drm/amd/display/dc/dc_hw_types.h      | 21 ++++++++++++++++-----
+ drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c      | 14 ++++++++++----
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_ipp.c  | 11 +++++++----
+ 4 files changed, 40 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index d7544aa..dc812ae 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2006,15 +2006,14 @@ static int fill_plane_attributes_from_fb(
+ 
+ }
+ 
+-#define NUM_OF_RAW_GAMMA_RAMP_RGB_256 256
+-
+ static void fill_gamma_from_crtc_state(
+ 	const struct drm_crtc_state *crtc_state,
+ 	struct dc_plane_state *plane_state)
+ {
+ 	int i;
+ 	struct dc_gamma *gamma;
+-	struct drm_color_lut *lut = (struct drm_color_lut *) crtc_state->gamma_lut->data;
++	struct drm_color_lut *lut =
++			(struct drm_color_lut *) crtc_state->gamma_lut->data;
+ 
+ 	gamma = dc_create_gamma();
+ 
+@@ -2023,10 +2022,11 @@ static void fill_gamma_from_crtc_state(
+ 		return;
+ 	}
+ 
+-	for (i = 0; i < NUM_OF_RAW_GAMMA_RAMP_RGB_256; i++) {
+-		gamma->red[i] = lut[i].red;
+-		gamma->green[i] = lut[i].green;
+-		gamma->blue[i] = lut[i].blue;
++	gamma->type = GAMMA_RGB_256_ENTRIES;
++	for (i = 0; i < GAMMA_RGB_256_ENTRIES; i++) {
++		gamma->entries.red[i] = dal_fixed31_32_from_int(lut[i].red);
++		gamma->entries.green[i] = dal_fixed31_32_from_int(lut[i].green);
++		gamma->entries.blue[i] = dal_fixed31_32_from_int(lut[i].blue);
+ 	}
+ 
+ 	plane_state->gamma_correction = gamma;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+index 778bd55..8d15046 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+@@ -409,20 +409,31 @@ struct dc_cursor_mi_param {
+ /* IPP related types */
+ 
+ enum {
+-	INPUT_LUT_ENTRIES = 256
++	GAMMA_RGB_256_ENTRIES = 256,
++	GAMMA_RGB_FLOAT_1024_ENTRIES = 1024,
++	GAMMA_MAX_ENTRIES = 1024
++};
++
++enum dc_gamma_type {
++	GAMMA_RGB_256 = 1,
++	GAMMA_RGB_FLOAT_1024 = 2
+ };
+ 
+ struct dc_gamma {
+-	uint16_t red[INPUT_LUT_ENTRIES];
+-	uint16_t green[INPUT_LUT_ENTRIES];
+-	uint16_t blue[INPUT_LUT_ENTRIES];
++	enum dc_gamma_type type;
++	unsigned int num_entries;
++
++	struct dc_gamma_entries {
++		struct fixed31_32 red[GAMMA_MAX_ENTRIES];
++		struct fixed31_32 green[GAMMA_MAX_ENTRIES];
++		struct fixed31_32 blue[GAMMA_MAX_ENTRIES];
++	} entries;
+ 
+ 	/* private to DC core */
+ 	struct dc_context *ctx;
+ 
+ 	/* private to dc_surface.c */
+ 	int ref_count;
+-
+ };
+ 
+ /* Used by both ipp amd opp functions*/
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c b/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c
+index 9e8f0a3..e010cf1 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c
+@@ -193,10 +193,16 @@ static void dce_ipp_program_input_lut(
+ 	REG_SET(DC_LUT_RW_INDEX, 0,
+ 		DC_LUT_RW_INDEX, 0);
+ 
+-	for (i = 0; i < INPUT_LUT_ENTRIES; i++) {
+-		REG_SET(DC_LUT_SEQ_COLOR, 0, DC_LUT_SEQ_COLOR, gamma->red[i]);
+-		REG_SET(DC_LUT_SEQ_COLOR, 0, DC_LUT_SEQ_COLOR, gamma->green[i]);
+-		REG_SET(DC_LUT_SEQ_COLOR, 0, DC_LUT_SEQ_COLOR, gamma->blue[i]);
++	for (i = 0; i < gamma->num_entries; i++) {
++		REG_SET(DC_LUT_SEQ_COLOR, 0, DC_LUT_SEQ_COLOR,
++				dal_fixed31_32_round(
++					gamma->entries.red[i]));
++		REG_SET(DC_LUT_SEQ_COLOR, 0, DC_LUT_SEQ_COLOR,
++				dal_fixed31_32_round(
++					gamma->entries.green[i]));
++		REG_SET(DC_LUT_SEQ_COLOR, 0, DC_LUT_SEQ_COLOR,
++				dal_fixed31_32_round(
++					gamma->entries.blue[i]));
+ 	}
+ 
+ 	/* power off LUT memory */
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_ipp.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_ipp.c
+index ee12f67..8ee8305 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_ipp.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_ipp.c
+@@ -910,13 +910,16 @@ static void ippn10_program_input_lut(
+ 		CM_IGAM_LUT_FORMAT_B, 3);
+ 	// Start at index 0 of IGAM LUT
+ 	REG_UPDATE(CM_IGAM_LUT_RW_INDEX, CM_IGAM_LUT_RW_INDEX, 0);
+-	for (i = 0; i < INPUT_LUT_ENTRIES; i++) {
++	for (i = 0; i < gamma->num_entries; i++) {
+ 		REG_SET(CM_IGAM_LUT_SEQ_COLOR, 0, CM_IGAM_LUT_SEQ_COLOR,
+-					gamma->red[i]);
++				dal_fixed31_32_round(
++					gamma->entries.red[i]));
+ 		REG_SET(CM_IGAM_LUT_SEQ_COLOR, 0, CM_IGAM_LUT_SEQ_COLOR,
+-					gamma->green[i]);
++				dal_fixed31_32_round(
++					gamma->entries.green[i]));
+ 		REG_SET(CM_IGAM_LUT_SEQ_COLOR, 0, CM_IGAM_LUT_SEQ_COLOR,
+-					gamma->blue[i]);
++				dal_fixed31_32_round(
++					gamma->entries.blue[i]));
+ 	}
+ 	// Power off LUT memory
+ 	REG_SET(CM_MEM_PWR_CTRL, 0, SHARED_MEM_PWR_DIS, 0);
+-- 
+2.7.4
+
