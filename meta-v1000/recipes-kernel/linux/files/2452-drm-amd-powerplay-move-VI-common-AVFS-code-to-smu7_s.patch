@@ -1,0 +1,475 @@
+From 01fba70eb12a3e591ded9d450e4a0e3093db58a4 Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Wed, 5 Jul 2017 18:12:46 +0800
+Subject: [PATCH 2452/2500] drm/amd/powerplay: move VI common AVFS code to
+ smu7_smumgr.c
+
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/powerplay/inc/smumgr.h         |  3 +
+ drivers/gpu/drm/amd/powerplay/smumgr/fiji_smc.c    |  6 +-
+ drivers/gpu/drm/amd/powerplay/smumgr/fiji_smumgr.c | 75 ++++++++++------------
+ drivers/gpu/drm/amd/powerplay/smumgr/fiji_smumgr.h | 11 ----
+ .../gpu/drm/amd/powerplay/smumgr/polaris10_smc.c   |  4 +-
+ .../drm/amd/powerplay/smumgr/polaris10_smumgr.c    | 29 ++++-----
+ .../drm/amd/powerplay/smumgr/polaris10_smumgr.h    | 12 +---
+ drivers/gpu/drm/amd/powerplay/smumgr/smu7_smumgr.c |  6 +-
+ drivers/gpu/drm/amd/powerplay/smumgr/smu7_smumgr.h |  8 ++-
+ drivers/gpu/drm/amd/powerplay/smumgr/smumgr.c      |  8 +++
+ 10 files changed, 75 insertions(+), 87 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/smumgr.h b/drivers/gpu/drm/amd/powerplay/inc/smumgr.h
+index 976e942..5d61cc9 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/smumgr.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/smumgr.h
+@@ -131,6 +131,7 @@ struct pp_smumgr_func {
+ 	bool (*is_dpm_running)(struct pp_hwmgr *hwmgr);
+ 	int (*populate_requested_graphic_levels)(struct pp_hwmgr *hwmgr,
+ 			struct amd_pp_profile *request);
++	bool (*is_hw_avfs_present)(struct pp_smumgr *smumgr);
+ };
+ 
+ struct pp_smumgr {
+@@ -202,6 +203,8 @@ extern bool smum_is_dpm_running(struct pp_hwmgr *hwmgr);
+ extern int smum_populate_requested_graphic_levels(struct pp_hwmgr *hwmgr,
+ 		struct amd_pp_profile *request);
+ 
++extern bool smum_is_hw_avfs_present(struct pp_smumgr *smumgr);
++
+ #define SMUM_FIELD_SHIFT(reg, field) reg##__##field##__SHIFT
+ 
+ #define SMUM_FIELD_MASK(reg, field) reg##__##field##_MASK
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smc.c b/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smc.c
+index ca24e15..8712f09 100644
+--- a/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smc.c
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smc.c
+@@ -2134,16 +2134,16 @@ int fiji_thermal_avfs_enable(struct pp_hwmgr *hwmgr)
+ {
+ 	int ret;
+ 	struct pp_smumgr *smumgr = (struct pp_smumgr *)(hwmgr->smumgr);
+-	struct fiji_smumgr *smu_data = (struct fiji_smumgr *)(smumgr->backend);
++	struct smu7_smumgr *smu_data = (struct smu7_smumgr *)(smumgr->backend);
+ 
+-	if (smu_data->avfs.AvfsBtcStatus != AVFS_BTC_ENABLEAVFS)
++	if (smu_data->avfs.avfs_btc_status != AVFS_BTC_ENABLEAVFS)
+ 		return 0;
+ 
+ 	ret = smum_send_msg_to_smc(smumgr, PPSMC_MSG_EnableAvfs);
+ 
+ 	if (!ret)
+ 		/* If this param is not changed, this function could fire unnecessarily */
+-		smu_data->avfs.AvfsBtcStatus = AVFS_BTC_COMPLETED_PREVIOUSLY;
++		smu_data->avfs.avfs_btc_status = AVFS_BTC_COMPLETED_PREVIOUSLY;
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smumgr.c b/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smumgr.c
+index 719e885..6ae948f 100755
+--- a/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smumgr.c
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smumgr.c
+@@ -161,44 +161,47 @@ static int fiji_start_smu_in_non_protection_mode(struct pp_smumgr *smumgr)
+ 
+ static int fiji_setup_pwr_virus(struct pp_smumgr *smumgr)
+ {
+-	int i, result = -1;
++	int i;
++	int result = -EINVAL;
+ 	uint32_t reg, data;
+-	const PWR_Command_Table *virus = PwrVirusTable;
+-	struct fiji_smumgr *priv = (struct fiji_smumgr *)(smumgr->backend);
+ 
+-	priv->avfs.AvfsBtcStatus = AVFS_LOAD_VIRUS;
+-	for (i = 0; (i < PWR_VIRUS_TABLE_SIZE); i++) {
+-		switch (virus->command) {
++	const PWR_Command_Table *pvirus = PwrVirusTable;
++	struct smu7_smumgr *smu_data = (struct smu7_smumgr *)(smumgr->backend);
++
++	for (i = 0; i < PWR_VIRUS_TABLE_SIZE; i++) {
++		switch (pvirus->command) {
+ 		case PwrCmdWrite:
+-			reg  = virus->reg;
+-			data = virus->data;
++			reg  = pvirus->reg;
++			data = pvirus->data;
+ 			cgs_write_register(smumgr->device, reg, data);
+ 			break;
++
+ 		case PwrCmdEnd:
+-			priv->avfs.AvfsBtcStatus = AVFS_BTC_VIRUS_LOADED;
+ 			result = 0;
+ 			break;
++
+ 		default:
+-			pr_err("Table Exit with Invalid Command!");
+-			priv->avfs.AvfsBtcStatus = AVFS_BTC_VIRUS_FAIL;
+-			result = -1;
++			pr_info("Table Exit with Invalid Command!");
++			smu_data->avfs.avfs_btc_status = AVFS_BTC_VIRUS_FAIL;
++			result = -EINVAL;
+ 			break;
+ 		}
+-		virus++;
++		pvirus++;
+ 	}
++
+ 	return result;
+ }
+ 
+ static int fiji_start_avfs_btc(struct pp_smumgr *smumgr)
+ {
+ 	int result = 0;
+-	struct fiji_smumgr *priv = (struct fiji_smumgr *)(smumgr->backend);
++	struct smu7_smumgr *smu_data = (struct smu7_smumgr *)(smumgr->backend);
+ 
+-	if (priv->avfs.AvfsBtcParam) {
+-		if (!smum_send_msg_to_smc_with_parameter(smumgr,
+-				PPSMC_MSG_PerformBtc, priv->avfs.AvfsBtcParam)) {
+-			pr_err("PerformBTC SMU msg failed \n");
+-			result = -1;
++	if (0 != smu_data->avfs.avfs_btc_param) {
++		if (0 != smu7_send_msg_to_smc_with_parameter(smumgr,
++				PPSMC_MSG_PerformBtc, smu_data->avfs.avfs_btc_param)) {
++			pr_info("[AVFS][Fiji_PerformBtc] PerformBTC SMU msg failed");
++			result = -EINVAL;
+ 		}
+ 	}
+ 	/* Soft-Reset to reset the engine before loading uCode */
+@@ -252,39 +255,39 @@ static int fiji_setup_graphics_level_structure(struct pp_smumgr *smumgr)
+ 
+ static int fiji_avfs_event_mgr(struct pp_smumgr *smumgr, bool smu_started)
+ {
+-	struct fiji_smumgr *priv = (struct fiji_smumgr *)(smumgr->backend);
++	struct smu7_smumgr *smu_data = (struct smu7_smumgr *)(smumgr->backend);
+ 
+-	switch (priv->avfs.AvfsBtcStatus) {
++	switch (smu_data->avfs.avfs_btc_status) {
+ 	case AVFS_BTC_COMPLETED_PREVIOUSLY:
+ 		break;
+ 
+ 	case AVFS_BTC_BOOT: /*Cold Boot State - Post SMU Start*/
+ 		if (!smu_started)
+ 			break;
+-		priv->avfs.AvfsBtcStatus = AVFS_BTC_FAILED;
++		smu_data->avfs.avfs_btc_status = AVFS_BTC_FAILED;
+ 		PP_ASSERT_WITH_CODE(0 == fiji_setup_graphics_level_structure(smumgr),
+ 				"[AVFS][fiji_avfs_event_mgr] Could not Copy Graphics Level"
+ 				" table over to SMU",
+-				return -1;);
+-		priv->avfs.AvfsBtcStatus = AVFS_BTC_VIRUS_FAIL;
++				return -EINVAL;);
++		smu_data->avfs.avfs_btc_status = AVFS_BTC_VIRUS_FAIL;
+ 		PP_ASSERT_WITH_CODE(0 == fiji_setup_pwr_virus(smumgr),
+ 				"[AVFS][fiji_avfs_event_mgr] Could not setup "
+ 				"Pwr Virus for AVFS ",
+-				return -1;);
+-		priv->avfs.AvfsBtcStatus = AVFS_BTC_FAILED;
++				return -EINVAL;);
++		smu_data->avfs.avfs_btc_status = AVFS_BTC_FAILED;
+ 		PP_ASSERT_WITH_CODE(0 == fiji_start_avfs_btc(smumgr),
+ 				"[AVFS][fiji_avfs_event_mgr] Failure at "
+ 				"fiji_start_avfs_btc. AVFS Disabled",
+-				return -1;);
++				return -EINVAL;);
+ 
+-		priv->avfs.AvfsBtcStatus =  AVFS_BTC_ENABLEAVFS;
++		smu_data->avfs.avfs_btc_status = AVFS_BTC_ENABLEAVFS;
+ 		break;
+ 	case AVFS_BTC_DISABLED: /* Do nothing */
+ 	case AVFS_BTC_NOTSUPPORTED: /* Do nothing */
+ 	case AVFS_BTC_ENABLEAVFS:
+ 		break;
+ 	default:
+-		pr_err("AVFS failed status is %x !\n", priv->avfs.AvfsBtcStatus);
++		pr_err("AVFS failed status is %x !\n", smu_data->avfs.avfs_btc_status);
+ 		break;
+ 	}
+ 	return 0;
+@@ -377,19 +380,6 @@ static int fiji_smu_init(struct pp_smumgr *smumgr)
+ 	if (smu7_init(smumgr))
+ 		return -EINVAL;
+ 
+-	fiji_priv->avfs.AvfsBtcStatus = AVFS_BTC_BOOT;
+-	if (fiji_is_hw_avfs_present(smumgr))
+-		/* AVFS Parameter
+-		 * 0 - BTC DC disabled, BTC AC disabled
+-		 * 1 - BTC DC enabled,  BTC AC disabled
+-		 * 2 - BTC DC disabled, BTC AC enabled
+-		 * 3 - BTC DC enabled,  BTC AC enabled
+-		 * Default is 0 - BTC DC disabled, BTC AC disabled
+-		 */
+-		fiji_priv->avfs.AvfsBtcParam = 0;
+-	else
+-		fiji_priv->avfs.AvfsBtcStatus = AVFS_BTC_NOTSUPPORTED;
+-
+ 	for (i = 0; i < SMU73_MAX_LEVELS_GRAPHICS; i++)
+ 		fiji_priv->activity_target[i] = 30;
+ 
+@@ -421,4 +411,5 @@ const struct pp_smumgr_func fiji_smu_funcs = {
+ 	.initialize_mc_reg_table = fiji_initialize_mc_reg_table,
+ 	.is_dpm_running = fiji_is_dpm_running,
+ 	.populate_requested_graphic_levels = fiji_populate_requested_graphic_levels,
++	.is_hw_avfs_present = fiji_is_hw_avfs_present,
+ };
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smumgr.h b/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smumgr.h
+index adcbdfb..175bf9f 100644
+--- a/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smumgr.h
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/fiji_smumgr.h
+@@ -28,17 +28,8 @@
+ #include "smu7_smumgr.h"
+ 
+ 
+-
+-struct fiji_smu_avfs {
+-	enum AVFS_BTC_STATUS AvfsBtcStatus;
+-	uint32_t           AvfsBtcParam;
+-};
+-
+-
+ struct fiji_smumgr {
+ 	struct smu7_smumgr                   smu7_data;
+-
+-	struct fiji_smu_avfs avfs;
+ 	struct SMU73_Discrete_DpmTable       smc_state_table;
+ 	struct SMU73_Discrete_Ulv            ulv_setting;
+ 	struct SMU73_Discrete_PmFuses  power_tune_table;
+@@ -47,7 +38,5 @@ struct fiji_smumgr {
+ 
+ };
+ 
+-
+-
+ #endif
+ 
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smc.c b/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smc.c
+index f68e759..99a00bd 100644
+--- a/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smc.c
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smc.c
+@@ -1498,7 +1498,7 @@ static int polaris10_populate_avfs_parameters(struct pp_hwmgr *hwmgr)
+ 			table_info->vdd_dep_on_sclk;
+ 
+ 
+-	if (smu_data->avfs.avfs_btc_status == AVFS_BTC_NOTSUPPORTED)
++	if (((struct smu7_smumgr *)smu_data)->avfs.avfs_btc_status == AVFS_BTC_NOTSUPPORTED)
+ 		return result;
+ 
+ 	result = atomctrl_get_avfs_information(hwmgr, &avfs_params);
+@@ -1889,7 +1889,7 @@ int polaris10_thermal_avfs_enable(struct pp_hwmgr *hwmgr)
+ {
+ 	int ret;
+ 	struct pp_smumgr *smumgr = (struct pp_smumgr *)(hwmgr->smumgr);
+-	struct polaris10_smumgr *smu_data = (struct polaris10_smumgr *)(smumgr->backend);
++	struct smu7_smumgr *smu_data = (struct smu7_smumgr *)(smumgr->backend);
+ 	struct smu7_hwmgr *data = (struct smu7_hwmgr *)(hwmgr->backend);
+ 
+ 	if (smu_data->avfs.avfs_btc_status == AVFS_BTC_NOTSUPPORTED)
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smumgr.c b/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smumgr.c
+index 7e03470..75f43da 100644
+--- a/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smumgr.c
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smumgr.c
+@@ -60,16 +60,14 @@ static const SMU74_Discrete_GraphicsLevel avfs_graphics_level_polaris10[8] = {
+ static const SMU74_Discrete_MemoryLevel avfs_memory_level_polaris10 = {
+ 	0x100ea446, 0, 0x30750000, 0x01, 0x01, 0x01, 0x00, 0x00, 0x64, 0x00, 0x00, 0x1f00, 0x00, 0x00};
+ 
+-
+ static int polaris10_setup_pwr_virus(struct pp_smumgr *smumgr)
+ {
+ 	int i;
+-	int result = -1;
++	int result = -EINVAL;
+ 	uint32_t reg, data;
+ 
+ 	const PWR_Command_Table *pvirus = pwr_virus_table;
+-	struct polaris10_smumgr *smu_data = (struct polaris10_smumgr *)(smumgr->backend);
+-
++	struct smu7_smumgr *smu_data = (struct smu7_smumgr *)(smumgr->backend);
+ 
+ 	for (i = 0; i < PWR_VIRUS_TABLE_SIZE; i++) {
+ 		switch (pvirus->command) {
+@@ -86,7 +84,7 @@ static int polaris10_setup_pwr_virus(struct pp_smumgr *smumgr)
+ 		default:
+ 			pr_info("Table Exit with Invalid Command!");
+ 			smu_data->avfs.avfs_btc_status = AVFS_BTC_VIRUS_FAIL;
+-			result = -1;
++			result = -EINVAL;
+ 			break;
+ 		}
+ 		pvirus++;
+@@ -98,7 +96,7 @@ static int polaris10_setup_pwr_virus(struct pp_smumgr *smumgr)
+ static int polaris10_perform_btc(struct pp_smumgr *smumgr)
+ {
+ 	int result = 0;
+-	struct polaris10_smumgr *smu_data = (struct polaris10_smumgr *)(smumgr->backend);
++	struct smu7_smumgr *smu_data = (struct smu7_smumgr *)(smumgr->backend);
+ 
+ 	if (0 != smu_data->avfs.avfs_btc_param) {
+ 		if (0 != smu7_send_msg_to_smc_with_parameter(smumgr, PPSMC_MSG_PerformBtc, smu_data->avfs.avfs_btc_param)) {
+@@ -172,10 +170,11 @@ static int polaris10_setup_graphics_level_structure(struct pp_smumgr *smumgr)
+ 	return 0;
+ }
+ 
++
+ static int
+ polaris10_avfs_event_mgr(struct pp_smumgr *smumgr, bool SMU_VFT_INTACT)
+ {
+-	struct polaris10_smumgr *smu_data = (struct polaris10_smumgr *)(smumgr->backend);
++	struct smu7_smumgr *smu_data = (struct smu7_smumgr *)(smumgr->backend);
+ 
+ 	switch (smu_data->avfs.avfs_btc_status) {
+ 	case AVFS_BTC_COMPLETED_PREVIOUSLY:
+@@ -185,21 +184,21 @@ polaris10_avfs_event_mgr(struct pp_smumgr *smumgr, bool SMU_VFT_INTACT)
+ 
+ 		smu_data->avfs.avfs_btc_status = AVFS_BTC_DPMTABLESETUP_FAILED;
+ 		PP_ASSERT_WITH_CODE(0 == polaris10_setup_graphics_level_structure(smumgr),
+-		"[AVFS][Polaris10_AVFSEventMgr] Could not Copy Graphics Level table over to SMU",
+-		return -1);
++			"[AVFS][Polaris10_AVFSEventMgr] Could not Copy Graphics Level table over to SMU",
++			return -EINVAL);
+ 
+ 		if (smu_data->avfs.avfs_btc_param > 1) {
+ 			pr_info("[AVFS][Polaris10_AVFSEventMgr] AC BTC has not been successfully verified on Fiji. There may be in this setting.");
+ 			smu_data->avfs.avfs_btc_status = AVFS_BTC_VIRUS_FAIL;
+-			PP_ASSERT_WITH_CODE(-1 == polaris10_setup_pwr_virus(smumgr),
++			PP_ASSERT_WITH_CODE(0 == polaris10_setup_pwr_virus(smumgr),
+ 			"[AVFS][Polaris10_AVFSEventMgr] Could not setup Pwr Virus for AVFS ",
+-			return -1);
++			return -EINVAL);
+ 		}
+ 
+ 		smu_data->avfs.avfs_btc_status = AVFS_BTC_FAILED;
+ 		PP_ASSERT_WITH_CODE(0 == polaris10_perform_btc(smumgr),
+ 					"[AVFS][Polaris10_AVFSEventMgr] Failure at SmuPolaris10_PerformBTC. AVFS Disabled",
+-				 return -1);
++				 return -EINVAL);
+ 		smu_data->avfs.avfs_btc_status = AVFS_BTC_ENABLEAVFS;
+ 		break;
+ 
+@@ -377,11 +376,6 @@ static int polaris10_smu_init(struct pp_smumgr *smumgr)
+ 	if (smu7_init(smumgr))
+ 		return -EINVAL;
+ 
+-	if (polaris10_is_hw_avfs_present(smumgr))
+-		smu_data->avfs.avfs_btc_status = AVFS_BTC_BOOT;
+-	else
+-		smu_data->avfs.avfs_btc_status = AVFS_BTC_NOTSUPPORTED;
+-
+ 	for (i = 0; i < SMU74_MAX_LEVELS_GRAPHICS; i++)
+ 		smu_data->activity_target[i] = PPPOLARIS10_TARGETACTIVITY_DFLT;
+ 
+@@ -411,4 +405,5 @@ const struct pp_smumgr_func polaris10_smu_funcs = {
+ 	.get_mac_definition = polaris10_get_mac_definition,
+ 	.is_dpm_running = polaris10_is_dpm_running,
+ 	.populate_requested_graphic_levels = polaris10_populate_requested_graphic_levels,
++	.is_hw_avfs_present = polaris10_is_hw_avfs_present,
+ };
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smumgr.h b/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smumgr.h
+index 49ebf1d..5e19c24 100644
+--- a/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smumgr.h
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/polaris10_smumgr.h
+@@ -32,11 +32,6 @@
+ 
+ #define SMC_RAM_END 0x40000
+ 
+-struct polaris10_avfs {
+-	enum AVFS_BTC_STATUS avfs_btc_status;
+-	uint32_t           avfs_btc_param;
+-};
+-
+ struct polaris10_pt_defaults {
+ 	uint8_t   SviLoadLineEn;
+ 	uint8_t   SviLoadLineVddC;
+@@ -51,8 +46,6 @@ struct polaris10_pt_defaults {
+ 	uint16_t  BAPMTI_RC[SMU74_DTE_ITERATIONS * SMU74_DTE_SOURCES * SMU74_DTE_SINKS];
+ };
+ 
+-
+-
+ struct polaris10_range_table {
+ 	uint32_t trans_lower_frequency; /* in 10khz */
+ 	uint32_t trans_upper_frequency;
+@@ -61,14 +54,13 @@ struct polaris10_range_table {
+ struct polaris10_smumgr {
+ 	struct smu7_smumgr smu7_data;
+ 	uint8_t protected_mode;
+-	struct polaris10_avfs  avfs;
+ 	SMU74_Discrete_DpmTable              smc_state_table;
+ 	struct SMU74_Discrete_Ulv            ulv_setting;
+ 	struct SMU74_Discrete_PmFuses  power_tune_table;
+ 	struct polaris10_range_table                range_table[NUM_SCLK_RANGE];
+ 	const struct polaris10_pt_defaults       *power_tune_defaults;
+-	uint32_t                   activity_target[SMU74_MAX_LEVELS_GRAPHICS];
+-	uint32_t                   bif_sclk_table[SMU74_MAX_LEVELS_LINK];
++	uint32_t               activity_target[SMU74_MAX_LEVELS_GRAPHICS];
++	uint32_t               bif_sclk_table[SMU74_MAX_LEVELS_LINK];
+ };
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/smu7_smumgr.c b/drivers/gpu/drm/amd/powerplay/smumgr/smu7_smumgr.c
+index 35ac276..76347ff 100644
+--- a/drivers/gpu/drm/amd/powerplay/smumgr/smu7_smumgr.c
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/smu7_smumgr.c
+@@ -540,7 +540,6 @@ int smu7_upload_smu_firmware_image(struct pp_smumgr *smumgr)
+ 	return result;
+ }
+ 
+-
+ int smu7_init(struct pp_smumgr *smumgr)
+ {
+ 	struct smu7_smumgr *smu_data;
+@@ -596,6 +595,11 @@ int smu7_init(struct pp_smumgr *smumgr)
+ 		(cgs_handle_t)smu_data->smu_buffer.handle);
+ 		return -EINVAL);
+ 
++	if (smum_is_hw_avfs_present(smumgr))
++		smu_data->avfs.avfs_btc_status = AVFS_BTC_BOOT;
++	else
++		smu_data->avfs.avfs_btc_status = AVFS_BTC_NOTSUPPORTED;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/smu7_smumgr.h b/drivers/gpu/drm/amd/powerplay/smumgr/smu7_smumgr.h
+index 919be43..ee5e32d 100644
+--- a/drivers/gpu/drm/amd/powerplay/smumgr/smu7_smumgr.h
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/smu7_smumgr.h
+@@ -37,6 +37,11 @@ struct smu7_buffer_entry {
+ 	unsigned long  handle;
+ };
+ 
++struct smu7_avfs {
++	enum AVFS_BTC_STATUS avfs_btc_status;
++	uint32_t           avfs_btc_param;
++};
++
+ struct smu7_smumgr {
+ 	uint8_t *header;
+ 	uint8_t *mec_image;
+@@ -50,7 +55,8 @@ struct smu7_smumgr {
+ 	uint32_t                             arb_table_start;
+ 	uint32_t                             ulv_setting_starts;
+ 	uint8_t                              security_hard_key;
+-	uint32_t acpi_optimization;
++	uint32_t                             acpi_optimization;
++	struct smu7_avfs                     avfs;
+ };
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/smumgr.c b/drivers/gpu/drm/amd/powerplay/smumgr/smumgr.c
+index 698575d..f62c875 100644
+--- a/drivers/gpu/drm/amd/powerplay/smumgr/smumgr.c
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/smumgr.c
+@@ -403,3 +403,11 @@ int smum_populate_requested_graphic_levels(struct pp_hwmgr *hwmgr,
+ 
+ 	return 0;
+ }
++
++bool smum_is_hw_avfs_present(struct pp_smumgr *smumgr)
++{
++	if (smumgr->smumgr_funcs->is_hw_avfs_present)
++		return smumgr->smumgr_funcs->is_hw_avfs_present(smumgr);
++
++	return false;
++}
+-- 
+2.7.4
+

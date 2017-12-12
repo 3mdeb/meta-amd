@@ -1,0 +1,159 @@
+From e506b55e00e77c8cda6529d7c13c9f7c3cd6bf66 Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Tue, 2 May 2017 16:51:49 +0800
+Subject: [PATCH 1319/2094] drm/amd/powerplay: set soc floor voltage on boot on
+ vega10.
+
+Send the VBIOS bootup VDDC as a SOC floor voltage to SMU
+before populating the PPTABLE. After DPM is enabled, This
+floor voltage will be removed. This will prevent SMC from
+going to Vmin upon receiving PPTable causing a violation.
+
+Change-Id: Ic53b554c05eae977234b3f1cc1af5d4c47567bfc
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/powerplay/hwmgr/ppatomfwctrl.c | 28 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/powerplay/hwmgr/ppatomfwctrl.h | 15 ++++++++++++
+ drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c | 25 +++++++++++++++++++
+ drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.h |  3 +++
+ 4 files changed, 71 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/ppatomfwctrl.c b/drivers/gpu/drm/amd/powerplay/hwmgr/ppatomfwctrl.c
+index de3d8f3..5602311 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/ppatomfwctrl.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/ppatomfwctrl.c
+@@ -387,3 +387,31 @@ int pp_atomfwctrl_get_gpio_information(struct pp_hwmgr *hwmgr,
+ 
+ 	return 0;
+ }
++
++int pp_atomfwctrl_get_vbios_bootup_values(struct pp_hwmgr *hwmgr,
++			struct pp_atomfwctrl_bios_boot_up_values *boot_values)
++{
++	struct atom_firmware_info_v3_1 *info = NULL;
++	uint16_t ix;
++
++	ix = GetIndexIntoMasterDataTable(firmwareinfo);
++	info = (struct atom_firmware_info_v3_1 *)
++		cgs_atom_get_data_table(hwmgr->device,
++				ix, NULL, NULL, NULL);
++
++	if (!info) {
++		pr_info("Error retrieving BIOS firmwareinfo!");
++		return -EINVAL;
++	}
++
++	boot_values->ulRevision = info->firmware_revision;
++	boot_values->ulGfxClk   = info->bootup_sclk_in10khz;
++	boot_values->ulUClk     = info->bootup_mclk_in10khz;
++	boot_values->ulSocClk   = 0;
++	boot_values->usVddc     = info->bootup_vddc_mv;
++	boot_values->usVddci    = info->bootup_vddci_mv;
++	boot_values->usMvddc    = info->bootup_mvddc_mv;
++	boot_values->usVddGfx   = info->bootup_vddgfx_mv;
++
++	return 0;
++}
+\ No newline at end of file
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/ppatomfwctrl.h b/drivers/gpu/drm/amd/powerplay/hwmgr/ppatomfwctrl.h
+index be1579e..43a6711 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/ppatomfwctrl.h
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/ppatomfwctrl.h
+@@ -119,6 +119,18 @@ struct pp_atomfwctrl_gpio_parameters {
+ 	uint8_t   ucFwCtfGpio;
+ 	uint8_t   ucFwCtfPolarity;
+ };
++
++struct pp_atomfwctrl_bios_boot_up_values {
++	uint32_t   ulRevision;
++	uint32_t   ulGfxClk;
++	uint32_t   ulUClk;
++	uint32_t   ulSocClk;
++	uint16_t   usVddc;
++	uint16_t   usVddci;
++	uint16_t   usMvddc;
++	uint16_t   usVddGfx;
++};
++
+ int pp_atomfwctrl_get_gpu_pll_dividers_vega10(struct pp_hwmgr *hwmgr,
+ 		uint32_t clock_type, uint32_t clock_value,
+ 		struct pp_atomfwctrl_clock_dividers_soc15 *dividers);
+@@ -136,5 +148,8 @@ int pp_atomfwctrl_get_avfs_information(struct pp_hwmgr *hwmgr,
+ int pp_atomfwctrl_get_gpio_information(struct pp_hwmgr *hwmgr,
+ 		struct pp_atomfwctrl_gpio_parameters *param);
+ 
++int pp_atomfwctrl_get_vbios_bootup_values(struct pp_hwmgr *hwmgr,
++			struct pp_atomfwctrl_bios_boot_up_values *boot_values);
++
+ #endif
+ 
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c b/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c
+index 68eae52..dbc1c03 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c
+@@ -2298,6 +2298,7 @@ static int vega10_init_smc_table(struct pp_hwmgr *hwmgr)
+ 			(struct phm_ppt_v2_information *)(hwmgr->pptable);
+ 	PPTable_t *pp_table = &(data->smc_state_table.pp_table);
+ 	struct pp_atomfwctrl_voltage_table voltage_table;
++	struct pp_atomfwctrl_bios_boot_up_values boot_up_values;
+ 
+ 	result = vega10_setup_default_dpm_tables(hwmgr);
+ 	PP_ASSERT_WITH_CODE(!result,
+@@ -2369,6 +2370,24 @@ static int vega10_init_smc_table(struct pp_hwmgr *hwmgr)
+ 				return result);
+ 	}
+ 
++	result = pp_atomfwctrl_get_vbios_bootup_values(hwmgr, &boot_up_values);
++	if (!result) {
++		data->vbios_boot_state.vddc     = boot_up_values.usVddc;
++		data->vbios_boot_state.vddci    = boot_up_values.usVddci;
++		data->vbios_boot_state.mvddc    = boot_up_values.usMvddc;
++		data->vbios_boot_state.gfx_clock = boot_up_values.ulGfxClk;
++		data->vbios_boot_state.mem_clock = boot_up_values.ulUClk;
++		data->vbios_boot_state.soc_clock = boot_up_values.ulSocClk;
++		if (0 != boot_up_values.usVddc) {
++			smum_send_msg_to_smc_with_parameter(hwmgr->smumgr,
++						PPSMC_MSG_SetFloorSocVoltage,
++						(boot_up_values.usVddc * 4));
++			data->vbios_boot_state.bsoc_vddc_lock = true;
++		} else {
++			data->vbios_boot_state.bsoc_vddc_lock = false;
++		}
++	}
++
+ 	result = vega10_populate_avfs_parameters(hwmgr);
+ 	PP_ASSERT_WITH_CODE(!result,
+ 			"Failed to initialize AVFS Parameters!",
+@@ -2590,6 +2609,12 @@ static int vega10_start_dpm(struct pp_hwmgr *hwmgr, uint32_t bitmap)
+ 		data->smu_features[GNLD_LED_DISPLAY].enabled = true;
+ 	}
+ 
++	if (data->vbios_boot_state.bsoc_vddc_lock) {
++		smum_send_msg_to_smc_with_parameter(hwmgr->smumgr,
++						PPSMC_MSG_SetFloorSocVoltage, 0);
++		data->vbios_boot_state.bsoc_vddc_lock = false;
++	}
++
+ 	if (phm_cap_enabled(hwmgr->platform_descriptor.platformCaps,
+ 			PHM_PlatformCaps_Falcon_QuickTransition)) {
+ 		if (data->smu_features[GNLD_ACDC].supported) {
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.h b/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.h
+index 83c67b9..1912e08 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.h
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.h
+@@ -177,8 +177,11 @@ struct vega10_dpmlevel_enable_mask {
+ };
+ 
+ struct vega10_vbios_boot_state {
++	bool        bsoc_vddc_lock;
+ 	uint16_t    vddc;
+ 	uint16_t    vddci;
++	uint16_t    mvddc;
++	uint16_t    vdd_gfx;
+ 	uint32_t    gfx_clock;
+ 	uint32_t    mem_clock;
+ 	uint32_t    soc_clock;
+-- 
+2.7.4
+

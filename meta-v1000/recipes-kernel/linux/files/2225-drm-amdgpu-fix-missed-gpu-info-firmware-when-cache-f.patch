@@ -1,0 +1,118 @@
+From 94e5655ea87b2d50e96edb8ecf59f9ebd3850c7a Mon Sep 17 00:00:00 2001
+From: Huang Rui <ray.huang@amd.com>
+Date: Mon, 5 Jun 2017 22:11:59 +0800
+Subject: [PATCH 2225/2500] drm/amdgpu: fix missed gpu info firmware when cache
+ firmware during S3
+
+gpu_info firmware is released after data is used. But when system enters into
+suspend, upper class driver will cache all firmware names. At that time,
+gpu_info will be failing to load. It seems an upper class issue, that we should
+not release gpu_info firmware until device finished.
+
+[  903.236589] cache_firmware: amdgpu/vega10_sdma1.bin
+[  903.236590] fw_set_page_data: fw-amdgpu/vega10_sdma1.bin buf=ffff88041eee10c0 data=ffffc90002561000 size=17408
+[  903.236591] cache_firmware: amdgpu/vega10_sdma1.bin ret=0
+[  903.464160] __allocate_fw_buf: fw-amdgpu/vega10_gpu_info.bin buf=ffff88041eee2c00
+[  903.471815] (NULL device *): loading /lib/firmware/updates/4.11.0-custom/amdgpu/vega10_gpu_info.bin failed with error -2
+[  903.482870] (NULL device *): loading /lib/firmware/updates/amdgpu/vega10_gpu_info.bin failed with error -2
+[  903.492716] (NULL device *): loading /lib/firmware/4.11.0-custom/amdgpu/vega10_gpu_info.bin failed with error -2
+[  903.503156] (NULL device *): direct-loading amdgpu/vega10_gpu_info.bin
+
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  3 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 18 ++++++++++--------
+ 2 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 698b071..83fd0f5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1301,6 +1301,9 @@ struct amdgpu_firmware {
+ 	const struct amdgpu_psp_funcs *funcs;
+ 	struct amdgpu_bo *rbuf;
+ 	struct mutex mutex;
++
++	/* gpu info firmware data pointer */
++	const struct firmware *gpu_info_fw;
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 8ad7203..740b418 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1429,12 +1429,13 @@ static void amdgpu_device_enable_virtual_display(struct amdgpu_device *adev)
+ 
+ static int amdgpu_device_parse_gpu_info_fw(struct amdgpu_device *adev)
+ {
+-	const struct firmware *fw;
+ 	const char *chip_name;
+ 	char fw_name[30];
+ 	int err;
+ 	const struct gpu_info_firmware_header_v1_0 *hdr;
+ 
++	adev->firmware.gpu_info_fw = NULL;
++
+ 	switch (adev->asic_type) {
+ 	case CHIP_TOPAZ:
+ 	case CHIP_TONGA:
+@@ -1469,14 +1470,14 @@ static int amdgpu_device_parse_gpu_info_fw(struct amdgpu_device *adev)
+ 	}
+ 
+ 	snprintf(fw_name, sizeof(fw_name), "amdgpu/%s_gpu_info.bin", chip_name);
+-	err = request_firmware(&fw, fw_name, adev->dev);
++	err = request_firmware(&adev->firmware.gpu_info_fw, fw_name, adev->dev);
+ 	if (err) {
+ 		dev_err(adev->dev,
+ 			"Failed to load gpu_info firmware \"%s\"\n",
+ 			fw_name);
+ 		goto out;
+ 	}
+-	err = amdgpu_ucode_validate(fw);
++	err = amdgpu_ucode_validate(adev->firmware.gpu_info_fw);
+ 	if (err) {
+ 		dev_err(adev->dev,
+ 			"Failed to validate gpu_info firmware \"%s\"\n",
+@@ -1484,14 +1485,14 @@ static int amdgpu_device_parse_gpu_info_fw(struct amdgpu_device *adev)
+ 		goto out;
+ 	}
+ 
+-	hdr = (const struct gpu_info_firmware_header_v1_0 *)fw->data;
++	hdr = (const struct gpu_info_firmware_header_v1_0 *)adev->firmware.gpu_info_fw->data;
+ 	amdgpu_ucode_print_gpu_info_hdr(&hdr->header);
+ 
+ 	switch (hdr->version_major) {
+ 	case 1:
+ 	{
+ 		const struct gpu_info_firmware_v1_0 *gpu_info_fw =
+-			(const struct gpu_info_firmware_v1_0 *)(fw->data +
++			(const struct gpu_info_firmware_v1_0 *)(adev->firmware.gpu_info_fw->data +
+ 								le32_to_cpu(hdr->header.ucode_array_offset_bytes));
+ 
+ 		adev->gfx.config.max_shader_engines = le32_to_cpu(gpu_info_fw->gc_num_se);
+@@ -1521,9 +1522,6 @@ static int amdgpu_device_parse_gpu_info_fw(struct amdgpu_device *adev)
+ 		goto out;
+ 	}
+ out:
+-	release_firmware(fw);
+-	fw = NULL;
+-
+ 	return err;
+ }
+ 
+@@ -2354,6 +2352,10 @@ void amdgpu_device_fini(struct amdgpu_device *adev)
+ 	amdgpu_fence_driver_fini(adev);
+ 	amdgpu_fbdev_fini(adev);
+ 	r = amdgpu_fini(adev);
++	if (adev->firmware.gpu_info_fw) {
++		release_firmware(adev->firmware.gpu_info_fw);
++		adev->firmware.gpu_info_fw = NULL;
++	}
+ 	adev->accel_working = false;
+ 	cancel_delayed_work_sync(&adev->late_init_work);
+ 	/* free i2c buses */
+-- 
+2.7.4
+

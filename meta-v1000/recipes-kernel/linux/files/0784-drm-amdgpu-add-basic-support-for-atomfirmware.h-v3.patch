@@ -1,0 +1,290 @@
+From ecaa2d791b7a5c83c400ea45d174ad95aaa4b180 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Fri, 23 Sep 2016 16:23:41 -0400
+Subject: [PATCH 0784/2094] drm/amdgpu: add basic support for atomfirmware.h
+ (v3)
+
+This adds basic support for asics that use atomfirmware.h
+to define their vbios tables.
+
+v2: rebase
+v3: squash in num scratch reg fix
+
+Reviewed-by: Ken Wang <Qingqing.Wang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile              |   2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h              |   3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.c | 112 +++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.h |  33 +++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c       |  38 +++++---
+ 5 files changed, 173 insertions(+), 15 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index 8870e2e..fbf6474 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -30,7 +30,7 @@ amdgpu-y += amdgpu_device.o amdgpu_kms.o \
+ 	atombios_encoders.o amdgpu_sa.o atombios_i2c.o \
+ 	amdgpu_prime.o amdgpu_vm.o amdgpu_ib.o amdgpu_pll.o \
+ 	amdgpu_ucode.o amdgpu_bo_list.o amdgpu_ctx.o amdgpu_sync.o \
+-	amdgpu_gtt_mgr.o amdgpu_vram_mgr.o amdgpu_virt.o
++	amdgpu_gtt_mgr.o amdgpu_vram_mgr.o amdgpu_virt.o amdgpu_atomfirmware.o
+ 
+ # add asic specific block
+ amdgpu-$(CONFIG_DRM_AMDGPU_CIK)+= cik.o cik_ih.o kv_smc.o kv_dpm.o \
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 15e985e..b713f37 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -113,7 +113,7 @@ extern int amdgpu_vram_page_split;
+ #define AMDGPU_IB_POOL_SIZE			16
+ #define AMDGPU_DEBUGFS_MAX_COMPONENTS		32
+ #define AMDGPUFB_CONN_LIMIT			4
+-#define AMDGPU_BIOS_NUM_SCRATCH			8
++#define AMDGPU_BIOS_NUM_SCRATCH			16
+ 
+ /* max number of IP instances */
+ #define AMDGPU_MAX_SDMA_INSTANCES		2
+@@ -1318,6 +1318,7 @@ struct amdgpu_device {
+ 	uint8_t				*bios;
+ 	uint32_t			bios_size;
+ 	struct amdgpu_bo		*stollen_vga_memory;
++	uint32_t			bios_scratch_reg_offset;
+ 	uint32_t			bios_scratch[AMDGPU_BIOS_NUM_SCRATCH];
+ 
+ 	/* Register/doorbell mmio */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.c
+new file mode 100644
+index 0000000..4b9abd6
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.c
+@@ -0,0 +1,112 @@
++/*
++ * Copyright 2016 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#include <drm/drmP.h>
++#include <drm/amdgpu_drm.h>
++#include "amdgpu.h"
++#include "atomfirmware.h"
++#include "amdgpu_atomfirmware.h"
++#include "atom.h"
++
++#define get_index_into_master_table(master_table, table_name) (offsetof(struct master_table, table_name) / sizeof(uint16_t))
++
++bool amdgpu_atomfirmware_gpu_supports_virtualization(struct amdgpu_device *adev)
++{
++	int index = get_index_into_master_table(atom_master_list_of_data_tables_v2_1,
++						firmwareinfo);
++	uint16_t data_offset;
++
++	if (amdgpu_atom_parse_data_header(adev->mode_info.atom_context, index, NULL,
++					  NULL, NULL, &data_offset)) {
++		struct atom_firmware_info_v3_1 *firmware_info =
++			(struct atom_firmware_info_v3_1 *)(adev->mode_info.atom_context->bios +
++							   data_offset);
++
++		if (le32_to_cpu(firmware_info->firmware_capability) &
++		    ATOM_FIRMWARE_CAP_GPU_VIRTUALIZATION)
++			return true;
++	}
++	return false;
++}
++
++void amdgpu_atomfirmware_scratch_regs_init(struct amdgpu_device *adev)
++{
++	int index = get_index_into_master_table(atom_master_list_of_data_tables_v2_1,
++						firmwareinfo);
++	uint16_t data_offset;
++
++	if (amdgpu_atom_parse_data_header(adev->mode_info.atom_context, index, NULL,
++					  NULL, NULL, &data_offset)) {
++		struct atom_firmware_info_v3_1 *firmware_info =
++			(struct atom_firmware_info_v3_1 *)(adev->mode_info.atom_context->bios +
++							   data_offset);
++
++		adev->bios_scratch_reg_offset =
++			le32_to_cpu(firmware_info->bios_scratch_reg_startaddr);
++	}
++}
++
++void amdgpu_atomfirmware_scratch_regs_save(struct amdgpu_device *adev)
++{
++	int i;
++
++	for (i = 0; i < AMDGPU_BIOS_NUM_SCRATCH; i++)
++		adev->bios_scratch[i] = RREG32(adev->bios_scratch_reg_offset + i);
++}
++
++void amdgpu_atomfirmware_scratch_regs_restore(struct amdgpu_device *adev)
++{
++	int i;
++
++	for (i = 0; i < AMDGPU_BIOS_NUM_SCRATCH; i++)
++		WREG32(adev->bios_scratch_reg_offset + i, adev->bios_scratch[i]);
++}
++
++int amdgpu_atomfirmware_allocate_fb_scratch(struct amdgpu_device *adev)
++{
++	struct atom_context *ctx = adev->mode_info.atom_context;
++	int index = get_index_into_master_table(atom_master_list_of_data_tables_v2_1,
++						vram_usagebyfirmware);
++	uint16_t data_offset;
++	int usage_bytes = 0;
++
++	if (amdgpu_atom_parse_data_header(ctx, index, NULL, NULL, NULL, &data_offset)) {
++		struct vram_usagebyfirmware_v2_1 *firmware_usage =
++			(struct vram_usagebyfirmware_v2_1 *)(ctx->bios + data_offset);
++
++		DRM_DEBUG("atom firmware requested %08x %dkb fw %dkb drv\n",
++			  le32_to_cpu(firmware_usage->start_address_in_kb),
++			  le16_to_cpu(firmware_usage->used_by_firmware_in_kb),
++			  le16_to_cpu(firmware_usage->used_by_driver_in_kb));
++
++		usage_bytes = le16_to_cpu(firmware_usage->used_by_driver_in_kb) * 1024;
++	}
++	ctx->scratch_size_bytes = 0;
++	if (usage_bytes == 0)
++		usage_bytes = 20 * 1024;
++	/* allocate some scratch memory */
++	ctx->scratch = kzalloc(usage_bytes, GFP_KERNEL);
++	if (!ctx->scratch)
++		return -ENOMEM;
++	ctx->scratch_size_bytes = usage_bytes;
++	return 0;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.h
+new file mode 100644
+index 0000000..d0c4dcd
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.h
+@@ -0,0 +1,33 @@
++/*
++ * Copyright 2014 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef __AMDGPU_ATOMFIRMWARE_H__
++#define __AMDGPU_ATOMFIRMWARE_H__
++
++bool amdgpu_atomfirmware_gpu_supports_virtualization(struct amdgpu_device *adev);
++void amdgpu_atomfirmware_scratch_regs_init(struct amdgpu_device *adev);
++void amdgpu_atomfirmware_scratch_regs_save(struct amdgpu_device *adev);
++void amdgpu_atomfirmware_scratch_regs_restore(struct amdgpu_device *adev);
++int amdgpu_atomfirmware_allocate_fb_scratch(struct amdgpu_device *adev);
++
++#endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index f87c1cb..5a17899 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -41,6 +41,7 @@
+ #include "amdgpu_i2c.h"
+ #include "atom.h"
+ #include "amdgpu_atombios.h"
++#include "amdgpu_atomfirmware.h"
+ #include "amd_pcie.h"
+ #ifdef CONFIG_DRM_AMDGPU_SI
+ #include "si.h"
+@@ -992,8 +993,13 @@ static int amdgpu_atombios_init(struct amdgpu_device *adev)
+ 	}
+ 
+ 	mutex_init(&adev->mode_info.atom_context->mutex);
+-	amdgpu_atombios_scratch_regs_init(adev);
+-	amdgpu_atombios_allocate_fb_scratch(adev);
++	if (adev->is_atom_fw) {
++		amdgpu_atomfirmware_scratch_regs_init(adev);
++		amdgpu_atomfirmware_allocate_fb_scratch(adev);
++	} else {
++		amdgpu_atombios_scratch_regs_init(adev);
++		amdgpu_atombios_allocate_fb_scratch(adev);
++	}
+ 	return 0;
+ }
+ 
+@@ -1755,8 +1761,13 @@ static int amdgpu_resume(struct amdgpu_device *adev)
+ 
+ static void amdgpu_device_detect_sriov_bios(struct amdgpu_device *adev)
+ {
+-	if (amdgpu_atombios_has_gpu_virtualization_table(adev))
+-		adev->virt.caps |= AMDGPU_SRIOV_CAPS_SRIOV_VBIOS;
++	if (adev->is_atom_fw) {
++		if (amdgpu_atomfirmware_gpu_supports_virtualization(adev))
++			adev->virt.caps |= AMDGPU_SRIOV_CAPS_SRIOV_VBIOS;
++	} else {
++		if (amdgpu_atombios_has_gpu_virtualization_table(adev))
++			adev->virt.caps |= AMDGPU_SRIOV_CAPS_SRIOV_VBIOS;
++	}
+ }
+ 
+ bool amdgpu_device_asic_has_dc_support(enum amd_asic_type asic_type)
+@@ -1964,17 +1975,18 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 		DRM_INFO("GPU post is not needed\n");
+ 	}
+ 
+-	/* Initialize clocks */
+-	r = amdgpu_atombios_get_clock_info(adev);
+-	if (r) {
+-		dev_err(adev->dev, "amdgpu_atombios_get_clock_info failed\n");
+-		goto failed;
++	if (!adev->is_atom_fw) {
++		/* Initialize clocks */
++		r = amdgpu_atombios_get_clock_info(adev);
++		if (r) {
++			dev_err(adev->dev, "amdgpu_atombios_get_clock_info failed\n");
++			return r;
++		}
++		/* init i2c buses */
++		if (!amdgpu_device_has_dc_support(adev))
++			amdgpu_atombios_i2c_init(adev);
+ 	}
+ 
+-	/* init i2c buses */
+-	if (!amdgpu_device_has_dc_support(adev))
+-		amdgpu_atombios_i2c_init(adev);
+-
+ 	/* Fence driver */
+ 	r = amdgpu_fence_driver_init(adev);
+ 	if (r) {
+-- 
+2.7.4
+

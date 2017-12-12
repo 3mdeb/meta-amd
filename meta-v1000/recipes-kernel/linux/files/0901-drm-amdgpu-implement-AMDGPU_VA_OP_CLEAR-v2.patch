@@ -1,0 +1,267 @@
+From 457c9cc1f377e19bdc03f1e5390a27f116f86918 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 13 Mar 2017 10:13:38 +0100
+Subject: [PATCH 0901/2094] drm/amdgpu: implement AMDGPU_VA_OP_CLEAR v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A new VM operation to remove all mappings in a range.
+
+v2: limit unmapped area as noted by Jerry
+
+Change-Id: I80fd05203649afdca5d268c89267e167158478a5
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Junwei Zhang <Jerry.Zhang@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c   | 27 ++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c    | 99 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h    |  3 +
+ include/uapi/drm/amdgpu_drm.h             |  1 +
+ 5 files changed, 124 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 00e0e2c..be976fd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -509,14 +509,16 @@ static int amdgpu_gem_va_check(void *param, struct amdgpu_bo *bo)
+  * amdgpu_gem_va_update_vm -update the bo_va in its VM
+  *
+  * @adev: amdgpu_device pointer
++ * @vm: vm to update
+  * @bo_va: bo_va to update
+  * @list: validation list
+- * @operation: map or unmap
++ * @operation: map, unmap or clear
+  *
+  * Update the bo_va directly after setting its address. Errors are not
+  * vital here, so they are not reported back to userspace.
+  */
+ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
++				    struct amdgpu_vm *vm,
+ 				    struct amdgpu_bo_va *bo_va,
+ 				    struct list_head *list,
+ 				    uint32_t operation)
+@@ -531,16 +533,16 @@ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
+ 			goto error;
+ 	}
+ 
+-	r = amdgpu_vm_validate_pt_bos(adev, bo_va->vm, amdgpu_gem_va_check,
++	r = amdgpu_vm_validate_pt_bos(adev, vm, amdgpu_gem_va_check,
+ 				      NULL);
+ 	if (r)
+ 		goto error;
+ 
+-	r = amdgpu_vm_update_page_directory(adev, bo_va->vm);
++	r = amdgpu_vm_update_page_directory(adev, vm);
+ 	if (r)
+ 		goto error;
+ 
+-	r = amdgpu_vm_clear_freed(adev, bo_va->vm);
++	r = amdgpu_vm_clear_freed(adev, vm);
+ 	if (r)
+ 		goto error;
+ 
+@@ -594,6 +596,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 	switch (args->operation) {
+ 	case AMDGPU_VA_OP_MAP:
+ 	case AMDGPU_VA_OP_UNMAP:
++	case AMDGPU_VA_OP_CLEAR:
+ 		break;
+ 	default:
+ 		dev_err(&dev->pdev->dev, "unsupported operation %d\n",
+@@ -602,7 +605,8 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 	}
+ 
+ 	INIT_LIST_HEAD(&list);
+-	if (!(args->flags & AMDGPU_VM_PAGE_PRT)) {
++	if ((args->operation != AMDGPU_VA_OP_CLEAR) &&
++	    !(args->flags & AMDGPU_VM_PAGE_PRT)) {
+ 		gobj = drm_gem_object_lookup(filp, args->handle);
+ 		if (gobj == NULL)
+ 			return -ENOENT;
+@@ -627,8 +631,10 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 			r = -ENOENT;
+ 			goto error_backoff;
+ 		}
+-	} else {
++	} else if (args->operation != AMDGPU_VA_OP_CLEAR) {
+ 		bo_va = fpriv->prt_va;
++	} else {
++		bo_va = NULL;
+ 	}
+ 
+ 	switch (args->operation) {
+@@ -646,11 +652,18 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 	case AMDGPU_VA_OP_UNMAP:
+ 		r = amdgpu_vm_bo_unmap(adev, bo_va, args->va_address);
+ 		break;
++
++	case AMDGPU_VA_OP_CLEAR:
++		r = amdgpu_vm_bo_clear_mappings(adev, &fpriv->vm,
++						args->va_address,
++						args->map_size);
++		break;
+ 	default:
+ 		break;
+ 	}
+ 	if (!r && !(args->flags & AMDGPU_VM_DELAY_UPDATE) && !amdgpu_vm_debug)
+-		amdgpu_gem_va_update_vm(adev, bo_va, &list, args->operation);
++		amdgpu_gem_va_update_vm(adev, &fpriv->vm, bo_va, &list,
++					args->operation);
+ 
+ error_backoff:
+ 	ttm_eu_backoff_reservation(&ticket, &list);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
+index fc05db0..f38e5e2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
+@@ -225,7 +225,7 @@ TRACE_EVENT(amdgpu_vm_bo_map,
+ 			     ),
+ 
+ 	    TP_fast_assign(
+-			   __entry->bo = bo_va->bo;
++			   __entry->bo = bo_va ? bo_va->bo : NULL;
+ 			   __entry->start = mapping->it.start;
+ 			   __entry->last = mapping->it.last;
+ 			   __entry->offset = mapping->offset;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 73c9967..c280328 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1635,6 +1635,105 @@ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
+ }
+ 
+ /**
++ * amdgpu_vm_bo_clear_mappings - remove all mappings in a specific range
++ *
++ * @adev: amdgpu_device pointer
++ * @vm: VM structure to use
++ * @saddr: start of the range
++ * @size: size of the range
++ *
++ * Remove all mappings in a range, split them as appropriate.
++ * Returns 0 for success, error for failure.
++ */
++int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
++				struct amdgpu_vm *vm,
++				uint64_t saddr, uint64_t size)
++{
++	struct amdgpu_bo_va_mapping *before, *after, *tmp, *next;
++	struct interval_tree_node *it;
++	LIST_HEAD(removed);
++	uint64_t eaddr;
++
++	eaddr = saddr + size - 1;
++	saddr /= AMDGPU_GPU_PAGE_SIZE;
++	eaddr /= AMDGPU_GPU_PAGE_SIZE;
++
++	/* Allocate all the needed memory */
++	before = kzalloc(sizeof(*before), GFP_KERNEL);
++	if (!before)
++		return -ENOMEM;
++
++	after = kzalloc(sizeof(*after), GFP_KERNEL);
++	if (!after) {
++		kfree(before);
++		return -ENOMEM;
++	}
++
++	/* Now gather all removed mappings */
++	it = interval_tree_iter_first(&vm->va, saddr, eaddr);
++	while (it) {
++		tmp = container_of(it, struct amdgpu_bo_va_mapping, it);
++		it = interval_tree_iter_next(it, saddr, eaddr);
++
++		/* Remember mapping split at the start */
++		if (tmp->it.start < saddr) {
++			before->it.start = tmp->it.start;;
++			before->it.last = saddr - 1;
++			before->offset = tmp->offset;
++			before->flags = tmp->flags;
++			list_add(&before->list, &tmp->list);
++		}
++
++		/* Remember mapping split at the end */
++		if (tmp->it.last > eaddr) {
++			after->it.start = eaddr + 1;
++			after->it.last = tmp->it.last;
++			after->offset = tmp->offset;
++			after->offset += after->it.start - tmp->it.start;
++			after->flags = tmp->flags;
++			list_add(&after->list, &tmp->list);
++		}
++
++		list_del(&tmp->list);
++		list_add(&tmp->list, &removed);
++	}
++
++	/* And free them up */
++	list_for_each_entry_safe(tmp, next, &removed, list) {
++		interval_tree_remove(&tmp->it, &vm->va);
++		list_del(&tmp->list);
++
++		if (tmp->it.start < saddr)
++		    tmp->it.start = saddr;
++		if (tmp->it.last > eaddr)
++		    tmp->it.last = eaddr;
++
++		list_add(&tmp->list, &vm->freed);
++		trace_amdgpu_vm_bo_unmap(NULL, tmp);
++	}
++
++	/* Insert partial mapping before the range*/
++	if (before->it.start != before->it.last) {
++		interval_tree_insert(&before->it, &vm->va);
++		if (before->flags & AMDGPU_PTE_PRT)
++			amdgpu_vm_prt_get(adev);
++	} else {
++		kfree(before);
++	}
++
++	/* Insert partial mapping after the range */
++	if (after->it.start != after->it.last) {
++		interval_tree_insert(&after->it, &vm->va);
++		if (after->flags & AMDGPU_PTE_PRT)
++			amdgpu_vm_prt_get(adev);
++	} else {
++		kfree(after);
++	}
++
++	return 0;
++}
++
++/**
+  * amdgpu_vm_bo_rmv - remove a bo to a specific vm
+  *
+  * @adev: amdgpu_device pointer
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 0b2c0f8..1f861bb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -214,6 +214,9 @@ int amdgpu_vm_bo_map(struct amdgpu_device *adev,
+ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
+ 		       struct amdgpu_bo_va *bo_va,
+ 		       uint64_t addr);
++int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
++				struct amdgpu_vm *vm,
++				uint64_t saddr, uint64_t size);
+ void amdgpu_vm_bo_rmv(struct amdgpu_device *adev,
+ 		      struct amdgpu_bo_va *bo_va);
+ 
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 7da19cd..e17f5c4 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -356,6 +356,7 @@ struct drm_amdgpu_gem_op {
+ 
+ #define AMDGPU_VA_OP_MAP			1
+ #define AMDGPU_VA_OP_UNMAP			2
++#define AMDGPU_VA_OP_CLEAR			3
+ 
+ /* Delay the page table update till the next CS */
+ #define AMDGPU_VM_DELAY_UPDATE		(1 << 0)
+-- 
+2.7.4
+

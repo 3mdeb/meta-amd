@@ -1,0 +1,211 @@
+From 942fd4423c14f55b57f4514a3ac2692627f18215 Mon Sep 17 00:00:00 2001
+From: Andres Rodriguez <andresx7@gmail.com>
+Date: Thu, 6 Apr 2017 00:10:53 -0400
+Subject: [PATCH 2182/2500] drm/amdgpu: avoid KIQ clashing with compute or KFD
+ queues v2
+
+Instead of picking an arbitrary queue for KIQ, search for one according
+to policy. The queue must be unused.
+
+Also report the KIQ as an unavailable resource to KFD.
+
+In testing I ran into KCQ initialization issues when using pipes 2/3 of
+MEC2 for the KIQ. Therefore the policy disallows grabbing one of these.
+
+v2: fix (ring.me + 1) to (ring.me -1) in amdgpu_amdkfd_device_init
+
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Andres Rodriguez <andresx7@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        | 23 +++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c |  8 ++++++
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c      | 43 ++++++++++++++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c      | 42 ++++++++++++++++++++++++-----
+ 4 files changed, 98 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index a2c57c4..0dcc888 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1919,8 +1919,8 @@ amdgpu_get_sdma_instance(struct amdgpu_ring *ring)
+ 		return NULL;
+ }
+ 
+-static inline bool amdgpu_is_mec_queue_enabled(struct amdgpu_device *adev,
+-						int mec, int pipe, int queue)
++static inline int amdgpu_queue_to_bit(struct amdgpu_device *adev,
++				      int mec, int pipe, int queue)
+ {
+ 	int bit = 0;
+ 
+@@ -1929,7 +1929,24 @@ static inline bool amdgpu_is_mec_queue_enabled(struct amdgpu_device *adev,
+ 	bit += pipe * adev->gfx.mec.num_queue_per_pipe;
+ 	bit += queue;
+ 
+-	return test_bit(bit, adev->gfx.mec.queue_bitmap);
++	return bit;
++}
++
++static inline void amdgpu_bit_to_queue(struct amdgpu_device *adev, int bit,
++				       int *mec, int *pipe, int *queue)
++{
++	*queue = bit % adev->gfx.mec.num_queue_per_pipe;
++	*pipe = (bit / adev->gfx.mec.num_queue_per_pipe)
++		% adev->gfx.mec.num_pipe_per_mec;
++	*mec = (bit / adev->gfx.mec.num_queue_per_pipe)
++	       / adev->gfx.mec.num_pipe_per_mec;
++
++}
++static inline bool amdgpu_is_mec_queue_enabled(struct amdgpu_device *adev,
++					       int mec, int pipe, int queue)
++{
++	return test_bit(amdgpu_queue_to_bit(adev, mec, pipe, queue),
++			adev->gfx.mec.queue_bitmap);
+ }
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index f287b86..44cf6ea 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -126,6 +126,14 @@ void amdgpu_amdkfd_device_init(struct amdgpu_device *adev)
+ 				  adev->gfx.mec.queue_bitmap,
+ 				  KGD_MAX_QUEUES);
+ 
++		/* remove the KIQ bit as well */
++		if (adev->gfx.kiq.ring.ready)
++			clear_bit(amdgpu_queue_to_bit(adev,
++						      adev->gfx.kiq.ring.me - 1,
++						      adev->gfx.kiq.ring.pipe,
++						      adev->gfx.kiq.ring.queue),
++				  gpu_resources.queue_bitmap);
++
+ 		/* According to linux/bitmap.h we shouldn't use bitmap_clear if
+ 		 * nbits is not compile time constant */
+ 		last_valid_bit = adev->gfx.mec.num_mec
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 0a2e556..c6d59d7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -1378,6 +1378,37 @@ static void gfx_v8_0_mec_fini(struct amdgpu_device *adev)
+ 	}
+ }
+ 
++static int gfx_v8_0_kiq_acquire(struct amdgpu_device *adev,
++				 struct amdgpu_ring *ring)
++{
++	int queue_bit;
++	int mec, pipe, queue;
++
++	queue_bit = adev->gfx.mec.num_mec
++		    * adev->gfx.mec.num_pipe_per_mec
++		    * adev->gfx.mec.num_queue_per_pipe;
++
++	while (queue_bit-- >= 0) {
++		if (test_bit(queue_bit, adev->gfx.mec.queue_bitmap))
++			continue;
++
++		amdgpu_bit_to_queue(adev, queue_bit, &mec, &pipe, &queue);
++
++		/* Using pipes 2/3 from MEC 2 seems cause problems */
++		if (mec == 1 && pipe > 1)
++			continue;
++
++		ring->me = mec + 1;
++		ring->pipe = pipe;
++		ring->queue = queue;
++
++		return 0;
++	}
++
++	dev_err(adev->dev, "Failed to find a queue for KIQ\n");
++	return -EINVAL;
++}
++
+ static int gfx_v8_0_kiq_init_ring(struct amdgpu_device *adev,
+ 				  struct amdgpu_ring *ring,
+ 				  struct amdgpu_irq_src *irq)
+@@ -1395,15 +1426,11 @@ static int gfx_v8_0_kiq_init_ring(struct amdgpu_device *adev,
+ 	ring->ring_obj = NULL;
+ 	ring->use_doorbell = true;
+ 	ring->doorbell_index = AMDGPU_DOORBELL_KIQ;
+-	if (adev->gfx.mec2_fw) {
+-		ring->me = 2;
+-		ring->pipe = 0;
+-	} else {
+-		ring->me = 1;
+-		ring->pipe = 1;
+-	}
+ 
+-	ring->queue = 0;
++	r = gfx_v8_0_kiq_acquire(adev, ring);
++	if (r)
++		return r;
++
+ 	ring->eop_gpu_addr = kiq->eop_gpu_addr;
+ 	sprintf(ring->name, "kiq %d.%d.%d", ring->me, ring->pipe, ring->queue);
+ 	r = amdgpu_ring_init(adev, ring, 1024,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index 0bfef96..28e9403 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -1031,6 +1031,37 @@ static int gfx_v9_0_kiq_init(struct amdgpu_device *adev)
+ 	return 0;
+ }
+ 
++static int gfx_v9_0_kiq_acquire(struct amdgpu_device *adev,
++				 struct amdgpu_ring *ring)
++{
++	int queue_bit;
++	int mec, pipe, queue;
++
++	queue_bit = adev->gfx.mec.num_mec
++		    * adev->gfx.mec.num_pipe_per_mec
++		    * adev->gfx.mec.num_queue_per_pipe;
++
++	while (queue_bit-- >= 0) {
++		if (test_bit(queue_bit, adev->gfx.mec.queue_bitmap))
++			continue;
++
++		amdgpu_bit_to_queue(adev, queue_bit, &mec, &pipe, &queue);
++
++		/* Using pipes 2/3 from MEC 2 seems cause problems */
++		if (mec == 1 && pipe > 1)
++			continue;
++
++		ring->me = mec + 1;
++		ring->pipe = pipe;
++		ring->queue = queue;
++
++		return 0;
++	}
++
++	dev_err(adev->dev, "Failed to find a queue for KIQ\n");
++	return -EINVAL;
++}
++
+ static int gfx_v9_0_kiq_init_ring(struct amdgpu_device *adev,
+ 				  struct amdgpu_ring *ring,
+ 				  struct amdgpu_irq_src *irq)
+@@ -1048,13 +1079,10 @@ static int gfx_v9_0_kiq_init_ring(struct amdgpu_device *adev,
+ 	ring->ring_obj = NULL;
+ 	ring->use_doorbell = true;
+ 	ring->doorbell_index = AMDGPU_DOORBELL_KIQ;
+-	if (adev->gfx.mec2_fw) {
+-		ring->me = 2;
+-		ring->pipe = 0;
+-	} else {
+-		ring->me = 1;
+-		ring->pipe = 1;
+-	}
++
++	r = gfx_v9_0_kiq_acquire(adev, ring);
++	if (r)
++		return r;
+ 
+ 	ring->queue = 0;
+ 	ring->eop_gpu_addr = kiq->eop_gpu_addr;
+-- 
+2.7.4
+

@@ -1,0 +1,306 @@
+From c3be526816dbd0af4fb4323a7a3b1a5f8d213859 Mon Sep 17 00:00:00 2001
+From: Xiangliang Yu <Xiangliang.Yu@amd.com>
+Date: Fri, 10 Mar 2017 14:18:17 +0800
+Subject: [PATCH 0867/2094] drm/amdgpu/virt: impl mailbox for ai
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implement mailbox protocol for AI so that guest vf can communicate
+with GPU hypervisor.
+
+Signed-off-by: Xiangliang Yu <Xiangliang.Yu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Monk Liu <Monk.Liu@amd.com>
+Acked-by: Christian KÃ¶nig <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile   |   2 +-
+ drivers/gpu/drm/amd/amdgpu/mxgpu_ai.c | 207 ++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/mxgpu_ai.h |  47 ++++++++
+ 3 files changed, 255 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/mxgpu_ai.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/mxgpu_ai.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index a377fdb..d227695 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -40,7 +40,7 @@ amdgpu-$(CONFIG_DRM_AMDGPU_CIK)+= cik.o cik_ih.o kv_smc.o kv_dpm.o \
+ amdgpu-$(CONFIG_DRM_AMDGPU_SI)+= si.o gmc_v6_0.o gfx_v6_0.o si_ih.o si_dma.o dce_v6_0.o si_dpm.o si_smc.o
+ 
+ amdgpu-y += \
+-	vi.o mxgpu_vi.o nbio_v6_1.o soc15.o
++	vi.o mxgpu_vi.o nbio_v6_1.o soc15.o mxgpu_ai.o
+ 
+ # add GMC block
+ amdgpu-y += \
+diff --git a/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.c b/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.c
+new file mode 100644
+index 0000000..cfd5e54
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.c
+@@ -0,0 +1,207 @@
++/*
++ * Copyright 2014 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#include "amdgpu.h"
++#include "vega10/soc15ip.h"
++#include "vega10/NBIO/nbio_6_1_offset.h"
++#include "vega10/NBIO/nbio_6_1_sh_mask.h"
++#include "vega10/GC/gc_9_0_offset.h"
++#include "vega10/GC/gc_9_0_sh_mask.h"
++#include "soc15.h"
++#include "soc15_common.h"
++#include "mxgpu_ai.h"
++
++static void xgpu_ai_mailbox_send_ack(struct amdgpu_device *adev)
++{
++	u32 reg;
++	int timeout = AI_MAILBOX_TIMEDOUT;
++	u32 mask = REG_FIELD_MASK(BIF_BX_PF0_MAILBOX_CONTROL, RCV_MSG_VALID);
++
++	reg = RREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0,
++					     mmBIF_BX_PF0_MAILBOX_CONTROL));
++	reg = REG_SET_FIELD(reg, BIF_BX_PF0_MAILBOX_CONTROL, RCV_MSG_ACK, 1);
++	WREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0,
++				       mmBIF_BX_PF0_MAILBOX_CONTROL), reg);
++
++	/*Wait for RCV_MSG_VALID to be 0*/
++	reg = RREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0,
++					     mmBIF_BX_PF0_MAILBOX_CONTROL));
++	while (reg & mask) {
++		if (timeout <= 0) {
++			pr_err("RCV_MSG_VALID is not cleared\n");
++			break;
++		}
++		mdelay(1);
++		timeout -=1;
++
++		reg = RREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0,
++						     mmBIF_BX_PF0_MAILBOX_CONTROL));
++	}
++}
++
++static void xgpu_ai_mailbox_set_valid(struct amdgpu_device *adev, bool val)
++{
++	u32 reg;
++
++	reg = RREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0,
++					     mmBIF_BX_PF0_MAILBOX_CONTROL));
++	reg = REG_SET_FIELD(reg, BIF_BX_PF0_MAILBOX_CONTROL,
++			    TRN_MSG_VALID, val ? 1 : 0);
++	WREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0, mmBIF_BX_PF0_MAILBOX_CONTROL),
++		      reg);
++}
++
++static void xgpu_ai_mailbox_trans_msg(struct amdgpu_device *adev,
++				      enum idh_request req)
++{
++	u32 reg;
++
++	reg = RREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0,
++					     mmBIF_BX_PF0_MAILBOX_MSGBUF_TRN_DW0));
++	reg = REG_SET_FIELD(reg, BIF_BX_PF0_MAILBOX_MSGBUF_TRN_DW0,
++			    MSGBUF_DATA, req);
++	WREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0, mmBIF_BX_PF0_MAILBOX_MSGBUF_TRN_DW0),
++		      reg);
++
++	xgpu_ai_mailbox_set_valid(adev, true);
++}
++
++static int xgpu_ai_mailbox_rcv_msg(struct amdgpu_device *adev,
++				   enum idh_event event)
++{
++	u32 reg;
++	u32 mask = REG_FIELD_MASK(BIF_BX_PF0_MAILBOX_CONTROL, RCV_MSG_VALID);
++
++	if (event != IDH_FLR_NOTIFICATION_CMPL) {
++		reg = RREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0,
++						     mmBIF_BX_PF0_MAILBOX_CONTROL));
++		if (!(reg & mask))
++			return -ENOENT;
++	}
++
++	reg = RREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0,
++					     mmBIF_BX_PF0_MAILBOX_MSGBUF_RCV_DW0));
++	if (reg != event)
++		return -ENOENT;
++
++	xgpu_ai_mailbox_send_ack(adev);
++
++	return 0;
++}
++
++static int xgpu_ai_poll_ack(struct amdgpu_device *adev)
++{
++	int r = 0, timeout = AI_MAILBOX_TIMEDOUT;
++	u32 mask = REG_FIELD_MASK(BIF_BX_PF0_MAILBOX_CONTROL, TRN_MSG_ACK);
++	u32 reg;
++
++	reg = RREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0,
++					     mmBIF_BX_PF0_MAILBOX_CONTROL));
++	while (!(reg & mask)) {
++		if (timeout <= 0) {
++			pr_err("Doesn't get ack from pf.\n");
++			r = -ETIME;
++			break;
++		}
++		msleep(1);
++		timeout -= 1;
++
++		reg = RREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0,
++						     mmBIF_BX_PF0_MAILBOX_CONTROL));
++	}
++
++	return r;
++}
++
++static int xgpu_vi_poll_msg(struct amdgpu_device *adev, enum idh_event event)
++{
++	int r = 0, timeout = AI_MAILBOX_TIMEDOUT;
++
++	r = xgpu_ai_mailbox_rcv_msg(adev, event);
++	while (r) {
++		if (timeout <= 0) {
++			pr_err("Doesn't get ack from pf.\n");
++			r = -ETIME;
++			break;
++		}
++		msleep(1);
++		timeout -= 1;
++
++		r = xgpu_ai_mailbox_rcv_msg(adev, event);
++	}
++
++	return r;
++}
++
++
++static int xgpu_ai_send_access_requests(struct amdgpu_device *adev,
++					enum idh_request req)
++{
++	int r;
++
++	xgpu_ai_mailbox_trans_msg(adev, req);
++
++	/* start to poll ack */
++	r = xgpu_ai_poll_ack(adev);
++	if (r)
++		return r;
++
++	xgpu_ai_mailbox_set_valid(adev, false);
++
++	/* start to check msg if request is idh_req_gpu_init_access */
++	if (req == IDH_REQ_GPU_INIT_ACCESS ||
++		req == IDH_REQ_GPU_FINI_ACCESS ||
++		req == IDH_REQ_GPU_RESET_ACCESS) {
++		r = xgpu_vi_poll_msg(adev, IDH_READY_TO_ACCESS_GPU);
++		if (r)
++			return r;
++	}
++
++	return 0;
++}
++
++static int xgpu_ai_request_full_gpu_access(struct amdgpu_device *adev,
++					   bool init)
++{
++	enum idh_request req;
++
++	req = init ? IDH_REQ_GPU_INIT_ACCESS : IDH_REQ_GPU_FINI_ACCESS;
++	return xgpu_ai_send_access_requests(adev, req);
++}
++
++static int xgpu_ai_release_full_gpu_access(struct amdgpu_device *adev,
++					   bool init)
++{
++	enum idh_request req;
++	int r = 0;
++
++	req = init ? IDH_REL_GPU_INIT_ACCESS : IDH_REL_GPU_FINI_ACCESS;
++	r = xgpu_ai_send_access_requests(adev, req);
++
++	return r;
++}
++
++const struct amdgpu_virt_ops xgpu_ai_virt_ops = {
++	.req_full_gpu	= xgpu_ai_request_full_gpu_access,
++	.rel_full_gpu	= xgpu_ai_release_full_gpu_access,
++};
+diff --git a/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.h b/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.h
+new file mode 100644
+index 0000000..bf8ab8f
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright 2014 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef __MXGPU_AI_H__
++#define __MXGPU_AI_H__
++
++#define AI_MAILBOX_TIMEDOUT	150000
++
++enum idh_request {
++	IDH_REQ_GPU_INIT_ACCESS = 1,
++	IDH_REL_GPU_INIT_ACCESS,
++	IDH_REQ_GPU_FINI_ACCESS,
++	IDH_REL_GPU_FINI_ACCESS,
++	IDH_REQ_GPU_RESET_ACCESS
++};
++
++enum idh_event {
++	IDH_CLR_MSG_BUF	= 0,
++	IDH_READY_TO_ACCESS_GPU,
++	IDH_FLR_NOTIFICATION,
++	IDH_FLR_NOTIFICATION_CMPL,
++	IDH_EVENT_MAX
++};
++
++extern const struct amdgpu_virt_ops xgpu_ai_virt_ops;
++
++#endif
+-- 
+2.7.4
+

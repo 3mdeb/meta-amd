@@ -1,0 +1,149 @@
+From 29d7b205e0eca9a725986b34898e3e691a553add Mon Sep 17 00:00:00 2001
+From: xhdu <Duke.Du@amd.com>
+Date: Tue, 21 Mar 2017 11:05:32 -0400
+Subject: [PATCH 1043/2094] drm/amd/display: Add audio/video ContainerId
+ implementation
+
+Leave hardcoded if no ContainerId provided by DM.
+
+Change-Id: Ifb1639992a771f08c3b57ee09d11cc3ac8f8dfd2
+Signed-off-by: Duke Du <Duke.Du@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Reviewed-by: Charlene Liu <Charlene.Liu@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_sink.c   | 39 ++++++++++++++++++++++++-
+ drivers/gpu/drm/amd/display/dc/core/dc_stream.c | 14 +++++++--
+ drivers/gpu/drm/amd/display/dc/dc.h             | 14 +++++++++
+ 3 files changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_sink.c b/drivers/gpu/drm/amd/display/dc/core/dc_sink.c
+index 8a20473..da99556 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_sink.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_sink.c
+@@ -45,7 +45,10 @@ struct sink {
+ 
+ static void destruct(struct sink *sink)
+ {
+-
++	if (sink->protected.public.dc_container_id) {
++		dm_free(sink->protected.public.dc_container_id);
++		sink->protected.public.dc_container_id = NULL;
++	}
+ }
+ 
+ static bool construct(struct sink *sink, const struct dc_sink_init_data *init_params)
+@@ -63,6 +66,7 @@ static bool construct(struct sink *sink, const struct dc_sink_init_data *init_pa
+ 	sink->protected.public.dongle_max_pix_clk = init_params->dongle_max_pix_clk;
+ 	sink->protected.public.converter_disable_audio =
+ 			init_params->converter_disable_audio;
++	sink->protected.public.dc_container_id = NULL;
+ 
+ 	return true;
+ }
+@@ -113,6 +117,39 @@ struct dc_sink *dc_sink_create(const struct dc_sink_init_data *init_params)
+ 	return NULL;
+ }
+ 
++bool dc_sink_get_container_id(struct dc_sink *dc_sink, struct dc_container_id *container_id)
++{
++	if (dc_sink && container_id && dc_sink->dc_container_id) {
++		memmove(&container_id->guid, &dc_sink->dc_container_id->guid,
++			sizeof(container_id->guid));
++		memmove(&container_id->portId, &dc_sink->dc_container_id->portId,
++			sizeof(container_id->portId));
++		container_id->manufacturerName = dc_sink->dc_container_id->manufacturerName;
++		container_id->productCode = dc_sink->dc_container_id->productCode;
++		return true;
++	}
++	return false;
++}
++
++bool dc_sink_set_container_id(struct dc_sink *dc_sink, const struct dc_container_id *container_id)
++{
++	if (dc_sink && container_id) {
++		if (!dc_sink->dc_container_id)
++			dc_sink->dc_container_id = dm_alloc(sizeof(*dc_sink->dc_container_id));
++
++		if (dc_sink->dc_container_id) {
++			memmove(&dc_sink->dc_container_id->guid, &container_id->guid,
++				sizeof(container_id->guid));
++			memmove(&dc_sink->dc_container_id->portId, &container_id->portId,
++				sizeof(container_id->portId));
++			dc_sink->dc_container_id->manufacturerName = container_id->manufacturerName;
++			dc_sink->dc_container_id->productCode = container_id->productCode;
++			return true;
++		}
++	}
++	return false;
++}
++
+ /*******************************************************************************
+  * Protected functions - visible only inside of DC (not visible in DM)
+  ******************************************************************************/
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+index bafba1f..512a53b 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+@@ -76,9 +76,17 @@ static bool construct(struct core_stream *stream,
+ 	stream->public.audio_info.product_id = dc_sink_data->edid_caps.product_id;
+ 	stream->public.audio_info.flags.all = dc_sink_data->edid_caps.speaker_flags;
+ 
+-	/* TODO - Unhardcode port_id */
+-	stream->public.audio_info.port_id[0] = 0x5558859e;
+-	stream->public.audio_info.port_id[1] = 0xd989449;
++	if (dc_sink_data->dc_container_id != NULL) {
++		struct dc_container_id *dc_container_id = dc_sink_data->dc_container_id;
++
++		stream->public.audio_info.port_id[0] = dc_container_id->portId[0];
++		stream->public.audio_info.port_id[1] = dc_container_id->portId[1];
++	} else {
++		/* TODO - WindowDM has implemented,
++		other DMs need Unhardcode port_id */
++		stream->public.audio_info.port_id[0] = 0x5558859e;
++		stream->public.audio_info.port_id[1] = 0xd989449;
++	}
+ 
+ 	/* EDID CAP translation for HDMI 2.0 */
+ 	stream->public.timing.flags.LTE_340MCSC_SCRAMBLE = dc_sink_data->edid_caps.lte_340mcsc_scramble;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 8b033ba..b3d5b92 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -695,6 +695,17 @@ bool dc_link_dp_set_test_pattern(
+  * Sink Interfaces - A sink corresponds to a display output device
+  ******************************************************************************/
+ 
++struct dc_container_id {
++	// 128bit GUID in binary form
++	unsigned char  guid[16];
++	// 8 byte port ID -> ELD.PortID
++	unsigned int   portId[2];
++	// 128bit GUID in binary formufacturer name -> ELD.ManufacturerName
++	unsigned short manufacturerName;
++	// 2 byte product code -> ELD.ProductCode
++	unsigned short productCode;
++};
++
+ /*
+  * The sink structure contains EDID and other display device properties
+  */
+@@ -702,6 +713,7 @@ struct dc_sink {
+ 	enum signal_type sink_signal;
+ 	struct dc_edid dc_edid; /* raw edid */
+ 	struct dc_edid_caps edid_caps; /* parse display caps */
++	struct dc_container_id *dc_container_id;
+ 	uint32_t dongle_max_pix_clk;
+ 	bool converter_disable_audio;
+ };
+@@ -719,6 +731,8 @@ struct dc_sink_init_data {
+ };
+ 
+ struct dc_sink *dc_sink_create(const struct dc_sink_init_data *init_params);
++bool dc_sink_get_container_id(struct dc_sink *dc_sink, struct dc_container_id *container_id);
++bool dc_sink_set_container_id(struct dc_sink *dc_sink, const struct dc_container_id *container_id);
+ 
+ /*******************************************************************************
+  * Cursor interfaces - To manages the cursor within a stream
+-- 
+2.7.4
+

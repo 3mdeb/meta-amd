@@ -1,0 +1,152 @@
+From b0d6c4c71c0304219f0942d546e0a577d914aaca Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 30 Jun 2017 10:41:07 +0200
+Subject: [PATCH 2403/2500] drm/amdgpu: bind BOs with GTT space allocated
+ directly v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This avoids binding them later on.
+
+v2: fix typo in function name
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c | 16 +++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c     | 49 ++++++++++++++++++-----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h     |  1 +
+ 3 files changed, 46 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
+index f586cb7..7a25e81 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
+@@ -81,6 +81,20 @@ static int amdgpu_gtt_mgr_fini(struct ttm_mem_type_manager *man)
+ }
+ 
+ /**
++ * amdgpu_gtt_mgr_is_allocated - Check if mem has address space
++ *
++ * @mem: the mem object to check
++ *
++ * Check if a mem object has already address space allocated.
++ */
++bool amdgpu_gtt_mgr_is_allocated(struct ttm_mem_reg *mem)
++{
++	struct drm_mm_node *node = mem->mm_node;
++
++	return (node->start != AMDGPU_BO_INVALID_OFFSET);
++}
++
++/**
+  * amdgpu_gtt_mgr_alloc - allocate new ranges
+  *
+  * @man: TTM memory type manager
+@@ -102,7 +116,7 @@ int amdgpu_gtt_mgr_alloc(struct ttm_mem_type_manager *man,
+ 	unsigned long fpfn, lpfn;
+ 	int r;
+ 
+-	if (node->start != AMDGPU_BO_INVALID_OFFSET)
++	if (amdgpu_gtt_mgr_is_allocated(mem))
+ 		return 0;
+ 
+ 	if (place)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index e3af40b..f99b282 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -751,6 +751,31 @@ static void amdgpu_ttm_tt_unpin_userptr(struct ttm_tt *ttm)
+ 	sg_free_table(ttm->sg);
+ }
+ 
++static int amdgpu_ttm_do_bind(struct ttm_tt *ttm, struct ttm_mem_reg *mem)
++{
++	struct amdgpu_ttm_tt *gtt = (void *)ttm;
++	uint64_t flags;
++	int r;
++
++	spin_lock(&gtt->adev->gtt_list_lock);
++	flags = amdgpu_ttm_tt_pte_flags(gtt->adev, ttm, mem);
++	gtt->offset = (u64)mem->start << PAGE_SHIFT;
++	r = amdgpu_gart_bind(gtt->adev, gtt->offset, ttm->num_pages,
++		ttm->pages, gtt->ttm.dma_address, flags);
++
++	if (r) {
++		DRM_ERROR("failed to bind %lu pages at 0x%08llX\n",
++			  ttm->num_pages, gtt->offset);
++		goto error_gart_bind;
++	}
++
++	list_add_tail(&gtt->list, &gtt->adev->gtt_list);
++error_gart_bind:
++	spin_unlock(&gtt->adev->gtt_list_lock);
++	return r;
++
++}
++
+ static int amdgpu_ttm_backend_bind(struct ttm_tt *ttm,
+ 				   struct ttm_mem_reg *bo_mem)
+ {
+@@ -774,7 +799,10 @@ static int amdgpu_ttm_backend_bind(struct ttm_tt *ttm,
+ 	    bo_mem->mem_type == AMDGPU_PL_OA)
+ 		return -EINVAL;
+ 
+-	return 0;
++	if (amdgpu_gtt_mgr_is_allocated(bo_mem))
++	    r = amdgpu_ttm_do_bind(ttm, bo_mem);
++
++	return r;
+ }
+ 
+ bool amdgpu_ttm_is_bound(struct ttm_tt *ttm)
+@@ -787,8 +815,6 @@ bool amdgpu_ttm_is_bound(struct ttm_tt *ttm)
+ int amdgpu_ttm_bind(struct ttm_buffer_object *bo, struct ttm_mem_reg *bo_mem)
+ {
+ 	struct ttm_tt *ttm = bo->ttm;
+-	struct amdgpu_ttm_tt *gtt = (void *)bo->ttm;
+-	uint64_t flags;
+ 	int r;
+ 
+ 	if (!ttm || amdgpu_ttm_is_bound(ttm))
+@@ -801,22 +827,7 @@ int amdgpu_ttm_bind(struct ttm_buffer_object *bo, struct ttm_mem_reg *bo_mem)
+ 		return r;
+ 	}
+ 
+-	spin_lock(&gtt->adev->gtt_list_lock);
+-	flags = amdgpu_ttm_tt_pte_flags(gtt->adev, ttm, bo_mem);
+-	gtt->offset = (u64)bo_mem->start << PAGE_SHIFT;
+-	r = amdgpu_gart_bind(gtt->adev, gtt->offset, ttm->num_pages,
+-		ttm->pages, gtt->ttm.dma_address, flags);
+-
+-	if (r) {
+-		DRM_ERROR("failed to bind %lu pages at 0x%08llX\n",
+-			  ttm->num_pages, gtt->offset);
+-		goto error_gart_bind;
+-	}
+-
+-	list_add_tail(&gtt->list, &gtt->adev->gtt_list);
+-error_gart_bind:
+-	spin_unlock(&gtt->adev->gtt_list_lock);
+-	return r;
++	return amdgpu_ttm_do_bind(ttm, bo_mem);
+ }
+ 
+ int amdgpu_ttm_recover_gart(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index d3479e151..965de77 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -60,6 +60,7 @@ struct amdgpu_mman {
+ extern const struct ttm_mem_type_manager_func amdgpu_gtt_mgr_func;
+ extern const struct ttm_mem_type_manager_func amdgpu_vram_mgr_func;
+ 
++bool amdgpu_gtt_mgr_is_allocated(struct ttm_mem_reg *mem);
+ int amdgpu_gtt_mgr_alloc(struct ttm_mem_type_manager *man,
+ 			 struct ttm_buffer_object *tbo,
+ 			 const struct ttm_place *place,
+-- 
+2.7.4
+

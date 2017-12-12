@@ -1,0 +1,191 @@
+From 9dc95aeae8528992770b239dcd5435484e202729 Mon Sep 17 00:00:00 2001
+From: Bhawanpreet Lakha <Bhawanpreet.Lakha@amd.com>
+Date: Fri, 28 Jul 2017 13:11:00 -0400
+Subject: [PATCH 2780/2831] drm/amd/display: Avoid full modeset when not
+ required
+
+Fix IGT test case (kms_atomic_transition)
+-DRM sets the mode_changed flag, while we don't need to do a full
+ modeset.
+-We want to override the mode_changed flag in this case
+
+If we don't do this, we will still bypass the modeset in DC. This will
+fail to update the new stream_status, causing nullptr at a later stage
+when trying to access stream_status"
+
+We now avoid this by discarding the new_stream instead of partially
+filling it.
+
+Change-Id: I76522e0b53ef3865b8911e7d71e3c0b19e412abc
+Signed-off-by: Bhawanpreet Lakha <Bhawanpreet.Lakha@amd.com>
+Reviewed-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 97 +++++++++++++++--------
+ 1 file changed, 62 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 4df066a..bf5ed51 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -1741,8 +1741,16 @@ struct dm_connector_state {
+ #define to_dm_connector_state(x)\
+ 	container_of((x), struct dm_connector_state, base)
+ 
+-static bool modeset_required(struct drm_crtc_state *crtc_state)
++static bool modeset_required(struct drm_crtc_state *crtc_state,
++			     struct dc_stream *new_stream,
++			     struct dc_stream *old_stream)
+ {
++	if (dc_is_stream_unchanged(new_stream, old_stream)) {
++		crtc_state->mode_changed = false;
++		DRM_DEBUG_KMS("Mode change not required, setting mode_changed to %d",
++			      crtc_state->mode_changed);
++	}
++
+ 	if (!drm_atomic_crtc_needs_modeset(crtc_state))
+ 		return false;
+ 
+@@ -3202,7 +3210,8 @@ static int dm_crtc_helper_atomic_check(
+ 	struct dm_crtc_state *dm_crtc_state = to_dm_crtc_state(state);
+ 	int ret = -EINVAL;
+ 
+-	if (unlikely(!dm_crtc_state->stream && modeset_required(state))) {
++	if (unlikely(!dm_crtc_state->stream &&
++		     modeset_required(state, NULL, dm_crtc_state->stream))) {
+ 		WARN_ON(1);
+ 		return ret;
+ 	}
+@@ -4425,7 +4434,7 @@ void amdgpu_dm_atomic_commit_tail(
+ 		 * aconnector as needed
+ 		 */
+ 
+-		if (modeset_required(new_state)) {
++		if (modeset_required(new_state, new_acrtc_state->stream, old_acrtc_state->stream)) {
+ 
+ 			DRM_INFO("Atomic commit: SET crtc id %d: [%p]\n", acrtc->crtc_id, acrtc);
+ 
+@@ -4874,6 +4883,9 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 	for_each_crtc_in_state(state, crtc, crtc_state, i) {
+ 		struct amdgpu_crtc *acrtc = NULL;
+ 		struct amdgpu_connector *aconnector = NULL;
++		struct dc_stream *new_stream = NULL;
++		struct drm_connector_state *conn_state = NULL;
++		struct dm_connector_state *dm_conn_state = NULL;
+ 
+ 		old_acrtc_state = to_dm_crtc_state(crtc->state);
+ 		new_acrtc_state = to_dm_crtc_state(crtc_state);
+@@ -4895,23 +4907,50 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 			crtc_state->connectors_changed);
+ #endif
+ 
+-		if (modeset_required(crtc_state)) {
++		if (modereset_required(crtc_state)) {
+ 
+-			struct dc_stream *new_stream = NULL;
+-			struct drm_connector_state *conn_state = NULL;
+-			struct dm_connector_state *dm_conn_state = NULL;
++					/* i.e. reset mode */
++			if (new_acrtc_state->stream) {
++				set_count = remove_from_val_sets(
++						set,
++						set_count,
++						new_acrtc_state->stream);
++
++				dc_stream_release(new_acrtc_state->stream);
++				new_acrtc_state->stream = NULL;
++
++				lock_and_validation_needed = true;
++			}
++
++		} else {
+ 
+ 			if (aconnector) {
+-				conn_state = drm_atomic_get_connector_state(state, &aconnector->base);
++				conn_state = drm_atomic_get_connector_state(state,
++									    &aconnector->base);
++
+ 				if (IS_ERR(conn_state)) {
+ 					ret = PTR_ERR_OR_ZERO(conn_state);
+ 					goto fail;
+ 				}
+ 
+ 				dm_conn_state = to_dm_connector_state(conn_state);
++
++				new_stream = create_stream_for_sink(aconnector,
++								    &crtc_state->mode,
++								    dm_conn_state);
++
++				if (!new_stream) {
++					DRM_DEBUG_KMS("%s: Failed to create new stream for crtc %d\n",
++							__func__, acrtc->base.base.id);
++					break;
++				}
++
++
+ 			}
+ 
+-			new_stream = create_stream_for_sink(aconnector, &crtc_state->mode, dm_conn_state);
++			if (modeset_required(crtc_state, new_stream,
++					     old_acrtc_state->stream)) {
++
+ 
+ 			/*
+ 			 * we can have no stream on ACTION_SET if a display
+@@ -4919,39 +4958,27 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 			 * error, the OS will be updated after detection, and
+ 			 * do the right thing on next atomic commit
+ 			 */
+-			if (!new_stream) {
+-				DRM_DEBUG_KMS("%s: Failed to create new stream for crtc %d\n",
+-						__func__, acrtc->base.base.id);
+-				break;
+-			}
+-
+-			if (new_acrtc_state->stream)
+-				dc_stream_release(new_acrtc_state->stream);
+-
+-			new_acrtc_state->stream = new_stream;
+-
+-			set_count = update_in_val_sets_stream(
+-					set,
+-					set_count,
+-					old_acrtc_state->stream,
+-					new_acrtc_state->stream,
+-					crtc);
+ 
+-			lock_and_validation_needed = true;
++				if (new_acrtc_state->stream)
++					dc_stream_release(new_acrtc_state->stream);
+ 
+-		} else if (modereset_required(crtc_state)) {
++				new_acrtc_state->stream = new_stream;
+ 
+-			/* i.e. reset mode */
+-			if (new_acrtc_state->stream) {
+-				set_count = remove_from_val_sets(
++				set_count = update_in_val_sets_stream(
+ 						set,
+ 						set_count,
+-						new_acrtc_state->stream);
+-
+-				dc_stream_release(new_acrtc_state->stream);
+-				new_acrtc_state->stream = NULL;
++						old_acrtc_state->stream,
++						new_acrtc_state->stream,
++						crtc);
+ 
+ 				lock_and_validation_needed = true;
++			} else {
++				/*
++				 * The new stream is unused, so we release it
++				 */
++				if (new_stream)
++					dc_stream_release(new_stream);
++
+ 			}
+ 		}
+ 
+-- 
+2.7.4
+

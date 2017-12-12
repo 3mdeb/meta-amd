@@ -1,0 +1,370 @@
+From b7980b3f79db899b9000a743d67ffc8510f8910f Mon Sep 17 00:00:00 2001
+From: Sudheesh Mavila <sudheesh.mavila@amd.com>
+Date: Tue, 17 Oct 2017 12:54:18 +0530
+Subject: [PATCH] AMD eMMC fixes
+
+Signed-off-by: Sudheesh Mavila <sudheesh.mavila@amd.com>
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/mmc/core/mmc.c        | 39 +++++++++---------
+ drivers/mmc/host/sdhci-acpi.c | 94 ++++++++++++++++++++++++++++++++++---------
+ drivers/mmc/host/sdhci.c      | 24 +----------
+ drivers/mmc/host/sdhci.h      |  7 +++-
+ include/linux/mmc/host.h      |  7 +++-
+ 5 files changed, 106 insertions(+), 65 deletions(-)
+
+diff --git a/drivers/mmc/core/mmc.c b/drivers/mmc/core/mmc.c
+index ed8304b..b382ef9 100755
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@ -1135,14 +1135,14 @@ static int mmc_select_hs400(struct mmc_card *card)
+ 			mmc_hostname(host), err);
+ 		return err;
+ 	}
+-	/*In AMD Platform due to hardware ip issue this fails*/
+-	if (!host->ops->set_hs400_dll) {
+-		/* Set host controller to HS timing */
+-		mmc_set_timing(card->host, MMC_TIMING_MMC_HS);
+-		/* Reduce frequency to HS frequency */
+-		max_dtr = card->ext_csd.hs_max_dtr;
+-		mmc_set_clock(host, max_dtr);
+-	}
++
++	/* Set host controller to HS timing */
++	mmc_set_timing(card->host, MMC_TIMING_MMC_HS);
++	host->ios.transition = HS200_TO_HS_TO_HS400;
++	/* Reduce frequency to HS frequency */
++	max_dtr = card->ext_csd.hs_max_dtr;
++	mmc_set_clock(host, max_dtr);
++
+ 	err = mmc_switch_status(card);
+ 	if (err)
+ 		goto out_err;
+@@ -1170,7 +1170,7 @@ static int mmc_select_hs400(struct mmc_card *card)
+ 			 mmc_hostname(host), err);
+ 		return err;
+ 	}
+-
++	host->ios.transition = SWITCHING_TO_HS400;
+ 	/* Set host controller to HS400 timing and frequency */
+ 	mmc_set_timing(host, MMC_TIMING_MMC_HS400);
+ 	mmc_set_bus_speed(card);
+@@ -1178,8 +1178,7 @@ static int mmc_select_hs400(struct mmc_card *card)
+ 	err = mmc_switch_status(card);
+ 	if (err)
+ 		goto out_err;
+-	if (host->ops->set_hs400_dll)
+-		host->ops->set_hs400_dll(host);
++	host->ios.transition = SWITCHED_TO_HS400;
+ 	return 0;
+ 
+ out_err:
+@@ -1202,8 +1201,8 @@ int mmc_hs400_to_hs200(struct mmc_card *card)
+ 
+ 	/* Reduce frequency to HS */
+ 	max_dtr = card->ext_csd.hs_max_dtr;
+-	if (!host->ops->set_hs400_dll)
+-		mmc_set_clock(host, max_dtr);
++	mmc_set_clock(host, max_dtr);
++
+ 	/* Switch HS400 to HS DDR */
+ 	val = EXT_CSD_TIMING_HS;
+ 	err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_HS_TIMING,
+@@ -1211,14 +1210,12 @@ int mmc_hs400_to_hs200(struct mmc_card *card)
+ 			   true, false, true);
+ 	if (err)
+ 		goto out_err;
+-       /*In AMD Platform due to hardware ip issue this fails*/
+-	if (!host->ops->set_hs400_dll)
+-	{
+-		mmc_set_timing(host, MMC_TIMING_MMC_DDR52);
+-		err = mmc_switch_status(card);
+-		if (err)
+-			goto out_err;
+-	}
++
++	mmc_set_timing(host, MMC_TIMING_MMC_DDR52);
++
++	err = mmc_switch_status(card);
++	if (err)
++		goto out_err;
+ 
+ 	/* Switch HS DDR to HS */
+ 	err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_BUS_WIDTH,
+diff --git a/drivers/mmc/host/sdhci-acpi.c b/drivers/mmc/host/sdhci-acpi.c
+index de3bc88..0944a8c 100755
+--- a/drivers/mmc/host/sdhci-acpi.c
++++ b/drivers/mmc/host/sdhci-acpi.c
+@@ -88,6 +88,47 @@ static inline bool sdhci_acpi_flag(struct sdhci_acpi_host *c, unsigned int flag)
+ 	return c->slot && (c->slot->flags & flag);
+ }
+ 
++ /*AMD Driver Strength function*/
++
++static int amd_select_drive_strength(struct mmc_card *card,
++				     unsigned int max_dtr, int host_drv,
++				     int card_drv, int *drv_type)
++{
++	return MMC_SET_DRIVER_TYPE_A;
++}
++
++static void sdhci_acpi_amd_hs400_dll(struct sdhci_host *host)
++{
++	/*AMD Platform requires dll setting*/
++	sdhci_writel(host, 0x40003210, SDHCI_AMD_REST_DLL_REGISTER);
++	udelay(10);
++	sdhci_writel(host, 0x40033210, SDHCI_AMD_REST_DLL_REGISTER);
++}
++
++/*
++ * For AMD Platform it is required to disable the tuning
++ * bit first controller to bring to HS Mode from HS200
++ * mode, later enable to tune to HS400 mode.
++ */
++
++static void sdhci_amd_set_hs400_transition(struct sdhci_host *host)
++{
++	switch (host->mmc->ios.transition) {
++	case HS200_TO_HS_TO_HS400:
++		sdhci_writew(host, 0x9, SDHCI_HOST_CONTROL2);
++		break;
++
++	case SWITCHING_TO_HS400:
++		sdhci_writew(host, 0x80, SDHCI_HOST_CONTROL2);
++		sdhci_acpi_amd_hs400_dll(host);
++		break;
++
++	case SWITCHED_TO_HS400:
++	default:
++		break;
++	}
++}
++
+ static void sdhci_acpi_int_hw_reset(struct sdhci_host *host)
+ {
+ 	u8 reg;
+@@ -103,15 +144,6 @@ static void sdhci_acpi_int_hw_reset(struct sdhci_host *host)
+ 	usleep_range(300, 1000);
+ }
+ 
+-static void sdhci_acpi_amd_hs400_dll(struct sdhci_host *host)
+-{
+-	//host->caps1 = sdhci_readl(host, SDHCI_CAPABILITIES_1);
+-	if (host->mmc->caps2 & MMC_CAP2_HS400_1_8V) {
+-		sdhci_writel(host, 0x40003210, 0x908);
+-		udelay(10);
+-		sdhci_writel(host, 0x40033210, 0x908);
+-	}
+-}
+ static const struct sdhci_ops sdhci_acpi_ops_dflt = {
+ 	.set_clock = sdhci_set_clock,
+ 	.set_bus_width = sdhci_set_bus_width,
+@@ -136,7 +168,7 @@ static const struct sdhci_ops sdhci_acpi_ops_amd = {
+ 	.set_bus_width = sdhci_set_bus_width,
+ 	.reset = sdhci_reset,
+ 	.set_uhs_signaling = sdhci_set_uhs_signaling,
+-	 .set_hs400_dll = sdhci_acpi_amd_hs400_dll,
++	.set_platform_hs400_transition = sdhci_amd_set_hs400_transition,
+ };
+ 
+ static const struct sdhci_acpi_chip sdhci_acpi_chip_amd = {
+@@ -234,6 +266,31 @@ static int bxt_get_cd(struct mmc_host *mmc)
+ 	return ret;
+ }
+ 
++static int sdhci_acpi_emmc_amd_probe_slot(struct platform_device *pdev,
++					  const char *hid, const char *uid)
++{
++	struct sdhci_acpi_host *c = platform_get_drvdata(pdev);
++	struct sdhci_host *host;
++	unsigned int caps1, caps;
++	if (!c || !c->host)
++		return 0;
++
++	host = c->host;
++
++	caps1 = sdhci_readl(host, SDHCI_CAPABILITIES_1);
++	caps  = sdhci_readl(host, SDHCI_CAPABILITIES);
++
++	if (caps1 & SDHCI_SUPPORT_DDR50)
++		host->mmc->caps = MMC_CAP_1_8V_DDR;
++
++	if ((caps1 & SDHCI_SUPPORT_SDR104) &&
++	    (host->mmc->caps & MMC_CAP_1_8V_DDR))
++		host->mmc->caps2 = MMC_CAP2_HS400_1_8V;
++
++	host->mmc_host_ops.select_drive_strength = amd_select_drive_strength;
++	return 0;
++}
++
+ static int sdhci_acpi_emmc_probe_slot(struct platform_device *pdev,
+ 				      const char *hid, const char *uid)
+ {
+@@ -306,14 +363,6 @@ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_emmc = {
+ 	.probe_slot	= sdhci_acpi_emmc_probe_slot,
+ };
+ 
+-static const struct sdhci_acpi_slot sdhci_acpi_slot_amd_emmc = {
+-    .chip    = &sdhci_acpi_chip_amd,
+-    .caps    = MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |  MMC_CAP_HW_RESET,
+-    .quirks  =  SDHCI_QUIRK_BROKEN_DMA | SDHCI_QUIRK_BROKEN_ADMA,
+-    .quirks2 =  SDHCI_QUIRK2_BROKEN_TUNING_WA,
+-    .probe_slot     = sdhci_acpi_emmc_probe_slot,
+-};
+-
+ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sdio = {
+ 	.quirks  = SDHCI_QUIRK_BROKEN_CARD_DETECTION |
+ 		   SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC,
+@@ -346,6 +395,13 @@ static const struct sdhci_acpi_slot sdhci_acpi_slot_qcom_sd = {
+ 	.caps    = MMC_CAP_NONREMOVABLE,
+ };
+ 
++static const struct sdhci_acpi_slot sdhci_acpi_slot_amd_emmc = {
++	.chip   = &sdhci_acpi_chip_amd,
++	.caps   = MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |  MMC_CAP_HW_RESET,
++	//.quirks = SDHCI_QUIRK_32BIT_DMA_ADDR | SDHCI_QUIRK_32BIT_DMA_SIZE | SDHCI_QUIRK_32BIT_ADMA_SIZE,
++    .quirks  =  SDHCI_QUIRK_BROKEN_DMA | SDHCI_QUIRK_BROKEN_ADMA,
++	.probe_slot     = sdhci_acpi_emmc_amd_probe_slot,
++};
+ struct sdhci_acpi_uid_slot {
+ 	const char *hid;
+ 	const char *uid;
+@@ -366,9 +422,9 @@ static const struct sdhci_acpi_uid_slot sdhci_acpi_uids[] = {
+ 	{ "INT344D"  , NULL, &sdhci_acpi_slot_int_sdio },
+ 	{ "PNP0FFF"  , "3" , &sdhci_acpi_slot_int_sd   },
+ 	{ "PNP0D40"  },
+-	{ "AMDI0040", NULL, &sdhci_acpi_slot_amd_emmc  },
+ 	{ "QCOM8051", NULL, &sdhci_acpi_slot_qcom_sd_3v },
+ 	{ "QCOM8052", NULL, &sdhci_acpi_slot_qcom_sd },
++	{ "AMDI0040", NULL, &sdhci_acpi_slot_amd_emmc},
+ 	{ },
+ };
+ 
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index 1e25c26..6969e97 100755
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -1153,12 +1153,6 @@ void sdhci_send_command(struct sdhci_host *host, struct mmc_command *cmd)
+ 		flags |= SDHCI_CMD_DATA;
+ 
+ 	sdhci_writew(host, SDHCI_MAKE_CMD(cmd->opcode, flags), SDHCI_COMMAND);
+-
+-	if (cmd->opcode == MMC_SEND_TUNING_BLOCK_HS200  && (host->quirks2 & SDHCI_QUIRK2_BROKEN_TUNING_WA)) {
+-		mdelay(10);
+-		sdhci_writel(host, 0x8803040a, 0x8b8);
+-		mdelay(10);
+-	}
+ }
+ EXPORT_SYMBOL_GPL(sdhci_send_command);
+ 
+@@ -1622,7 +1616,8 @@ static void sdhci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+ 		host->ops->set_power(host, ios->power_mode, ios->vdd);
+ 	else
+ 		sdhci_set_power(host, ios->power_mode, ios->vdd);
+-
++	if (host->ops->set_platform_hs400_transition)
++		host->ops->set_platform_hs400_transition(host);
+ 	if (host->ops->platform_send_init_74_clocks)
+ 		host->ops->platform_send_init_74_clocks(host, ios->power_mode);
+ 
+@@ -1810,14 +1805,6 @@ static void sdhci_hw_reset(struct mmc_host *mmc)
+ 		host->ops->hw_reset(host);
+ }
+ 
+-static void sdhci_set_hs400_dll(struct mmc_host *mmc)
+-{
+-	struct sdhci_host *host = mmc_priv(mmc);
+-
+-	if (host->ops && host->ops->set_hs400_dll)
+-		host->ops->set_hs400_dll(host);
+-}
+-
+ static void sdhci_enable_sdio_irq_nolock(struct sdhci_host *host, int enable)
+ {
+ 	if (!(host->flags & SDHCI_DEVICE_DEAD)) {
+@@ -2303,7 +2290,6 @@ static const struct mmc_host_ops sdhci_ops = {
+ 	.get_cd		= sdhci_get_cd,
+ 	.get_ro		= sdhci_get_ro,
+ 	.hw_reset	= sdhci_hw_reset,
+-	.set_hs400_dll = sdhci_set_hs400_dll,
+ 	.enable_sdio_irq = sdhci_enable_sdio_irq,
+ 	.start_signal_voltage_switch	= sdhci_start_signal_voltage_switch,
+ 	.prepare_hs400_tuning		= sdhci_prepare_hs400_tuning,
+@@ -3076,12 +3062,6 @@ void __sdhci_read_caps(struct sdhci_host *host, u16 *ver, u32 *caps, u32 *caps1)
+ 		return;
+ 
+ 	host->caps1 = caps1 ? *caps1 : sdhci_readl(host, SDHCI_CAPABILITIES_1);
+-
+-	if ((host->caps1 & SDHCI_SUPPORT_SDR104) && (host->caps1 & SDHCI_SUPPORT_DDR50) &&
+-	 (host->quirks2 & SDHCI_QUIRK2_BROKEN_TUNING_WA))
+-	{
+-		host->mmc->caps2 = MMC_CAP2_HS400_1_8V;
+-	}
+ }
+ EXPORT_SYMBOL_GPL(__sdhci_read_caps);
+ 
+diff --git a/drivers/mmc/host/sdhci.h b/drivers/mmc/host/sdhci.h
+index e3a46d8..3cb5068 100755
+--- a/drivers/mmc/host/sdhci.h
++++ b/drivers/mmc/host/sdhci.h
+@@ -261,6 +261,9 @@
+ #define   SDHCI_SPEC_200	1
+ #define   SDHCI_SPEC_300	2
+ 
++/* AMD sdhci reset dll register.*/
++#define SDHCI_AMD_REST_DLL_REGISTER	0x908
++
+ /*
+  * End of controller registers.
+  */
+@@ -426,7 +429,6 @@ struct sdhci_host {
+ /* Broken Clock divider zero in controller */
+ #define SDHCI_QUIRK2_CLOCK_DIV_ZERO_BROKEN		(1<<15)
+ 
+-#define SDHCI_QUIRK2_BROKEN_TUNING_WA		(1<<16)
+ 	int irq;		/* Device IRQ */
+ 	void __iomem *ioaddr;	/* Mapped address */
+ 
+@@ -553,12 +555,13 @@ struct sdhci_ops {
+ 	void		(*set_bus_width)(struct sdhci_host *host, int width);
+ 	void (*platform_send_init_74_clocks)(struct sdhci_host *host,
+ 					     u8 power_mode);
++	/* ios for transiton phase for going to hs400 */
++	void (*set_platform_hs400_transition)(struct sdhci_host *host);
+ 	unsigned int    (*get_ro)(struct sdhci_host *host);
+ 	void		(*reset)(struct sdhci_host *host, u8 mask);
+ 	int	(*platform_execute_tuning)(struct sdhci_host *host, u32 opcode);
+ 	void	(*set_uhs_signaling)(struct sdhci_host *host, unsigned int uhs);
+ 	void	(*hw_reset)(struct sdhci_host *host);
+-	void    (*set_hs400_dll)(struct sdhci_host *host);
+ 	void    (*adma_workaround)(struct sdhci_host *host, u32 intmask);
+ 	void    (*card_event)(struct sdhci_host *host);
+ 	void	(*voltage_switch)(struct sdhci_host *host);
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 7889b4a..a48e0f7 100755
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -80,6 +80,12 @@ struct mmc_ios {
+ #define MMC_SET_DRIVER_TYPE_D	3
+ 
+ 	bool enhanced_strobe;			/* hs400es selection */
++
++	unsigned int transition;      /* track transition modes (hs200 hs400) */
++
++#define HS200_TO_HS_TO_HS400	1
++#define SWITCHING_TO_HS400	2
++#define SWITCHED_TO_HS400	3
+ };
+ 
+ struct mmc_host_ops {
+@@ -153,7 +159,6 @@ struct mmc_host_ops {
+ 					 unsigned int max_dtr, int host_drv,
+ 					 int card_drv, int *drv_type);
+ 	void	(*hw_reset)(struct mmc_host *host);
+-	void	(*set_hs400_dll)(struct mmc_host *host);
+ 	void	(*card_event)(struct mmc_host *host);
+ 
+ 	/*
+-- 
+2.7.4
+

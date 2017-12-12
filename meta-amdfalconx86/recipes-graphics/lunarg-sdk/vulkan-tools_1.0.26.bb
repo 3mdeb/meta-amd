@@ -22,7 +22,9 @@ SRC_URI = "git://github.com/LunarG/VulkanTools;branch=sdk-${PV} \
            file://0001-CMakeLists-add-include-path-so-Xlib.h-is-found-as-ne.patch \
            file://0002-obey-CMAKE_INSTALL_LIBDIR.patch \
            file://0003-vktrace-do-not-link-to-internal-loader.patch\
-           file://0004-json-correct-layer-lib-paths.patch"
+           file://0004-json-correct-layer-lib-paths.patch \
+           file://0005-CMakeLists-add-include-paths-for-xcb-and-Xlib.patch \
+"
 
 EXTRA_OECMAKE = " \
     -DBUILD_LOADER=0 \
@@ -50,4 +52,16 @@ do_install_append() {
     install -d ${D}${sysconfdir}/vulkan/explicit_layer.d
     cp -f ${S}/layersvt/${HOST_OS}/*.json ${D}${sysconfdir}/vulkan/explicit_layer.d
     cp -f ${S}/vktrace/src/vktrace_layer/${HOST_OS}/*.json ${D}${sysconfdir}/vulkan/explicit_layer.d
+}
+
+# Conditional building of vktraceviewer
+QTBITS ?= "${@bb.utils.contains('BBFILE_COLLECTIONS', 'qt5-layer', 'cmake_qt5', '',d)}"
+inherit ${QTBITS}
+DEPENDS += "${@base_conditional('QTBITS', '', '', 'libxcb', d)}"
+RDEPENDS_${PN}_append = " ${@base_conditional('QTBITS', '', '', 'qtsvg', d)}"
+do_install_append() {
+    if [ "${QTBITS}" != ""   ]
+    then
+        install ${B}/vktrace/vktraceviewer ${D}${bindir}
+    fi
 }

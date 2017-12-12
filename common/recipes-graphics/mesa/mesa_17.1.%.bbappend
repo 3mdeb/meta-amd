@@ -27,11 +27,8 @@ EXTRA_OECONF_append_amd = " \
 		 --enable-vdpau \
 		 --enable-glx \
 		 --enable-omx \
-		 --with-omx-libdir=${libdir}/bellagio \
-		"
-
-EXTRA_OECONF_append_amdfalconx86 = " \
 		 --enable-texture-float \
+		 --with-omx-libdir=${libdir}/bellagio \
 		"
 
 # Package all the libXvMC gallium extensions together

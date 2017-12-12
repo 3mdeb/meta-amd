@@ -1,0 +1,203 @@
+From 0f1b2160fabb1b8a8475e2717b0d413a40aaaa59 Mon Sep 17 00:00:00 2001
+From: Andres Rodriguez <andresx7@gmail.com>
+Date: Thu, 9 Feb 2017 17:39:52 -0500
+Subject: [PATCH 2140/2500] drm/amdgpu: teach amdgpu how to enable interrupts
+ for any pipe v3
+
+The current implementation is hardcoded to enable ME1/PIPE0 interrupts
+only.
+
+This patch allows amdgpu to enable interrupts for any pipe of ME1.
+
+v2: added gfx9 support
+v3: use soc15_grbm_select for gfx9
+
+Acked-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Andres Rodriguez <andresx7@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c | 48 ++++++++++++---------------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c | 33 +++++++++++------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c | 50 +++++++++++------------------------
+ 3 files changed, 49 insertions(+), 82 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 19b41ad..a48f649 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -5034,42 +5034,28 @@ static void gfx_v7_0_set_compute_eop_interrupt_state(struct amdgpu_device *adev,
+ 						     int me, int pipe,
+ 						     enum amdgpu_interrupt_state state)
+ {
+-	u32 mec_int_cntl, mec_int_cntl_reg;
+-
+-	/*
+-	 * amdgpu controls only pipe 0 of MEC1. That's why this function only
+-	 * handles the setting of interrupts for this specific pipe. All other
+-	 * pipes' interrupts are set by amdkfd.
++	/* Me 0 is for graphics and Me 2 is reserved for HW scheduling
++	 * So we should only really be configuring ME 1 i.e. MEC0
+ 	 */
+-
+-	if (me == 1) {
+-		switch (pipe) {
+-		case 0:
+-			mec_int_cntl_reg = mmCP_ME1_PIPE0_INT_CNTL;
+-			break;
+-		default:
+-			DRM_DEBUG("invalid pipe %d\n", pipe);
+-			return;
+-		}
+-	} else {
+-		DRM_DEBUG("invalid me %d\n", me);
++	if (me != 1) {
++		DRM_ERROR("Ignoring request to enable interrupts for invalid me:%d\n", me);
+ 		return;
+ 	}
+ 
+-	switch (state) {
+-	case AMDGPU_IRQ_STATE_DISABLE:
+-		mec_int_cntl = RREG32(mec_int_cntl_reg);
+-		mec_int_cntl &= ~CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK;
+-		WREG32(mec_int_cntl_reg, mec_int_cntl);
+-		break;
+-	case AMDGPU_IRQ_STATE_ENABLE:
+-		mec_int_cntl = RREG32(mec_int_cntl_reg);
+-		mec_int_cntl |= CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK;
+-		WREG32(mec_int_cntl_reg, mec_int_cntl);
+-		break;
+-	default:
+-		break;
++	if (pipe >= adev->gfx.mec.num_pipe_per_mec) {
++		DRM_ERROR("Ignoring request to enable interrupts for invalid "
++				"me:%d pipe:%d\n", pipe, me);
++		return;
+ 	}
++
++	mutex_lock(&adev->srbm_mutex);
++	cik_srbm_select(adev, me, pipe, 0, 0);
++
++	WREG32_FIELD(CPC_INT_CNTL, TIME_STAMP_INT_ENABLE,
++			state == AMDGPU_IRQ_STATE_DISABLE ? 0 : 1);
++
++	cik_srbm_select(adev, 0, 0, 0, 0);
++	mutex_unlock(&adev->srbm_mutex);
+ }
+ 
+ static int gfx_v7_0_set_priv_reg_fault_state(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 74796cc..22742cd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -6772,27 +6772,26 @@ static void gfx_v8_0_set_compute_eop_interrupt_state(struct amdgpu_device *adev,
+ 						     int me, int pipe,
+ 						     enum amdgpu_interrupt_state state)
+ {
+-	/*
+-	 * amdgpu controls only pipe 0 of MEC1. That's why this function only
+-	 * handles the setting of interrupts for this specific pipe. All other
+-	 * pipes' interrupts are set by amdkfd.
+-	 */
++	/* Me 0 is reserved for graphics */
++	if (me < 1 || me > adev->gfx.mec.num_mec) {
++		DRM_ERROR("Ignoring request to enable interrupts for invalid me:%d\n", me);
++		return;
++	}
+ 
+-	if (me == 1) {
+-		switch (pipe) {
+-		case 0:
+-			break;
+-		default:
+-			DRM_DEBUG("invalid pipe %d\n", pipe);
+-			return;
+-		}
+-	} else {
+-		DRM_DEBUG("invalid me %d\n", me);
++	if (pipe >= adev->gfx.mec.num_pipe_per_mec) {
++		DRM_ERROR("Ignoring request to enable interrupts for invalid "
++				"me:%d pipe:%d\n", pipe, me);
+ 		return;
+ 	}
+ 
+-	WREG32_FIELD(CP_ME1_PIPE0_INT_CNTL, TIME_STAMP_INT_ENABLE,
+-		     state == AMDGPU_IRQ_STATE_DISABLE ? 0 : 1);
++	mutex_lock(&adev->srbm_mutex);
++	vi_srbm_select(adev, me, pipe, 0, 0);
++
++	WREG32_FIELD(CPC_INT_CNTL, TIME_STAMP_INT_ENABLE,
++			state == AMDGPU_IRQ_STATE_DISABLE ? 0 : 1);
++
++	vi_srbm_select(adev, 0, 0, 0, 0);
++	mutex_unlock(&adev->srbm_mutex);
+ }
+ 
+ static int gfx_v8_0_set_priv_reg_fault_state(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index eb7a622..cb0e32b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -4147,44 +4147,26 @@ static void gfx_v9_0_set_compute_eop_interrupt_state(struct amdgpu_device *adev,
+ 						     int me, int pipe,
+ 						     enum amdgpu_interrupt_state state)
+ {
+-	u32 mec_int_cntl, mec_int_cntl_reg;
+-
+-	/*
+-	 * amdgpu controls only pipe 0 of MEC1. That's why this function only
+-	 * handles the setting of interrupts for this specific pipe. All other
+-	 * pipes' interrupts are set by amdkfd.
+-	 */
+-
+-	if (me == 1) {
+-		switch (pipe) {
+-		case 0:
+-			mec_int_cntl_reg = SOC15_REG_OFFSET(GC, 0, mmCP_ME1_PIPE0_INT_CNTL);
+-			break;
+-		default:
+-			DRM_DEBUG("invalid pipe %d\n", pipe);
+-			return;
+-		}
+-	} else {
+-		DRM_DEBUG("invalid me %d\n", me);
++	/* Me 0 is reserved for graphics */
++	if (me < 1 || me > adev->gfx.mec.num_mec) {
++		DRM_ERROR("Ignoring request to enable interrupts for invalid me:%d\n", me);
+ 		return;
+ 	}
+ 
+-	switch (state) {
+-	case AMDGPU_IRQ_STATE_DISABLE:
+-		mec_int_cntl = RREG32(mec_int_cntl_reg);
+-		mec_int_cntl = REG_SET_FIELD(mec_int_cntl, CP_ME1_PIPE0_INT_CNTL,
+-					     TIME_STAMP_INT_ENABLE, 0);
+-		WREG32(mec_int_cntl_reg, mec_int_cntl);
+-		break;
+-	case AMDGPU_IRQ_STATE_ENABLE:
+-		mec_int_cntl = RREG32(mec_int_cntl_reg);
+-		mec_int_cntl = REG_SET_FIELD(mec_int_cntl, CP_ME1_PIPE0_INT_CNTL,
+-					     TIME_STAMP_INT_ENABLE, 1);
+-		WREG32(mec_int_cntl_reg, mec_int_cntl);
+-		break;
+-	default:
+-		break;
++	if (pipe >= adev->gfx.mec.num_pipe_per_mec) {
++		DRM_ERROR("Ignoring request to enable interrupts for invalid "
++				"me:%d pipe:%d\n", pipe, me);
++		return;
+ 	}
++
++	mutex_lock(&adev->srbm_mutex);
++	soc15_grbm_select(adev, me, pipe, 0, 0);
++
++	WREG32_FIELD(CPC_INT_CNTL, TIME_STAMP_INT_ENABLE,
++			state == AMDGPU_IRQ_STATE_DISABLE ? 0 : 1);
++
++	soc15_grbm_select(adev, 0, 0, 0, 0);
++	mutex_unlock(&adev->srbm_mutex);
+ }
+ 
+ static int gfx_v9_0_set_priv_reg_fault_state(struct amdgpu_device *adev,
+-- 
+2.7.4
+

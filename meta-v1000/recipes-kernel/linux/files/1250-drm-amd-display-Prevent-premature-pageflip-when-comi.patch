@@ -1,0 +1,96 @@
+From bbcbc58feea51d3899ba514bcccf93653847dd59 Mon Sep 17 00:00:00 2001
+From: Mario Kleiner <mario.kleiner.de@gmail.com>
+Date: Mon, 24 Apr 2017 18:54:20 +0200
+Subject: [PATCH 1250/2094] drm/amd/display: Prevent premature pageflip when
+ comitting in vblank. (v3)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Make sure we do not program a hw pageflip inside vblank 'n' iff the
+atomic flip is comitted while inside the same vblank 'n'. We must
+defer such a flip by one refresh cycle to vblank 'n+1', unless this
+is a DRM_MODE_PAGE_FLIP_ASYNC async pageflip, which must always
+execute as soon as possible.
+
+Without this, pageflips programmed via X11 GLX_OML_sync_control extensions
+glXSwapBuffersMscOML(..., target_msc, ...); call and/or via DRI3/Present
+PresentPixmap(..., target_msc, ...); request will complete one vblank
+too early whenever target_msc > current_msc + 1, ie. more than 1 vblank
+in the future. In such a case, the call of the pageflip ioctl() would be
+triggered by a queued drmWaitVblank() vblank event, which itself gets
+dispatched inside the vblank one frame before the target_msc vblank.
+
+Testing with this patch does no longer show any problems with
+OML_sync_control swap scheduling or flip completion timestamps.
+Tested on R9 380 Tonga.
+
+v2: Add acked/r-b by Harry and Michel.
+v3: Feedback from Andrey: Must not wait an extra frame for
+    DRM_MODE_PAGE_FLIP_ASYNC flips.
+
+Signed-off-by: Mario Kleiner <mario.kleiner.de@gmail.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com> (v1)
+Reviewed-by: Michel Dänzer <michel.daenzer@amd.com>
+Reviewed-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+
+Cc: Harry Wentland <Harry.Wentland@amd.com>
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Michel Dänzer <michel.daenzer@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c  | 20 ++++++++++----------
+ 1 file changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+index 4904d11..93a96f0 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_types.c
+@@ -2435,6 +2435,9 @@ static void amdgpu_dm_do_flip(
+ 	struct amdgpu_device *adev = crtc->dev->dev_private;
+ 	bool async_flip = (acrtc->flip_flags & DRM_MODE_PAGE_FLIP_ASYNC) != 0;
+ 
++	/* Prepare wait for target vblank early - before the fence-waits */
++	target_vblank = target - drm_crtc_vblank_count(crtc) +
++			amdgpu_get_vblank_counter_kms(crtc->dev, acrtc->crtc_id);
+ 
+ 	/*TODO This might fail and hence better not used, wait
+ 	 * explicitly on fences instead
+@@ -2453,13 +2456,9 @@ static void amdgpu_dm_do_flip(
+ 
+ 	amdgpu_bo_unreserve(abo);
+ 
+-	/* Wait for target vblank */
+ 	/* Wait until we're out of the vertical blank period before the one
+ 	 * targeted by the flip
+ 	 */
+-	target_vblank = target - drm_crtc_vblank_count(crtc) +
+-			amdgpu_get_vblank_counter_kms(crtc->dev, acrtc->crtc_id);
+-
+ 	while ((acrtc->enabled &&
+ 		(amdgpu_get_crtc_scanoutpos(adev->ddev, acrtc->crtc_id, 0,
+ 					&vpos, &hpos, NULL, NULL,
+@@ -2735,14 +2734,15 @@ void amdgpu_dm_atomic_commit_tail(
+ 		pflip_needed = !state->allow_modeset;
+ 
+ 		if (pflip_needed) {
++			wait_for_vblank =
++				acrtc->flip_flags & DRM_MODE_PAGE_FLIP_ASYNC ?
++				false : true;
++
+ 			amdgpu_dm_do_flip(
+-					crtc,
+-					fb,
+-					drm_crtc_vblank_count(crtc));
++				crtc,
++				fb,
++				drm_crtc_vblank_count(crtc) + wait_for_vblank);
+ 
+-			wait_for_vblank =
+-					acrtc->flip_flags & DRM_MODE_PAGE_FLIP_ASYNC ?
+-							false : true;
+ 			/*clean up the flags for next usage*/
+ 			acrtc->flip_flags = 0;
+ 		}
+-- 
+2.7.4
+

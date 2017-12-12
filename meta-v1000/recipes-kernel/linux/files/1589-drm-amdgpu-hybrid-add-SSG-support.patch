@@ -1,0 +1,262 @@
+From c698da7b95be2d06f72faca42af607414a4d5f67 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <Qiang.Yu@amd.com>
+Date: Mon, 13 Feb 2017 16:01:52 +0800
+Subject: [PATCH 1589/2094] drm/amdgpu/hybrid: add SSG support
+
+Depend on DirectGMA and CONFIG_ZONE_DEVICE/PFN_MAP. User process
+can mmap a DirectGMA amdgpu_bo and use it as the buffer for file
+directio read/write which means disk can transfer data directly
+between visible VRAM and disk controller without pass the DRAM.
+
+This implementation is inspired by DAX-GUP:
+https://lwn.net/Articles/667148/
+
+Change-Id: I7205f3391d67677277b4b5cbcb26fd81b66e15fb
+Signed-off-by: Qiang Yu <Qiang.Yu@amd.com>
+Acked-by: Chunming Zhou <david1.zhou@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+Signed-off-by: Avinash M N <avimn@amd.com>
+
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        | 16 ++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c    |  4 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c |  3 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    | 79 ++++++++++++++++++++++++++++++
+ drivers/gpu/drm/ttm/ttm_bo.c               |  1 +
+ drivers/gpu/drm/ttm/ttm_bo_vm.c            |  4 +-
+ include/drm/ttm/ttm_bo_api.h               |  1 +
+ 7 files changed, 106 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 13b657c..1a7ab24 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -100,6 +100,7 @@ extern int amdgpu_sched_jobs;
+ extern int amdgpu_sched_hw_submission;
+ extern int amdgpu_no_evict;
+ extern int amdgpu_direct_gma_size;
++extern int amdgpu_ssg_enabled;
+ extern unsigned amdgpu_pcie_gen_cap;
+ extern unsigned amdgpu_pcie_lane_cap;
+ extern unsigned amdgpu_cg_mask;
+@@ -1459,6 +1460,18 @@ struct amdgpu_direct_gma {
+ 	atomic64_t		gart_usage;
+ };
+ 
++#if defined(CONFIG_ZONE_DEVICE)
++#define CONFIG_ENABLE_SSG
++#endif
++
++struct amdgpu_ssg {
++	bool			enabled;
++#ifdef CONFIG_ENABLE_SSG
++	struct percpu_ref	ref;
++	struct completion	cmp;
++#endif
++};
++
+ struct amdgpu_device {
+ 	struct device			*dev;
+ 	struct drm_device		*ddev;
+@@ -1504,6 +1517,9 @@ struct amdgpu_device {
+ 	uint32_t			bios_scratch_reg_offset;
+ 	uint32_t			bios_scratch[AMDGPU_BIOS_NUM_SCRATCH];
+ 
++	/* SSG */
++	struct amdgpu_ssg		ssg;
++
+ 	/* Register/doorbell mmio */
+ 	resource_size_t			rmmio_base;
+ 	resource_size_t			rmmio_size;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 9adbc2e..7b2e2ee 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -100,6 +100,7 @@ int amdgpu_sched_jobs = 32;
+ int amdgpu_sched_hw_submission = 2;
+ int amdgpu_no_evict = 0;
+ int amdgpu_direct_gma_size = 0;
++int amdgpu_ssg_enabled = 0;
+ unsigned amdgpu_pcie_gen_cap = 0;
+ unsigned amdgpu_pcie_lane_cap = 0;
+ unsigned amdgpu_cg_mask = 0xffffffff;
+@@ -204,6 +205,9 @@ module_param_named(no_evict, amdgpu_no_evict, int, 0444);
+ MODULE_PARM_DESC(direct_gma_size, "Direct GMA size in megabytes (max 96MB)");
+ module_param_named(direct_gma_size, amdgpu_direct_gma_size, int, 0444);
+ 
++MODULE_PARM_DESC(ssg, "SSG support (1 = enable, 0 = disable (default))");
++module_param_named(ssg, amdgpu_ssg_enabled, int, 0444);
++
+ MODULE_PARM_DESC(pcie_gen_cap, "PCIE Gen Caps (0: autodetect (default))");
+ module_param_named(pcie_gen_cap, amdgpu_pcie_gen_cap, uint, 0444);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index a3443e2..d862189 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -444,6 +444,9 @@ int amdgpu_bo_create_restricted(struct amdgpu_device *adev,
+ 	if (unlikely(r != 0))
+ 		return r;
+ 
++	if (domain & AMDGPU_GEM_DOMAIN_DGMA && adev->ssg.enabled)
++		bo->tbo.ssg_can_map = true;
++
+ 	if (kernel)
+ 		bo->tbo.priority = 1;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 25ca06f..96d5731 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1218,6 +1218,83 @@ static void amdgpu_direct_gma_fini(struct amdgpu_device *adev)
+ 	adev->gart_pin_size -= (u64)amdgpu_direct_gma_size << 20;
+ }
+ 
++#ifdef CONFIG_ENABLE_SSG
++#include <linux/memremap.h>
++
++static struct amdgpu_ssg *to_amdgpu_ssg(struct percpu_ref *ref)
++{
++	return container_of(ref, struct amdgpu_ssg, ref);
++}
++
++static void amdgpu_ssg_percpu_release(struct percpu_ref *ref)
++{
++	struct amdgpu_ssg *ssg = to_amdgpu_ssg(ref);
++
++	complete(&ssg->cmp);
++}
++
++static int amdgpu_ssg_init(struct amdgpu_device *adev)
++{
++	struct resource res;
++	void *addr;
++	int rc;
++
++	adev->ssg.enabled = false;
++
++	if (!amdgpu_ssg_enabled)
++		return 0;
++
++	if (amdgpu_direct_gma_size == 0) {
++		DRM_INFO("SSG: not enabled due to DirectGMA is disabled\n");
++		return 0;
++	}
++
++	init_completion(&adev->ssg.cmp);
++
++	res.start = adev->mc.aper_base +
++		(amdgpu_bo_gpu_offset(adev->direct_gma.dgma_bo) -
++		 adev->mc.vram_start);
++	res.end = res.start + amdgpu_bo_size(adev->direct_gma.dgma_bo);
++	res.name = "DirectGMA";
++
++	rc = percpu_ref_init(&adev->ssg.ref, amdgpu_ssg_percpu_release,
++			     0, GFP_KERNEL);
++	if (rc)
++		return rc;
++
++	addr = devm_memremap_pages(adev->dev, &res, &adev->ssg.ref, NULL);
++	if (IS_ERR(addr)) {
++		percpu_ref_exit(&adev->ssg.ref);
++		return PTR_ERR(addr);
++	}
++
++	adev->ssg.enabled = true;
++	DRM_INFO("SSG: remap %llx-%llx to %p\n", res.start, res.end, addr);
++	return 0;
++}
++
++static void amdgpu_ssg_fini(struct amdgpu_device *adev)
++{
++	if (!adev->ssg.enabled)
++		return;
++
++	percpu_ref_kill(&adev->ssg.ref);
++	wait_for_completion(&adev->ssg.cmp);
++	percpu_ref_exit(&adev->ssg.ref);
++}
++#else
++static int amdgpu_ssg_init(struct amdgpu_device *adev)
++{
++	adev->ssg.enabled = false;
++	return 0;
++}
++
++static void amdgpu_ssg_fini(struct amdgpu_device *adev)
++{
++
++}
++#endif
++
+ int amdgpu_ttm_init(struct amdgpu_device *adev)
+ {
+ 	int r;
+@@ -1276,6 +1353,7 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
+ 		 (unsigned)(adev->mc.gtt_size / (1024 * 1024)));
+ 
+ 	amdgpu_direct_gma_init(adev);
++	amdgpu_ssg_init(adev);
+ 
+ 	adev->gds.mem.total_size = adev->gds.mem.total_size << AMDGPU_GDS_SHIFT;
+ 	adev->gds.mem.gfx_partition_size = adev->gds.mem.gfx_partition_size << AMDGPU_GDS_SHIFT;
+@@ -1339,6 +1417,7 @@ void amdgpu_ttm_fini(struct amdgpu_device *adev)
+ 		}
+ 		amdgpu_bo_unref(&adev->stollen_vga_memory);
+ 	}
++	amdgpu_ssg_fini(adev);
+ 	amdgpu_direct_gma_fini(adev);
+ 	ttm_bo_clean_mm(&adev->mman.bdev, TTM_PL_VRAM);
+ 	ttm_bo_clean_mm(&adev->mman.bdev, TTM_PL_TT);
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index 50ab8808..2b077e8 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -1190,6 +1190,7 @@ int ttm_bo_init_reserved(struct ttm_bo_device *bdev,
+ 	bo->persistent_swap_storage = persistent_swap_storage;
+ 	bo->acc_size = acc_size;
+ 	bo->sg = sg;
++	bo->ssg_can_map = false;
+ 	if (resv) {
+ 		bo->resv = resv;
+ 		lockdep_assert_held(&bo->resv->lock.base);
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_vm.c b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+index be84e3dc..dba2674 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+@@ -248,7 +248,7 @@ static int ttm_bo_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 
+ 		if (vma->vm_flags & VM_MIXEDMAP)
+ 			ret = vm_insert_mixed(&cvma, address,
+-					__pfn_to_pfn_t(pfn, PFN_DEV));
++					__pfn_to_pfn_t(pfn, PFN_DEV | (bo->ssg_can_map ? PFN_MAP : 0)));
+ 		else
+ 			ret = vm_insert_pfn(&cvma, address, pfn);
+ 
+@@ -369,7 +369,7 @@ int ttm_bo_mmap(struct file *filp, struct vm_area_struct *vma,
+ 	 * VM_MIXEDMAP on all mappings. See freedesktop.org bug #75719
+ 	 */
+ 	vma->vm_flags |= VM_MIXEDMAP;
+-	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
++	vma->vm_flags |= (bo->ssg_can_map ? 0 : VM_IO) | VM_DONTEXPAND | VM_DONTDUMP;
+ 	return 0;
+ out_unref:
+ 	ttm_bo_unref(&bo);
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index 3b302a5..429be7d 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -175,6 +175,7 @@ struct ttm_buffer_object {
+ 	void (*destroy) (struct ttm_buffer_object *);
+ 	unsigned long num_pages;
+ 	size_t acc_size;
++	bool ssg_can_map;
+ 
+ 	/**
+ 	* Members not needing protection.
+-- 
+2.7.4
+

@@ -1,0 +1,193 @@
+From 7b32dd51167e1eae3fe0b517fae4bea1f984205d Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Date: Thu, 11 May 2017 11:28:15 -0400
+Subject: [PATCH 2203/2500] drm/amdgpu: Add vm context module param
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add VM update mode module param (amdgpu.vm_update_mode) that can used to
+control how VM pde/pte are updated for Graphics and Compute.
+
+BIT0 controls Graphics and BIT1 Compute.
+ BIT0 [= 0] Graphics updated by SDMA [= 1] by CPU
+ BIT1 [= 0] Compute updated by SDMA [= 1] by CPU
+
+By default, only for large BAR system vm_update_mode = 2, indicating
+that Graphics VMs will be updated via SDMA and Compute VMs will be
+updated via CPU. And for all all other systems (by default)
+vm_update_mode = 0
+
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+	drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+	drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+
+Change-Id: Ia2891d20e769b032a8387f7a297cea7557b5b0d8
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c  | 33 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h  | 14 ++++++++++++++
+ 5 files changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 7f0c35b..a1ee8a3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -97,6 +97,7 @@ extern int amdgpu_vm_size;
+ extern int amdgpu_vm_block_size;
+ extern int amdgpu_vm_fault_stop;
+ extern int amdgpu_vm_debug;
++extern int amdgpu_vm_update_mode;
+ extern int amdgpu_dc;
+ extern int amdgpu_sched_jobs;
+ extern int amdgpu_sched_hw_submission;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 9b2a2e3..45462d3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -95,6 +95,7 @@ int amdgpu_vm_block_size = -1;
+ int amdgpu_vm_fault_stop = 0;
+ int amdgpu_vm_debug = 0;
+ int amdgpu_vram_page_split = 1024;
++int amdgpu_vm_update_mode = -1;
+ int amdgpu_exp_hw_support = 0;
+ int amdgpu_dc = -1;
+ int amdgpu_sched_jobs = 32;
+@@ -184,6 +185,9 @@ module_param_named(vm_fault_stop, amdgpu_vm_fault_stop, int, 0444);
+ MODULE_PARM_DESC(vm_debug, "Debug VM handling (0 = disabled (default), 1 = enabled)");
+ module_param_named(vm_debug, amdgpu_vm_debug, int, 0644);
+ 
++MODULE_PARM_DESC(vm_update_mode, "VM update using CPU (0 = never (default except for large BAR(LB)), 1 = Graphics only, 2 = Compute only (default for LB), 3 = Both");
++module_param_named(vm_update_mode, amdgpu_vm_update_mode, int, 0444);
++
+ MODULE_PARM_DESC(vram_page_split, "Number of pages after we split VRAM allocations (default 1024, -1 = disable)");
+ module_param_named(vram_page_split, amdgpu_vram_page_split, int, 0444);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 11c8bcc..9baba40 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -850,7 +850,8 @@ int amdgpu_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
+ 		goto out_suspend;
+ 	}
+ 
+-	r = amdgpu_vm_init(adev, &fpriv->vm, AMDGPU_VM_CONTEXT_GFX);
++	r = amdgpu_vm_init(adev, &fpriv->vm,
++			   AMDGPU_VM_CONTEXT_GFX);
+ 	if (r) {
+ 		kfree(fpriv);
+ 		goto out_suspend;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 2561855..3bcbbf1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -718,6 +718,11 @@ bool amdgpu_vm_need_pipeline_sync(struct amdgpu_ring *ring,
+ 	return vm_flush_needed || gds_switch_needed;
+ }
+ 
++static bool amdgpu_vm_is_large_bar(struct amdgpu_device *adev)
++{
++	return (adev->mc.real_vram_size == adev->mc.visible_vram_size);
++}
++
+ /**
+  * amdgpu_vm_flush - hardware flush the vm
+  *
+@@ -2298,6 +2303,7 @@ void amdgpu_vm_adjust_size(struct amdgpu_device *adev, uint64_t vm_size)
+  *
+  * @adev: amdgpu_device pointer
+  * @vm: requested vm
++ * @vm_context: Indicates if it GFX or Compute context
+  *
+  * Init @vm fields.
+  */
+@@ -2331,6 +2337,16 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 	if (r)
+ 		return r;
+ 
++	if (vm_context == AMDGPU_VM_CONTEXT_COMPUTE)
++		vm->use_cpu_for_update = !!(adev->vm_manager.vm_update_mode &
++						AMDGPU_VM_USE_CPU_FOR_COMPUTE);
++	else
++		vm->use_cpu_for_update = !!(adev->vm_manager.vm_update_mode &
++						AMDGPU_VM_USE_CPU_FOR_GFX);
++	DRM_DEBUG_DRIVER("VM update mode is %s\n",
++			 vm->use_cpu_for_update ? "CPU" : "SDMA");
++	WARN_ONCE((vm->use_cpu_for_update & !amdgpu_vm_is_large_bar(adev)),
++		  "CPU update of VM recommended only for large BAR system\n");
+ 	vm->last_dir_update = NULL;
+ 
+ 	r = amdgpu_bo_create(adev, amdgpu_vm_bo_size(adev, 0), align, true,
+@@ -2504,6 +2520,23 @@ void amdgpu_vm_manager_init(struct amdgpu_device *adev)
+ 	atomic_set(&adev->vm_manager.num_prt_users, 0);
+ 
+ 	adev->vm_manager.n_compute_vms = 0;
++
++	/* If not overridden by the user, by default, only in large BAR systems
++	 * Compute VM tables will be updated by CPU
++	 */
++#ifdef CONFIG_X86_64
++	if (amdgpu_vm_update_mode == -1) {
++		if (amdgpu_vm_is_large_bar(adev))
++			adev->vm_manager.vm_update_mode =
++				AMDGPU_VM_USE_CPU_FOR_COMPUTE;
++		else
++			adev->vm_manager.vm_update_mode = 0;
++	} else
++		adev->vm_manager.vm_update_mode = amdgpu_vm_update_mode;
++#else
++	adev->vm_manager.vm_update_mode = 0;
++#endif
++
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 7b9d671..5f56c93 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -90,6 +90,11 @@ struct amdgpu_bo_list_entry;
+ #define AMDGPU_VM_CONTEXT_GFX 0
+ #define AMDGPU_VM_CONTEXT_COMPUTE 1
+ 
++/* See vm_update_mode */
++#define AMDGPU_VM_USE_CPU_FOR_GFX (1 << 0)
++#define AMDGPU_VM_USE_CPU_FOR_COMPUTE (1 << 1)
++
++
+ struct amdgpu_vm_pt {
+ 	struct amdgpu_bo	*bo;
+ 	uint64_t		addr;
+@@ -135,6 +140,9 @@ struct amdgpu_vm {
+ 
+ 	/* Whether this is a Compute or GFX Context */
+ 	int			vm_context;
++
++	/* Flag to indicate if VM tables are updated by CPU or GPU (SDMA) */
++	bool                    use_cpu_for_update;
+ };
+ 
+ struct amdgpu_vm_id {
+@@ -193,6 +201,12 @@ struct amdgpu_vm_manager {
+ 
+ 	/* Number of Compute VMs, used for detecting Compute activity */
+ 	unsigned                                n_compute_vms;
++
++	/* controls how VM page tables are updated for Graphics and Compute.
++	 * BIT0[= 0] Graphics updated by SDMA [= 1] by CPU
++	 * BIT1[= 0] Compute updated by SDMA [= 1] by CPU
++	 */
++	int					vm_update_mode;
+ };
+ 
+ void amdgpu_vm_manager_init(struct amdgpu_device *adev);
+-- 
+2.7.4
+

@@ -1,0 +1,166 @@
+From 1109d359ed491d4e7212665b8db3ce6d09a26b89 Mon Sep 17 00:00:00 2001
+From: Roger He <Hongbo.He@amd.com>
+Date: Mon, 31 Jul 2017 17:55:47 +0800
+Subject: [PATCH 2639/2831] /drm/amd/amdgpu: [DGMA] no need to reserve Gart
+ table now for DGMA
+
+only gtt size reservation is enough
+
+Change-Id: I060da4249d15860e5efbe86076eaebbd0902de5d
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Reviewed-by: Flora Cui <Flora.Cui@amd.com>
+Signed-off-by: Roger He <Hongbo.He@amd.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c    | 25 ++++---------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c |  9 +++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    |  7 ++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c     | 14 +++++---------
+ 4 files changed, 14 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index d815353..4acb028 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -482,8 +482,7 @@ int amdgpu_gem_dgma_ioctl(struct drm_device *dev, void *data,
+ 	struct drm_gem_object *gobj;
+ 	struct amdgpu_bo *abo;
+ 	dma_addr_t *dma_addr;
+-	uint32_t handle, flags;
+-	uint64_t offset;
++	uint32_t handle;
+ 	int i, r = 0;
+ 
+ 	switch (args->op) {
+@@ -496,31 +495,15 @@ int amdgpu_gem_dgma_ioctl(struct drm_device *dev, void *data,
+ 			return r;
+ 
+ 		abo = gem_to_amdgpu_bo(gobj);
+-		r = amdgpu_bo_reserve(abo, true);
+-		if (unlikely(r))
+-			goto release_object;
+-
+ 		dma_addr = kmalloc_array(abo->tbo.num_pages, sizeof(dma_addr_t), GFP_KERNEL);
+-		if (unlikely(dma_addr == NULL)) {
+-			amdgpu_bo_unreserve(abo);
++		if (unlikely(dma_addr == NULL))
+ 			goto release_object;
+-		}
++
+ 		for (i = 0; i < abo->tbo.num_pages; i++)
+ 			dma_addr[i] = args->addr + i * PAGE_SIZE;
+-
+-		flags = amdgpu_ttm_tt_pte_flags(adev, abo->tbo.ttm, &abo->tbo.mem);
+-
+-		offset = amdgpu_bo_gpu_offset(abo);
+-		offset -= adev->mman.bdev.man[TTM_PL_TT].gpu_offset;
+-		r = amdgpu_gart_bind(adev, offset, abo->tbo.num_pages,
+-					NULL, dma_addr, flags);
+-		kfree(dma_addr);
+-		amdgpu_bo_unreserve(abo);
+-		if (unlikely(r))
+-			goto release_object;
+-
+ 		abo->tbo.mem.bus.base = args->addr;
+ 		abo->tbo.mem.bus.offset = 0;
++		abo->tbo.mem.bus.addr = (void *)dma_addr;
+ 
+ 		r = drm_gem_handle_create(filp, gobj, &handle);
+ 		args->handle = handle;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index c18ba67..59b8eca 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -102,15 +102,12 @@ static void amdgpu_ttm_bo_destroy(struct ttm_buffer_object *tbo)
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(tbo->bdev);
+ 	struct amdgpu_bo *bo;
+-	u64 offset;
+ 
+ 	bo = container_of(tbo, struct amdgpu_bo, tbo);
+ 
+-	if (bo->tbo.mem.mem_type == AMDGPU_PL_DGMA_IMPORT) {
+-		offset = amdgpu_bo_gpu_offset(bo);
+-		offset -= adev->mman.bdev.man[TTM_PL_TT].gpu_offset;
+-		amdgpu_gart_unbind(adev, offset, bo->tbo.num_pages);
+-	}
++	if (bo->tbo.mem.mem_type == AMDGPU_PL_DGMA_IMPORT)
++		kfree(tbo->mem.bus.addr);
++
+ 	if (bo->kfd_bo)
+ 		amdgpu_amdkfd_unreserve_system_memory_limit(bo);
+ 	amdgpu_update_memory_usage(adev, &bo->tbo.mem, NULL);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index cfc0b42..24b57b4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -619,6 +619,7 @@ static int amdgpu_ttm_io_mem_reserve(struct ttm_bo_device *bdev, struct ttm_mem_
+ 		mem->bus.is_iomem = true;
+ 		break;
+ 	case AMDGPU_PL_DGMA_IMPORT:
++		mem->bus.addr = backup.bus.addr;
+ 		mem->bus.offset = backup.bus.offset;
+ 		mem->bus.base = backup.bus.base;
+ 		mem->bus.is_iomem = true;
+@@ -1281,11 +1282,7 @@ static int amdgpu_direct_gma_init(struct amdgpu_device *adev)
+ 	struct ttm_mem_reg *mem = &adev->direct_gma.gart_mem;
+ 	struct amdgpu_bo *abo;
+ 	struct ttm_buffer_object gtt_bo;
+-	struct ttm_place place = {
+-		.fpfn = 0,
+-		.lpfn = adev->mc.gart_size >> PAGE_SHIFT,
+-		.flags = TTM_PL_FLAG_TOPDOWN
+-	};
++	struct ttm_place place = {0};
+ 	unsigned long size;
+ 	int r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index b9b28b9..becd223 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1724,12 +1724,6 @@ static int amdgpu_vm_bo_split_mapping(struct amdgpu_device *adev,
+ 			max_entries = (nodes->size - pfn) *
+ 				(PAGE_SIZE / AMDGPU_GPU_PAGE_SIZE);
+ 			switch (mem->mem_type) {
+-			case AMDGPU_PL_DGMA_IMPORT:
+-				pages_addr = (dma_addr_t *)mem->bus.base;
+-				addr += adev->mman.bdev.man[mem->mem_type].gpu_offset -
+-					adev->mman.bdev.man[TTM_PL_TT].gpu_offset;
+-				gtt_flags = flags;
+-				/* fall through */
+ 			case TTM_PL_TT:
+ 				if (flags == gtt_flags)
+ 					src = adev->gart.table_addr +
+@@ -1738,6 +1732,10 @@ static int amdgpu_vm_bo_split_mapping(struct amdgpu_device *adev,
+ 					max_entries = min(max_entries, 16ull * 1024ull);
+ 				addr = 0;
+ 				break;
++			case AMDGPU_PL_DGMA_IMPORT:
++				addr = 0;
++				max_entries = min(max_entries, 16ull * 1024ull);
++				break;
+ 			case AMDGPU_PL_DGMA:
+ 				addr += vram_base_offset +
+ 					adev->mman.bdev.man[mem->mem_type].gpu_offset -
+@@ -1815,7 +1813,7 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 					   ttm_dma_tt, ttm);
+ 			pages_addr = ttm->dma_address;
+ 		} else if (mem->mem_type == AMDGPU_PL_DGMA_IMPORT) {
+-			pages_addr = (dma_addr_t *)bo_va->bo->tbo.mem.bus.base;
++			pages_addr = (dma_addr_t *)bo_va->bo->tbo.mem.bus.addr;
+ 		}
+ 		exclusive = reservation_object_get_excl(bo_va->bo->tbo.resv);
+ 	}
+@@ -1826,8 +1824,6 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 		gtt_flags = (amdgpu_ttm_is_bound(bo_va->bo->tbo.ttm) &&
+ 			adev == bo_adev) ?
+ 			flags : 0;
+-		if (mem && mem->mem_type == AMDGPU_PL_DGMA_IMPORT)
+-			gtt_flags = (adev == amdgpu_ttm_adev(bo_va->bo->tbo.bdev)) ? flags : 0;
+ 		if (mem && mem->mem_type == TTM_PL_VRAM &&
+ 			adev != bo_adev) {
+ 			flags |= AMDGPU_PTE_SYSTEM;
+-- 
+2.7.4
+

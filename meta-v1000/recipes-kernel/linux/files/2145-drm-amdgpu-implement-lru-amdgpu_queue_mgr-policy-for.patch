@@ -1,0 +1,237 @@
+From b971e4bff83748296e9224b4187f1f284706bb37 Mon Sep 17 00:00:00 2001
+From: Andres Rodriguez <andresx7@gmail.com>
+Date: Mon, 6 Mar 2017 16:27:55 -0500
+Subject: [PATCH 2145/2500] drm/amdgpu: implement lru amdgpu_queue_mgr policy
+ for compute v4
+
+Use an LRU policy to map usermode rings to HW compute queues.
+
+Most compute clients use one queue, and usually the first queue
+available. This results in poor pipe/queue work distribution when
+multiple compute apps are running. In most cases pipe 0 queue 0 is
+the only queue that gets used.
+
+In order to better distribute work across multiple HW queues, we adopt
+a policy to map the usermode ring ids to the LRU HW queue.
+
+This fixes a large majority of multi-app compute workloads sharing the
+same HW queue, even though 7 other queues are available.
+
+v2: use ring->funcs->type instead of ring->hw_ip
+v3: remove amdgpu_queue_mapper_funcs
+v4: change ring_lru_list_lock to spinlock, grab only once in lru_get()
+
+Signed-off-by: Andres Rodriguez <andresx7@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  3 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c    |  3 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_queue_mgr.c | 38 +++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c      | 63 +++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h      |  4 ++
+ 5 files changed, 110 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 2696fc8..96109f0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1741,6 +1741,9 @@ struct amdgpu_device {
+ 	/* link all gtt */
+ 	spinlock_t			gtt_list_lock;
+ 	struct list_head                gtt_list;
++	/* keep an lru list of rings by HW IP */
++	struct list_head		ring_lru_list;
++	spinlock_t			ring_lru_list_lock;
+ 
+ 	/* record hw reset is performed */
+ 	bool has_hw_reset;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 4ffe434..bdd8f60 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2139,6 +2139,9 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	INIT_LIST_HEAD(&adev->gtt_list);
+ 	spin_lock_init(&adev->gtt_list_lock);
+ 
++	INIT_LIST_HEAD(&adev->ring_lru_list);
++	spin_lock_init(&adev->ring_lru_list_lock);
++
+ 	INIT_DELAYED_WORK(&adev->late_init_work, amdgpu_late_init_func_handler);
+ 
+ 	if (adev->asic_type >= CHIP_BONAIRE) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_queue_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_queue_mgr.c
+index c13a553..4073f07 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_queue_mgr.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_queue_mgr.c
+@@ -100,6 +100,40 @@ static int amdgpu_identity_map(struct amdgpu_device *adev,
+ 	return amdgpu_update_cached_map(mapper, ring, *out_ring);
+ }
+ 
++static enum amdgpu_ring_type amdgpu_hw_ip_to_ring_type(int hw_ip)
++{
++	switch (hw_ip) {
++	case AMDGPU_HW_IP_GFX:
++		return AMDGPU_RING_TYPE_GFX;
++	case AMDGPU_HW_IP_COMPUTE:
++		return AMDGPU_RING_TYPE_COMPUTE;
++	case AMDGPU_HW_IP_DMA:
++		return AMDGPU_RING_TYPE_SDMA;
++	case AMDGPU_HW_IP_UVD:
++		return AMDGPU_RING_TYPE_UVD;
++	case AMDGPU_HW_IP_VCE:
++		return AMDGPU_RING_TYPE_VCE;
++	default:
++		DRM_ERROR("Invalid HW IP specified %d\n", hw_ip);
++		return -1;
++	}
++}
++
++static int amdgpu_lru_map(struct amdgpu_device *adev,
++			  struct amdgpu_queue_mapper *mapper,
++			  int user_ring,
++			  struct amdgpu_ring **out_ring)
++{
++	int r;
++	int ring_type = amdgpu_hw_ip_to_ring_type(mapper->hw_ip);
++
++	r = amdgpu_ring_lru_get(adev, ring_type, out_ring);
++	if (r)
++		return r;
++
++	return amdgpu_update_cached_map(mapper, user_ring, *out_ring);
++}
++
+ /**
+  * amdgpu_queue_mgr_init - init an amdgpu_queue_mgr struct
+  *
+@@ -230,7 +264,6 @@ int amdgpu_queue_mgr_map(struct amdgpu_device *adev,
+ 
+ 	switch (mapper->hw_ip) {
+ 	case AMDGPU_HW_IP_GFX:
+-	case AMDGPU_HW_IP_COMPUTE:
+ 	case AMDGPU_HW_IP_DMA:
+ 	case AMDGPU_HW_IP_UVD:
+ 	case AMDGPU_HW_IP_VCE:
+@@ -239,6 +272,9 @@ int amdgpu_queue_mgr_map(struct amdgpu_device *adev,
+ 	case AMDGPU_HW_IP_VCN_ENC:
+ 		r = amdgpu_identity_map(adev, mapper, ring, out_ring);
+ 		break;
++	case AMDGPU_HW_IP_COMPUTE:
++		r = amdgpu_lru_map(adev, mapper, ring, out_ring);
++		break;
+ 	default:
+ 		*out_ring = NULL;
+ 		r = -EINVAL;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index 9d78047..d4db690 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -135,6 +135,8 @@ void amdgpu_ring_commit(struct amdgpu_ring *ring)
+ 
+ 	if (ring->funcs->end_use)
+ 		ring->funcs->end_use(ring);
++
++	amdgpu_ring_lru_touch(ring->adev, ring);
+ }
+ 
+ /**
+@@ -283,6 +285,8 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 	}
+ 
+ 	ring->max_dw = max_dw;
++	INIT_LIST_HEAD(&ring->lru_list);
++	amdgpu_ring_lru_touch(adev, ring);
+ 
+ 	if (amdgpu_debugfs_ring_init(adev, ring)) {
+ 		DRM_ERROR("Failed to register debugfs file for rings !\n");
+@@ -327,6 +331,65 @@ void amdgpu_ring_fini(struct amdgpu_ring *ring)
+ 	ring->adev->rings[ring->idx] = NULL;
+ }
+ 
++static void amdgpu_ring_lru_touch_locked(struct amdgpu_device *adev,
++					 struct amdgpu_ring *ring)
++{
++	/* list_move_tail handles the case where ring isn't part of the list */
++	list_move_tail(&ring->lru_list, &adev->ring_lru_list);
++}
++
++/**
++ * amdgpu_ring_lru_get - get the least recently used ring for a HW IP block
++ *
++ * @adev: amdgpu_device pointer
++ * @type: amdgpu_ring_type enum
++ * @ring: output ring
++ *
++ * Retrieve the amdgpu_ring structure for the least recently used ring of
++ * a specific IP block (all asics).
++ * Returns 0 on success, error on failure.
++ */
++int amdgpu_ring_lru_get(struct amdgpu_device *adev, int type,
++			struct amdgpu_ring **ring)
++{
++	struct amdgpu_ring *entry;
++
++	/* List is sorted in LRU order, find first entry corresponding
++	 * to the desired HW IP */
++	*ring = NULL;
++	spin_lock(&adev->ring_lru_list_lock);
++	list_for_each_entry(entry, &adev->ring_lru_list, lru_list) {
++		if (entry->funcs->type == type) {
++			*ring = entry;
++			amdgpu_ring_lru_touch_locked(adev, *ring);
++			break;
++		}
++	}
++	spin_unlock(&adev->ring_lru_list_lock);
++
++	if (!*ring) {
++		DRM_ERROR("Ring LRU contains no entries for ring type:%d\n", type);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++/**
++ * amdgpu_ring_lru_touch - mark a ring as recently being used
++ *
++ * @adev: amdgpu_device pointer
++ * @ring: ring to touch
++ *
++ * Move @ring to the tail of the lru list
++ */
++void amdgpu_ring_lru_touch(struct amdgpu_device *adev, struct amdgpu_ring *ring)
++{
++	spin_lock(&adev->ring_lru_list_lock);
++	amdgpu_ring_lru_touch_locked(adev, ring);
++	spin_unlock(&adev->ring_lru_list_lock);
++}
++
+ /*
+  * Debugfs info
+  */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+index 7fc5ad4..b1be01c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -155,6 +155,7 @@ struct amdgpu_ring {
+ 	const struct amdgpu_ring_funcs	*funcs;
+ 	struct amdgpu_fence_driver	fence_drv;
+ 	struct amd_gpu_scheduler	sched;
++	struct list_head		lru_list;
+ 
+ 	struct amdgpu_bo	*ring_obj;
+ 	volatile uint32_t	*ring;
+@@ -201,6 +202,9 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 		     unsigned ring_size, struct amdgpu_irq_src *irq_src,
+ 		     unsigned irq_type);
+ void amdgpu_ring_fini(struct amdgpu_ring *ring);
++int amdgpu_ring_lru_get(struct amdgpu_device *adev, int hw_ip,
++			struct amdgpu_ring **ring);
++void amdgpu_ring_lru_touch(struct amdgpu_device *adev, struct amdgpu_ring *ring);
+ static inline void amdgpu_ring_clear_ring(struct amdgpu_ring *ring)
+ {
+ 	int i = 0;
+-- 
+2.7.4
+

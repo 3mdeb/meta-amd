@@ -1,0 +1,173 @@
+From f385e85518ff8c82d511dac3791fbe03b7f379d5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Nicolai=20H=C3=A4hnle?= <nicolai.haehnle@amd.com>
+Date: Thu, 16 Feb 2017 10:56:40 +0100
+Subject: [PATCH 0644/2094] drm/ttm: add ttm_bo_init_reserved
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This variant of ttm_bo_init returns the validated buffer object with
+the reservation lock held when resv == NULL. This is convenient for
+callers that want to use the BO immediately, e.g. for initializing its
+contents.
+
+Signed-off-by: Nicolai Hähnle <nicolai.haehnle@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/ttm/ttm_bo.c | 59 +++++++++++++++++++++++++++++++++-----------
+ include/drm/ttm/ttm_bo_api.h | 54 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 98 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index fe21e72..795e4c0 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -1119,18 +1119,18 @@ int ttm_bo_validate(struct ttm_buffer_object *bo,
+ }
+ EXPORT_SYMBOL(ttm_bo_validate);
+ 
+-int ttm_bo_init(struct ttm_bo_device *bdev,
+-		struct ttm_buffer_object *bo,
+-		unsigned long size,
+-		enum ttm_bo_type type,
+-		struct ttm_placement *placement,
+-		uint32_t page_alignment,
+-		bool interruptible,
+-		struct file *persistent_swap_storage,
+-		size_t acc_size,
+-		struct sg_table *sg,
+-		struct reservation_object *resv,
+-		void (*destroy) (struct ttm_buffer_object *))
++int ttm_bo_init_reserved(struct ttm_bo_device *bdev,
++			 struct ttm_buffer_object *bo,
++			 unsigned long size,
++			 enum ttm_bo_type type,
++			 struct ttm_placement *placement,
++			 uint32_t page_alignment,
++			 bool interruptible,
++			 struct file *persistent_swap_storage,
++			 size_t acc_size,
++			 struct sg_table *sg,
++			 struct reservation_object *resv,
++			 void (*destroy) (struct ttm_buffer_object *))
+ {
+ 	int ret = 0;
+ 	unsigned long num_pages;
+@@ -1214,10 +1214,10 @@ int ttm_bo_init(struct ttm_bo_device *bdev,
+ 	if (likely(!ret))
+ 		ret = ttm_bo_validate(bo, placement, interruptible, false);
+ 
+-	if (!resv)
+-		ttm_bo_unreserve(bo);
+-
+ 	if (unlikely(ret)) {
++		if (!resv)
++			ttm_bo_unreserve(bo);
++
+ 		ttm_bo_unref(&bo);
+ 		return ret;
+ 	}
+@@ -1230,6 +1230,35 @@ int ttm_bo_init(struct ttm_bo_device *bdev,
+ 
+ 	return ret;
+ }
++EXPORT_SYMBOL(ttm_bo_init_reserved);
++
++int ttm_bo_init(struct ttm_bo_device *bdev,
++		struct ttm_buffer_object *bo,
++		unsigned long size,
++		enum ttm_bo_type type,
++		struct ttm_placement *placement,
++		uint32_t page_alignment,
++		bool interruptible,
++		struct file *persistent_swap_storage,
++		size_t acc_size,
++		struct sg_table *sg,
++		struct reservation_object *resv,
++		void (*destroy) (struct ttm_buffer_object *))
++{
++	int ret;
++
++	ret = ttm_bo_init_reserved(bdev, bo, size, type, placement,
++				   page_alignment, interruptible,
++				   persistent_swap_storage, acc_size,
++				   sg, resv, destroy);
++	if (ret)
++		return ret;
++
++	if (!resv)
++		ttm_bo_unreserve(bo);
++
++	return 0;
++}
+ EXPORT_SYMBOL(ttm_bo_init);
+ 
+ size_t ttm_bo_acc_size(struct ttm_bo_device *bdev,
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index c0ebbd6..2d0f63e 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -453,6 +453,60 @@ size_t ttm_bo_dma_acc_size(struct ttm_bo_device *bdev,
+ 			   unsigned struct_size);
+ 
+ /**
++ * ttm_bo_init_reserved
++ *
++ * @bdev: Pointer to a ttm_bo_device struct.
++ * @bo: Pointer to a ttm_buffer_object to be initialized.
++ * @size: Requested size of buffer object.
++ * @type: Requested type of buffer object.
++ * @flags: Initial placement flags.
++ * @page_alignment: Data alignment in pages.
++ * @interruptible: If needing to sleep to wait for GPU resources,
++ * sleep interruptible.
++ * @persistent_swap_storage: Usually the swap storage is deleted for buffers
++ * pinned in physical memory. If this behaviour is not desired, this member
++ * holds a pointer to a persistent shmem object. Typically, this would
++ * point to the shmem object backing a GEM object if TTM is used to back a
++ * GEM user interface.
++ * @acc_size: Accounted size for this object.
++ * @resv: Pointer to a reservation_object, or NULL to let ttm allocate one.
++ * @destroy: Destroy function. Use NULL for kfree().
++ *
++ * This function initializes a pre-allocated struct ttm_buffer_object.
++ * As this object may be part of a larger structure, this function,
++ * together with the @destroy function,
++ * enables driver-specific objects derived from a ttm_buffer_object.
++ *
++ * On successful return, the caller owns an object kref to @bo. The kref and
++ * list_kref are usually set to 1, but note that in some situations, other
++ * tasks may already be holding references to @bo as well.
++ * Furthermore, if resv == NULL, the buffer's reservation lock will be held,
++ * and it is the caller's responsibility to call ttm_bo_unreserve.
++ *
++ * If a failure occurs, the function will call the @destroy function, or
++ * kfree() if @destroy is NULL. Thus, after a failure, dereferencing @bo is
++ * illegal and will likely cause memory corruption.
++ *
++ * Returns
++ * -ENOMEM: Out of memory.
++ * -EINVAL: Invalid placement flags.
++ * -ERESTARTSYS: Interrupted by signal while sleeping waiting for resources.
++ */
++
++extern int ttm_bo_init_reserved(struct ttm_bo_device *bdev,
++				struct ttm_buffer_object *bo,
++				unsigned long size,
++				enum ttm_bo_type type,
++				struct ttm_placement *placement,
++				uint32_t page_alignment,
++				bool interrubtible,
++				struct file *persistent_swap_storage,
++				size_t acc_size,
++				struct sg_table *sg,
++				struct reservation_object *resv,
++				void (*destroy) (struct ttm_buffer_object *));
++
++/**
+  * ttm_bo_init
+  *
+  * @bdev: Pointer to a ttm_bo_device struct.
+-- 
+2.7.4
+

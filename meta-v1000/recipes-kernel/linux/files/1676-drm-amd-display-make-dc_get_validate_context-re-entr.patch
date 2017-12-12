@@ -1,0 +1,636 @@
+From a7c0866e260627cf1aefcba58108b9cd56a0c52c Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Wed, 17 May 2017 16:05:40 -0400
+Subject: [PATCH 1676/2094] drm/amd/display: make dc_get_validate_context
+ re-entrant
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           | 44 ++--------------------
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c  | 30 +++++++--------
+ .../drm/amd/display/dc/dce100/dce100_resource.c    | 22 ++++++-----
+ .../drm/amd/display/dc/dce110/dce110_resource.c    | 22 ++++++-----
+ .../drm/amd/display/dc/dce112/dce112_resource.c    | 27 +++++++------
+ .../drm/amd/display/dc/dce112/dce112_resource.h    |  3 +-
+ .../gpu/drm/amd/display/dc/dce80/dce80_resource.c  | 22 ++++++-----
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_resource.c  | 24 ++++++------
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h    |  3 +-
+ drivers/gpu/drm/amd/display/dc/inc/resource.h      |  9 +++--
+ 10 files changed, 92 insertions(+), 114 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 5adf610..09854da 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -653,40 +653,6 @@ void dc_destroy(struct dc **dc)
+ 	*dc = NULL;
+ }
+ 
+-static bool is_validation_required(
+-		const struct core_dc *dc,
+-		const struct dc_validation_set set[],
+-		int set_count)
+-{
+-	const struct validate_context *context = dc->current_context;
+-	int i, j;
+-
+-	if (context->stream_count != set_count)
+-		return true;
+-
+-	for (i = 0; i < set_count; i++) {
+-
+-		if (set[i].surface_count != context->stream_status[i].surface_count)
+-			return true;
+-		if (!is_stream_unchanged(DC_STREAM_TO_CORE(set[i].stream), context->streams[i]))
+-			return true;
+-
+-		for (j = 0; j < set[i].surface_count; j++) {
+-			struct dc_surface temp_surf = { 0 };
+-
+-			temp_surf = *context->stream_status[i].surfaces[j];
+-			temp_surf.clip_rect = set[i].surfaces[j]->clip_rect;
+-			temp_surf.dst_rect.x = set[i].surfaces[j]->dst_rect.x;
+-			temp_surf.dst_rect.y = set[i].surfaces[j]->dst_rect.y;
+-
+-			if (memcmp(&temp_surf, set[i].surfaces[j], sizeof(temp_surf)) != 0)
+-				return true;
+-		}
+-	}
+-
+-	return false;
+-}
+-
+ struct validate_context *dc_get_validate_context(
+ 		const struct dc *dc,
+ 		const struct dc_validation_set set[],
+@@ -700,13 +666,8 @@ struct validate_context *dc_get_validate_context(
+ 	if(context == NULL)
+ 		goto context_alloc_fail;
+ 
+-	if (!is_validation_required(core_dc, set, set_count)) {
+-		dc_resource_validate_ctx_copy_construct(core_dc->current_context, context);
+-		return context;
+-	}
+-
+ 	result = core_dc->res_pool->funcs->validate_with_context(
+-						core_dc, set, set_count, context);
++				core_dc, set, set_count, context, NULL);
+ 
+ context_alloc_fail:
+ 	if (result != DC_OK) {
+@@ -903,7 +864,8 @@ bool dc_commit_streams(
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+ 
+-	result = core_dc->res_pool->funcs->validate_with_context(core_dc, set, stream_count, context);
++	result = core_dc->res_pool->funcs->validate_with_context(
++			core_dc, set, stream_count, context, core_dc->current_context);
+ 	if (result != DC_OK){
+ 		dm_logger_write(core_dc->ctx->logger, LOG_ERROR,
+ 					"%s: Context validation failed! dc_status:%d\n",
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 7ca03d1..ec50457 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -1148,7 +1148,7 @@ bool resource_validate_attach_surfaces(
+ 	int i, j;
+ 
+ 	for (i = 0; i < set_count; i++) {
+-		for (j = 0; j < old_context->stream_count; j++)
++		for (j = 0; old_context && j < old_context->stream_count; j++)
+ 			if (is_stream_unchanged(
+ 					old_context->streams[j],
+ 					context->streams[i])) {
+@@ -1387,9 +1387,7 @@ static int get_norm_pix_clk(const struct dc_crtc_timing *timing)
+ 	return normalized_pix_clk;
+ }
+ 
+-static void calculate_phy_pix_clks(
+-		const struct core_dc *dc,
+-		struct validate_context *context)
++static void calculate_phy_pix_clks(struct validate_context *context)
+ {
+ 	int i;
+ 
+@@ -1410,21 +1408,22 @@ static void calculate_phy_pix_clks(
+ 
+ enum dc_status resource_map_pool_resources(
+ 		const struct core_dc *dc,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	const struct resource_pool *pool = dc->res_pool;
+ 	int i, j;
+ 
+-	calculate_phy_pix_clks(dc, context);
++	calculate_phy_pix_clks(context);
+ 
+-	for (i = 0; i < context->stream_count; i++) {
++	for (i = 0; old_context && i < context->stream_count; i++) {
+ 		struct core_stream *stream = context->streams[i];
+ 
+-		if (!resource_is_stream_unchanged(dc->current_context, stream)) {
+-			if (stream != NULL && dc->current_context->streams[i] != NULL) {
++		if (!resource_is_stream_unchanged(old_context, stream)) {
++			if (stream != NULL && old_context->streams[i] != NULL) {
+ 				stream->bit_depth_params =
+-						dc->current_context->streams[i]->bit_depth_params;
+-				stream->clamping = dc->current_context->streams[i]->clamping;
++						old_context->streams[i]->bit_depth_params;
++				stream->clamping = old_context->streams[i]->clamping;
+ 				continue;
+ 			}
+ 		}
+@@ -1434,7 +1433,7 @@ enum dc_status resource_map_pool_resources(
+ 			struct pipe_ctx *pipe_ctx =
+ 				&context->res_ctx.pipe_ctx[j];
+ 			const struct pipe_ctx *old_pipe_ctx =
+-				&dc->current_context->res_ctx.pipe_ctx[j];
++					&old_context->res_ctx.pipe_ctx[j];
+ 
+ 			if (!are_stream_backends_same(old_pipe_ctx->stream, stream))
+ 				continue;
+@@ -1475,7 +1474,7 @@ enum dc_status resource_map_pool_resources(
+ 		struct pipe_ctx *pipe_ctx = NULL;
+ 		int pipe_idx = -1;
+ 
+-		if (resource_is_stream_unchanged(dc->current_context, stream))
++		if (old_context && resource_is_stream_unchanged(old_context, stream))
+ 			continue;
+ 		/* acquire new resources */
+ 		pipe_idx = acquire_first_free_pipe(
+@@ -2203,7 +2202,8 @@ void resource_build_info_frame(struct pipe_ctx *pipe_ctx)
+ 
+ enum dc_status resource_map_clock_resources(
+ 		const struct core_dc *dc,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	int i, j;
+ 	const struct resource_pool *pool = dc->res_pool;
+@@ -2212,7 +2212,7 @@ enum dc_status resource_map_clock_resources(
+ 	for (i = 0; i < context->stream_count; i++) {
+ 		const struct core_stream *stream = context->streams[i];
+ 
+-		if (resource_is_stream_unchanged(dc->current_context, stream))
++		if (old_context && resource_is_stream_unchanged(old_context, stream))
+ 			continue;
+ 
+ 		for (j = 0; j < MAX_PIPES; j++) {
+diff --git a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+index 8f1fe95..716f664 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+@@ -653,7 +653,8 @@ static void destruct(struct dce110_resource_pool *pool)
+ 
+ static enum dc_status validate_mapped_resource(
+ 		const struct core_dc *dc,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	enum dc_status status = DC_OK;
+ 	uint8_t i, j;
+@@ -662,7 +663,7 @@ static enum dc_status validate_mapped_resource(
+ 		struct core_stream *stream = context->streams[i];
+ 		struct core_link *link = stream->sink->link;
+ 
+-		if (resource_is_stream_unchanged(dc->current_context, stream))
++		if (old_context && resource_is_stream_unchanged(old_context, stream))
+ 			continue;
+ 
+ 		for (j = 0; j < MAX_PIPES; j++) {
+@@ -740,7 +741,8 @@ enum dc_status dce100_validate_with_context(
+ 		const struct core_dc *dc,
+ 		const struct dc_validation_set set[],
+ 		int set_count,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	struct dc_context *dc_ctx = dc->ctx;
+ 	enum dc_status result = DC_ERROR_UNEXPECTED;
+@@ -755,19 +757,19 @@ enum dc_status dce100_validate_with_context(
+ 		context->stream_count++;
+ 	}
+ 
+-	result = resource_map_pool_resources(dc, context);
++	result = resource_map_pool_resources(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context);
++		result = resource_map_clock_resources(dc, context, old_context);
+ 
+ 	if (!resource_validate_attach_surfaces(set, set_count,
+-			dc->current_context, context, dc->res_pool)) {
++			old_context, context, dc->res_pool)) {
+ 		DC_ERROR("Failed to attach surface to stream!\n");
+ 		return DC_FAIL_ATTACH_SURFACES;
+ 	}
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context);
++		result = validate_mapped_resource(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+ 		result = resource_build_scaling_params_for_context(dc, context);
+@@ -790,13 +792,13 @@ enum dc_status dce100_validate_guaranteed(
+ 	dc_stream_retain(&context->streams[0]->public);
+ 	context->stream_count++;
+ 
+-	result = resource_map_pool_resources(dc, context);
++	result = resource_map_pool_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context);
++		result = resource_map_clock_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context);
++		result = validate_mapped_resource(dc, context, NULL);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+index 3ed5b94..45759b9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+@@ -769,7 +769,8 @@ static bool is_surface_pixel_format_supported(struct pipe_ctx *pipe_ctx, unsigne
+ 
+ static enum dc_status validate_mapped_resource(
+ 		const struct core_dc *dc,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	enum dc_status status = DC_OK;
+ 	uint8_t i, j;
+@@ -778,7 +779,7 @@ static enum dc_status validate_mapped_resource(
+ 		struct core_stream *stream = context->streams[i];
+ 		struct core_link *link = stream->sink->link;
+ 
+-		if (resource_is_stream_unchanged(dc->current_context, stream))
++		if (old_context && resource_is_stream_unchanged(old_context, stream))
+ 			continue;
+ 
+ 		for (j = 0; j < MAX_PIPES; j++) {
+@@ -943,7 +944,8 @@ enum dc_status dce110_validate_with_context(
+ 		const struct core_dc *dc,
+ 		const struct dc_validation_set set[],
+ 		int set_count,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	struct dc_context *dc_ctx = dc->ctx;
+ 	enum dc_status result = DC_ERROR_UNEXPECTED;
+@@ -958,19 +960,19 @@ enum dc_status dce110_validate_with_context(
+ 		context->stream_count++;
+ 	}
+ 
+-	result = resource_map_pool_resources(dc, context);
++	result = resource_map_pool_resources(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context);
++		result = resource_map_clock_resources(dc, context, old_context);
+ 
+ 	if (!resource_validate_attach_surfaces(set, set_count,
+-			dc->current_context, context, dc->res_pool)) {
++			old_context, context, dc->res_pool)) {
+ 		DC_ERROR("Failed to attach surface to stream!\n");
+ 		return DC_FAIL_ATTACH_SURFACES;
+ 	}
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context);
++		result = validate_mapped_resource(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+ 		result = resource_build_scaling_params_for_context(dc, context);
+@@ -993,13 +995,13 @@ enum dc_status dce110_validate_guaranteed(
+ 	dc_stream_retain(&context->streams[0]->public);
+ 	context->stream_count++;
+ 
+-	result = resource_map_pool_resources(dc, context);
++	result = resource_map_pool_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context);
++		result = resource_map_clock_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context);
++		result = validate_mapped_resource(dc, context, NULL);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+index f405d6e..80f0673 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+@@ -722,7 +722,8 @@ static struct clock_source *find_matching_pll(
+ 
+ static enum dc_status validate_mapped_resource(
+ 		const struct core_dc *dc,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	enum dc_status status = DC_OK;
+ 	uint8_t i, j;
+@@ -731,7 +732,7 @@ static enum dc_status validate_mapped_resource(
+ 		struct core_stream *stream = context->streams[i];
+ 		struct core_link *link = stream->sink->link;
+ 
+-		if (resource_is_stream_unchanged(dc->current_context, stream))
++		if (old_context && resource_is_stream_unchanged(old_context, stream))
+ 			continue;
+ 
+ 		for (j = 0; j < MAX_PIPES; j++) {
+@@ -854,7 +855,8 @@ bool dce112_validate_bandwidth(
+ 
+ enum dc_status resource_map_phy_clock_resources(
+ 		const struct core_dc *dc,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	uint8_t i, j;
+ 
+@@ -862,7 +864,7 @@ enum dc_status resource_map_phy_clock_resources(
+ 	for (i = 0; i < context->stream_count; i++) {
+ 		struct core_stream *stream = context->streams[i];
+ 
+-		if (resource_is_stream_unchanged(dc->current_context, stream))
++		if (old_context && resource_is_stream_unchanged(old_context, stream))
+ 			continue;
+ 
+ 		for (j = 0; j < MAX_PIPES; j++) {
+@@ -922,7 +924,8 @@ enum dc_status dce112_validate_with_context(
+ 		const struct core_dc *dc,
+ 		const struct dc_validation_set set[],
+ 		int set_count,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	struct dc_context *dc_ctx = dc->ctx;
+ 	enum dc_status result = DC_ERROR_UNEXPECTED;
+@@ -937,19 +940,19 @@ enum dc_status dce112_validate_with_context(
+ 		context->stream_count++;
+ 	}
+ 
+-	result = resource_map_pool_resources(dc, context);
++	result = resource_map_pool_resources(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_phy_clock_resources(dc, context);
++		result = resource_map_phy_clock_resources(dc, context, old_context);
+ 
+ 	if (!resource_validate_attach_surfaces(set, set_count,
+-			dc->current_context, context, dc->res_pool)) {
++			old_context, context, dc->res_pool)) {
+ 		DC_ERROR("Failed to attach surface to stream!\n");
+ 		return DC_FAIL_ATTACH_SURFACES;
+ 	}
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context);
++		result = validate_mapped_resource(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+ 		result = resource_build_scaling_params_for_context(dc, context);
+@@ -972,13 +975,13 @@ enum dc_status dce112_validate_guaranteed(
+ 	dc_stream_retain(&context->streams[0]->public);
+ 	context->stream_count++;
+ 
+-	result = resource_map_pool_resources(dc, context);
++	result = resource_map_pool_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_phy_clock_resources(dc, context);
++		result = resource_map_phy_clock_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context);
++		result = validate_mapped_resource(dc, context, NULL);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h
+index dc842aa..c6c0bba 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h
++++ b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h
+@@ -39,7 +39,8 @@ enum dc_status dce112_validate_with_context(
+ 		const struct core_dc *dc,
+ 		const struct dc_validation_set set[],
+ 		int set_count,
+-		struct validate_context *context);
++		struct validate_context *context,
++		struct validate_context *old_context);
+ 
+ enum dc_status dce112_validate_guaranteed(
+ 		const struct core_dc *dc,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+index 095e437..5861b3f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+@@ -669,7 +669,8 @@ static void destruct(struct dce110_resource_pool *pool)
+ 
+ static enum dc_status validate_mapped_resource(
+ 		const struct core_dc *dc,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	enum dc_status status = DC_OK;
+ 	uint8_t i, j;
+@@ -678,7 +679,7 @@ static enum dc_status validate_mapped_resource(
+ 		struct core_stream *stream = context->streams[i];
+ 		struct core_link *link = stream->sink->link;
+ 
+-		if (resource_is_stream_unchanged(dc->current_context, stream))
++		if (old_context && resource_is_stream_unchanged(old_context, stream))
+ 			continue;
+ 
+ 		for (j = 0; j < MAX_PIPES; j++) {
+@@ -757,7 +758,8 @@ enum dc_status dce80_validate_with_context(
+ 		const struct core_dc *dc,
+ 		const struct dc_validation_set set[],
+ 		int set_count,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	struct dc_context *dc_ctx = dc->ctx;
+ 	enum dc_status result = DC_ERROR_UNEXPECTED;
+@@ -772,19 +774,19 @@ enum dc_status dce80_validate_with_context(
+ 		context->stream_count++;
+ 	}
+ 
+-	result = resource_map_pool_resources(dc, context);
++	result = resource_map_pool_resources(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context);
++		result = resource_map_clock_resources(dc, context, old_context);
+ 
+ 	if (!resource_validate_attach_surfaces(set, set_count,
+-			dc->current_context, context, dc->res_pool)) {
++			old_context, context, dc->res_pool)) {
+ 		DC_ERROR("Failed to attach surface to stream!\n");
+ 		return DC_FAIL_ATTACH_SURFACES;
+ 	}
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context);
++		result = validate_mapped_resource(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+ 		result = resource_build_scaling_params_for_context(dc, context);
+@@ -806,13 +808,13 @@ enum dc_status dce80_validate_guaranteed(
+ 	dc_stream_retain(&context->streams[0]->public);
+ 	context->stream_count++;
+ 
+-	result = resource_map_pool_resources(dc, context);
++	result = resource_map_pool_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context);
++		result = resource_map_clock_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context);
++		result = validate_mapped_resource(dc, context, NULL);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+index 7fdc586..94cd7a9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+@@ -853,7 +853,8 @@ static enum dc_status build_pipe_hw_param(struct pipe_ctx *pipe_ctx)
+ 
+ static enum dc_status validate_mapped_resource(
+ 		const struct core_dc *dc,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	enum dc_status status = DC_OK;
+ 	uint8_t i, j;
+@@ -862,8 +863,8 @@ static enum dc_status validate_mapped_resource(
+ 		struct core_stream *stream = context->streams[i];
+ 		struct core_link *link = stream->sink->link;
+ 
+-		if (resource_is_stream_unchanged(dc->current_context, stream)) {
+-			if (stream != NULL && dc->current_context->streams[i] != NULL) {
++		if (old_context && resource_is_stream_unchanged(old_context, stream)) {
++			if (stream != NULL && old_context->streams[i] != NULL) {
+ 				/* todo: shouldn't have to copy missing parameter here */
+ 				resource_build_bit_depth_reduction_params(stream,
+ 						&stream->bit_depth_params);
+@@ -920,7 +921,8 @@ enum dc_status dcn10_validate_with_context(
+ 		const struct core_dc *dc,
+ 		const struct dc_validation_set set[],
+ 		int set_count,
+-		struct validate_context *context)
++		struct validate_context *context,
++		struct validate_context *old_context)
+ {
+ 	enum dc_status result = DC_OK;
+ 	int i;
+@@ -934,20 +936,20 @@ enum dc_status dcn10_validate_with_context(
+ 		context->stream_count++;
+ 	}
+ 
+-	result = resource_map_pool_resources(dc, context);
++	result = resource_map_pool_resources(dc, context, old_context);
+ 	if (result != DC_OK)
+ 		return result;
+ 
+-	result = resource_map_phy_clock_resources(dc, context);
++	result = resource_map_phy_clock_resources(dc, context, old_context);
+ 	if (result != DC_OK)
+ 		return result;
+ 
+-	result = validate_mapped_resource(dc, context);
++	result = validate_mapped_resource(dc, context, old_context);
+ 	if (result != DC_OK)
+ 		return result;
+ 
+ 	if (!resource_validate_attach_surfaces(set, set_count,
+-			dc->current_context, context, dc->res_pool))
++			old_context, context, dc->res_pool))
+ 		return DC_FAIL_ATTACH_SURFACES;
+ 
+ 	result = resource_build_scaling_params_for_context(dc, context);
+@@ -971,13 +973,13 @@ enum dc_status dcn10_validate_guaranteed(
+ 	dc_stream_retain(&context->streams[0]->public);
+ 	context->stream_count++;
+ 
+-	result = resource_map_pool_resources(dc, context);
++	result = resource_map_pool_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_phy_clock_resources(dc, context);
++		result = resource_map_phy_clock_resources(dc, context, NULL);
+ 
+ 	if (result == DC_OK)
+-		result = validate_mapped_resource(dc, context);
++		result = validate_mapped_resource(dc, context, NULL);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index 46bd031..d8a378d 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -203,7 +203,8 @@ struct resource_funcs {
+ 					const struct core_dc *dc,
+ 					const struct dc_validation_set set[],
+ 					int set_count,
+-					struct validate_context *context);
++					struct validate_context *context,
++					struct validate_context *old_context);
+ 
+ 	enum dc_status (*validate_guaranteed)(
+ 					const struct core_dc *dc,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/resource.h b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+index 4e07b9f..7cac24d 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+@@ -80,7 +80,8 @@ void dc_destroy_resource_pool(struct core_dc *dc);
+ 
+ enum dc_status resource_map_pool_resources(
+ 		const struct core_dc *dc,
+-		struct validate_context *context);
++		struct validate_context *context,
++		struct validate_context *old_context);
+ 
+ bool resource_build_scaling_params(struct pipe_ctx *pipe_ctx);
+ 
+@@ -150,11 +151,13 @@ void resource_validate_ctx_update_pointer_after_copy(
+ 
+ enum dc_status resource_map_clock_resources(
+ 		const struct core_dc *dc,
+-		struct validate_context *context);
++		struct validate_context *context,
++		struct validate_context *old_context);
+ 
+ enum dc_status resource_map_phy_clock_resources(
+ 		const struct core_dc *dc,
+-		struct validate_context *context);
++		struct validate_context *context,
++		struct validate_context *old_context);
+ 
+ bool pipe_need_reprogram(
+ 		struct pipe_ctx *pipe_ctx_old,
+-- 
+2.7.4
+

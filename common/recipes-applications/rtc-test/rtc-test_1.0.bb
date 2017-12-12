@@ -4,9 +4,6 @@ LICENSE = "BSD"
 DEPENDS = "readline"
 LIC_FILES_CHKSUM = "file://rtc-test.c;md5=ab350f4f921bfc19f7b7938a07f5688a"
 
-PR = "r1"
-PV = "1.0"
-
 SRC_URI = "file://rtc-test.c"
 
 S = "${WORKDIR}"

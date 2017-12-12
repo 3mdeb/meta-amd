@@ -4,9 +4,6 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/GPL-2.0;md5=801f80980d171dd6425
 
 SRC_URI = "file://modprobe.d/snd-soc-acp-rt286-mach.conf"
 
-PR = "r0"
-PV = "1.0"
-
 S = "${WORKDIR}"
 
 do_install() {

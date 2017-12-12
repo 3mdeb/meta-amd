@@ -1,0 +1,156 @@
+From 047daf5d89bb0a2860118b517fe908cb4ad53b30 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Tue, 26 Jul 2016 17:30:54 -0400
+Subject: [PATCH 1829/2094] drm/amdkfd: Don't dereference kfd_process.mm
+
+The kfd_process doesn't own a reference to the mm_struct, so it can
+disappear without warning even while the kfd_process still exists.
+In fact, the delayed kfd_process teardown is triggered by an MMU
+notifier when the mm_struct is destroyed. Permanently holding a
+reference to the mm_struct would prevent this from happening.
+
+Therefore, avoid dereferencing the kfd_process.mm pointer and make
+it opaque. Use other ways to access the mm:
+ * In process context, use current->mm
+ * In calls that know the mm, use it directly
+ * Otherwise use get_task_mm to get a reference
+
+Change-Id: Idcea859d0eaa6d62978b3a8ee54d83cbcfc0d7cd
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c               |  9 ++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c | 10 ++--------
+ drivers/gpu/drm/amd/amdkfd/kfd_events.c               | 17 ++++++++++++++---
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h                 |  7 ++++++-
+ 4 files changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index af3790f..0111510 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -708,9 +708,16 @@ int kgd2kfd_resume_mm(struct kfd_dev *kfd, struct mm_struct *mm)
+ 
+ 	r = -ENODEV;
+ 	pdd = kfd_get_process_device_data(kfd, p);
+-	if (pdd)
++	if (pdd) {
++		if (kfd->dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
++			down_read(&mm->mmap_sem);
++
+ 		r = process_restore_queues(kfd->dqm, &pdd->qpd);
+ 
++		if (kfd->dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
++			up_read(&mm->mmap_sem);
++	}
++
+ 	up_read(&p->lock);
+ 	return r;
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 6085a64..fc3e21b 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -389,7 +389,7 @@ static int update_queue(struct device_queue_manager *dqm, struct queue *q)
+ 	BUG_ON(!dqm || !q || !q->mqd);
+ 
+ 	if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
+-		down_read(&q->process->mm->mmap_sem);
++		down_read(&current->mm->mmap_sem);
+ 	mutex_lock(&dqm->lock);
+ 
+ 	pdd = kfd_get_process_device_data(q->device, q->process);
+@@ -446,7 +446,7 @@ static int update_queue(struct device_queue_manager *dqm, struct queue *q)
+ out_unlock:
+ 	mutex_unlock(&dqm->lock);
+ 	if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
+-		up_read(&q->process->mm->mmap_sem);
++		up_read(&current->mm->mmap_sem);
+ 
+ 	return retval;
+ }
+@@ -521,14 +521,10 @@ int process_restore_queues(struct device_queue_manager *dqm,
+ {
+ 	struct queue *q, *next;
+ 	struct mqd_manager *mqd;
+-	struct kfd_process_device *pdd =
+-		container_of(qpd, struct kfd_process_device, qpd);
+ 	int retval = 0;
+ 
+ 	BUG_ON(!dqm || !qpd);
+ 
+-	if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
+-		down_read(&pdd->process->mm->mmap_sem);
+ 	mutex_lock(&dqm->lock);
+ 	if (qpd->evicted == 0) /* already restored, do nothing */
+ 		goto out_unlock;
+@@ -568,8 +564,6 @@ int process_restore_queues(struct device_queue_manager *dqm,
+ 
+ out_unlock:
+ 	mutex_unlock(&dqm->lock);
+-	if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
+-		up_read(&pdd->process->mm->mmap_sem);
+ 
+ 	return retval;
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_events.c b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+index f8056b1..f926e90 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+@@ -1025,14 +1025,24 @@ void kfd_signal_iommu_event(struct kfd_dev *dev, unsigned int pasid,
+ 	 * running so the lookup function returns a read-locked process.
+ 	 */
+ 	struct kfd_process *p = kfd_lookup_process_by_pasid(pasid);
++	struct mm_struct *mm;
+ 
+ 	if (!p)
+ 		return; /* Presumably process exited. */
+ 
++	/* Take a safe reference to the mm_struct, which may otherwise
++	 * disappear even while the kfd_process is still referenced.
++	 */
++	mm = get_task_mm(p->lead_thread);
++	if (!mm) {
++		up_read(&p->lock);
++		return; /* Process is exiting */
++	}
++
+ 	memset(&memory_exception_data, 0, sizeof(memory_exception_data));
+ 
+-	down_read(&p->mm->mmap_sem);
+-	vma = find_vma(p->mm, address);
++	down_read(&mm->mmap_sem);
++	vma = find_vma(mm, address);
+ 
+ 	memory_exception_data.gpu_id = dev->id;
+ 	memory_exception_data.va = address;
+@@ -1058,7 +1068,8 @@ void kfd_signal_iommu_event(struct kfd_dev *dev, unsigned int pasid,
+ 		}
+ 	}
+ 
+-	up_read(&p->mm->mmap_sem);
++	up_read(&mm->mmap_sem);
++	mmdrop(mm);
+ 
+ 	mutex_lock(&p->event_mutex);
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 054a784..cea4efd 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -607,7 +607,12 @@ struct kfd_process {
+ 	 */
+ 	struct hlist_node kfd_processes;
+ 
+-	struct mm_struct *mm;
++	/*
++	 * Opaque pointer to mm_struct. We don't hold a reference to
++	 * it so it should never be dereferenced from here. This is
++	 * only used for looking up processes by their mm.
++	 */
++	void *mm;
+ 
+ 	struct kref ref;
+ 	struct work_struct release_work;
+-- 
+2.7.4
+

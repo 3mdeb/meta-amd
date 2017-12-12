@@ -1,0 +1,1026 @@
+From a620b79d207e0dd17c8c99c2f3af544d7849b12c Mon Sep 17 00:00:00 2001
+From: Anthony Koo <Anthony.Koo@amd.com>
+Date: Tue, 24 Jan 2017 15:19:42 -0500
+Subject: [PATCH 0517/2094] drm/amd/display: Move backlight from encoder to ABM
+
+Change-Id: Ib35cfb683cb78a3d111400864f12acba60c25579
+Signed-off-by: Anthony Koo <anthony.koo@amd.com>
+Reviewed-by: Aric Cyr <Aric.Cyr@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |  34 ---
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c      |  63 +++--
+ drivers/gpu/drm/amd/display/dc/dc.h                |   5 -
+ drivers/gpu/drm/amd/display/dc/dce/dce_abm.c       | 264 +++++++++++++++++++--
+ drivers/gpu/drm/amd/display/dc/dce/dce_abm.h       |  35 ++-
+ .../gpu/drm/amd/display/dc/dce/dce_link_encoder.c  | 260 --------------------
+ .../gpu/drm/amd/display/dc/dce/dce_link_encoder.h  |  24 --
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    |   4 +-
+ drivers/gpu/drm/amd/display/dc/inc/hw/abm.h        |   5 +
+ .../gpu/drm/amd/display/dc/inc/hw/link_encoder.h   |   5 -
+ drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h  |   4 -
+ .../amd/display/dc/virtual/virtual_link_encoder.c  |  13 -
+ 12 files changed, 316 insertions(+), 400 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 152c694..499ef56 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -240,34 +240,6 @@ static void stream_update_scaling(
+ 	}
+ }
+ 
+-static bool set_backlight(struct dc *dc, unsigned int backlight_level,
+-			unsigned int frame_ramp, const struct dc_stream *stream)
+-{
+-	struct core_dc *core_dc = DC_TO_CORE(dc);
+-	int i;
+-
+-	if (stream->sink->sink_signal == SIGNAL_TYPE_EDP) {
+-		for (i = 0; i < core_dc->link_count; i++)
+-			dc_link_set_backlight_level(&core_dc->links[i]->public,
+-					backlight_level, frame_ramp, stream);
+-	}
+-
+-	return true;
+-
+-}
+-
+-static bool init_dmcu_backlight_settings(struct dc *dc)
+-{
+-	struct core_dc *core_dc = DC_TO_CORE(dc);
+-	int i;
+-
+-	for (i = 0; i < core_dc->link_count; i++)
+-		dc_link_init_dmcu_backlight_settings
+-			(&core_dc->links[i]->public);
+-
+-	return true;
+-}
+-
+ static bool set_psr_enable(struct dc *dc, bool enable)
+ {
+ 	struct core_dc *core_dc = DC_TO_CORE(dc);
+@@ -390,12 +362,6 @@ static void allocate_dc_stream_funcs(struct core_dc *core_dc)
+ 	core_dc->public.stream_funcs.set_gamut_remap =
+ 			set_gamut_remap;
+ 
+-	core_dc->public.stream_funcs.set_backlight =
+-			set_backlight;
+-
+-	core_dc->public.stream_funcs.init_dmcu_backlight_settings =
+-			init_dmcu_backlight_settings;
+-
+ 	core_dc->public.stream_funcs.set_psr_enable =
+ 			set_psr_enable;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index 84efc25..2bceb3a 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -37,6 +37,7 @@
+ #include "link_encoder.h"
+ #include "hw_sequencer.h"
+ #include "resource.h"
++#include "abm.h"
+ #include "fixed31_32.h"
+ #include "dpcd_defs.h"
+ 
+@@ -1386,48 +1387,40 @@ bool dc_link_set_backlight_level(const struct dc_link *dc_link, uint32_t level,
+ 		uint32_t frame_ramp, const struct dc_stream *stream)
+ {
+ 	struct core_link *link = DC_LINK_TO_CORE(dc_link);
+-	struct dc_context *ctx = link->ctx;
+-	struct core_dc *core_dc = DC_TO_CORE(ctx->dc);
+-	struct core_stream *core_stream = DC_STREAM_TO_CORE(stream);
++	struct core_dc *core_dc = DC_TO_CORE(link->ctx->dc);
++	struct core_stream *core_stream = NULL;
++	struct abm *abm = core_dc->res_pool->abm;
+ 	unsigned int controller_id = 0;
+ 	int i;
+-	uint32_t dmcu_status;
+ 
+-	dm_logger_write(ctx->logger, LOG_BACKLIGHT,
+-			"New Backlight level: %d (0x%X)\n", level, level);
++	if ((abm == NULL) || (abm->funcs->set_backlight_level == NULL))
++		return false;
+ 
+-	dmcu_status = dm_read_reg(ctx, mmDMCU_STATUS);
++	dm_logger_write(link->ctx->logger, LOG_BACKLIGHT,
++			"New Backlight level: %d (0x%X)\n", level, level);
+ 
+-	/* If DMCU is in reset state, DMCU is uninitialized */
+-	if (get_reg_field_value(dmcu_status, mmDMCU_STATUS, UC_IN_RESET)) {
+-		link->link_enc->funcs->set_lcd_backlight_level(link->link_enc,
+-						level);
+-	} else {
+-		for (i = 0; i < MAX_PIPES; i++) {
+-			if (core_dc->current_context->res_ctx.pipe_ctx[i].stream
+-					== core_stream)
+-				/* dmcu -1 for all controller id values,
+-				 * therefore +1 here
+-				 */
+-				controller_id = core_dc->current_context->res_ctx.
+-						pipe_ctx[i].tg->inst + 1;
++	if (link->device_tag.dev_id.device_type == DEVICE_TYPE_LCD) {
++		if (stream != NULL) {
++			core_stream = DC_STREAM_TO_CORE(stream);
++			for (i = 0; i < MAX_PIPES; i++) {
++				if (core_dc->current_context->res_ctx.
++						pipe_ctx[i].stream
++						== core_stream)
++					/* DMCU -1 for all controller id values,
++					 * therefore +1 here
++					 */
++					controller_id =
++						core_dc->current_context->
++						res_ctx.pipe_ctx[i].tg->inst +
++						1;
++			}
+ 		}
+-
+-		link->link_enc->funcs->set_dmcu_backlight_level
+-				(link->link_enc, level,
+-				frame_ramp, controller_id);
++		abm->funcs->set_backlight_level(
++				abm,
++				level,
++				frame_ramp,
++				controller_id);
+ 	}
+-	return true;
+-}
+-
+-
+-bool dc_link_init_dmcu_backlight_settings(const struct dc_link *dc_link)
+-{
+-	struct core_link *link = DC_LINK_TO_CORE(dc_link);
+-
+-	if (link->link_enc->funcs->init_dmcu_backlight_settings != NULL)
+-		link->link_enc->funcs->
+-			init_dmcu_backlight_settings(link->link_enc);
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 8cb53b6..1308af5 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -100,9 +100,6 @@ struct dc_stream_funcs {
+ 			const struct rect *dst);
+ 	bool (*set_gamut_remap)(struct dc *dc,
+ 			const struct dc_stream **stream, int num_streams);
+-	bool (*set_backlight)(struct dc *dc, unsigned int backlight_level,
+-		unsigned int frame_ramp, const struct dc_stream *stream);
+-	bool (*init_dmcu_backlight_settings)(struct dc *dc);
+ 	bool (*set_psr_enable)(struct dc *dc, bool enable);
+ 	bool (*setup_psr)(struct dc *dc, const struct dc_stream *stream);
+ };
+@@ -572,8 +569,6 @@ const struct graphics_object_id dc_get_link_id_at_index(
+ bool dc_link_set_backlight_level(const struct dc_link *dc_link, uint32_t level,
+ 		uint32_t frame_ramp, const struct dc_stream *stream);
+ 
+-bool dc_link_init_dmcu_backlight_settings(const struct dc_link *dc_link);
+-
+ bool dc_link_set_psr_enable(const struct dc_link *dc_link, bool enable);
+ 
+ bool dc_link_setup_psr(const struct dc_link *dc_link,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c b/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c
+index ce49bee..f4696bf 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c
+@@ -29,6 +29,9 @@
+ #include "fixed32_32.h"
+ #include "dc.h"
+ 
++#include "atom.h"
++
++
+ #define TO_DCE_ABM(abm)\
+ 	container_of(abm, struct dce_abm, base)
+ 
+@@ -43,6 +46,19 @@
+ 	abm_dce->base.ctx
+ 
+ #define MCP_ABM_LEVEL_SET 0x65
++#define MCP_ABM_PIPE_SET 0x66
++#define MCP_BL_SET 0x67
++
++struct abm_backlight_registers {
++	unsigned int BL_PWM_CNTL;
++	unsigned int BL_PWM_CNTL2;
++	unsigned int BL_PWM_PERIOD_CNTL;
++	unsigned int LVTMA_PWRSEQ_REF_DIV_BL_PWM_REF_DIV;
++};
++
++/* registers setting needs to be save and restored used at InitBacklight */
++static struct abm_backlight_registers stored_backlight_registers = {0};
++
+ 
+ static unsigned int get_current_backlight(struct dce_abm *abm_dce)
+ {
+@@ -93,7 +109,147 @@ static unsigned int get_current_backlight(struct dce_abm *abm_dce)
+ 	return (uint32_t)(current_backlight);
+ }
+ 
+-void dce_abm_init(struct abm *abm)
++static void driver_set_backlight_level(struct dce_abm *abm_dce, uint32_t level)
++{
++	uint32_t backlight_24bit;
++	uint32_t backlight_17bit;
++	uint32_t backlight_16bit;
++	uint32_t masked_pwm_period;
++	uint8_t rounding_bit;
++	uint8_t bit_count;
++	uint64_t active_duty_cycle;
++	uint32_t pwm_period_bitcnt;
++
++	/*
++	 * 1. Convert 8-bit value to 17 bit U1.16 format
++	 * (1 integer, 16 fractional bits)
++	 */
++
++	/* 1.1 multiply 8 bit value by 0x10101 to get a 24 bit value,
++	 * effectively multiplying value by 256/255
++	 * eg. for a level of 0xEF, backlight_24bit = 0xEF * 0x10101 = 0xEFEFEF
++	 */
++	backlight_24bit = level * 0x10101;
++
++	/* 1.2 The upper 16 bits of the 24 bit value is the fraction, lower 8
++	 * used for rounding, take most significant bit of fraction for
++	 * rounding, e.g. for 0xEFEFEF, rounding bit is 1
++	 */
++	rounding_bit = (backlight_24bit >> 7) & 1;
++
++	/* 1.3 Add the upper 16 bits of the 24 bit value with the rounding bit
++	 * resulting in a 17 bit value e.g. 0xEFF0 = (0xEFEFEF >> 8) + 1
++	 */
++	backlight_17bit = (backlight_24bit >> 8) + rounding_bit;
++
++	/*
++	 * 2. Find  16 bit backlight active duty cycle, where 0 <= backlight
++	 * active duty cycle <= backlight period
++	 */
++
++	/* 2.1 Apply bitmask for backlight period value based on value of BITCNT
++	 */
++	REG_GET_2(BL_PWM_PERIOD_CNTL,
++			BL_PWM_PERIOD_BITCNT, &pwm_period_bitcnt,
++			BL_PWM_PERIOD, &masked_pwm_period);
++
++	if (pwm_period_bitcnt == 0)
++		bit_count = 16;
++	else
++		bit_count = pwm_period_bitcnt;
++
++	/* e.g. maskedPwmPeriod = 0x24 when bitCount is 6 */
++	masked_pwm_period = masked_pwm_period & ((1 << bit_count) - 1);
++
++	/* 2.2 Calculate integer active duty cycle required upper 16 bits
++	 * contain integer component, lower 16 bits contain fractional component
++	 * of active duty cycle e.g. 0x21BDC0 = 0xEFF0 * 0x24
++	 */
++	active_duty_cycle = backlight_17bit * masked_pwm_period;
++
++	/* 2.3 Calculate 16 bit active duty cycle from integer and fractional
++	 * components shift by bitCount then mask 16 bits and add rounding bit
++	 * from MSB of fraction e.g. 0x86F7 = ((0x21BDC0 >> 6) & 0xFFF) + 0
++	 */
++	backlight_16bit = active_duty_cycle >> bit_count;
++	backlight_16bit &= 0xFFFF;
++	backlight_16bit += (active_duty_cycle >> (bit_count - 1)) & 0x1;
++
++	/*
++	 * 3. Program register with updated value
++	 */
++
++	/* 3.1 Lock group 2 backlight registers */
++
++	REG_UPDATE_2(BL_PWM_GRP1_REG_LOCK,
++			BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN, 1,
++			BL_PWM_GRP1_REG_LOCK, 1);
++
++	// 3.2 Write new active duty cycle
++	REG_UPDATE(BL_PWM_CNTL, BL_ACTIVE_INT_FRAC_CNT, backlight_16bit);
++
++	/* 3.3 Unlock group 2 backlight registers */
++	REG_UPDATE(BL_PWM_GRP1_REG_LOCK,
++			BL_PWM_GRP1_REG_LOCK, 0);
++
++	/* 5.4.4 Wait for pending bit to be cleared */
++	REG_WAIT(BL_PWM_GRP1_REG_LOCK, BL_PWM_GRP1_REG_UPDATE_PENDING,
++			0, 10, 1000);
++}
++
++static void dmcu_set_backlight_level(
++	struct dce_abm *abm_dce,
++	uint32_t level,
++	uint32_t frame_ramp,
++	uint32_t controller_id)
++{
++	unsigned int backlight_16_bit = (level * 0x10101) >> 8;
++	unsigned int backlight_17_bit = backlight_16_bit +
++				(((backlight_16_bit & 0x80) >> 7) & 1);
++	uint32_t rampingBoundary = 0xFFFF;
++	uint32_t s2;
++
++	/* set ramping boundary */
++	REG_WRITE(MASTER_COMM_DATA_REG1, rampingBoundary);
++
++	/* setDMCUParam_Pipe */
++	REG_UPDATE_2(MASTER_COMM_CMD_REG,
++			MASTER_COMM_CMD_REG_BYTE0, MCP_ABM_PIPE_SET,
++			MASTER_COMM_CMD_REG_BYTE1, controller_id);
++
++	/* notifyDMCUMsg */
++	REG_UPDATE(MASTER_COMM_CNTL_REG, MASTER_COMM_INTERRUPT, 1);
++
++	/* waitDMCUReadyForCmd */
++	REG_WAIT(MASTER_COMM_CNTL_REG, MASTER_COMM_INTERRUPT,
++			0, 100, 800);
++
++	/* setDMCUParam_BL */
++	REG_UPDATE(BL1_PWM_USER_LEVEL, BL1_PWM_USER_LEVEL, backlight_17_bit);
++
++	/* write ramp */
++	if (controller_id == 0)
++		frame_ramp = 0;
++	REG_WRITE(MASTER_COMM_DATA_REG1, frame_ramp);
++
++	/* setDMCUParam_Cmd */
++	REG_UPDATE(MASTER_COMM_CMD_REG, MASTER_COMM_CMD_REG_BYTE0, MCP_BL_SET);
++
++	/* notifyDMCUMsg */
++	REG_UPDATE(MASTER_COMM_CNTL_REG, MASTER_COMM_INTERRUPT, 1);
++
++	/* UpdateRequestedBacklightLevel */
++	s2 = REG_READ(BIOS_SCRATCH_2);
++
++	s2 &= ~ATOM_S2_CURRENT_BL_LEVEL_MASK;
++	level &= (ATOM_S2_CURRENT_BL_LEVEL_MASK >>
++				ATOM_S2_CURRENT_BL_LEVEL_SHIFT);
++	s2 |= (level << ATOM_S2_CURRENT_BL_LEVEL_SHIFT);
++
++	REG_WRITE(BIOS_SCRATCH_2, s2);
++}
++
++static void dce_abm_init(struct abm *abm)
+ {
+ 	struct dce_abm *abm_dce = TO_DCE_ABM(abm);
+ 	unsigned int backlight = get_current_backlight(abm_dce);
+@@ -133,24 +289,13 @@ void dce_abm_init(struct abm *abm)
+ 			ABM1_BL_REG_READ_MISSED_FRAME_CLEAR, 1);
+ }
+ 
+-bool dce_abm_set_level(struct abm *abm, uint32_t level)
++static bool dce_abm_set_level(struct abm *abm, uint32_t level)
+ {
+ 	struct dce_abm *abm_dce = TO_DCE_ABM(abm);
+ 	struct dc_context *ctx = abm_dce->base.ctx;
+ 
+-	unsigned int dmcu_max_retry_on_wait_reg_ready = 801;
+-	unsigned int dmcu_wait_reg_ready_interval = 100;
+-	unsigned int value;
+-
+-	/* waitDMCUReadyForCmd */
+-	do {
+-		dm_delay_in_microseconds(ctx, dmcu_wait_reg_ready_interval);
+-		REG_GET(MASTER_COMM_CNTL_REG, MASTER_COMM_INTERRUPT, &value);
+-		dmcu_max_retry_on_wait_reg_ready--;
+-	} while
+-	/* expected value is 0, loop while not 0*/
+-	((value & abm_dce->abm_mask->MASTER_COMM_INTERRUPT) &&
+-		dmcu_max_retry_on_wait_reg_ready > 0);
++	REG_WAIT(MASTER_COMM_CNTL_REG, MASTER_COMM_INTERRUPT, 0,
++			100, 800);
+ 
+ 	/* setDMCUParam_ABMLevel */
+ 	REG_UPDATE_2(MASTER_COMM_CMD_REG,
+@@ -163,9 +308,98 @@ bool dce_abm_set_level(struct abm *abm, uint32_t level)
+ 	return true;
+ }
+ 
++static bool dce_abm_init_backlight(struct abm *abm)
++{
++	struct dce_abm *abm_dce = TO_DCE_ABM(abm);
++	uint32_t value;
++
++	/* It must not be 0, so we have to restore them
++	 * Bios bug w/a - period resets to zero,
++	 * restoring to cache values which is always correct
++	 */
++	REG_GET(BL_PWM_CNTL, BL_ACTIVE_INT_FRAC_CNT, &value);
++	if (value == 0 || value == 1) {
++		if (stored_backlight_registers.BL_PWM_CNTL != 0) {
++			REG_WRITE(BL_PWM_CNTL,
++				stored_backlight_registers.BL_PWM_CNTL);
++			REG_WRITE(BL_PWM_CNTL2,
++				stored_backlight_registers.BL_PWM_CNTL2);
++			REG_WRITE(BL_PWM_PERIOD_CNTL,
++				stored_backlight_registers.BL_PWM_PERIOD_CNTL);
++			REG_UPDATE(LVTMA_PWRSEQ_REF_DIV,
++				BL_PWM_REF_DIV,
++				stored_backlight_registers.
++				LVTMA_PWRSEQ_REF_DIV_BL_PWM_REF_DIV);
++		} else {
++			/* TODO: Note: This should not really happen since VBIOS
++			 * should have initialized PWM registers on boot.
++			 */
++			REG_WRITE(BL_PWM_CNTL, 0xC000FA00);
++			REG_WRITE(BL_PWM_PERIOD_CNTL, 0x000C0FA0);
++		}
++	} else {
++		stored_backlight_registers.BL_PWM_CNTL =
++				REG_READ(BL_PWM_CNTL);
++		stored_backlight_registers.BL_PWM_CNTL2 =
++				REG_READ(BL_PWM_CNTL2);
++		stored_backlight_registers.BL_PWM_PERIOD_CNTL =
++				REG_READ(BL_PWM_PERIOD_CNTL);
++
++		REG_GET(LVTMA_PWRSEQ_REF_DIV, BL_PWM_REF_DIV,
++				&stored_backlight_registers.
++				LVTMA_PWRSEQ_REF_DIV_BL_PWM_REF_DIV);
++	}
++
++	/* Have driver take backlight control
++	 * TakeBacklightControl(true)
++	 */
++	value = REG_READ(BIOS_SCRATCH_2);
++	value |= ATOM_S2_VRI_BRIGHT_ENABLE;
++	REG_WRITE(BIOS_SCRATCH_2, value);
++
++	/* Enable the backlight output */
++	REG_UPDATE(BL_PWM_CNTL, BL_PWM_EN, 1);
++
++	/* Unlock group 2 backlight registers */
++	REG_UPDATE(BL_PWM_GRP1_REG_LOCK,
++			BL_PWM_GRP1_REG_LOCK, 0);
++
++	return true;
++}
++
++static bool dce_abm_set_backlight_level(
++		struct abm *abm,
++		unsigned int backlight_level,
++		unsigned int frame_ramp,
++		unsigned int controller_id)
++{
++	struct dce_abm *abm_dce = TO_DCE_ABM(abm);
++	unsigned int dmcu_uc_reset;
++
++	dm_logger_write(abm->ctx->logger, LOG_BACKLIGHT,
++			"New Backlight level: %d (0x%X)\n",
++			backlight_level, backlight_level);
++
++	REG_GET(DMCU_STATUS, UC_IN_RESET, &dmcu_uc_reset);
++
++	/* If DMCU is in reset state, DMCU is uninitialized */
++	if (dmcu_uc_reset) {
++		driver_set_backlight_level(abm_dce, backlight_level);
++	} else {
++		dmcu_set_backlight_level(abm_dce,
++				backlight_level,
++				frame_ramp,
++				controller_id);
++	}
++
++	return true;
++}
++
+ static const struct abm_funcs dce_funcs = {
+ 	.abm_init = dce_abm_init,
+ 	.set_abm_level = dce_abm_set_level,
++	.init_backlight = dce_abm_init_backlight,
++	.set_backlight_level = dce_abm_set_backlight_level
+ };
+ 
+ static void dce_abm_construct(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_abm.h b/drivers/gpu/drm/amd/display/dc/dce/dce_abm.h
+index cf40e30..56087b3 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_abm.h
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_abm.h
+@@ -32,8 +32,13 @@
+ #define ABM_COMMON_REG_LIST_DCE_BASE() \
+ 	SR(BL_PWM_PERIOD_CNTL), \
+ 	SR(BL_PWM_CNTL), \
++	SR(BL_PWM_CNTL2), \
++	SR(BL_PWM_GRP1_REG_LOCK), \
++	SR(LVTMA_PWRSEQ_REF_DIV), \
+ 	SR(MASTER_COMM_CNTL_REG), \
+-	SR(MASTER_COMM_CMD_REG)
++	SR(MASTER_COMM_CMD_REG), \
++	SR(MASTER_COMM_DATA_REG1), \
++	SR(DMCU_STATUS)
+ 
+ #define ABM_DCE110_COMMON_REG_LIST() \
+ 	ABM_COMMON_REG_LIST_DCE_BASE(), \
+@@ -46,7 +51,8 @@
+ 	SR(BL1_PWM_TARGET_ABM_LEVEL), \
+ 	SR(BL1_PWM_USER_LEVEL), \
+ 	SR(DC_ABM1_LS_MIN_MAX_PIXEL_VALUE_THRES), \
+-	SR(DC_ABM1_HGLS_REG_READ_PROGRESS)
++	SR(DC_ABM1_HGLS_REG_READ_PROGRESS), \
++	SR(BIOS_SCRATCH_2)
+ 
+ #define ABM_SF(reg_name, field_name, post_fix)\
+ 	.field_name = reg_name ## __ ## field_name ## post_fix
+@@ -56,9 +62,16 @@
+ 	ABM_SF(BL_PWM_PERIOD_CNTL, BL_PWM_PERIOD_BITCNT, mask_sh), \
+ 	ABM_SF(BL_PWM_CNTL, BL_ACTIVE_INT_FRAC_CNT, mask_sh), \
+ 	ABM_SF(BL_PWM_CNTL, BL_PWM_FRACTIONAL_EN, mask_sh), \
++	ABM_SF(BL_PWM_CNTL, BL_PWM_EN, mask_sh), \
++	ABM_SF(BL_PWM_GRP1_REG_LOCK, BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN, mask_sh), \
++	ABM_SF(BL_PWM_GRP1_REG_LOCK, BL_PWM_GRP1_REG_LOCK, mask_sh), \
++	ABM_SF(BL_PWM_GRP1_REG_LOCK, BL_PWM_GRP1_REG_UPDATE_PENDING, mask_sh), \
++	ABM_SF(LVTMA_PWRSEQ_REF_DIV, BL_PWM_REF_DIV, mask_sh), \
+ 	ABM_SF(MASTER_COMM_CNTL_REG, MASTER_COMM_INTERRUPT, mask_sh), \
+ 	ABM_SF(MASTER_COMM_CMD_REG, MASTER_COMM_CMD_REG_BYTE0, mask_sh), \
+-	ABM_SF(MASTER_COMM_CMD_REG, MASTER_COMM_CMD_REG_BYTE2, mask_sh)
++	ABM_SF(MASTER_COMM_CMD_REG, MASTER_COMM_CMD_REG_BYTE1, mask_sh), \
++	ABM_SF(MASTER_COMM_CMD_REG, MASTER_COMM_CMD_REG_BYTE2, mask_sh), \
++	ABM_SF(DMCU_STATUS, UC_IN_RESET, mask_sh)
+ 
+ #define ABM_MASK_SH_LIST_DCE110(mask_sh) \
+ 	ABM_COMMON_MASK_SH_LIST_DCE_COMMON_BASE(mask_sh), \
+@@ -91,6 +104,7 @@
+ 	ABM_SF(DC_ABM1_HGLS_REG_READ_PROGRESS, \
+ 			ABM1_BL_REG_READ_MISSED_FRAME_CLEAR, mask_sh)
+ 
++
+ #define ABM_REG_FIELD_LIST(type) \
+ 	type ABM1_HG_NUM_OF_BINS_SEL; \
+ 	type ABM1_HG_VMAX_SEL; \
+@@ -112,7 +126,14 @@
+ 	type BL_PWM_FRACTIONAL_EN; \
+ 	type MASTER_COMM_INTERRUPT; \
+ 	type MASTER_COMM_CMD_REG_BYTE0; \
+-	type MASTER_COMM_CMD_REG_BYTE2
++	type MASTER_COMM_CMD_REG_BYTE1; \
++	type MASTER_COMM_CMD_REG_BYTE2; \
++	type BL_PWM_REF_DIV; \
++	type BL_PWM_EN; \
++	type UC_IN_RESET; \
++	type BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN; \
++	type BL_PWM_GRP1_REG_LOCK; \
++	type BL_PWM_GRP1_REG_UPDATE_PENDING
+ 
+ struct dce_abm_shift {
+ 	ABM_REG_FIELD_LIST(uint8_t);
+@@ -125,6 +146,8 @@ struct dce_abm_mask {
+ struct dce_abm_registers {
+ 	uint32_t BL_PWM_PERIOD_CNTL;
+ 	uint32_t BL_PWM_CNTL;
++	uint32_t BL_PWM_CNTL2;
++	uint32_t LVTMA_PWRSEQ_REF_DIV;
+ 	uint32_t DC_ABM1_HG_SAMPLE_RATE;
+ 	uint32_t DC_ABM1_LS_SAMPLE_RATE;
+ 	uint32_t BL1_PWM_BL_UPDATE_SAMPLE_RATE;
+@@ -137,6 +160,10 @@ struct dce_abm_registers {
+ 	uint32_t DC_ABM1_HGLS_REG_READ_PROGRESS;
+ 	uint32_t MASTER_COMM_CNTL_REG;
+ 	uint32_t MASTER_COMM_CMD_REG;
++	uint32_t MASTER_COMM_DATA_REG1;
++	uint32_t BIOS_SCRATCH_2;
++	uint32_t DMCU_STATUS;
++	uint32_t BL_PWM_GRP1_REG_LOCK;
+ };
+ 
+ struct dce_abm {
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+index f932562..3847764 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+@@ -38,15 +38,6 @@
+ #include "dce/dce_11_0_sh_mask.h"
+ #include "dce/dce_11_0_enum.h"
+ 
+-#ifndef ATOM_S2_CURRENT_BL_LEVEL_MASK
+-#define ATOM_S2_CURRENT_BL_LEVEL_MASK   0x0000FF00L
+-#define ATOM_S2_VRI_BRIGHT_ENABLE       0x20000000L
+-#endif
+-
+-#ifndef ATOM_S2_CURRENT_BL_LEVEL_SHIFT
+-#define ATOM_S2_CURRENT_BL_LEVEL_SHIFT  8
+-#endif
+-
+ #ifndef HPD0_DC_HPD_CONTROL__DC_HPD_EN_MASK
+ #define HPD0_DC_HPD_CONTROL__DC_HPD_EN_MASK  0x10000000L
+ #endif
+@@ -96,13 +87,6 @@
+ /* For current ASICs pixel clock - 600MHz */
+ #define MAX_ENCODER_CLOCK 600000
+ 
+-/* Set the ABM Pipe */
+-#define MCP_ABM_PIPE_SET 0x66
+-/* Set the ABM level */
+-#define MCP_ABM_LEVEL_SET 0x65
+-/* Set backlight level */
+-#define MCP_BL_SET 0x67
+-
+ /* PSR related commands */
+ #define PSR_ENABLE 0x20
+ #define PSR_EXIT 0x21
+@@ -111,9 +95,6 @@
+ /*TODO: Used for psr wakeup for set backlight level*/
+ static unsigned int psr_crtc_offset;
+ 
+-/* registers setting needs to be save and restored used at InitBacklight */
+-static struct dce110_abm_backlight_registers stored_backlight_registers;
+-
+ enum {
+ 	DP_MST_UPDATE_MAX_RETRY = 50
+ };
+@@ -137,11 +118,6 @@ static const struct link_encoder_funcs dce110_lnk_enc_funcs = {
+ 	.dp_set_phy_pattern = dce110_link_encoder_dp_set_phy_pattern,
+ 	.update_mst_stream_allocation_table =
+ 		dce110_link_encoder_update_mst_stream_allocation_table,
+-	.set_lcd_backlight_level = dce110_link_encoder_set_lcd_backlight_level,
+-	.set_dmcu_backlight_level =
+-			dce110_link_encoder_set_dmcu_backlight_level,
+-	.init_dmcu_backlight_settings =
+-			dce110_link_encoder_init_dmcu_backlight_settings,
+ 	.set_dmcu_psr_enable = dce110_link_encoder_set_dmcu_psr_enable,
+ 	.setup_dmcu_psr = dce110_link_encoder_setup_dmcu_psr,
+ 	.backlight_control = dce110_link_encoder_edp_backlight_control,
+@@ -1574,242 +1550,6 @@ void dce110_link_encoder_update_mst_stream_allocation_table(
+ 	} while (retries < DP_MST_UPDATE_MAX_RETRY);
+ }
+ 
+-void dce110_link_encoder_set_lcd_backlight_level(
+-	struct link_encoder *enc,
+-	uint32_t level)
+-{
+-	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+-
+-	const uint32_t backlight_update_pending_max_retry = 1000;
+-
+-	uint32_t backlight_lock;
+-
+-	uint32_t i;
+-	uint32_t backlight_24bit;
+-	uint32_t backlight_17bit;
+-	uint32_t backlight_16bit;
+-	uint32_t masked_pwm_period;
+-	uint8_t rounding_bit;
+-	uint8_t bit_count;
+-	uint64_t active_duty_cycle;
+-	uint32_t pwm_period_bitcnt;
+-
+-	backlight_lock = REG_READ(BL_PWM_GRP1_REG_LOCK);
+-
+-	/*
+-	 * 1. Convert 8-bit value to 17 bit U1.16 format
+-	 * (1 integer, 16 fractional bits)
+-	 */
+-
+-	/* 1.1 multiply 8 bit value by 0x10101 to get a 24 bit value,
+-	 * effectively multiplying value by 256/255
+-	 * eg. for a level of 0xEF, backlight_24bit = 0xEF * 0x10101 = 0xEFEFEF
+-	 */
+-	backlight_24bit = level * 0x10101;
+-
+-	/* 1.2 The upper 16 bits of the 24 bit value is the fraction, lower 8
+-	 * used for rounding, take most significant bit of fraction for
+-	 * rounding, e.g. for 0xEFEFEF, rounding bit is 1
+-	 */
+-	rounding_bit = (backlight_24bit >> 7) & 1;
+-
+-	/* 1.3 Add the upper 16 bits of the 24 bit value with the rounding bit
+-	 * resulting in a 17 bit value e.g. 0xEFF0 = (0xEFEFEF >> 8) + 1
+-	 */
+-	backlight_17bit = (backlight_24bit >> 8) + rounding_bit;
+-
+-	/*
+-	 * 2. Find  16 bit backlight active duty cycle, where 0 <= backlight
+-	 * active duty cycle <= backlight period
+-	 */
+-
+-	/* 2.1 Apply bitmask for backlight period value based on value of BITCNT
+-	 */
+-	{
+-		REG_GET(BL_PWM_PERIOD_CNTL,
+-			BL_PWM_PERIOD_BITCNT, &pwm_period_bitcnt);
+-
+-		if (pwm_period_bitcnt == 0)
+-			bit_count = 16;
+-		else
+-			bit_count = pwm_period_bitcnt;
+-	}
+-
+-	/* e.g. maskedPwmPeriod = 0x24 when bitCount is 6 */
+-	masked_pwm_period =
+-		REG_GET(BL_PWM_PERIOD_CNTL,
+-				BL_PWM_PERIOD, &masked_pwm_period)
+-		& ((1 << bit_count) - 1);
+-
+-	/* 2.2 Calculate integer active duty cycle required upper 16 bits
+-	 * contain integer component, lower 16 bits contain fractional component
+-	 * of active duty cycle e.g. 0x21BDC0 = 0xEFF0 * 0x24
+-	 */
+-	active_duty_cycle = backlight_17bit * masked_pwm_period;
+-
+-	/* 2.3 Calculate 16 bit active duty cycle from integer and fractional
+-	 * components shift by bitCount then mask 16 bits and add rounding bit
+-	 * from MSB of fraction e.g. 0x86F7 = ((0x21BDC0 >> 6) & 0xFFF) + 0
+-	 */
+-	backlight_16bit = active_duty_cycle >> bit_count;
+-	backlight_16bit &= 0xFFFF;
+-	backlight_16bit += (active_duty_cycle >> (bit_count - 1)) & 0x1;
+-
+-	REG_UPDATE(BL_PWM_CNTL,
+-			BL_ACTIVE_INT_FRAC_CNT, backlight_16bit);
+-
+-	/*
+-	 * 3. Program register with updated value
+-	 */
+-
+-	/* 3.1 Lock group 2 backlight registers */
+-
+-	REG_UPDATE(BL_PWM_GRP1_REG_LOCK,
+-			BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN, 1);
+-
+-	REG_UPDATE(BL_PWM_GRP1_REG_LOCK,
+-			BL_PWM_GRP1_REG_LOCK, 1);
+-
+-	/* 3.3 Unlock group 2 backlight registers */
+-	REG_UPDATE(BL_PWM_GRP1_REG_LOCK,
+-			BL_PWM_GRP1_REG_LOCK, 0);
+-
+-	/* 5.4.4 Wait for pending bit to be cleared */
+-	for (i = 0; i < backlight_update_pending_max_retry; ++i) {
+-		REG_GET(BL_PWM_GRP1_REG_LOCK,
+-						BL_PWM_GRP1_REG_UPDATE_PENDING, &backlight_lock);
+-		if (!backlight_lock)
+-			break;
+-
+-		udelay(10);
+-	}
+-}
+-
+-void dce110_link_encoder_set_dmcu_backlight_level(
+-	struct link_encoder *enc,
+-	uint32_t level,
+-	uint32_t frame_ramp,
+-	uint32_t controller_id)
+-{
+-	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+-	struct dc_context *ctx = enc110->base.ctx;
+-	unsigned int dmcu_max_retry_on_wait_reg_ready = 801;
+-	unsigned int dmcu_wait_reg_ready_interval = 100;
+-	unsigned int backlight_17bit = level * 0x10101;
+-	unsigned char temp_uchar =
+-			(unsigned char)(((backlight_17bit & 0x80) >> 7) & 1);
+-	unsigned int regValue;
+-	uint32_t rampingBoundary = 0xFFFF;
+-	uint32_t s2;
+-
+-	backlight_17bit = (backlight_17bit >> 8) + temp_uchar;
+-
+-	/* set ramping boundary */
+-	REG_WRITE(MASTER_COMM_DATA_REG1, rampingBoundary);
+-
+-	/* setDMCUParam_Pipe */
+-	REG_UPDATE_2(MASTER_COMM_CMD_REG,
+-			MASTER_COMM_CMD_REG_BYTE0, MCP_ABM_PIPE_SET,
+-			MASTER_COMM_CMD_REG_BYTE1, controller_id);
+-
+-	/* notifyDMCUMsg */
+-	REG_UPDATE(MASTER_COMM_CNTL_REG, MASTER_COMM_INTERRUPT, 1);
+-
+-	/* waitDMCUReadyForCmd */
+-	do {
+-		dm_delay_in_microseconds(ctx, dmcu_wait_reg_ready_interval);
+-		regValue = REG_READ(MASTER_COMM_CNTL_REG);
+-		dmcu_max_retry_on_wait_reg_ready--;
+-	} while
+-	/* expected value is 0, loop while not 0*/
+-	((MASTER_COMM_CNTL_REG__MASTER_COMM_INTERRUPT_MASK & regValue) &&
+-		dmcu_max_retry_on_wait_reg_ready > 0);
+-
+-	/* setDMCUParam_BL */
+-	REG_UPDATE(BL1_PWM_USER_LEVEL, BL1_PWM_USER_LEVEL, backlight_17bit);
+-
+-	/* write ramp */
+-	REG_WRITE(MASTER_COMM_DATA_REG1, frame_ramp);
+-
+-	/* setDMCUParam_Cmd */
+-	REG_UPDATE(MASTER_COMM_CMD_REG, MASTER_COMM_CMD_REG_BYTE0, MCP_BL_SET);
+-
+-	/* notifyDMCUMsg */
+-	REG_UPDATE(MASTER_COMM_CNTL_REG, MASTER_COMM_INTERRUPT, 1);
+-
+-	/* UpdateRequestedBacklightLevel */
+-	s2 = REG_READ(BIOS_SCRATCH_2);
+-
+-	s2 &= ~ATOM_S2_CURRENT_BL_LEVEL_MASK;
+-	level &= (ATOM_S2_CURRENT_BL_LEVEL_MASK >>
+-				ATOM_S2_CURRENT_BL_LEVEL_SHIFT);
+-	s2 |= (level << ATOM_S2_CURRENT_BL_LEVEL_SHIFT);
+-
+-	REG_WRITE(BIOS_SCRATCH_2, s2);
+-}
+-
+-void dce110_link_encoder_init_dmcu_backlight_settings(
+-	struct link_encoder *enc)
+-{
+-	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+-	uint32_t bl_pwm_cntl;
+-	uint32_t pwmCntl;
+-	uint32_t pwmCntl2;
+-	uint32_t periodCntl;
+-	uint32_t s2;
+-	uint32_t value;
+-
+-	if (enc->ctx->dc->debug.disable_dmcu)
+-		return;
+-
+-	bl_pwm_cntl = REG_READ(BL_PWM_CNTL);
+-
+-	/* It must not be 0, so we have to restore them
+-	 * Bios bug w/a - period resets to zero,
+-	 * restoring to cache values which is always correct
+-	 */
+-	REG_GET(BL_PWM_CNTL, BL_ACTIVE_INT_FRAC_CNT, &value);
+-	if (value == 0 || bl_pwm_cntl == 1) {
+-		if (stored_backlight_registers.vBL_PWM_CNTL != 0) {
+-			pwmCntl = stored_backlight_registers.vBL_PWM_CNTL;
+-			REG_WRITE(BL_PWM_CNTL, pwmCntl);
+-
+-			pwmCntl2 = stored_backlight_registers.vBL_PWM_CNTL2;
+-			REG_WRITE(BL_PWM_CNTL2, pwmCntl2);
+-
+-			periodCntl =
+-				stored_backlight_registers.vBL_PWM_PERIOD_CNTL;
+-			REG_WRITE(BL_PWM_PERIOD_CNTL, periodCntl);
+-
+-			REG_UPDATE(LVTMA_PWRSEQ_REF_DIV,
+-				BL_PWM_REF_DIV,
+-				stored_backlight_registers.
+-				vLVTMA_PWRSEQ_REF_DIV_BL_PWM_REF_DIV);
+-		}
+-	} else {
+-		stored_backlight_registers.vBL_PWM_CNTL =
+-				REG_READ(BL_PWM_CNTL);
+-		stored_backlight_registers.vBL_PWM_CNTL2 =
+-				REG_READ(BL_PWM_CNTL2);
+-		stored_backlight_registers.vBL_PWM_PERIOD_CNTL =
+-				REG_READ(BL_PWM_PERIOD_CNTL);
+-
+-		REG_GET(LVTMA_PWRSEQ_REF_DIV, BL_PWM_REF_DIV,
+-				&stored_backlight_registers.
+-				vLVTMA_PWRSEQ_REF_DIV_BL_PWM_REF_DIV);
+-	}
+-
+-	/* Have driver take backlight control
+-	 * TakeBacklightControl(true)
+-	 */
+-	s2 = REG_READ(BIOS_SCRATCH_2);
+-	s2 |= ATOM_S2_VRI_BRIGHT_ENABLE;
+-	REG_WRITE(BIOS_SCRATCH_2, s2);
+-
+-	/* Enable the backlight output */
+-	REG_UPDATE(BL_PWM_CNTL, BL_PWM_EN, 1);
+-}
+-
+ static void get_dmcu_psr_state(struct link_encoder *enc, uint32_t *psr_state)
+ {
+ 	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
+index b3667df..053f72b 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
+@@ -226,13 +226,6 @@ union dce110_dmcu_psr_config_data_reg3 {
+ 	unsigned int u32All;
+ };
+ 
+-struct dce110_abm_backlight_registers {
+-	unsigned int vBL_PWM_CNTL;
+-	unsigned int vBL_PWM_CNTL2;
+-	unsigned int vBL_PWM_PERIOD_CNTL;
+-	unsigned int vLVTMA_PWRSEQ_REF_DIV_BL_PWM_REF_DIV;
+-};
+-
+ bool dce110_link_encoder_construct(
+ 	struct dce110_link_encoder *enc110,
+ 	const struct encoder_init_data *init_data,
+@@ -317,23 +310,6 @@ void dce110_link_encoder_update_mst_stream_allocation_table(
+ 	struct link_encoder *enc,
+ 	const struct link_mst_stream_allocation_table *table);
+ 
+-void dce110_link_encoder_set_lcd_backlight_level(
+-	struct link_encoder *enc,
+-	uint32_t level);
+-
+-void dce110_link_encoder_set_dmcu_backlight_level(
+-	struct link_encoder *enc,
+-	uint32_t level,
+-	uint32_t frame_ramp,
+-	uint32_t controller_id);
+-
+-void dce110_link_encoder_init_dmcu_backlight_settings(
+-	struct link_encoder *enc);
+-
+-void dce110_link_encoder_set_dmcu_abm_level(
+-	struct link_encoder *enc,
+-	uint32_t level);
+-
+ void dce110_link_encoder_set_dmcu_psr_enable(
+ 		struct link_encoder *enc, bool enable);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index d67f110..a1a5dc6 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -2214,8 +2214,10 @@ static void init_hw(struct core_dc *dc)
+ 	}
+ 
+ 	abm = dc->res_pool->abm;
+-	if (abm != NULL)
++	if (abm != NULL) {
++		abm->funcs->init_backlight(abm);
+ 		abm->funcs->abm_init(abm);
++	}
+ }
+ 
+ /* TODO: move this to apply_ctx_tohw some how?*/
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h b/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
+index 9c9a687..7d07b79 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
+@@ -35,6 +35,11 @@ struct abm {
+ struct abm_funcs {
+ 	void (*abm_init)(struct abm *abm);
+ 	bool (*set_abm_level)(struct abm *abm, unsigned int abm_level);
++	bool (*init_backlight)(struct abm *abm);
++	bool (*set_backlight_level)(struct abm *abm,
++			unsigned int backlight_level,
++			unsigned int frame_ramp,
++			unsigned int controller_id);
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+index 949eae6..7b37b96 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+@@ -220,11 +220,6 @@ struct link_encoder_funcs {
+ 	void (*update_mst_stream_allocation_table)(
+ 		struct link_encoder *enc,
+ 		const struct link_mst_stream_allocation_table *table);
+-	void (*set_lcd_backlight_level) (struct link_encoder *enc,
+-		uint32_t level);
+-	void (*set_dmcu_backlight_level)(struct link_encoder *enc,
+-		uint32_t level, uint32_t frame_ramp, uint32_t controller_id);
+-	void (*init_dmcu_backlight_settings)(struct link_encoder *enc);
+ 	void (*set_dmcu_psr_enable)(struct link_encoder *enc, bool enable);
+ 	void (*setup_dmcu_psr)(struct link_encoder *enc,
+ 			struct psr_dmcu_context *psr_context);
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index 562c897..758a568 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -94,10 +94,6 @@ struct hw_sequencer_funcs {
+ 			int group_size,
+ 			struct pipe_ctx *grouped_pipes[]);
+ 
+-	/* backlight control */
+-	void (*encoder_set_lcd_backlight_level)(
+-		struct link_encoder *enc, uint32_t level);
+-
+ 	void (*enable_display_pipe_clock_gating)(
+ 					struct dc_context *ctx,
+ 					bool clock_gating);
+diff --git a/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c b/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c
+index 869dedc..12df499 100644
+--- a/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c
+@@ -72,16 +72,6 @@ static void virtual_link_encoder_update_mst_stream_allocation_table(
+ 	struct link_encoder *enc,
+ 	const struct link_mst_stream_allocation_table *table) {}
+ 
+-static void virtual_link_encoder_set_lcd_backlight_level(
+-	struct link_encoder *enc,
+-	uint32_t level) {}
+-
+-static void virtual_link_encoder_set_dmcu_backlight_level(
+-	struct link_encoder *enc,
+-	uint32_t level,
+-	uint32_t frame_ramp,
+-	uint32_t controller_id) {}
+-
+ static void virtual_link_encoder_edp_backlight_control(
+ 	struct link_encoder *enc,
+ 	bool enable) {}
+@@ -115,9 +105,6 @@ static const struct link_encoder_funcs virtual_lnk_enc_funcs = {
+ 	.dp_set_phy_pattern = virtual_link_encoder_dp_set_phy_pattern,
+ 	.update_mst_stream_allocation_table =
+ 		virtual_link_encoder_update_mst_stream_allocation_table,
+-	.set_lcd_backlight_level = virtual_link_encoder_set_lcd_backlight_level,
+-	.set_dmcu_backlight_level =
+-			virtual_link_encoder_set_dmcu_backlight_level,
+ 	.backlight_control = virtual_link_encoder_edp_backlight_control,
+ 	.power_control = virtual_link_encoder_edp_power_control,
+ 	.connect_dig_be_to_fe = virtual_link_encoder_connect_dig_be_to_fe,
+-- 
+2.7.4
+

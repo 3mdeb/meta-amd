@@ -1,0 +1,127 @@
+From fca522781fd6ba2f2b5f1e30eec6d5662fd0e9fc Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <David1.Zhou@amd.com>
+Date: Tue, 9 May 2017 13:39:40 +0800
+Subject: [PATCH 1538/2094] drm/amdgpu: fix dependency issue
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The problem is that executing the jobs in the right order doesn't give you the right result
+because consecutive jobs executed on the same engine are pipelined.
+In other words job B does it buffer read before job A has written it's result.
+
+Signed-off-by: Chunming Zhou <David1.Zhou@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c        |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c       |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c        |  2 +-
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 17 +++++++++++++++++
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  2 ++
+ 6 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 24f846c..793afe9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1139,6 +1139,7 @@ struct amdgpu_job {
+ 	void			*owner;
+ 	uint64_t		fence_ctx; /* the fence_context this job uses */
+ 	bool                    vm_needs_flush;
++	bool			need_pipeline_sync;
+ 	unsigned		vm_id;
+ 	uint64_t		vm_pd_addr;
+ 	uint32_t		gds_base, gds_size;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index c4faad4..c3085a5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -160,6 +160,8 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 		dev_err(adev->dev, "scheduling IB failed (%d).\n", r);
+ 		return r;
+ 	}
++	if (ring->funcs->emit_pipeline_sync && job && job->need_pipeline_sync)
++		amdgpu_ring_emit_pipeline_sync(ring);
+ 
+ 	if (ring->funcs->insert_start)
+ 		ring->funcs->insert_start(ring);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index 690ef3d..cfa97ab 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -57,6 +57,7 @@ int amdgpu_job_alloc(struct amdgpu_device *adev, unsigned num_ibs,
+ 	(*job)->vm = vm;
+ 	(*job)->ibs = (void *)&(*job)[1];
+ 	(*job)->num_ibs = num_ibs;
++	(*job)->need_pipeline_sync = false;
+ 
+ 	amdgpu_sync_create(&(*job)->sync);
+ 
+@@ -152,6 +153,9 @@ static struct fence *amdgpu_job_dependency(struct amd_sched_job *sched_job)
+ 		fence = amdgpu_sync_get_fence(&job->sync);
+ 	}
+ 
++	if (amd_sched_dependency_optimized(fence, sched_job->s_entity))
++		job->need_pipeline_sync = true;
++
+ 	return fence;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index ed97a2e..27b8e15 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -732,7 +732,7 @@ int amdgpu_vm_flush(struct amdgpu_ring *ring, struct amdgpu_job *job)
+ 	if (ring->funcs->init_cond_exec)
+ 		patch_offset = amdgpu_ring_init_cond_exec(ring);
+ 
+-	if (ring->funcs->emit_pipeline_sync)
++	if (ring->funcs->emit_pipeline_sync && !job->need_pipeline_sync)
+ 		amdgpu_ring_emit_pipeline_sync(ring);
+ 
+ 	if (ring->funcs->emit_vm_flush && vm_flush_needed) {
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index 4971b5e..b9ca4fb 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -235,6 +235,23 @@ static void amd_sched_entity_clear_dep(struct fence *f, struct fence_cb *cb)
+ 	fence_put(f);
+ }
+ 
++bool amd_sched_dependency_optimized(struct fence* fence,
++		struct amd_sched_entity *entity)
++{
++	struct amd_gpu_scheduler *sched = entity->sched;
++	struct amd_sched_fence *s_fence;
++
++	if (!fence || fence_is_signaled(fence))
++		return false;
++	if (fence->context == entity->fence_context)
++		return true;
++	s_fence = to_amd_sched_fence(fence);
++	if (s_fence && s_fence->sched == sched)
++		return true;
++
++	return false;
++}
++
+ static bool amd_sched_entity_add_dependency_cb(struct amd_sched_entity *entity)
+ {
+ 	struct amd_gpu_scheduler *sched = entity->sched;
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index 8cb41d3..ed5a847 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -158,4 +158,6 @@ int amd_sched_job_init(struct amd_sched_job *job,
+ 		       void *owner);
+ void amd_sched_hw_job_reset(struct amd_gpu_scheduler *sched);
+ void amd_sched_job_recovery(struct amd_gpu_scheduler *sched);
++bool amd_sched_dependency_optimized(struct fence* fence,
++				    struct amd_sched_entity *entity);
+ #endif
+-- 
+2.7.4
+

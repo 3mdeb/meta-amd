@@ -1,0 +1,159 @@
+From d87fe8d89afb51e8756823e88e0af276c2182978 Mon Sep 17 00:00:00 2001
+From: Junwei Zhang <Jerry.Zhang@amd.com>
+Date: Mon, 15 May 2017 10:32:42 +0800
+Subject: [PATCH 1606/2094] drm/amdgpu: [hybrid] add dependency to sync fence
+ for semaphore
+
+It also fixed sem list soft lockup issue
+
+[  264.133878] NMI watchdog: BUG: soft lockup - CPU#5 stuck for 22s!
+...
+[  264.133928] task: ffffa216ffbfbd00 task.stack: ffffa216f4220000
+[  264.133929] RIP: 0010:[<ffffffffc0584523>]  [<ffffffffc0584523>]
+amdgpu_sem_put+0x13/0x30 [amdgpu]
+[  264.133983] RSP: 0018:ffffa216f4223cb0  EFLAGS: 00200286
+
+Change-Id: I8e99ba32319deffca472c2d943beaa750e4297c1
+Signed-off-by: Junwei Zhang <Jerry.Zhang@amd.com>
+Reviewed-by: David Zhou <david1.zhou@amd.com>
+Reviewed-by: Monk Liu <monk.liu@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_sem.c
+Signed-off-by: Avinash M N <avimn@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c | 12 ++++++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sem.c | 29 +++++++++++++++++------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sem.h |  5 +++++
+ 4 files changed, 31 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 1a7ab24..24a7bcf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -785,7 +785,7 @@ struct amdgpu_ctx_ring {
+ 	uint64_t		sequence;
+ 	struct fence		**fences;
+ 	struct amd_sched_entity	entity;
+-	struct list_head	sem_list;
++	struct list_head	sem_dep_list;
+ 	struct mutex            sem_lock;
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index e6f0055..ca40ab5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -42,7 +42,7 @@ static int amdgpu_ctx_init(struct amdgpu_device *adev, struct amdgpu_ctx *ctx)
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+ 		ctx->rings[i].sequence = 1;
+ 		ctx->rings[i].fences = &ctx->fences[amdgpu_sched_jobs * i];
+-		INIT_LIST_HEAD(&ctx->rings[i].sem_list);
++		INIT_LIST_HEAD(&ctx->rings[i].sem_dep_list);
+ 		mutex_init(&ctx->rings[i].sem_lock);
+ 	}
+ 
+@@ -84,12 +84,16 @@ static void amdgpu_ctx_fini(struct amdgpu_ctx *ctx)
+ 		return;
+ 
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+-		struct amdgpu_sem *sem, *tmp;
++		struct amdgpu_sem_dep *dep, *tmp;
+ 
+ 		mutex_lock(&ctx->rings[i].sem_lock);
+ 		/* release all the reset inserted SEM here */
+-		list_for_each_entry_safe(sem, tmp, &ctx->rings[i].sem_list, list)
+-			amdgpu_sem_put(sem);
++		list_for_each_entry_safe(dep, tmp, &ctx->rings[i].sem_dep_list,
++					 list) {
++			fence_put(dep->fence);
++			list_del_init(&dep->list);
++			kfree(dep);
++		}
+ 
+ 		mutex_unlock(&ctx->rings[i].sem_lock);
+ 		mutex_destroy(&ctx->rings[i].sem_lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.c
+index 2533a46..2bea5f6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.c
+@@ -357,6 +357,7 @@ static int amdgpu_sem_cring_add(struct amdgpu_fpriv *fpriv,
+ {
+ 	struct amdgpu_ring *out_ring;
+ 	struct amdgpu_ctx *ctx;
++	struct amdgpu_sem_dep *dep;
+ 	uint32_t ctx_id, ip_type, ip_instance, ring;
+ 	int r;
+ 
+@@ -371,10 +372,17 @@ static int amdgpu_sem_cring_add(struct amdgpu_fpriv *fpriv,
+ 			       &out_ring);
+ 	if (r)
+ 		goto err;
++
++	dep = kzalloc(sizeof(*dep), GFP_KERNEL);
++	if (!dep)
++		goto err;
++
++	INIT_LIST_HEAD(&dep->list);
++	dep->fence = fence_get(sem->base->fence);
++
+ 	mutex_lock(&ctx->rings[out_ring->idx].sem_lock);
+-	list_add(&sem->list, &ctx->rings[out_ring->idx].sem_list);
++	list_add(&dep->list, &ctx->rings[out_ring->idx].sem_dep_list);
+ 	mutex_unlock(&ctx->rings[out_ring->idx].sem_lock);
+-	amdgpu_sem_get(sem);
+ 
+ err:
+ 	amdgpu_ctx_put(ctx);
+@@ -384,24 +392,21 @@ static int amdgpu_sem_cring_add(struct amdgpu_fpriv *fpriv,
+ int amdgpu_sem_add_cs(struct amdgpu_ctx *ctx, struct amdgpu_ring *ring,
+ 		     struct amdgpu_sync *sync)
+ {
+-	struct amdgpu_sem *sem, *tmp;
++	struct amdgpu_sem_dep *dep, *tmp;
+ 	int r = 0;
+ 
+-	if (list_empty(&ctx->rings[ring->idx].sem_list))
++	if (list_empty(&ctx->rings[ring->idx].sem_dep_list))
+ 		return 0;
+ 
+ 	mutex_lock(&ctx->rings[ring->idx].sem_lock);
+-	list_for_each_entry_safe(sem, tmp, &ctx->rings[ring->idx].sem_list,
++	list_for_each_entry_safe(dep, tmp, &ctx->rings[ring->idx].sem_dep_list,
+ 				 list) {
+-		r = amdgpu_sync_fence(ctx->adev, sync, sem->base->fence);
++		r = amdgpu_sync_fence(ctx->adev, sync, dep->fence);
+ 		if (r)
+ 			goto err;
+-		mutex_lock(&sem->base->lock);
+-		fence_put(sem->base->fence);
+-		sem->base->fence = NULL;
+-		mutex_unlock(&sem->base->lock);
+-		list_del_init(&sem->list);
+-		amdgpu_sem_put(sem);
++		fence_put(dep->fence);
++		list_del_init(&dep->list);
++		kfree(dep);
+ 	}
+ err:
+ 	mutex_unlock(&ctx->rings[ring->idx].sem_lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.h
+index 93c6224..8ec9b31 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sem.h
+@@ -41,6 +41,11 @@ struct amdgpu_sem_core {
+ 	struct mutex	lock;
+ };
+ 
++struct amdgpu_sem_dep {
++	struct fence		*fence;
++	struct list_head	list;
++};
++
+ struct amdgpu_sem {
+ 	struct amdgpu_sem_core	*base;
+ 	struct kref		kref;
+-- 
+2.7.4
+
