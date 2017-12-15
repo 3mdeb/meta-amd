@@ -6,7 +6,6 @@ PACKAGECONFIG[va] = "--enable-va,--disable-va,libva"
 PACKAGECONFIG_append_amd = " xvmc gallium r600 gallium-llvm xa osmesa"
 PACKAGECONFIG_append_radeon = " va"
 PACKAGECONFIG_append_amdgpu = " va"
-PACKAGECONFIG_remove_amd = "dri3"
 PACKAGECONFIG_remove_amdfalconx86 = "xvmc"
 
 LIBVA_PLATFORMS  = "libva"
@@ -15,13 +14,12 @@ LIBVA_PLATFORMS .= "${@bb.utils.contains('DISTRO_FEATURES', 'wayland', ' libva-w
 LIBVA_PLATFORMS .= "${@bb.utils.contains('DISTRO_FEATURES', 'opengl', ' libva-gl', '', d)}"
 RDEPENDS_mesa-megadriver += "${@bb.utils.contains('PACKAGECONFIG', 'va', '${LIBVA_PLATFORMS}', '', d)}"
 
-MESA_LLVM_RELEASE_amd = "3.9"
-
 SRC_URI_append_amd = "\
 			file://0001-fix-building-with-flex-2.6.2.patch \
+			file://0001-configure.ac-for-llvm-config-to-report-correct-libdi.patch \
+			file://0002-configure.ac-fix-the-llvm-version-correctly.patch \
+			file://0003-strip-llvm-ldflags.patch \
 "
-
-EXTRA_OECONF_remove_amd = "--with-llvm-prefix=${STAGING_BINDIR_NATIVE}"
 
 EXTRA_OECONF_append_amd = " \
 		 --enable-vdpau \
