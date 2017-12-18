@@ -2,7 +2,6 @@ POKY_DEFAULT_DISTRO_FEATURES_remove = "wayland"
 
 PREFERRED_PROVIDER_jpeg ?= "jpeg"
 PREFERRED_PROVIDER_jpeg-native ?= "jpeg-native"
-PREFERRED_PROVIDER_llvm ?= "llvm3.9"
 PREFERRED_VERSION_linux-yocto ?= "4.4%"
 PREFERRED_VERSION_libav ?= "9.18"
 

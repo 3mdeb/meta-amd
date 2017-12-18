@@ -13,7 +13,7 @@ PV = "git"
 
 inherit autotools pkgconfig
 
-SRCREV = "23e234a3503f51b9d9c585123d33b936f522808d"
+SRCREV = "e580be90e88eeed95faa5452e343f3ec509517e5"
 DEPENDS = "libpthread-stubs udev libpciaccess freetype libxext cairo fontconfig libxrender libpng pixman"
 
 SRC_URI = "git://anongit.freedesktop.org/mesa/drm;branch=master \
@@ -42,27 +42,13 @@ SRC_URI = "git://anongit.freedesktop.org/mesa/drm;branch=master \
 	       file://0023-implement-import-export-sem.patch \
 	       file://0024-test-case-for-export-import-sem.patch \
 	       file://0025-amdgpu-Sparse-resource-support-for-Vulkan-v2.patch \
-	       file://0026-tests-amdgpu-add-uvd-enc-unit-tests-v2.patch \
-	       file://0027-tests-amdgpu-add-uve-ib-header.patch \
-	       file://0028-tests-amdgpu-implement-hevc-encode-test-v2.patch \
 	       file://0029-amdgpu-support-16-ibs-per-submit-for-PAL-SRIOV.patch \
 	       file://0030-amdgpu-hybrid-add-a-flag-of-memory-allcation-from-to.patch \
 	       file://0031-amdgpu-unify-dk-drm-header-changes.patch \
 	       file://0032-amdgpu-add-interface-for-reserve-unserve-vmid-v2.patch \
 	       file://0033-amdgpu-HYBRID-add-AMDGPU_CAPABILITY_SSG_FLAG.patch \
-	       file://0034-tests-amdgpu-bypass-UVD-CS-tests-on-raven.patch \
-	       file://0035-tests-amdgpu-bypass-UVD-ENC-tests-on-raven.patch \
-	       file://0036-tests-amdgpu-bypass-VCE-tests-on-raven.patch \
 	       file://0037-tests-amdgpu-HYBRID-add-SSG-unit-test.patch \
-	       file://0038-amdgpu-Add-gpu-always-on-cu-bitmap.patch \
-	       file://0039-test-amdgpu-fix-test-failure-for-SI.patch \
-	       file://0040-drm-fix-missing-mutex-unlock-before-return.patch \
-	       file://0041-drm-fix-race-issue-between-two-bo-functions-v2.patch \
-	       file://0042-amdgpu-fix-potential-deadlock.patch \
-	       file://0043-Revert-amdgpu-fix-potential-deadlock.patch \
 	       file://0044-amdgpu-HYBRID-change-to-use-amdgpu_bo_free.patch \
-	       file://0045-amdgpu-merge-and-cleanup-amdgpu_bo_free.patch \
-	       file://0046-tests-amdgpu-update-uvd-enc-test-for-new-fw.patch \
 	       file://amdgpu.ids \
 "
 
