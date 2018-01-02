@@ -3,7 +3,7 @@ require recipes-bsp/grub/grub2.inc
 DEFAULT_PREFERENCE = "-1"
 
 DEPENDS_class-target = "grub-efi-native"
-RDEPENDS_${PN}_class-target = "diffutils freetype"
+RDEPENDS_${PN}_class-target = "diffutils freetype efibootmgr"
 PR = "r3"
 
 FILESEXTRAPATHS =. "${FILE_DIRNAME}/grub-git:"
