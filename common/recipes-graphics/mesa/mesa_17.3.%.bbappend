@@ -7,6 +7,7 @@ PACKAGECONFIG_append_amd = " xvmc gallium r600 gallium-llvm xa osmesa"
 PACKAGECONFIG_append_radeon = " va"
 PACKAGECONFIG_append_amdgpu = " va"
 PACKAGECONFIG_remove_amdfalconx86 = "xvmc"
+PACKAGECONFIG_remove_amd = "vulkan"
 
 LIBVA_PLATFORMS  = "libva"
 LIBVA_PLATFORMS .= "${@bb.utils.contains('DISTRO_FEATURES', 'x11', ' libva-x11', '', d)}"
@@ -19,14 +20,15 @@ SRC_URI_append_amd = "\
 			file://0001-configure.ac-for-llvm-config-to-report-correct-libdi.patch \
 			file://0002-configure.ac-fix-the-llvm-version-correctly.patch \
 			file://0003-strip-llvm-ldflags.patch \
+			file://0004-egd_tables.py-fix-compatibility-with-python-versions.patch \
 "
 
 EXTRA_OECONF_append_amd = " \
 		 --enable-vdpau \
 		 --enable-glx \
-		 --enable-omx \
 		 --enable-texture-float \
-		 --with-omx-libdir=${libdir}/bellagio \
+		 --enable-omx-bellagio \
+		 --with-omx-bellagio-libdir=${libdir}/bellagio \
 		"
 
 # Package all the libXvMC gallium extensions together
