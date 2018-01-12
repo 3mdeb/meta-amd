@@ -14,6 +14,7 @@ SRC_URI_append_v1000 += "file://v1000-user-features.scc \
     file://v1000-extra-config.cfg \
     file://hid.cfg \
     file://wifi-drivers.cfg \
+    ${@bb.utils.contains('DISTRO', 'mel', 'file://enable-kgdb.cfg', 'file://disable-kgdb.cfg', d)} \
 "
 
 KERNEL_FEATURES_append_v1000 = " cfg/smp.scc cfg/sound.scc"
