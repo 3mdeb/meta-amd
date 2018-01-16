@@ -1,0 +1,101 @@
+From e5a754c6570bc2e626af6df1ac0f11a91ca43757 Mon Sep 17 00:00:00 2001
+From: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+Date: Wed, 6 Dec 2017 18:40:45 +0530
+Subject: [PATCH] drm/amd: Implement parallel memory mapping on mGPUs
+
+Alter the KFD-KGD interface to optimize multi-GPU memory mappings to
+work concurrently instead of sequentially. Return the fences
+during the process, wait for all fences after the mappings are done.
+The fences are stored in the associated kgd_mem object.
+
+This change also enables interruptible waiting with proper signal
+handling
+
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c | 9 ++++++---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c         | 7 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c         | 7 +++++++
+ 3 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 0d98b43..2beb61e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -871,8 +871,11 @@ static int unreserve_bo_and_vms(struct bo_vm_reservation_context *ctx,
+ {
+ 	int ret = 0;
+ 
+-	if (wait)
++	if (wait) {
+ 		ret = amdgpu_sync_wait(ctx->sync, intr);
++                if (ret)
++                    return ret;
++        }
+ 
+ 	if (ctx->reserved)
+ 		ttm_eu_backoff_reservation(&ctx->ticket, &ctx->list);
+@@ -1220,7 +1223,7 @@ int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
+ 				entry, bo_size);
+ 	}
+ 
+-	ret = unreserve_bo_and_vms(&ctx, false, false);
++	ret = unreserve_bo_and_vms(&ctx, false, true);
+ 
+ 	/* Free the sync object */
+ 	amdgpu_sync_free(&mem->sync);
+@@ -1349,7 +1352,7 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ 		amdgpu_bo_fence(bo,
+ 				&kfd_vm->process_info->eviction_fence->base,
+ 				true);
+-	ret = unreserve_bo_and_vms(&ctx, false, false);
++	ret = unreserve_bo_and_vms(&ctx, false, true);
+ 
+ 	mutex_unlock(&mem->process_info->lock);
+ 	mutex_unlock(&mem->lock);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 437a133..3dec240 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1402,6 +1402,12 @@ static int kfd_ioctl_map_memory_to_gpu(struct file *filep,
+ 		kfd_flush_tlb(dev, p->pasid);
+ 	}
+ 
++	err = dev->kfd2kgd->sync_memory(dev->kgd, (struct kgd_mem *) mem, true);
++	if (err) {
++		pr_debug("Sync memory failed, wait interrupted by user signal\n");
++		goto sync_memory_failed;
++	}
++
+ 	if (args->device_ids_array_size > 0 && devices_arr)
+ 		kfree(devices_arr);
+ 
+@@ -1512,6 +1518,7 @@ static int kfd_ioctl_unmap_memory_from_gpu(struct file *filep,
+ 	up_write(&p->lock);
+ get_mem_obj_from_handle_failed:
+ copy_from_user_failed:
++sync_memory_failed:
+ 	kfree(devices_arr);
+ 	return err;
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index c85122f..78a5f7a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -121,6 +121,13 @@ static int kfd_process_alloc_gpuvm(struct kfd_process *p,
+ 
+ 	kfd_flush_tlb(kdev, p->pasid);
+ 
++	err = kdev->kfd2kgd->sync_memory(kdev->kgd, (struct kgd_mem *) mem,
++				true);
++	if (err) {
++		pr_debug("Sync memory failed, wait interrupted by user signal\n");
++		goto sync_memory_failed;
++	}
++
+ 	/* Create an obj handle so kfd_process_device_remove_obj_handle
+ 	 * will take care of the bo removal when the process finishes.
+ 	 * We do not need to take p->lock, because the process is just
+-- 
+2.7.4
+
