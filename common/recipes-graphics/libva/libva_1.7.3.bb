@@ -15,8 +15,8 @@ inherit autotools pkgconfig
 
 SRC_URI = "http://www.freedesktop.org/software/vaapi/releases/libva/${BP}.tar.bz2"
 
-SRC_URI[md5sum] = "7309097b790de8dbc9641ed6393eab9f"
-SRC_URI[sha256sum] = "a689bccbcc81a66b458e448377f108c057d3eee44a2e21a23c92c549dc8bc95f"
+SRC_URI[md5sum] = "dafb1d7d6449e850e9eb1a099895c683"
+SRC_URI[sha256sum] = "22bc139498065a7950d966dbdb000cad04905cbd3dc8f3541f80d36c4670b9d9"
 
 DEPENDS = "libdrm"
 
