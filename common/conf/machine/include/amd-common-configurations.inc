@@ -56,3 +56,5 @@ PREFERRED_VERSION_xserver-nodm-init ?= "2.0"
 SPLASH ?= "psplash"
 
 IMAGE_FSTYPES += "hddimg iso"
+
+IMAGE_OVERHEAD_FACTOR = "1.1"
