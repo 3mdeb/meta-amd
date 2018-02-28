@@ -95,8 +95,9 @@ do_install() {
 
     ln -s ${LLVM_DIR}/libLLVM-${PV}${SOLIBSDEV} ${D}${libdir}/libLLVM-${PV}${SOLIBSDEV}
 
-    # We'll have to delete the libLLVM.so due to multiple reasons...
+    # We'll have to delete libLLVM.so and libLTO.so due to multiple reasons...
     rm -rf ${D}${libdir}/${LLVM_DIR}/libLLVM.so
+    rm -rf ${D}${libdir}/${LLVM_DIR}/libLTO.so
 }
 
 SYSROOT_PREPROCESS_FUNCS += "llvm_sysroot_preprocess"
@@ -106,33 +107,51 @@ llvm_sysroot_preprocess() {
     cp ${LLVM_INSTALL_DIR}/llvm-config-host ${SYSROOT_DESTDIR}${bindir_crossscripts}/llvm-config${PV}
 }
 
+PACKAGES += "${PN}-bugpointpasses ${PN}-llvmhello"
 ALLOW_EMPTY_${PN} = "1"
 ALLOW_EMPTY_${PN}-staticdev = "1"
 FILES_${PN} = ""
 FILES_${PN}-staticdev = ""
 FILES_${PN}-dbg = " \
     ${bindir}/${LLVM_DIR}/.debug \
-    ${libdir}/${LLVM_DIR}/.debug/* \
+    ${libdir}/${LLVM_DIR}/.debug/BugpointPasses.so \
+    ${libdir}/${LLVM_DIR}/.debug/LLVMHello.so \
+    ${libdir}/${LLVM_DIR}/.debug/libLTO.so* \
+    ${libdir}/${LLVM_DIR}/.debug/llvm-config \
     /usr/src/debug \
 "
 
 FILES_${PN}-dev = " \
     ${bindir}/${LLVM_DIR} \
     ${includedir}/${LLVM_DIR} \
+    ${libdir}/${LLVM_DIR}/llvm-config \
+"
+RRECOMMENDS_${PN}-dev += "${PN}-bugpointpasses ${PN}-llvmhello"
+
+FILES_${PN}-bugpointpasses = "\
+    ${libdir}/${LLVM_DIR}/BugpointPasses.so \
+"
+
+FILES_${PN}-llvmhello = "\
+    ${libdir}/${LLVM_DIR}/LLVMHello.so \
+"
+
+FILES_${PN} += "\
+    ${libdir}/${LLVM_DIR}/libLTO.so.* \
 "
 
 PACKAGES_DYNAMIC = "^libllvm${LLVM_RELEASE}-.*$"
 NOAUTOPACKAGEDEBUG = "1"
 
-INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-libllvm-${LLVM_RELEASE}.${PATCH_VERSION} += "dev-so"
-INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-libllvm-${LLVM_RELEASE} += "dev-so"
-INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-liblto += "dev-so"
+INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-llvm-${LLVM_RELEASE}.${PATCH_VERSION} += "dev-so"
+INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-llvm-${LLVM_RELEASE} += "dev-so"
+INSANE_SKIP_${MLPREFIX}libllvm${LLVM_RELEASE}-llvm += "dev-so"
 
-python populate_packages_prepend() {
+python llvm_populate_packages() {
     libdir = bb.data.expand('${libdir}', d)
     libllvm_libdir = bb.data.expand('${libdir}/${LLVM_DIR}', d)
     split_dbg_packages = do_split_packages(d, libllvm_libdir+'/.debug', '^lib(.*)\.so$', 'libllvm${LLVM_RELEASE}-%s-dbg', 'Split debug package for %s', allow_dirs=True)
-    split_packages = do_split_packages(d, libdir, '^(.*)\.so\.*', 'libllvm${LLVM_RELEASE}-%s', 'Split package for %s', allow_dirs=True, allow_links=True, recursive=True)
+    split_packages = do_split_packages(d, libdir, '^lib(.*)\.so$', 'libllvm${LLVM_RELEASE}-%s', 'Split package for %s', allow_dirs=True, allow_links=True, recursive=True)
     split_staticdev_packages = do_split_packages(d, libllvm_libdir, '^lib(.*)\.a$', 'libllvm${LLVM_RELEASE}-%s-staticdev', 'Split staticdev package for %s', allow_dirs=True)
     if split_packages:
         pn = d.getVar('PN', True)
@@ -140,3 +159,5 @@ python populate_packages_prepend() {
         d.appendVar('RDEPENDS_' + pn + '-dbg', ' '+' '.join(split_dbg_packages))
         d.appendVar('RDEPENDS_' + pn + '-staticdev', ' '+' '.join(split_staticdev_packages))
 }
+
+PACKAGESPLITFUNCS_prepend = "llvm_populate_packages "
