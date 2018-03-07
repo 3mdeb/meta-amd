@@ -5,7 +5,7 @@ FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 # Convention is option,value. If there's
 # no value requred simply skip just
 # like DRI3.
-AMDGPU_OPTS = "DRI3, "
+AMDGPU_OPTS = "DRI3, TearFree,on"
 RADEON_OPTS = ""
 
 do_install_append_amdgpu () {
