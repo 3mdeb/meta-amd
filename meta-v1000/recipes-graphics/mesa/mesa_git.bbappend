@@ -6,6 +6,8 @@ PV_v1000 = "17.3.0+git${SRCPV}"
 
 MESA_LLVM_RELEASE_v1000 = "6.0"
 
+PACKAGECONFIG_append_v1000 = " dri3"
+
 SRC_URI_v1000 = "\
 			git://anongit.freedesktop.org/mesa/mesa;branch=master \
 				file://0001-st-omx-enc-Correct-the-timestamping.patch \

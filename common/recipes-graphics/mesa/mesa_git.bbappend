@@ -8,7 +8,6 @@ PACKAGECONFIG[va] = "--enable-va,--disable-va,libva"
 PACKAGECONFIG_append_amd = " xvmc gallium r600 gallium-llvm xa"
 PACKAGECONFIG_append_radeon = " va"
 PACKAGECONFIG_append_amdgpu = " va"
-PACKAGECONFIG_remove_amd = "dri3"
 PACKAGECONFIG_remove_amdfalconx86 = "xvmc"
 
 LIBVA_PLATFORMS  = "libva"
