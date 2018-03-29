@@ -43,6 +43,10 @@ SRC_URI += "\
             file://0002-net-axgbe-fix-shared-libs-build.patch \
 "
 
+# Fix up paths as needed, we want things to land under /usr/share/dpdk/
+export datadir := "${datadir}/${PN}"
+export INSTALL_PATH = "${prefix}/share/${PN}"
+
 # takes n or y
 BUILD_SHARED = "n"
 do_configure_prepend () {
