@@ -1,0 +1,813 @@
+From patchwork Fri Mar  9 08:42:26 2018
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+Subject: [dpdk-dev, v3,
+ 10/18] net/axgbe: add transmit and receive data path apis
+From: Ravi Kumar <ravi1.kumar@amd.com>
+X-Patchwork-Id: 35829
+X-Patchwork-Delegate: ferruh.yigit@intel.com
+Message-Id: <1520584954-130575-10-git-send-email-Ravi1.kumar@amd.com>
+List-Id: dev.dpdk.org
+To: dev@dpdk.org
+Cc: ferruh.yigit@intel.com
+Date: Fri,  9 Mar 2018 03:42:26 -0500
+
+Signed-off-by: Ravi Kumar <Ravi1.kumar@amd.com>
+---
+ drivers/net/axgbe/Makefile             |   1 +
+ drivers/net/axgbe/axgbe_ethdev.c       |  22 +-
+ drivers/net/axgbe/axgbe_rxtx.c         | 429 +++++++++++++++++++++++++++++++++
+ drivers/net/axgbe/axgbe_rxtx.h         |  19 ++
+ drivers/net/axgbe/axgbe_rxtx_vec_sse.c | 215 +++++++++++++++++
+ 5 files changed, 685 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/axgbe/axgbe_rxtx_vec_sse.c
+
+diff --git a/drivers/net/axgbe/Makefile b/drivers/net/axgbe/Makefile
+index d030530..58eb41e 100644
+--- a/drivers/net/axgbe/Makefile
++++ b/drivers/net/axgbe/Makefile
+@@ -147,5 +147,6 @@ SRCS-$(CONFIG_RTE_LIBRTE_AXGBE_PMD) += axgbe_mdio.c
+ SRCS-$(CONFIG_RTE_LIBRTE_AXGBE_PMD) += axgbe_phy_impl.c
+ SRCS-$(CONFIG_RTE_LIBRTE_AXGBE_PMD) += axgbe_i2c.c
+ SRCS-$(CONFIG_RTE_LIBRTE_AXGBE_PMD) += axgbe_rxtx.c
++SRCS-$(CONFIG_RTE_LIBRTE_AXGBE_PMD) += axgbe_rxtx_vec_sse.c
+ 
+ include $(RTE_SDK)/mk/rte.lib.mk
+diff --git a/drivers/net/axgbe/axgbe_ethdev.c b/drivers/net/axgbe/axgbe_ethdev.c
+index 9065a44..ae78e09 100644
+--- a/drivers/net/axgbe/axgbe_ethdev.c
++++ b/drivers/net/axgbe/axgbe_ethdev.c
+@@ -224,9 +224,22 @@ axgbe_dev_interrupt_handler(void *param)
+ {
+ 	struct rte_eth_dev *dev = (struct rte_eth_dev *)param;
+ 	struct axgbe_port *pdata = dev->data->dev_private;
++	unsigned int dma_isr, dma_ch_isr;
+ 
+ 	pdata->phy_if.an_isr(pdata);
+-
++	/*DMA related interrupts*/
++	dma_isr = AXGMAC_IOREAD(pdata, DMA_ISR);
++	if (dma_isr) {
++		if (dma_isr & 1) {
++			dma_ch_isr =
++				AXGMAC_DMA_IOREAD((struct axgbe_rx_queue *)
++						  pdata->rx_queues[0],
++						  DMA_CH_SR);
++			AXGMAC_DMA_IOWRITE((struct axgbe_rx_queue *)
++					   pdata->rx_queues[0],
++					   DMA_CH_SR, dma_ch_isr);
++		}
++	}
+ 	/* Enable interrupts since disabled after generation*/
+ 	rte_intr_enable(&pdata->pci_dev->intr_handle);
+ }
+@@ -288,6 +301,8 @@ axgbe_dev_start(struct rte_eth_dev *dev)
+ 
+ 	/* phy start*/
+ 	pdata->phy_if.phy_start(pdata);
++	axgbe_dev_enable_tx(dev);
++	axgbe_dev_enable_rx(dev);
+ 
+ 	axgbe_clear_bit(AXGBE_STOPPED, &pdata->dev_state);
+ 	axgbe_clear_bit(AXGBE_DOWN, &pdata->dev_state);
+@@ -307,6 +322,8 @@ axgbe_dev_stop(struct rte_eth_dev *dev)
+ 		return;
+ 
+ 	axgbe_set_bit(AXGBE_STOPPED, &pdata->dev_state);
++	axgbe_dev_disable_tx(dev);
++	axgbe_dev_disable_rx(dev);
+ 
+ 	pdata->phy_if.phy_stop(pdata);
+ 	pdata->hw_if.exit(pdata);
+@@ -550,6 +567,7 @@ eth_axgbe_dev_init(struct rte_eth_dev *eth_dev)
+ 	axgbe_set_bit(AXGBE_STOPPED, &pdata->dev_state);
+ 	pdata->eth_dev = eth_dev;
+ 	eth_dev->dev_ops = &axgbe_eth_dev_ops;
++	eth_dev->rx_pkt_burst = &axgbe_recv_pkts;
+ 
+ 	/*
+ 	 * For secondary processes, we don't initialise any further as primary
+@@ -694,6 +712,8 @@ eth_axgbe_dev_uninit(struct rte_eth_dev *eth_dev)
+ 	rte_free(eth_dev->data->mac_addrs);
+ 	eth_dev->data->mac_addrs = NULL;
+ 	eth_dev->dev_ops = NULL;
++	eth_dev->rx_pkt_burst = NULL;
++	eth_dev->tx_pkt_burst = NULL;
+ 	axgbe_dev_clear_queues(eth_dev);
+ 
+ 	/* disable uio intr before callback unregister */
+diff --git a/drivers/net/axgbe/axgbe_rxtx.c b/drivers/net/axgbe/axgbe_rxtx.c
+index 64065e8..c616fc1 100644
+--- a/drivers/net/axgbe/axgbe_rxtx.c
++++ b/drivers/net/axgbe/axgbe_rxtx.c
+@@ -235,6 +235,197 @@ int axgbe_dev_rx_queue_setup(struct rte_eth_dev *dev, uint16_t queue_idx,
+ 	return 0;
+ }
+ 
++static void axgbe_prepare_rx_stop(struct axgbe_port *pdata,
++				  unsigned int queue)
++{
++	unsigned int rx_status;
++	unsigned long rx_timeout;
++
++	/* The Rx engine cannot be stopped if it is actively processing
++	 * packets. Wait for the Rx queue to empty the Rx fifo.  Don't
++	 * wait forever though...
++	 */
++	rx_timeout = rte_get_timer_cycles() + (AXGBE_DMA_STOP_TIMEOUT *
++					       rte_get_timer_hz());
++
++	while (time_before(rte_get_timer_cycles(), rx_timeout)) {
++		rx_status = AXGMAC_MTL_IOREAD(pdata, queue, MTL_Q_RQDR);
++		if ((AXGMAC_GET_BITS(rx_status, MTL_Q_RQDR, PRXQ) == 0) &&
++		    (AXGMAC_GET_BITS(rx_status, MTL_Q_RQDR, RXQSTS) == 0))
++			break;
++
++		rte_delay_us(900);
++	}
++
++	if (!time_before(rte_get_timer_cycles(), rx_timeout))
++		PMD_DRV_LOG(ERR,
++			    "timed out waiting for Rx queue %u to empty\n",
++			    queue);
++}
++
++void axgbe_dev_disable_rx(struct rte_eth_dev *dev)
++{
++	struct axgbe_rx_queue *rxq;
++	struct axgbe_port *pdata = dev->data->dev_private;
++	unsigned int i;
++
++	/* Disable MAC Rx */
++	AXGMAC_IOWRITE_BITS(pdata, MAC_RCR, DCRCC, 0);
++	AXGMAC_IOWRITE_BITS(pdata, MAC_RCR, CST, 0);
++	AXGMAC_IOWRITE_BITS(pdata, MAC_RCR, ACS, 0);
++	AXGMAC_IOWRITE_BITS(pdata, MAC_RCR, RE, 0);
++
++	/* Prepare for Rx DMA channel stop */
++	for (i = 0; i < dev->data->nb_rx_queues; i++) {
++		rxq = dev->data->rx_queues[i];
++		axgbe_prepare_rx_stop(pdata, i);
++	}
++	/* Disable each Rx queue */
++	AXGMAC_IOWRITE(pdata, MAC_RQC0R, 0);
++	for (i = 0; i < dev->data->nb_rx_queues; i++) {
++		rxq = dev->data->rx_queues[i];
++		/* Disable Rx DMA channel */
++		AXGMAC_DMA_IOWRITE_BITS(rxq, DMA_CH_RCR, SR, 0);
++	}
++}
++
++void axgbe_dev_enable_rx(struct rte_eth_dev *dev)
++{
++	struct axgbe_rx_queue *rxq;
++	struct axgbe_port *pdata = dev->data->dev_private;
++	unsigned int i;
++	unsigned int reg_val = 0;
++
++	for (i = 0; i < dev->data->nb_rx_queues; i++) {
++		rxq = dev->data->rx_queues[i];
++		/* Enable Rx DMA channel */
++		AXGMAC_DMA_IOWRITE_BITS(rxq, DMA_CH_RCR, SR, 1);
++	}
++
++	reg_val = 0;
++	for (i = 0; i < pdata->rx_q_count; i++)
++		reg_val |= (0x02 << (i << 1));
++	AXGMAC_IOWRITE(pdata, MAC_RQC0R, reg_val);
++
++	/* Enable MAC Rx */
++	AXGMAC_IOWRITE_BITS(pdata, MAC_RCR, DCRCC, 1);
++	/* Frame is forwarded after stripping CRC to application*/
++	if (pdata->crc_strip_enable) {
++		AXGMAC_IOWRITE_BITS(pdata, MAC_RCR, CST, 1);
++		AXGMAC_IOWRITE_BITS(pdata, MAC_RCR, ACS, 1);
++	}
++	AXGMAC_IOWRITE_BITS(pdata, MAC_RCR, RE, 1);
++}
++
++/* Rx function one to one refresh */
++uint16_t
++axgbe_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
++		uint16_t nb_pkts)
++{
++	PMD_INIT_FUNC_TRACE();
++	uint16_t nb_rx = 0;
++	struct axgbe_rx_queue *rxq = rx_queue;
++	volatile union axgbe_rx_desc *desc;
++	uint64_t old_dirty = rxq->dirty;
++	struct rte_mbuf *mbuf, *tmbuf;
++	unsigned int err;
++	uint32_t error_status;
++	uint16_t idx, pidx, pkt_len;
++
++	idx = AXGBE_GET_DESC_IDX(rxq, rxq->cur);
++	while (nb_rx < nb_pkts) {
++		if (unlikely(idx == rxq->nb_desc))
++			idx = 0;
++
++		desc = &rxq->desc[idx];
++
++		if (AXGMAC_GET_BITS_LE(desc->write.desc3, RX_NORMAL_DESC3, OWN))
++			break;
++		tmbuf = rte_mbuf_raw_alloc(rxq->mb_pool);
++		if (unlikely(!tmbuf)) {
++			PMD_DRV_LOG(ERR, "RX mbuf alloc failed port_id = %u"
++				    " queue_id = %u\n",
++				    (unsigned int)rxq->port_id,
++				    (unsigned int)rxq->queue_id);
++			rte_eth_devices[
++				rxq->port_id].data->rx_mbuf_alloc_failed++;
++			break;
++		}
++		pidx = idx + 1;
++		if (unlikely(pidx == rxq->nb_desc))
++			pidx = 0;
++
++		rte_prefetch0(rxq->sw_ring[pidx]);
++		if ((pidx & 0x3) == 0) {
++			rte_prefetch0(&rxq->desc[pidx]);
++			rte_prefetch0(&rxq->sw_ring[pidx]);
++		}
++
++		mbuf = rxq->sw_ring[idx];
++		/* Check for any errors and free mbuf*/
++		err = AXGMAC_GET_BITS_LE(desc->write.desc3,
++					 RX_NORMAL_DESC3, ES);
++		error_status = 0;
++		if (unlikely(err)) {
++			error_status = desc->write.desc3 & AXGBE_ERR_STATUS;
++			if ((error_status != AXGBE_L3_CSUM_ERR) &&
++			    (error_status != AXGBE_L4_CSUM_ERR)) {
++				rxq->errors++;
++				rte_pktmbuf_free(mbuf);
++				goto err_set;
++			}
++		}
++		if (rxq->pdata->rx_csum_enable) {
++			mbuf->ol_flags = 0;
++			mbuf->ol_flags |= PKT_RX_IP_CKSUM_GOOD;
++			mbuf->ol_flags |= PKT_RX_L4_CKSUM_GOOD;
++			if (unlikely(error_status == AXGBE_L3_CSUM_ERR)) {
++				mbuf->ol_flags &= ~PKT_RX_IP_CKSUM_GOOD;
++				mbuf->ol_flags |= PKT_RX_IP_CKSUM_BAD;
++				mbuf->ol_flags &= ~PKT_RX_L4_CKSUM_GOOD;
++				mbuf->ol_flags |= PKT_RX_L4_CKSUM_UNKNOWN;
++			} else if (
++				unlikely(error_status == AXGBE_L4_CSUM_ERR)) {
++				mbuf->ol_flags &= ~PKT_RX_L4_CKSUM_GOOD;
++				mbuf->ol_flags |= PKT_RX_L4_CKSUM_BAD;
++			}
++		}
++		rte_prefetch1(rte_pktmbuf_mtod(mbuf, void *));
++		/* Get the RSS hash */
++		if (AXGMAC_GET_BITS_LE(desc->write.desc3, RX_NORMAL_DESC3, RSV))
++			mbuf->hash.rss = rte_le_to_cpu_32(desc->write.desc1);
++		pkt_len = AXGMAC_GET_BITS_LE(desc->write.desc3, RX_NORMAL_DESC3,
++					     PL) - rxq->crc_len;
++		/* Mbuf populate */
++		mbuf->next = NULL;
++		mbuf->data_off = RTE_PKTMBUF_HEADROOM;
++		mbuf->nb_segs = 1;
++		mbuf->port = rxq->port_id;
++		mbuf->pkt_len = pkt_len;
++		mbuf->data_len = pkt_len;
++		rxq->bytes += pkt_len;
++		rx_pkts[nb_rx++] = mbuf;
++err_set:
++		rxq->cur++;
++		rxq->sw_ring[idx++] = tmbuf;
++		desc->read.baddr =
++			rte_cpu_to_le_64(rte_mbuf_data_iova_default(tmbuf));
++		memset((void *)(&desc->read.desc2), 0, 8);
++		AXGMAC_SET_BITS_LE(desc->read.desc3, RX_NORMAL_DESC3, OWN, 1);
++		rxq->dirty++;
++	}
++	rxq->pkts += nb_rx;
++	if (rxq->dirty != old_dirty) {
++		rte_wmb();
++		idx = AXGBE_GET_DESC_IDX(rxq, rxq->dirty - 1);
++		AXGMAC_DMA_IOWRITE(rxq, DMA_CH_RDTR_LO,
++				   low32_value(rxq->ring_phys_addr +
++				   (idx * sizeof(union axgbe_rx_desc))));
++	}
++
++	return nb_rx;
++}
++
+ /* Tx Apis */
+ static void axgbe_tx_queue_release(struct axgbe_tx_queue *tx_queue)
+ {
+@@ -296,6 +487,10 @@ int axgbe_dev_tx_queue_setup(struct rte_eth_dev *dev, uint16_t queue_idx,
+ 		txq->free_thresh = (txq->nb_desc >> 1);
+ 	txq->free_batch_cnt = txq->free_thresh;
+ 
++	/* In vector_tx path threshold should be multiple of queue_size*/
++	if (txq->nb_desc % txq->free_thresh != 0)
++		txq->vector_disable = 1;
++
+ 	if ((tx_conf->txq_flags & (uint32_t)ETH_TXQ_FLAGS_NOOFFLOADS) !=
+ 	    ETH_TXQ_FLAGS_NOOFFLOADS) {
+ 		txq->vector_disable = 1;
+@@ -333,9 +528,243 @@ int axgbe_dev_tx_queue_setup(struct rte_eth_dev *dev, uint16_t queue_idx,
+ 	if (!pdata->tx_queues)
+ 		pdata->tx_queues = dev->data->tx_queues;
+ 
++	if (txq->vector_disable)
++		dev->tx_pkt_burst = &axgbe_xmit_pkts;
++	else
++		dev->tx_pkt_burst = &axgbe_xmit_pkts_vec;
++
+ 	return 0;
+ }
+ 
++static void axgbe_txq_prepare_tx_stop(struct axgbe_port *pdata,
++				      unsigned int queue)
++{
++	unsigned int tx_status;
++	unsigned long tx_timeout;
++
++	/* The Tx engine cannot be stopped if it is actively processing
++	 * packets. Wait for the Tx queue to empty the Tx fifo.  Don't
++	 * wait forever though...
++	 */
++	tx_timeout = rte_get_timer_cycles() + (AXGBE_DMA_STOP_TIMEOUT *
++					       rte_get_timer_hz());
++	while (time_before(rte_get_timer_cycles(), tx_timeout)) {
++		tx_status = AXGMAC_MTL_IOREAD(pdata, queue, MTL_Q_TQDR);
++		if ((AXGMAC_GET_BITS(tx_status, MTL_Q_TQDR, TRCSTS) != 1) &&
++		    (AXGMAC_GET_BITS(tx_status, MTL_Q_TQDR, TXQSTS) == 0))
++			break;
++
++		rte_delay_us(900);
++	}
++
++	if (!time_before(rte_get_timer_cycles(), tx_timeout))
++		PMD_DRV_LOG(ERR,
++			    "timed out waiting for Tx queue %u to empty\n",
++			    queue);
++}
++
++static void axgbe_prepare_tx_stop(struct axgbe_port *pdata,
++				  unsigned int queue)
++{
++	unsigned int tx_dsr, tx_pos, tx_qidx;
++	unsigned int tx_status;
++	unsigned long tx_timeout;
++
++	if (AXGMAC_GET_BITS(pdata->hw_feat.version, MAC_VR, SNPSVER) > 0x20)
++		return axgbe_txq_prepare_tx_stop(pdata, queue);
++
++	/* Calculate the status register to read and the position within */
++	if (queue < DMA_DSRX_FIRST_QUEUE) {
++		tx_dsr = DMA_DSR0;
++		tx_pos = (queue * DMA_DSR_Q_WIDTH) + DMA_DSR0_TPS_START;
++	} else {
++		tx_qidx = queue - DMA_DSRX_FIRST_QUEUE;
++
++		tx_dsr = DMA_DSR1 + ((tx_qidx / DMA_DSRX_QPR) * DMA_DSRX_INC);
++		tx_pos = ((tx_qidx % DMA_DSRX_QPR) * DMA_DSR_Q_WIDTH) +
++			DMA_DSRX_TPS_START;
++	}
++
++	/* The Tx engine cannot be stopped if it is actively processing
++	 * descriptors. Wait for the Tx engine to enter the stopped or
++	 * suspended state.  Don't wait forever though...
++	 */
++	tx_timeout = rte_get_timer_cycles() + (AXGBE_DMA_STOP_TIMEOUT *
++					       rte_get_timer_hz());
++	while (time_before(rte_get_timer_cycles(), tx_timeout)) {
++		tx_status = AXGMAC_IOREAD(pdata, tx_dsr);
++		tx_status = GET_BITS(tx_status, tx_pos, DMA_DSR_TPS_WIDTH);
++		if ((tx_status == DMA_TPS_STOPPED) ||
++		    (tx_status == DMA_TPS_SUSPENDED))
++			break;
++
++		rte_delay_us(900);
++	}
++
++	if (!time_before(rte_get_timer_cycles(), tx_timeout))
++		PMD_DRV_LOG(ERR,
++			    "timed out waiting for Tx DMA channel %u to stop\n",
++			    queue);
++}
++
++void axgbe_dev_disable_tx(struct rte_eth_dev *dev)
++{
++	struct axgbe_tx_queue *txq;
++	struct axgbe_port *pdata = dev->data->dev_private;
++	unsigned int i;
++
++	/* Prepare for stopping DMA channel */
++	for (i = 0; i < pdata->tx_q_count; i++) {
++		txq = dev->data->tx_queues[i];
++		axgbe_prepare_tx_stop(pdata, i);
++	}
++	/* Disable MAC Tx */
++	AXGMAC_IOWRITE_BITS(pdata, MAC_TCR, TE, 0);
++	/* Disable each Tx queue*/
++	for (i = 0; i < pdata->tx_q_count; i++)
++		AXGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_Q_TQOMR, TXQEN,
++					0);
++	/* Disable each  Tx DMA channel */
++	for (i = 0; i < dev->data->nb_tx_queues; i++) {
++		txq = dev->data->tx_queues[i];
++		AXGMAC_DMA_IOWRITE_BITS(txq, DMA_CH_TCR, ST, 0);
++	}
++}
++
++void axgbe_dev_enable_tx(struct rte_eth_dev *dev)
++{
++	struct axgbe_tx_queue *txq;
++	struct axgbe_port *pdata = dev->data->dev_private;
++	unsigned int i;
++
++	for (i = 0; i < dev->data->nb_tx_queues; i++) {
++		txq = dev->data->tx_queues[i];
++		/* Enable Tx DMA channel */
++		AXGMAC_DMA_IOWRITE_BITS(txq, DMA_CH_TCR, ST, 1);
++	}
++	/* Enable Tx queue*/
++	for (i = 0; i < pdata->tx_q_count; i++)
++		AXGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_Q_TQOMR, TXQEN,
++					MTL_Q_ENABLED);
++	/* Enable MAC Tx */
++	AXGMAC_IOWRITE_BITS(pdata, MAC_TCR, TE, 1);
++}
++
++/* Free Tx conformed mbufs */
++static void axgbe_xmit_cleanup(struct axgbe_tx_queue *txq)
++{
++	volatile struct axgbe_tx_desc *desc;
++	uint16_t idx;
++
++	idx = AXGBE_GET_DESC_IDX(txq, txq->dirty);
++	while (txq->cur != txq->dirty) {
++		if (unlikely(idx == txq->nb_desc))
++			idx = 0;
++		desc = &txq->desc[idx];
++		/* Check for ownership */
++		if (AXGMAC_GET_BITS_LE(desc->desc3, TX_NORMAL_DESC3, OWN))
++			return;
++		memset((void *)&desc->desc2, 0, 8);
++		/* Free mbuf */
++		rte_pktmbuf_free(txq->sw_ring[idx]);
++		txq->sw_ring[idx++] = NULL;
++		txq->dirty++;
++	}
++}
++
++/* Tx Descriptor formation
++ * Considering each mbuf requires one desc
++ * mbuf is linear
++ */
++static int axgbe_xmit_hw(struct axgbe_tx_queue *txq,
++			 struct rte_mbuf *mbuf)
++{
++	volatile struct axgbe_tx_desc *desc;
++	uint16_t idx;
++	uint64_t mask;
++
++	idx = AXGBE_GET_DESC_IDX(txq, txq->cur);
++	desc = &txq->desc[idx];
++
++	/* Update buffer address  and length */
++	desc->baddr = rte_mbuf_data_iova(mbuf);
++	AXGMAC_SET_BITS_LE(desc->desc2, TX_NORMAL_DESC2, HL_B1L,
++			   mbuf->pkt_len);
++	/* Total msg length to transmit */
++	AXGMAC_SET_BITS_LE(desc->desc3, TX_NORMAL_DESC3, FL,
++			   mbuf->pkt_len);
++	/* Mark it as First and Last Descriptor */
++	AXGMAC_SET_BITS_LE(desc->desc3, TX_NORMAL_DESC3, FD, 1);
++	AXGMAC_SET_BITS_LE(desc->desc3, TX_NORMAL_DESC3, LD, 1);
++	/* Mark it as a NORMAL descriptor */
++	AXGMAC_SET_BITS_LE(desc->desc3, TX_NORMAL_DESC3, CTXT, 0);
++	/* configure h/w Offload */
++	mask = mbuf->ol_flags & PKT_TX_L4_MASK;
++	if ((mask == PKT_TX_TCP_CKSUM) || (mask == PKT_TX_UDP_CKSUM))
++		AXGMAC_SET_BITS_LE(desc->desc3, TX_NORMAL_DESC3, CIC, 0x3);
++	else if (mbuf->ol_flags & PKT_TX_IP_CKSUM)
++		AXGMAC_SET_BITS_LE(desc->desc3, TX_NORMAL_DESC3, CIC, 0x1);
++	rte_wmb();
++
++	/* Set OWN bit */
++	AXGMAC_SET_BITS_LE(desc->desc3, TX_NORMAL_DESC3, OWN, 1);
++	rte_wmb();
++
++	/* Save mbuf */
++	txq->sw_ring[idx] = mbuf;
++	/* Update current index*/
++	txq->cur++;
++	/* Update stats */
++	txq->bytes += mbuf->pkt_len;
++
++	return 0;
++}
++
++/* Eal supported tx wrapper*/
++uint16_t
++axgbe_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
++		uint16_t nb_pkts)
++{
++	PMD_INIT_FUNC_TRACE();
++
++	if (unlikely(nb_pkts == 0))
++		return nb_pkts;
++
++	struct axgbe_tx_queue *txq;
++	uint16_t nb_desc_free;
++	uint16_t nb_pkt_sent = 0;
++	uint16_t idx;
++	uint32_t tail_addr;
++	struct rte_mbuf *mbuf;
++
++	txq  = (struct axgbe_tx_queue *)tx_queue;
++	nb_desc_free = txq->nb_desc - (txq->cur - txq->dirty);
++
++	if (unlikely(nb_desc_free <= txq->free_thresh)) {
++		axgbe_xmit_cleanup(txq);
++		nb_desc_free = txq->nb_desc - (txq->cur - txq->dirty);
++		if (unlikely(nb_desc_free == 0))
++			return 0;
++	}
++	nb_pkts = RTE_MIN(nb_desc_free, nb_pkts);
++	while (nb_pkts--) {
++		mbuf = *tx_pkts++;
++		if (axgbe_xmit_hw(txq, mbuf))
++			goto out;
++		nb_pkt_sent++;
++	}
++out:
++	/* Sync read and write */
++	rte_mb();
++	idx = AXGBE_GET_DESC_IDX(txq, txq->cur);
++	tail_addr = low32_value(txq->ring_phys_addr +
++				idx * sizeof(struct axgbe_tx_desc));
++	/* Update tail reg with next immediate address to kick Tx DMA channel*/
++	AXGMAC_DMA_IOWRITE(txq, DMA_CH_TDTR_LO, tail_addr);
++	txq->pkts += nb_pkt_sent;
++	return nb_pkt_sent;
++}
++
+ void axgbe_dev_clear_queues(struct rte_eth_dev *dev)
+ {
+ 	PMD_INIT_FUNC_TRACE();
+diff --git a/drivers/net/axgbe/axgbe_rxtx.h b/drivers/net/axgbe/axgbe_rxtx.h
+index 0d712f7..45aaf89 100644
+--- a/drivers/net/axgbe/axgbe_rxtx.h
++++ b/drivers/net/axgbe/axgbe_rxtx.h
+@@ -278,12 +278,31 @@ void axgbe_dev_tx_queue_release(void *txq);
+ int  axgbe_dev_tx_queue_setup(struct rte_eth_dev *dev, uint16_t tx_queue_id,
+ 			      uint16_t nb_tx_desc, unsigned int socket_id,
+ 			      const struct rte_eth_txconf *tx_conf);
++void axgbe_dev_enable_tx(struct rte_eth_dev *dev);
++void axgbe_dev_disable_tx(struct rte_eth_dev *dev);
++int axgbe_dev_tx_queue_start(struct rte_eth_dev *dev, uint16_t tx_queue_id);
++int axgbe_dev_tx_queue_stop(struct rte_eth_dev *dev, uint16_t tx_queue_id);
++
++uint16_t axgbe_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
++			 uint16_t nb_pkts);
++uint16_t axgbe_xmit_pkts_vec(void *tx_queue, struct rte_mbuf **tx_pkts,
++			 uint16_t nb_pkts);
++
+ 
+ void axgbe_dev_rx_queue_release(void *rxq);
+ int  axgbe_dev_rx_queue_setup(struct rte_eth_dev *dev, uint16_t rx_queue_id,
+ 			      uint16_t nb_rx_desc, unsigned int socket_id,
+ 			      const struct rte_eth_rxconf *rx_conf,
+ 			      struct rte_mempool *mb_pool);
++void axgbe_dev_enable_rx(struct rte_eth_dev *dev);
++void axgbe_dev_disable_rx(struct rte_eth_dev *dev);
++int axgbe_dev_rx_queue_start(struct rte_eth_dev *dev, uint16_t rx_queue_id);
++int axgbe_dev_rx_queue_stop(struct rte_eth_dev *dev, uint16_t rx_queue_id);
++uint16_t axgbe_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
++			 uint16_t nb_pkts);
++uint16_t axgbe_recv_pkts_threshold_refresh(void *rx_queue,
++					   struct rte_mbuf **rx_pkts,
++					   uint16_t nb_pkts);
+ void axgbe_dev_clear_queues(struct rte_eth_dev *dev);
+ 
+ #endif /* _AXGBE_RXTX_H_ */
+diff --git a/drivers/net/axgbe/axgbe_rxtx_vec_sse.c b/drivers/net/axgbe/axgbe_rxtx_vec_sse.c
+new file mode 100644
+index 0000000..c2bd5da
+--- /dev/null
++++ b/drivers/net/axgbe/axgbe_rxtx_vec_sse.c
+@@ -0,0 +1,215 @@
++/*-
++ *   Copyright(c) 2017 Advanced Micro Devices, Inc.
++ *   All rights reserved.
++ *
++ *   AMD 10Gb Ethernet driver
++ *
++ *   This file is available to you under your choice of the following two
++ *   licenses:
++ *
++ *   License 1: GPLv2
++ *
++ *   Copyright (c) 2017 Advanced Micro Devices, Inc.
++ *
++ *   This file is free software; you may copy, redistribute and/or modify
++ *   it under the terms of the GNU General Public License as published by
++ *   the Free Software Foundation, either version 2 of the License, or
++ *   (at your option) any later version.
++ *
++ *   This file is distributed in the hope that it will be useful, but
++ *   WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ *   General Public License for more details.
++ *
++ *   You should have received a copy of the GNU General Public License
++ *   along with this program. If not, see <http://www.gnu.org/licenses/>.
++ *
++ *   This file incorporates work covered by the following copyright and
++ *   permission notice:
++ *
++ *   Copyright (c) 2013 Synopsys, Inc.
++ *
++ *   The Synopsys DWC ETHER XGMAC Software Driver and documentation
++ *   (hereinafter "Software") is an unsupported proprietary work of Synopsys,
++ *   Inc. unless otherwise expressly agreed to in writing between Synopsys
++ *   and you.
++ *
++ *   The Software IS NOT an item of Licensed Software or Licensed Product
++ *   under any End User Software License Agreement or Agreement for Licensed
++ *   Product with Synopsys or any supplement thereto. Permission is hereby
++ *   granted, free of charge, to any person obtaining a copy of this software
++ *   annotated with this license and the Software, to deal in the Software
++ *   without restriction, including without limitation the rights to use,
++ *   copy, modify, merge, publish, distribute, sublicense, and/or sell copies
++ *   of the Software, and to permit persons to whom the Software is furnished
++ *   to do so, subject to the following conditions:
++ *
++ *   The above copyright notice and this permission notice shall be included
++ *   in all copies or substantial portions of the Software.
++ *
++ *   THIS SOFTWARE IS BEING DISTRIBUTED BY SYNOPSYS SOLELY ON AN "AS IS"
++ *   BASIS AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ *   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ *   PARTICULAR PURPOSE ARE HEREBY DISCLAIMED. IN NO EVENT SHALL SYNOPSYS
++ *   BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ *   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ *   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ *   INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ *   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ *   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++ *   THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ *   License 2: Modified BSD
++ *
++ *   Copyright (c) 2017 Advanced Micro Devices, Inc.
++ *   All rights reserved.
++ *
++ *   Redistribution and use in source and binary forms, with or without
++ *   modification, are permitted provided that the following conditions
++ *   are met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *       notice, this list of conditions and the following disclaimer in the
++ *       documentation and/or other materials provided with the distribution.
++ *     * Neither the name of Advanced Micro Devices, Inc. nor the
++ *       names of its contributors may be used to endorse or promote products
++ *       derived from this software without specific prior written permission.
++ *
++ *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
++ *   <COPYRIGHT HOLDER> BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ *   This file incorporates work covered by the following copyright and
++ *   permission notice:
++ *
++ *   Copyright (c) 2013 Synopsys, Inc.
++ *
++ *   The Synopsys DWC ETHER XGMAC Software Driver and documentation
++ *   (hereinafter "Software") is an unsupported proprietary work of Synopsys,
++ *   Inc. unless otherwise expressly agreed to in writing between Synopsys
++ *   and you.
++ *
++ *   The Software IS NOT an item of Licensed Software or Licensed Product
++ *   under any End User Software License Agreement or Agreement for Licensed
++ *   Product with Synopsys or any supplement thereto. Permission is hereby
++ *   granted, free of charge, to any person obtaining a copy of this software
++ *   annotated with this license and the Software, to deal in the Software
++ *   without restriction, including without limitation the rights to use,
++ *   copy, modify, merge, publish, distribute, sublicense, and/or sell copies
++ *   of the Software, and to permit persons to whom the Software is furnished
++ *   to do so, subject to the following conditions:
++ *
++ *   The above copyright notice and this permission notice shall be included
++ *   in all copies or substantial portions of the Software.
++ *
++ *   THIS SOFTWARE IS BEING DISTRIBUTED BY SYNOPSYS SOLELY ON AN "AS IS"
++ *   BASIS AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ *   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ *   PARTICULAR PURPOSE ARE HEREBY DISCLAIMED. IN NO EVENT SHALL SYNOPSYS
++ *   BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ *   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ *   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ *   INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ *   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ *   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++ *   THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "axgbe_ethdev.h"
++#include "axgbe_rxtx.h"
++#include "axgbe_phy.h"
++
++#include <rte_time.h>
++#include <rte_mempool.h>
++#include <rte_mbuf.h>
++
++/* Useful to avoid shifting for every descriptor prepration*/
++#define TX_DESC_CTRL_FLAGS 0xb000000000000000
++#define TX_FREE_BULK	   8
++#define TX_FREE_BULK_CHECK (TX_FREE_BULK - 1)
++
++static inline void
++axgbe_vec_tx(volatile struct axgbe_tx_desc *desc,
++	     struct rte_mbuf *mbuf)
++{
++	__m128i descriptor = _mm_set_epi64x((uint64_t)mbuf->pkt_len << 32 |
++					    TX_DESC_CTRL_FLAGS | mbuf->data_len,
++					    mbuf->buf_iova
++					    + mbuf->data_off);
++	_mm_store_si128((__m128i *)desc, descriptor);
++}
++
++static void
++axgbe_xmit_cleanup_vec(struct axgbe_tx_queue *txq)
++{
++	volatile struct axgbe_tx_desc *desc;
++	int idx, i;
++
++	idx = AXGBE_GET_DESC_IDX(txq, txq->dirty + txq->free_batch_cnt
++				 - 1);
++	desc = &txq->desc[idx];
++	if (desc->desc3 & AXGBE_DESC_OWN)
++		return;
++	/* memset avoided for desc ctrl fields since in vec_tx path
++	 * all 128 bits are populated
++	 */
++	for (i = 0; i < txq->free_batch_cnt; i++, idx--)
++		rte_pktmbuf_free_seg(txq->sw_ring[idx]);
++
++
++	txq->dirty += txq->free_batch_cnt;
++	txq->nb_desc_free += txq->free_batch_cnt;
++}
++
++uint16_t
++axgbe_xmit_pkts_vec(void *tx_queue, struct rte_mbuf **tx_pkts,
++		    uint16_t nb_pkts)
++{
++	PMD_INIT_FUNC_TRACE();
++
++	struct axgbe_tx_queue *txq;
++	uint16_t idx, nb_commit, loop, i;
++	uint32_t tail_addr;
++
++	txq  = (struct axgbe_tx_queue *)tx_queue;
++	if (txq->nb_desc_free < txq->free_thresh) {
++		axgbe_xmit_cleanup_vec(txq);
++		if (unlikely(txq->nb_desc_free == 0))
++			return 0;
++	}
++	nb_pkts = RTE_MIN(txq->nb_desc_free, nb_pkts);
++	nb_commit = nb_pkts;
++	idx = AXGBE_GET_DESC_IDX(txq, txq->cur);
++	loop = txq->nb_desc - idx;
++	if (nb_commit >= loop) {
++		for (i = 0; i < loop; ++i, ++idx, ++tx_pkts) {
++			axgbe_vec_tx(&txq->desc[idx], *tx_pkts);
++			txq->sw_ring[idx] = *tx_pkts;
++		}
++		nb_commit -= loop;
++		idx = 0;
++	}
++	for (i = 0; i < nb_commit; ++i, ++idx, ++tx_pkts) {
++		axgbe_vec_tx(&txq->desc[idx], *tx_pkts);
++		txq->sw_ring[idx] = *tx_pkts;
++	}
++	txq->cur += nb_pkts;
++	tail_addr = (uint32_t)(txq->ring_phys_addr +
++			       idx * sizeof(struct axgbe_tx_desc));
++	/* Update tail reg with next immediate address to kick Tx DMA channel*/
++	rte_write32(tail_addr, (void *)txq->dma_tail_reg);
++	txq->pkts += nb_pkts;
++	txq->nb_desc_free -= nb_pkts;
++
++	return nb_pkts;
++}

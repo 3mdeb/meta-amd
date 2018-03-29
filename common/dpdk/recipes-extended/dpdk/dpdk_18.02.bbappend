@@ -21,7 +21,25 @@ SRC_URI += "\
             file://dpdk-dev-v4-18-20-test-crypto-add-test-for-AMD-CCP-crypto-poll-mode.patch \
             file://dpdk-dev-v4-19-20-doc-add-document-for-AMD-CCP-crypto-poll-mode-driver.patch \
             file://dpdk-dev-v4-20-20-crypto-ccp-moved-license-headers-to-SPDX-format.patch \
-            "
+            file://dpdk-dev-v3-01-18-net-axgbe-add-minimal-dev-init-and-uninit-support.patch \
+            file://dpdk-dev-v3-02-18-net-axgbe-add-register-map-and-related-macros.patch \
+            file://dpdk-dev-v3-03-18-net-axgbe-add-phy-register-map-and-helper-macros.patch \
+            file://dpdk-dev-v3-04-18-net-axgbe-add-structures-for-MAC-initialization-and-reset.patch \
+            file://dpdk-dev-v3-05-18-net-axgbe-add-phy-initialization-and-related-apis.patch \
+            file://dpdk-dev-v3-06-18-net-axgbe-add-phy-programming-apis.patch \
+            file://dpdk-dev-v3-07-18-net-axgbe-add-interrupt-handler-for-autonegotiation.patch \
+            file://dpdk-dev-v3-08-18-net-axgbe-add-transmit-and-receive-queue-setup-apis.patch \
+            file://dpdk-dev-v3-09-18-net-axgbe-add-DMA-programming-and-dev-start-and-stop-apis.patch \
+            file://dpdk-dev-v3-10-18-net-axgbe-add-transmit-and-receive-data-path-apis.patch \
+            file://dpdk-dev-v3-11-18-doc-add-documents-for-AMD-axgbe-Ethernet-PMD.patch \
+            file://dpdk-dev-v3-12-18-net-axgbe-add-link-status-update.patch \
+            file://dpdk-dev-v3-13-18-net-axgbe-add-configure-flow-control-while-link-adjustment.patch \
+            file://dpdk-dev-v3-14-18-net-axgbe-add-promiscuous-mode-support.patch \
+            file://dpdk-dev-v3-15-18-net-axgbe-add-generic-transmit-and-receive-stats-support.patch \
+            file://dpdk-dev-v3-16-18-net-axgbe-add-support-for-build-32-bit-mode.patch \
+            file://dpdk-dev-v3-17-18-net-axgbe-add-workaround-for-axgbe-ethernet-training-bug.patch \
+            file://dpdk-dev-v3-18-18-net-axgbe-moved-license-headers-to-SPDX-format.patch \
+"
 
 do_configure_prepend () {
 	# enable the AMD CCP driver
