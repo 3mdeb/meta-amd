@@ -44,3 +44,4 @@ EXTRA_OECONF_append_pn-matchbox-panel-2 = " --with-battery=acpi"
 
 IMAGE_FSTYPES += "hddimg iso"
 
+IMAGE_OVERHEAD_FACTOR = "1.1"
