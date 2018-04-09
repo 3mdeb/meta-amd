@@ -33,17 +33,18 @@ Signed-off-by: Alex Xie <AlexBin.Xie@amd.com>
 Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
 Signed-off-by: Jammy Zhou <Jammy.Zhou@amd.com>
 Reviewed-by: Michel Dänzer <michel.daenzer@amd.com>
+Signed-off-by: Arsalan H. Awan <Arsalan_Awan@mentor.com>
 ---
- amdgpu/amdgpu.h          |  50 +++++++++++++++-
+ amdgpu/amdgpu.h          |  50 ++++++++++++++-
  amdgpu/amdgpu_internal.h |   3 +
- amdgpu/amdgpu_vamgr.c    | 145 ++++++++++++++++++++++++++++++++++++++++++++++-
- 3 files changed, 193 insertions(+), 5 deletions(-)
+ amdgpu/amdgpu_vamgr.c    | 179 ++++++++++++++++++++++++++++++++++++++++++++++++------
+ 3 files changed, 212 insertions(+), 20 deletions(-)
 
 diff --git a/amdgpu/amdgpu.h b/amdgpu/amdgpu.h
-index 238b1aa..f63abdc 100644
+index 36f9105..e4f73c9 100644
 --- a/amdgpu/amdgpu.h
 +++ b/amdgpu/amdgpu.h
-@@ -91,7 +91,9 @@ enum amdgpu_bo_handle_type {
+@@ -91,7 +91,10 @@ enum amdgpu_bo_handle_type {
  enum amdgpu_gpu_va_range
  {
  	/** Allocate from "normal"/general range */
@@ -51,18 +52,11 @@ index 238b1aa..f63abdc 100644
 +	amdgpu_gpu_va_range_general = 0,
 +	/** Allocate from svm range */
 +	amdgpu_gpu_va_range_svm = 1
++
  };
  
- /*--------------------------------------------------------------------------*/
-@@ -1249,7 +1251,6 @@ int amdgpu_bo_va_op(amdgpu_bo_handle bo,
-  *          <0 - Negative POSIX Error code
-  *
- */
--
- int amdgpu_bo_va_op_raw(amdgpu_device_handle dev,
- 			amdgpu_bo_handle bo,
- 			uint64_t offset,
-@@ -1259,6 +1260,51 @@ int amdgpu_bo_va_op_raw(amdgpu_device_handle dev,
+ enum amdgpu_sw_info {
+@@ -1294,6 +1297,51 @@ int amdgpu_bo_va_op_raw(amdgpu_device_handle dev,
  			uint32_t ops);
  
  /**
@@ -115,78 +109,110 @@ index 238b1aa..f63abdc 100644
   *
   * \param   sem	   - \c [out] semaphore handle
 diff --git a/amdgpu/amdgpu_internal.h b/amdgpu/amdgpu_internal.h
-index e68246b..3577f64 100644
+index 99b8ce0..13a7359 100644
 --- a/amdgpu/amdgpu_internal.h
 +++ b/amdgpu/amdgpu_internal.h
-@@ -55,6 +55,7 @@ struct amdgpu_bo_va_hole {
+@@ -49,6 +49,7 @@ struct amdgpu_bo_va_hole {
+ };
+ 
  struct amdgpu_bo_va_mgr {
- 	/* the start virtual address */
- 	uint64_t va_offset;
 +	uint64_t va_min;
  	uint64_t va_max;
  	struct list_head va_holes;
  	pthread_mutex_t bo_va_mutex;
-@@ -96,6 +97,8 @@ struct amdgpu_device {
- 	struct amdgpu_bo_va_mgr vamgr;
- 	/** The VA manager for the 32bit address space */
- 	struct amdgpu_bo_va_mgr vamgr_32;
+@@ -87,6 +88,8 @@ struct amdgpu_device {
+ 	struct amdgpu_bo_va_mgr vamgr_high;
+ 	/** The VA manager for the 32bit high address space */
+ 	struct amdgpu_bo_va_mgr vamgr_high_32;
 +	/** The VA manager for SVM address space */
 +	struct amdgpu_bo_va_mgr *vamgr_svm;
  };
  
  struct amdgpu_bo {
 diff --git a/amdgpu/amdgpu_vamgr.c b/amdgpu/amdgpu_vamgr.c
-index 2b1388e..2a9f28a 100644
+index 1de9f95..95483cb 100644
 --- a/amdgpu/amdgpu_vamgr.c
 +++ b/amdgpu/amdgpu_vamgr.c
-@@ -36,18 +36,30 @@
- int amdgpu_va_range_query(amdgpu_device_handle dev,
- 			  enum amdgpu_gpu_va_range type, uint64_t *start, uint64_t *end)
+@@ -33,12 +33,23 @@ int amdgpu_va_range_query(amdgpu_device_handle dev,
+ 			  enum amdgpu_gpu_va_range type,
+ 			  uint64_t *start, uint64_t *end)
  {
--	if (type == amdgpu_gpu_va_range_general) {
+-	if (type != amdgpu_gpu_va_range_general)
+-		return -EINVAL;
+-
+-	*start = dev->dev_info.virtual_address_offset;
+-	*end = dev->dev_info.virtual_address_max;
+-	return 0;
 +	switch (type) {
-+	case amdgpu_gpu_va_range_general:
- 		*start = dev->dev_info.virtual_address_offset;
- 		*end = dev->dev_info.virtual_address_max;
- 		return 0;
-+	case amdgpu_gpu_va_range_svm:
-+		if (dev->vamgr_svm) {
-+			*start = dev->vamgr_svm->va_min;
-+			*end = dev->vamgr_svm->va_max;
-+		} else {
-+			*start = 0ULL;
-+			*end = 0ULL;
-+		}
-+		return 0;
-+	default:
-+		return -EINVAL;
- 	}
--	return -EINVAL;
++		case amdgpu_gpu_va_range_general:
++			*start = dev->dev_info.virtual_address_offset;
++			*end = dev->dev_info.virtual_address_max;
++			return 0;
++		case amdgpu_gpu_va_range_svm:
++			if (dev->vamgr_svm) {
++				*start = dev->vamgr_svm->va_min;
++				*end = dev->vamgr_svm->va_max;
++			} else {
++				*start = 0ULL;
++				*end = 0ULL;
++			}
++			return 0;
++		default:
++			return -EINVAL;
++	}
  }
  
  drm_private void amdgpu_vamgr_init(struct amdgpu_bo_va_mgr *mgr, uint64_t start,
- 			      uint64_t max, uint64_t alignment)
- {
- 	mgr->va_offset = start;
-+	mgr->va_min = start;
+@@ -47,6 +58,7 @@ drm_private void amdgpu_vamgr_init(struct amdgpu_bo_va_mgr *mgr, uint64_t start,
+ 	struct amdgpu_bo_va_hole *n;
+ 
  	mgr->va_max = max;
++	mgr->va_min = start;
  	mgr->va_alignment = alignment;
  
-@@ -235,7 +247,12 @@ int amdgpu_va_range_alloc(amdgpu_device_handle dev,
+ 	list_inithead(&mgr->va_holes);
+@@ -197,20 +209,27 @@ int amdgpu_va_range_alloc(amdgpu_device_handle dev,
  {
  	struct amdgpu_bo_va_mgr *vamgr;
  
--	if (flags & AMDGPU_VA_RANGE_32_BIT)
+-	/* Clear the flag when the high VA manager is not initialized */
+-	if (flags & AMDGPU_VA_RANGE_HIGH && !dev->vamgr_high_32.va_max)
+-		flags &= ~AMDGPU_VA_RANGE_HIGH;
 +	if (amdgpu_gpu_va_range_svm == va_range_type) {
 +		vamgr = dev->vamgr_svm;
 +		if (!vamgr)
 +			return -EINVAL;
 +	}
-+	else if (flags & AMDGPU_VA_RANGE_32_BIT)
- 		vamgr = &dev->vamgr_32;
- 	else
- 		vamgr = &dev->vamgr;
-@@ -285,3 +302,125 @@ int amdgpu_va_range_free(amdgpu_va_handle va_range_handle)
++	else {
++		/* Clear the flag when the high VA manager is not initialized */
++		if (flags & AMDGPU_VA_RANGE_HIGH && !dev->vamgr_high_32.va_max)
++			flags &= ~AMDGPU_VA_RANGE_HIGH;
+ 
+-	if (flags & AMDGPU_VA_RANGE_HIGH) {
+-		if (flags & AMDGPU_VA_RANGE_32_BIT)
+-			vamgr = &dev->vamgr_high_32;
+-		else
+-			vamgr = &dev->vamgr_high;
+-	} else {
+-		if (flags & AMDGPU_VA_RANGE_32_BIT)
+-			vamgr = &dev->vamgr_32;
+-		else
+-			vamgr = &dev->vamgr;
++		if (flags & AMDGPU_VA_RANGE_HIGH) {
++			if (flags & AMDGPU_VA_RANGE_32_BIT)
++				vamgr = &dev->vamgr_high_32;
++			else
++				vamgr = &dev->vamgr_high;
++		} else {
++			if (flags & AMDGPU_VA_RANGE_32_BIT)
++				vamgr = &dev->vamgr_32;
++			else
++				vamgr = &dev->vamgr;
++		}
+ 	}
+ 
+ 	va_base_alignment = MAX2(va_base_alignment, vamgr->va_alignment);
+@@ -261,3 +280,125 @@ int amdgpu_va_range_free(amdgpu_va_handle va_range_handle)
  	free(va_range_handle);
  	return 0;
  }
@@ -314,4 +340,3 @@ index 2b1388e..2a9f28a 100644
 +}
 -- 
 2.7.4
-
