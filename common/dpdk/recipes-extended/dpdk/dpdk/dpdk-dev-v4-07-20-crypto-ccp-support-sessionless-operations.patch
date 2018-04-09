@@ -1,0 +1,80 @@
+From patchwork Fri Mar  9 08:35:07 2018
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+Subject: [dpdk-dev,v4,07/20] crypto/ccp: support sessionless operations
+From: Ravi Kumar <ravi1.kumar@amd.com>
+X-Patchwork-Id: 35806
+X-Patchwork-Delegate: pablo.de.lara.guarch@intel.com
+Message-Id: <1520584520-130522-7-git-send-email-Ravi1.kumar@amd.com>
+List-Id: dev.dpdk.org
+To: dev@dpdk.org
+Cc: pablo.de.lara.guarch@intel.com
+Date: Fri,  9 Mar 2018 03:35:07 -0500
+
+Signed-off-by: Ravi Kumar <Ravi1.kumar@amd.com>
+---
+ drivers/crypto/ccp/rte_ccp_pmd.c | 33 +++++++++++++++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/crypto/ccp/rte_ccp_pmd.c b/drivers/crypto/ccp/rte_ccp_pmd.c
+index ed6ca5d..23d3af3 100644
+--- a/drivers/crypto/ccp/rte_ccp_pmd.c
++++ b/drivers/crypto/ccp/rte_ccp_pmd.c
+@@ -49,7 +49,7 @@ static unsigned int ccp_pmd_init_done;
+ uint8_t ccp_cryptodev_driver_id;
+ 
+ static struct ccp_session *
+-get_ccp_session(struct ccp_qp *qp __rte_unused, struct rte_crypto_op *op)
++get_ccp_session(struct ccp_qp *qp, struct rte_crypto_op *op)
+ {
+ 	struct ccp_session *sess = NULL;
+ 
+@@ -61,6 +61,27 @@ get_ccp_session(struct ccp_qp *qp __rte_unused, struct rte_crypto_op *op)
+ 			get_session_private_data(
+ 				op->sym->session,
+ 				ccp_cryptodev_driver_id);
++	} else if (op->sess_type == RTE_CRYPTO_OP_SESSIONLESS) {
++		void *_sess;
++		void *_sess_private_data = NULL;
++
++		if (rte_mempool_get(qp->sess_mp, &_sess))
++			return NULL;
++		if (rte_mempool_get(qp->sess_mp, (void **)&_sess_private_data))
++			return NULL;
++
++		sess = (struct ccp_session *)_sess_private_data;
++
++		if (unlikely(ccp_set_session_parameters(sess,
++							op->sym->xform) != 0)) {
++			rte_mempool_put(qp->sess_mp, _sess);
++			rte_mempool_put(qp->sess_mp, _sess_private_data);
++			sess = NULL;
++		}
++		op->sym->session = (struct rte_cryptodev_sym_session *)_sess;
++		set_session_private_data(op->sym->session,
++					 ccp_cryptodev_driver_id,
++					 _sess_private_data);
+ 	}
+ 
+ 	return sess;
+@@ -108,10 +129,18 @@ ccp_pmd_dequeue_burst(void *queue_pair, struct rte_crypto_op **ops,
+ 		uint16_t nb_ops)
+ {
+ 	struct ccp_qp *qp = queue_pair;
+-	uint16_t nb_dequeued = 0;
++	uint16_t nb_dequeued = 0, i;
+ 
+ 	nb_dequeued = process_ops_to_dequeue(qp, ops, nb_ops);
+ 
++	/* Free session if a session-less crypto op */
++	for (i = 0; i < nb_dequeued; i++)
++		if (unlikely(ops[i]->sess_type ==
++			     RTE_CRYPTO_OP_SESSIONLESS)) {
++			rte_mempool_put(qp->sess_mp,
++					ops[i]->sym->session);
++			ops[i]->sym->session = NULL;
++		}
+ 	qp->qp_stats.dequeued_count += nb_dequeued;
+ 
+ 	return nb_dequeued;

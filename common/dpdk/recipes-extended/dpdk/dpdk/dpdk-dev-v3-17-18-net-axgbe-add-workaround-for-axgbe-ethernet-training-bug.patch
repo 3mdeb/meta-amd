@@ -1,0 +1,319 @@
+From patchwork Fri Mar  9 08:42:33 2018
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+Subject: [dpdk-dev, v3,
+ 17/18] net/axgbe: add workaround for axgbe ethernet training bug
+From: Ravi Kumar <ravi1.kumar@amd.com>
+X-Patchwork-Id: 35836
+X-Patchwork-Delegate: ferruh.yigit@intel.com
+Message-Id: <1520584954-130575-17-git-send-email-Ravi1.kumar@amd.com>
+List-Id: dev.dpdk.org
+To: dev@dpdk.org
+Cc: ferruh.yigit@intel.com
+Date: Fri,  9 Mar 2018 03:42:33 -0500
+
+Signed-off-by: Ravi Kumar <Ravi1.kumar@amd.com>
+---
+ drivers/net/axgbe/axgbe_common.h   |   8 +++
+ drivers/net/axgbe/axgbe_ethdev.c   |   2 +
+ drivers/net/axgbe/axgbe_ethdev.h   |   6 ++
+ drivers/net/axgbe/axgbe_mdio.c     |  13 ++++-
+ drivers/net/axgbe/axgbe_phy_impl.c | 117 +++++++++++++++++++++++++++++++++++++
+ 5 files changed, 144 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/axgbe/axgbe_common.h b/drivers/net/axgbe/axgbe_common.h
+index 189139b..e1f3b45 100644
+--- a/drivers/net/axgbe/axgbe_common.h
++++ b/drivers/net/axgbe/axgbe_common.h
+@@ -1369,6 +1369,10 @@
+ #define MDIO_VEND2_AN_STAT		0x8002
+ #endif
+ 
++#ifndef MDIO_VEND2_PMA_CDR_CONTROL
++#define MDIO_VEND2_PMA_CDR_CONTROL	0x8056
++#endif
++
+ #ifndef MDIO_CTRL1_SPEED1G
+ #define MDIO_CTRL1_SPEED1G		(MDIO_CTRL1_SPEED10G & ~BMCR_SPEED100)
+ #endif
+@@ -1416,6 +1420,10 @@
+ #define AXGBE_AN_CL37_PCS_MODE_SGMII	0x04
+ #define AXGBE_AN_CL37_TX_CONFIG_MASK	0x08
+ 
++#define AXGBE_PMA_CDR_TRACK_EN_MASK	0x01
++#define AXGBE_PMA_CDR_TRACK_EN_OFF	0x00
++#define AXGBE_PMA_CDR_TRACK_EN_ON	0x01
++
+ /*generic*/
+ #define __iomem
+ 
+diff --git a/drivers/net/axgbe/axgbe_ethdev.c b/drivers/net/axgbe/axgbe_ethdev.c
+index d4d437a..ca21152 100644
+--- a/drivers/net/axgbe/axgbe_ethdev.c
++++ b/drivers/net/axgbe/axgbe_ethdev.c
+@@ -172,6 +172,7 @@ static struct axgbe_version_data axgbe_v2a = {
+ 	.tx_tstamp_workaround		= 1,
+ 	.ecc_support			= 1,
+ 	.i2c_support			= 1,
++	.an_cdr_workaround		= 1,
+ };
+ 
+ static struct axgbe_version_data axgbe_v2b = {
+@@ -183,6 +184,7 @@ static struct axgbe_version_data axgbe_v2b = {
+ 	.tx_tstamp_workaround		= 1,
+ 	.ecc_support			= 1,
+ 	.i2c_support			= 1,
++	.an_cdr_workaround		= 1,
+ };
+ 
+ static const struct rte_eth_desc_lim rx_desc_lim = {
+diff --git a/drivers/net/axgbe/axgbe_ethdev.h b/drivers/net/axgbe/axgbe_ethdev.h
+index 91260ca..4d5e6e5 100644
+--- a/drivers/net/axgbe/axgbe_ethdev.h
++++ b/drivers/net/axgbe/axgbe_ethdev.h
+@@ -459,6 +459,10 @@ struct axgbe_phy_impl_if {
+ 	/* Process results of auto-negotiation */
+ 	enum axgbe_mode (*an_outcome)(struct axgbe_port *);
+ 
++	/* Pre/Post auto-negotiation support */
++	void (*an_pre)(struct axgbe_port *port);
++	void (*an_post)(struct axgbe_port *port);
++
+ 	/* Pre/Post KR training enablement support */
+ 	void (*kr_training_pre)(struct axgbe_port *);
+ 	void (*kr_training_post)(struct axgbe_port *);
+@@ -553,6 +557,7 @@ struct axgbe_version_data {
+ 	unsigned int tx_tstamp_workaround;
+ 	unsigned int ecc_support;
+ 	unsigned int i2c_support;
++	unsigned int an_cdr_workaround;
+ };
+ 
+ /*
+@@ -572,6 +577,7 @@ struct axgbe_port {
+ 	void *xprop_regs;	/* AXGBE property registers */
+ 	void *xi2c_regs;	/* AXGBE I2C CSRs */
+ 
++	bool cdr_track_early;
+ 	/* XPCS indirect addressing lock */
+ 	unsigned int xpcs_window_def_reg;
+ 	unsigned int xpcs_window_sel_reg;
+diff --git a/drivers/net/axgbe/axgbe_mdio.c b/drivers/net/axgbe/axgbe_mdio.c
+index 07f4087..5f629f5 100644
+--- a/drivers/net/axgbe/axgbe_mdio.c
++++ b/drivers/net/axgbe/axgbe_mdio.c
+@@ -409,10 +409,14 @@ static void axgbe_an73_disable(struct axgbe_port *pdata)
+ {
+ 	axgbe_an73_set(pdata, false, false);
+ 	axgbe_an73_disable_interrupts(pdata);
++	pdata->an_start = 0;
+ }
+ 
+ static void axgbe_an_restart(struct axgbe_port *pdata)
+ {
++	if (pdata->phy_if.phy_impl.an_pre)
++		pdata->phy_if.phy_impl.an_pre(pdata);
++
+ 	switch (pdata->an_mode) {
+ 	case AXGBE_AN_MODE_CL73:
+ 	case AXGBE_AN_MODE_CL73_REDRV:
+@@ -429,6 +433,9 @@ static void axgbe_an_restart(struct axgbe_port *pdata)
+ 
+ static void axgbe_an_disable(struct axgbe_port *pdata)
+ {
++	if (pdata->phy_if.phy_impl.an_post)
++		pdata->phy_if.phy_impl.an_post(pdata);
++
+ 	switch (pdata->an_mode) {
+ 	case AXGBE_AN_MODE_CL73:
+ 	case AXGBE_AN_MODE_CL73_REDRV:
+@@ -604,9 +611,9 @@ static enum axgbe_an axgbe_an73_incompat_link(struct axgbe_port *pdata)
+ 			return AXGBE_AN_NO_LINK;
+ 	}
+ 
+-	axgbe_an73_disable(pdata);
++	axgbe_an_disable(pdata);
+ 	axgbe_switch_mode(pdata);
+-	axgbe_an73_restart(pdata);
++	axgbe_an_restart(pdata);
+ 
+ 	return AXGBE_AN_INCOMPAT_LINK;
+ }
+@@ -675,6 +682,8 @@ static void axgbe_an73_state_machine(struct axgbe_port *pdata)
+ 		pdata->kr_state = AXGBE_RX_BPA;
+ 		pdata->kx_state = AXGBE_RX_BPA;
+ 		pdata->an_start = 0;
++		if (pdata->phy_if.phy_impl.an_post)
++			pdata->phy_if.phy_impl.an_post(pdata);
+ 	}
+ 
+ 	if (cur_state != pdata->an_state)
+diff --git a/drivers/net/axgbe/axgbe_phy_impl.c b/drivers/net/axgbe/axgbe_phy_impl.c
+index 5f69651..d9c7dc4 100644
+--- a/drivers/net/axgbe/axgbe_phy_impl.c
++++ b/drivers/net/axgbe/axgbe_phy_impl.c
+@@ -153,6 +153,11 @@
+ /* Rate-change complete wait/retry count */
+ #define AXGBE_RATECHANGE_COUNT		500
+ 
++/* CDR delay values for KR support (in usec) */
++#define AXGBE_CDR_DELAY_INIT		10000
++#define AXGBE_CDR_DELAY_INC		10000
++#define AXGBE_CDR_DELAY_MAX		100000
++
+ enum axgbe_port_mode {
+ 	AXGBE_PORT_MODE_RSVD = 0,
+ 	AXGBE_PORT_MODE_BACKPLANE,
+@@ -359,6 +364,10 @@ struct axgbe_phy_data {
+ 	unsigned int redrv_addr;
+ 	unsigned int redrv_lane;
+ 	unsigned int redrv_model;
++
++	/* KR AN support */
++	unsigned int phy_cdr_notrack;
++	unsigned int phy_cdr_delay;
+ };
+ 
+ static enum axgbe_an_mode axgbe_phy_an_mode(struct axgbe_port *pdata);
+@@ -1888,6 +1897,100 @@ static bool axgbe_phy_port_enabled(struct axgbe_port *pdata)
+ 	return true;
+ }
+ 
++static void axgbe_phy_cdr_track(struct axgbe_port *pdata)
++{
++	struct axgbe_phy_data *phy_data = pdata->phy_data;
++
++	if (!pdata->vdata->an_cdr_workaround)
++		return;
++
++	if (!phy_data->phy_cdr_notrack)
++		return;
++
++	rte_delay_us(phy_data->phy_cdr_delay + 400);
++
++	XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_VEND2_PMA_CDR_CONTROL,
++			 AXGBE_PMA_CDR_TRACK_EN_MASK,
++			 AXGBE_PMA_CDR_TRACK_EN_ON);
++
++	phy_data->phy_cdr_notrack = 0;
++}
++
++static void axgbe_phy_cdr_notrack(struct axgbe_port *pdata)
++{
++	struct axgbe_phy_data *phy_data = pdata->phy_data;
++
++	if (!pdata->vdata->an_cdr_workaround)
++		return;
++
++	if (phy_data->phy_cdr_notrack)
++		return;
++
++	XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_VEND2_PMA_CDR_CONTROL,
++			 AXGBE_PMA_CDR_TRACK_EN_MASK,
++			 AXGBE_PMA_CDR_TRACK_EN_OFF);
++
++	axgbe_phy_rrc(pdata);
++
++	phy_data->phy_cdr_notrack = 1;
++}
++
++static void axgbe_phy_kr_training_post(struct axgbe_port *pdata)
++{
++	if (!pdata->cdr_track_early)
++		axgbe_phy_cdr_track(pdata);
++}
++
++static void axgbe_phy_kr_training_pre(struct axgbe_port *pdata)
++{
++	if (pdata->cdr_track_early)
++		axgbe_phy_cdr_track(pdata);
++}
++
++static void axgbe_phy_an_post(struct axgbe_port *pdata)
++{
++	struct axgbe_phy_data *phy_data = pdata->phy_data;
++
++	switch (pdata->an_mode) {
++	case AXGBE_AN_MODE_CL73:
++	case AXGBE_AN_MODE_CL73_REDRV:
++		if (phy_data->cur_mode != AXGBE_MODE_KR)
++			break;
++
++		axgbe_phy_cdr_track(pdata);
++
++		switch (pdata->an_result) {
++		case AXGBE_AN_READY:
++		case AXGBE_AN_COMPLETE:
++			break;
++		default:
++			if (phy_data->phy_cdr_delay < AXGBE_CDR_DELAY_MAX)
++				phy_data->phy_cdr_delay += AXGBE_CDR_DELAY_INC;
++			break;
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++static void axgbe_phy_an_pre(struct axgbe_port *pdata)
++{
++	struct axgbe_phy_data *phy_data = pdata->phy_data;
++
++	switch (pdata->an_mode) {
++	case AXGBE_AN_MODE_CL73:
++	case AXGBE_AN_MODE_CL73_REDRV:
++		if (phy_data->cur_mode != AXGBE_MODE_KR)
++			break;
++
++		axgbe_phy_cdr_notrack(pdata);
++		break;
++	default:
++		break;
++	}
++}
++
+ static void axgbe_phy_stop(struct axgbe_port *pdata)
+ {
+ 	struct axgbe_phy_data *phy_data = pdata->phy_data;
+@@ -1896,6 +1999,9 @@ static void axgbe_phy_stop(struct axgbe_port *pdata)
+ 	axgbe_phy_sfp_reset(phy_data);
+ 	axgbe_phy_sfp_mod_absent(pdata);
+ 
++	/* Reset CDR support */
++	axgbe_phy_cdr_track(pdata);
++
+ 	/* Power off the PHY */
+ 	axgbe_phy_power_off(pdata);
+ 
+@@ -1916,6 +2022,9 @@ static int axgbe_phy_start(struct axgbe_port *pdata)
+ 	/* Start in highest supported mode */
+ 	axgbe_phy_set_mode(pdata, phy_data->start_mode);
+ 
++	/* Reset CDR support */
++	axgbe_phy_cdr_track(pdata);
++
+ 	/* After starting the I2C controller, we can check for an SFP */
+ 	switch (phy_data->port_mode) {
+ 	case AXGBE_PORT_MODE_SFP:
+@@ -2173,6 +2282,8 @@ static int axgbe_phy_init(struct axgbe_port *pdata)
+ 			return -EINVAL;
+ 		}
+ 	}
++
++	phy_data->phy_cdr_delay = AXGBE_CDR_DELAY_INIT;
+ 	return 0;
+ }
+ void axgbe_init_function_ptrs_phy_v2(struct axgbe_phy_if *phy_if)
+@@ -2193,4 +2304,10 @@ void axgbe_init_function_ptrs_phy_v2(struct axgbe_phy_if *phy_if)
+ 	phy_impl->an_config		= axgbe_phy_an_config;
+ 	phy_impl->an_advertising	= axgbe_phy_an_advertising;
+ 	phy_impl->an_outcome		= axgbe_phy_an_outcome;
++
++	phy_impl->an_pre		= axgbe_phy_an_pre;
++	phy_impl->an_post		= axgbe_phy_an_post;
++
++	phy_impl->kr_training_pre	= axgbe_phy_kr_training_pre;
++	phy_impl->kr_training_post	= axgbe_phy_kr_training_post;
+ }
