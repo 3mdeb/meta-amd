@@ -1,7 +1,5 @@
 #!/bin/sh
 
-export DISPLAY=:0
-
 declare -a connectedPorts=($(xrandr | grep " connected" | sed 's/ connected.*//'))
 for i in "${!connectedPorts[@]}"; do
     if [ $i -eq 0 ]; then
