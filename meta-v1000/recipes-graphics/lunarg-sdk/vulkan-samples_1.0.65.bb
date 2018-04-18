@@ -3,7 +3,7 @@ DESCRIPTION = "This project is a collection \
                of Vulkan C++ sample applications."
 SECTION = "graphics"
 HOMEPAGE = "https://github.com/LunarG/VulkanSamples"
-DEPENDS = "vulkan-loader-layers glslang"
+DEPENDS = "vulkan-loader-layers glslang glslang-native libxkbcommon"
 
 inherit cmake python3native
 
