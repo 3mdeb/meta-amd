@@ -30,10 +30,6 @@ do_install_append_amd () {
 PACKAGES_prepend_amd = "${PN}-test "
 FILES_${PN}-test_amd = "${bindir}/omxvolcontroltest ${bindir}/omxaudiomixertest ${bindir}/omxrmtest"
 
-pkg_postinst_${PN}_amd () {
-    if test -n "$D"; then
-        exit 1
-    else
-        OMX_BELLAGIO_REGISTRY=${ROOT_HOME}/.omxregister ${bindir}/omxregister-bellagio -v
-    fi
+pkg_postinst_ontarget_${PN}_amd () {
+    OMX_BELLAGIO_REGISTRY=${ROOT_HOME}/.omxregister ${bindir}/omxregister-bellagio -v
 }
