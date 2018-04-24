@@ -1,0 +1,903 @@
+From patchwork Fri Mar  9 08:42:24 2018
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+Subject: [dpdk-dev, v3,
+ 08/18] net/axgbe: add transmit and receive queue setup apis
+From: Ravi Kumar <ravi1.kumar@amd.com>
+X-Patchwork-Id: 35827
+X-Patchwork-Delegate: ferruh.yigit@intel.com
+Message-Id: <1520584954-130575-8-git-send-email-Ravi1.kumar@amd.com>
+List-Id: dev.dpdk.org
+To: dev@dpdk.org
+Cc: ferruh.yigit@intel.com
+Date: Fri,  9 Mar 2018 03:42:24 -0500
+
+Signed-off-by: Ravi Kumar <Ravi1.kumar@amd.com>
+---
+ drivers/net/axgbe/Makefile       |   1 +
+ drivers/net/axgbe/axgbe_ethdev.c |  81 +++++++++
+ drivers/net/axgbe/axgbe_ethdev.h |  36 ++++
+ drivers/net/axgbe/axgbe_rxtx.c   | 363 +++++++++++++++++++++++++++++++++++++++
+ drivers/net/axgbe/axgbe_rxtx.h   | 289 +++++++++++++++++++++++++++++++
+ 5 files changed, 770 insertions(+)
+ create mode 100644 drivers/net/axgbe/axgbe_rxtx.c
+ create mode 100644 drivers/net/axgbe/axgbe_rxtx.h
+
+diff --git a/drivers/net/axgbe/Makefile b/drivers/net/axgbe/Makefile
+index a8f3358..d030530 100644
+--- a/drivers/net/axgbe/Makefile
++++ b/drivers/net/axgbe/Makefile
+@@ -146,5 +146,6 @@ SRCS-$(CONFIG_RTE_LIBRTE_AXGBE_PMD) += axgbe_dev.c
+ SRCS-$(CONFIG_RTE_LIBRTE_AXGBE_PMD) += axgbe_mdio.c
+ SRCS-$(CONFIG_RTE_LIBRTE_AXGBE_PMD) += axgbe_phy_impl.c
+ SRCS-$(CONFIG_RTE_LIBRTE_AXGBE_PMD) += axgbe_i2c.c
++SRCS-$(CONFIG_RTE_LIBRTE_AXGBE_PMD) += axgbe_rxtx.c
+ 
+ include $(RTE_SDK)/mk/rte.lib.mk
+diff --git a/drivers/net/axgbe/axgbe_ethdev.c b/drivers/net/axgbe/axgbe_ethdev.c
+index daea0b2..ee1e48d 100644
+--- a/drivers/net/axgbe/axgbe_ethdev.c
++++ b/drivers/net/axgbe/axgbe_ethdev.c
+@@ -125,6 +125,7 @@
+  *   THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include "axgbe_rxtx.h"
+ #include "axgbe_ethdev.h"
+ #include "axgbe_common.h"
+ #include "axgbe_phy.h"
+@@ -132,6 +133,9 @@
+ static int eth_axgbe_dev_init(struct rte_eth_dev *eth_dev);
+ static int eth_axgbe_dev_uninit(struct rte_eth_dev *eth_dev);
+ static void axgbe_dev_interrupt_handler(void *param);
++static void axgbe_dev_close(struct rte_eth_dev *dev);
++static void axgbe_dev_info_get(struct rte_eth_dev *dev,
++			       struct rte_eth_dev_info *dev_info);
+ 
+ /* The set of PCI devices this driver supports */
+ #define AMD_PCI_VENDOR_ID       0x1022
+@@ -169,6 +173,27 @@ static struct axgbe_version_data axgbe_v2b = {
+ 	.i2c_support			= 1,
+ };
+ 
++static const struct rte_eth_desc_lim rx_desc_lim = {
++	.nb_max = AXGBE_MAX_RING_DESC,
++	.nb_min = AXGBE_MIN_RING_DESC,
++	.nb_align = 8,
++};
++
++static const struct rte_eth_desc_lim tx_desc_lim = {
++	.nb_max = AXGBE_MAX_RING_DESC,
++	.nb_min = AXGBE_MIN_RING_DESC,
++	.nb_align = 8,
++};
++
++static const struct eth_dev_ops axgbe_eth_dev_ops = {
++	.dev_close            = axgbe_dev_close,
++	.dev_infos_get        = axgbe_dev_info_get,
++	.rx_queue_setup       = axgbe_dev_rx_queue_setup,
++	.rx_queue_release     = axgbe_dev_rx_queue_release,
++	.tx_queue_setup       = axgbe_dev_tx_queue_setup,
++	.tx_queue_release     = axgbe_dev_tx_queue_release,
++};
++
+ /*
+  * Interrupt handler triggered by NIC  for handling
+  * specific interrupt.
+@@ -193,6 +218,57 @@ axgbe_dev_interrupt_handler(void *param)
+ 	rte_intr_enable(&pdata->pci_dev->intr_handle);
+ }
+ 
++/* Clear all resources like TX/RX queues. */
++static void
++axgbe_dev_close(struct rte_eth_dev *dev)
++{
++	axgbe_dev_clear_queues(dev);
++}
++
++static void
++axgbe_dev_info_get(struct rte_eth_dev *dev,
++		   struct rte_eth_dev_info *dev_info)
++{
++	struct axgbe_port *pdata = dev->data->dev_private;
++
++	dev_info->pci_dev = RTE_ETH_DEV_TO_PCI(dev);
++	dev_info->max_rx_queues = pdata->tx_ring_count;
++	dev_info->max_tx_queues = pdata->rx_ring_count;
++	dev_info->min_rx_bufsize = AXGBE_RX_MIN_BUF_SIZE;
++	dev_info->max_rx_pktlen = AXGBE_RX_MAX_BUF_SIZE;
++	dev_info->max_mac_addrs = AXGBE_MAX_MAC_ADDRS;
++	dev_info->speed_capa =  ETH_LINK_SPEED_10G;
++
++	dev_info->rx_offload_capa =
++		DEV_RX_OFFLOAD_IPV4_CKSUM |
++		DEV_RX_OFFLOAD_UDP_CKSUM  |
++		DEV_RX_OFFLOAD_TCP_CKSUM;
++
++	dev_info->tx_offload_capa =
++		DEV_TX_OFFLOAD_IPV4_CKSUM  |
++		DEV_TX_OFFLOAD_UDP_CKSUM   |
++		DEV_TX_OFFLOAD_TCP_CKSUM;
++
++	if (pdata->hw_feat.rss) {
++		dev_info->flow_type_rss_offloads = AXGBE_RSS_OFFLOAD;
++		dev_info->reta_size = pdata->hw_feat.hash_table_size;
++		dev_info->hash_key_size =  AXGBE_RSS_HASH_KEY_SIZE;
++	}
++
++	dev_info->rx_desc_lim = rx_desc_lim;
++	dev_info->tx_desc_lim = tx_desc_lim;
++
++	dev_info->default_rxconf = (struct rte_eth_rxconf) {
++		.rx_free_thresh = AXGBE_RX_FREE_THRESH,
++	};
++
++	dev_info->default_txconf = (struct rte_eth_txconf) {
++		.tx_free_thresh = AXGBE_TX_FREE_THRESH,
++		.txq_flags = ETH_TXQ_FLAGS_NOMULTSEGS |
++				ETH_TXQ_FLAGS_NOOFFLOADS,
++	};
++}
++
+ static void axgbe_get_all_hw_features(struct axgbe_port *pdata)
+ {
+ 	unsigned int mac_hfr0, mac_hfr1, mac_hfr2;
+@@ -377,6 +453,7 @@ eth_axgbe_dev_init(struct rte_eth_dev *eth_dev)
+ 	axgbe_set_bit(AXGBE_DOWN, &pdata->dev_state);
+ 	axgbe_set_bit(AXGBE_STOPPED, &pdata->dev_state);
+ 	pdata->eth_dev = eth_dev;
++	eth_dev->dev_ops = &axgbe_eth_dev_ops;
+ 
+ 	/*
+ 	 * For secondary processes, we don't initialise any further as primary
+@@ -483,6 +560,8 @@ eth_axgbe_dev_init(struct rte_eth_dev *eth_dev)
+ 	if (!pdata->rx_max_fifo_size)
+ 		pdata->rx_max_fifo_size = pdata->hw_feat.rx_fifo_size;
+ 
++	pdata->tx_desc_count = AXGBE_MAX_RING_DESC;
++	pdata->rx_desc_count = AXGBE_MAX_RING_DESC;
+ 	pthread_mutex_init(&pdata->xpcs_mutex, NULL);
+ 	pthread_mutex_init(&pdata->i2c_mutex, NULL);
+ 	pthread_mutex_init(&pdata->an_mutex, NULL);
+@@ -518,6 +597,8 @@ eth_axgbe_dev_uninit(struct rte_eth_dev *eth_dev)
+ 	/*Free macaddres*/
+ 	rte_free(eth_dev->data->mac_addrs);
+ 	eth_dev->data->mac_addrs = NULL;
++	eth_dev->dev_ops = NULL;
++	axgbe_dev_clear_queues(eth_dev);
+ 
+ 	/* disable uio intr before callback unregister */
+ 	rte_intr_disable(&pci_dev->intr_handle);
+diff --git a/drivers/net/axgbe/axgbe_ethdev.h b/drivers/net/axgbe/axgbe_ethdev.h
+index 6cddb57..4091d1a 100644
+--- a/drivers/net/axgbe/axgbe_ethdev.h
++++ b/drivers/net/axgbe/axgbe_ethdev.h
+@@ -132,6 +132,16 @@
+ #include <rte_lcore.h>
+ #include "axgbe_common.h"
+ 
++#define IRQ				0xff
++#define VLAN_HLEN			4
++
++#define AXGBE_TX_MAX_BUF_SIZE		(0x3fff & ~(64 - 1))
++#define AXGBE_RX_MAX_BUF_SIZE		(0x3fff & ~(64 - 1))
++#define AXGBE_RX_MIN_BUF_SIZE		(ETHER_MAX_LEN + VLAN_HLEN)
++#define AXGBE_MAX_MAC_ADDRS		1
++
++#define AXGBE_RX_BUF_ALIGN		64
++
+ #define AXGBE_MAX_DMA_CHANNELS		16
+ #define AXGBE_MAX_QUEUES		16
+ #define AXGBE_PRIORITY_QUEUES		8
+@@ -147,6 +157,23 @@
+ #define AXGBE_DMA_SYS_ARCACHE		0x0
+ #define AXGBE_DMA_SYS_AWCACHE		0x0
+ 
++/* DMA channel interrupt modes */
++#define AXGBE_IRQ_MODE_EDGE		0
++#define AXGBE_IRQ_MODE_LEVEL		1
++
++#define AXGBE_DMA_INTERRUPT_MASK	0x31c7
++
++#define AXGMAC_MIN_PACKET		60
++#define AXGMAC_STD_PACKET_MTU		1500
++#define AXGMAC_MAX_STD_PACKET		1518
++#define AXGMAC_JUMBO_PACKET_MTU		9000
++#define AXGMAC_MAX_JUMBO_PACKET		9018
++/* Inter-frame gap + preamble */
++#define AXGMAC_ETH_PREAMBLE		(12 + 8)
++
++#define AXGMAC_PFC_DATA_LEN		46
++#define AXGMAC_PFC_DELAYS		14000
++
+ /* PCI BAR mapping */
+ #define AXGBE_AXGMAC_BAR		0
+ #define AXGBE_XPCS_BAR			1
+@@ -630,6 +657,10 @@ struct axgbe_port {
+ 
+ 	struct ether_addr mac_addr;
+ 
++	/* Software Tx/Rx structure pointers*/
++	void **rx_queues;
++	void **tx_queues;
++
+ 	/* MDIO/PHY related settings */
+ 	unsigned int phy_started;
+ 	void *phy_data;
+@@ -656,6 +687,11 @@ struct axgbe_port {
+ 	/* I2C support */
+ 	struct axgbe_i2c i2c;
+ 	volatile int i2c_complete;
++
++	/* CRC stripping by H/w for Rx packet*/
++	int crc_strip_enable;
++	/* csum enable to hardware */
++	uint32_t rx_csum_enable;
+ };
+ 
+ void axgbe_init_function_ptrs_dev(struct axgbe_hw_if *hw_if);
+diff --git a/drivers/net/axgbe/axgbe_rxtx.c b/drivers/net/axgbe/axgbe_rxtx.c
+new file mode 100644
+index 0000000..64065e8
+--- /dev/null
++++ b/drivers/net/axgbe/axgbe_rxtx.c
+@@ -0,0 +1,363 @@
++/*-
++ *   Copyright(c) 2017 Advanced Micro Devices, Inc.
++ *   All rights reserved.
++ *
++ *   AMD 10Gb Ethernet driver
++ *
++ *   This file is available to you under your choice of the following two
++ *   licenses:
++ *
++ *   License 1: GPLv2
++ *
++ *   Copyright (c) 2017 Advanced Micro Devices, Inc.
++ *
++ *   This file is free software; you may copy, redistribute and/or modify
++ *   it under the terms of the GNU General Public License as published by
++ *   the Free Software Foundation, either version 2 of the License, or
++ *   (at your option) any later version.
++ *
++ *   This file is distributed in the hope that it will be useful, but
++ *   WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ *   General Public License for more details.
++ *
++ *   You should have received a copy of the GNU General Public License
++ *   along with this program. If not, see <http://www.gnu.org/licenses/>.
++ *
++ *   This file incorporates work covered by the following copyright and
++ *   permission notice:
++ *
++ *   Copyright (c) 2013 Synopsys, Inc.
++ *
++ *   The Synopsys DWC ETHER XGMAC Software Driver and documentation
++ *   (hereinafter "Software") is an unsupported proprietary work of Synopsys,
++ *   Inc. unless otherwise expressly agreed to in writing between Synopsys
++ *   and you.
++ *
++ *   The Software IS NOT an item of Licensed Software or Licensed Product
++ *   under any End User Software License Agreement or Agreement for Licensed
++ *   Product with Synopsys or any supplement thereto. Permission is hereby
++ *   granted, free of charge, to any person obtaining a copy of this software
++ *   annotated with this license and the Software, to deal in the Software
++ *   without restriction, including without limitation the rights to use,
++ *   copy, modify, merge, publish, distribute, sublicense, and/or sell copies
++ *   of the Software, and to permit persons to whom the Software is furnished
++ *   to do so, subject to the following conditions:
++ *
++ *   The above copyright notice and this permission notice shall be included
++ *   in all copies or substantial portions of the Software.
++ *
++ *   THIS SOFTWARE IS BEING DISTRIBUTED BY SYNOPSYS SOLELY ON AN "AS IS"
++ *   BASIS AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ *   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ *   PARTICULAR PURPOSE ARE HEREBY DISCLAIMED. IN NO EVENT SHALL SYNOPSYS
++ *   BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ *   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ *   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ *   INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ *   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ *   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++ *   THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ *   License 2: Modified BSD
++ *
++ *   Copyright (c) 2017 Advanced Micro Devices, Inc.
++ *   All rights reserved.
++ *
++ *   Redistribution and use in source and binary forms, with or without
++ *   modification, are permitted provided that the following conditions
++ *   are met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *       notice, this list of conditions and the following disclaimer in the
++ *       documentation and/or other materials provided with the distribution.
++ *     * Neither the name of Advanced Micro Devices, Inc. nor the
++ *       names of its contributors may be used to endorse or promote products
++ *       derived from this software without specific prior written permission.
++ *
++ *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
++ *   <COPYRIGHT HOLDER> BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ *   This file incorporates work covered by the following copyright and
++ *   permission notice:
++ *
++ *   Copyright (c) 2013 Synopsys, Inc.
++ *
++ *   The Synopsys DWC ETHER XGMAC Software Driver and documentation
++ *   (hereinafter "Software") is an unsupported proprietary work of Synopsys,
++ *   Inc. unless otherwise expressly agreed to in writing between Synopsys
++ *   and you.
++ *
++ *   The Software IS NOT an item of Licensed Software or Licensed Product
++ *   under any End User Software License Agreement or Agreement for Licensed
++ *   Product with Synopsys or any supplement thereto. Permission is hereby
++ *   granted, free of charge, to any person obtaining a copy of this software
++ *   annotated with this license and the Software, to deal in the Software
++ *   without restriction, including without limitation the rights to use,
++ *   copy, modify, merge, publish, distribute, sublicense, and/or sell copies
++ *   of the Software, and to permit persons to whom the Software is furnished
++ *   to do so, subject to the following conditions:
++ *
++ *   The above copyright notice and this permission notice shall be included
++ *   in all copies or substantial portions of the Software.
++ *
++ *   THIS SOFTWARE IS BEING DISTRIBUTED BY SYNOPSYS SOLELY ON AN "AS IS"
++ *   BASIS AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ *   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ *   PARTICULAR PURPOSE ARE HEREBY DISCLAIMED. IN NO EVENT SHALL SYNOPSYS
++ *   BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ *   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ *   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ *   INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ *   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ *   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++ *   THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "axgbe_ethdev.h"
++#include "axgbe_rxtx.h"
++#include "axgbe_phy.h"
++
++#include <rte_time.h>
++#include <rte_mempool.h>
++#include <rte_mbuf.h>
++
++static void
++axgbe_rx_queue_release(struct axgbe_rx_queue *rx_queue)
++{
++	uint16_t i;
++	struct rte_mbuf **sw_ring;
++
++	if (rx_queue) {
++		sw_ring = rx_queue->sw_ring;
++		if (sw_ring) {
++			for (i = 0; i < rx_queue->nb_desc; i++) {
++				if (sw_ring[i])
++					rte_pktmbuf_free(sw_ring[i]);
++			}
++			rte_free(sw_ring);
++		}
++		rte_free(rx_queue);
++	}
++}
++
++void axgbe_dev_rx_queue_release(void *rxq)
++{
++	axgbe_rx_queue_release(rxq);
++}
++
++int axgbe_dev_rx_queue_setup(struct rte_eth_dev *dev, uint16_t queue_idx,
++			     uint16_t nb_desc, unsigned int socket_id,
++			     const struct rte_eth_rxconf *rx_conf,
++			     struct rte_mempool *mp)
++{
++	PMD_INIT_FUNC_TRACE();
++	uint32_t size;
++	const struct rte_memzone *dma;
++	struct axgbe_rx_queue *rxq;
++	uint32_t rx_desc = nb_desc;
++	struct axgbe_port *pdata =  dev->data->dev_private;
++
++	/*
++	 * validate Rx descriptors count
++	 * should be power of 2 and less than h/w supported
++	 */
++	if ((!rte_is_power_of_2(rx_desc)) ||
++	    rx_desc > pdata->rx_desc_count)
++		return -EINVAL;
++	/* First allocate the rx queue data structure */
++	rxq = rte_zmalloc_socket("ethdev RX queue",
++				 sizeof(struct axgbe_rx_queue),
++				 RTE_CACHE_LINE_SIZE, socket_id);
++	if (!rxq) {
++		PMD_INIT_LOG(ERR, "rte_zmalloc for rxq failed!");
++		return -ENOMEM;
++	}
++
++	rxq->cur = 0;
++	rxq->dirty = 0;
++	rxq->pdata = pdata;
++	rxq->mb_pool = mp;
++	rxq->queue_id = queue_idx;
++	rxq->port_id = dev->data->port_id;
++	rxq->nb_desc = rx_desc;
++	rxq->dma_regs = pdata->xgmac_regs + DMA_CH_BASE +
++		(DMA_CH_INC * rxq->queue_id);
++	rxq->dma_tail_reg = (volatile uint32_t *)(rxq->dma_regs +
++						  DMA_CH_RDTR_LO);
++
++	rxq->crc_len = (uint8_t)((dev->data->dev_conf.rxmode.hw_strip_crc) ? 0 :
++				 ETHER_CRC_LEN);
++	/* CRC strip in AXGBE supports per port not per queue */
++	pdata->crc_strip_enable = (rxq->crc_len == 0) ? 1 : 0;
++	rxq->free_thresh = rx_conf->rx_free_thresh ?
++		rx_conf->rx_free_thresh : AXGBE_RX_FREE_THRESH;
++	if (rxq->free_thresh >  rxq->nb_desc)
++		rxq->free_thresh = rxq->nb_desc >> 3;
++
++	/* Allocate RX ring hardware descriptors */
++	size = rxq->nb_desc * sizeof(union axgbe_rx_desc);
++	dma = rte_eth_dma_zone_reserve(dev, "rx_ring", queue_idx, size, 128,
++				       socket_id);
++	if (!dma) {
++		PMD_DRV_LOG(ERR, "ring_dma_zone_reserve for rx_ring failed!");
++		axgbe_rx_queue_release(rxq);
++		return -ENOMEM;
++	}
++	rxq->ring_phys_addr = (uint64_t)dma->phys_addr;
++	rxq->desc = (volatile union axgbe_rx_desc *)dma->addr;
++	memset((void *)rxq->desc, 0, size);
++	/* Allocate software ring */
++	size = rxq->nb_desc * sizeof(struct rte_mbuf *);
++	rxq->sw_ring = rte_zmalloc_socket("sw_ring", size,
++					  RTE_CACHE_LINE_SIZE,
++					  socket_id);
++	if (!rxq->sw_ring) {
++		PMD_DRV_LOG(ERR, "rte_zmalloc for sw_ring failed!");
++		axgbe_rx_queue_release(rxq);
++		return -ENOMEM;
++	}
++	dev->data->rx_queues[queue_idx] = rxq;
++	if (!pdata->rx_queues)
++		pdata->rx_queues = dev->data->rx_queues;
++
++	return 0;
++}
++
++/* Tx Apis */
++static void axgbe_tx_queue_release(struct axgbe_tx_queue *tx_queue)
++{
++	uint16_t i;
++	struct rte_mbuf **sw_ring;
++
++	if (tx_queue) {
++		sw_ring = tx_queue->sw_ring;
++		if (sw_ring) {
++			for (i = 0; i < tx_queue->nb_desc; i++) {
++				if (sw_ring[i])
++					rte_pktmbuf_free(sw_ring[i]);
++			}
++			rte_free(sw_ring);
++		}
++		rte_free(tx_queue);
++	}
++}
++
++void axgbe_dev_tx_queue_release(void *txq)
++{
++	axgbe_tx_queue_release(txq);
++}
++
++int axgbe_dev_tx_queue_setup(struct rte_eth_dev *dev, uint16_t queue_idx,
++			     uint16_t nb_desc, unsigned int socket_id,
++			     const struct rte_eth_txconf *tx_conf)
++{
++	PMD_INIT_FUNC_TRACE();
++	uint32_t tx_desc;
++	struct axgbe_port *pdata;
++	struct axgbe_tx_queue *txq;
++	unsigned int tsize;
++	const struct rte_memzone *tz;
++
++	tx_desc = nb_desc;
++	pdata = (struct axgbe_port *)dev->data->dev_private;
++
++	/*
++	 * validate tx descriptors count
++	 * should be power of 2 and less than h/w supported
++	 */
++	if ((!rte_is_power_of_2(tx_desc)) ||
++	    tx_desc > pdata->tx_desc_count ||
++	    tx_desc < AXGBE_MIN_RING_DESC)
++		return -EINVAL;
++
++	/* First allocate the tx queue data structure */
++	txq = rte_zmalloc("ethdev TX queue", sizeof(struct axgbe_tx_queue),
++			  RTE_CACHE_LINE_SIZE);
++	if (!txq)
++		return -ENOMEM;
++	txq->pdata = pdata;
++
++	txq->nb_desc = tx_desc;
++	txq->free_thresh = tx_conf->tx_free_thresh ?
++		tx_conf->tx_free_thresh : AXGBE_TX_FREE_THRESH;
++	if (txq->free_thresh > txq->nb_desc)
++		txq->free_thresh = (txq->nb_desc >> 1);
++	txq->free_batch_cnt = txq->free_thresh;
++
++	if ((tx_conf->txq_flags & (uint32_t)ETH_TXQ_FLAGS_NOOFFLOADS) !=
++	    ETH_TXQ_FLAGS_NOOFFLOADS) {
++		txq->vector_disable = 1;
++	}
++
++	/* Allocate TX ring hardware descriptors */
++	tsize = txq->nb_desc * sizeof(struct axgbe_tx_desc);
++	tz = rte_eth_dma_zone_reserve(dev, "tx_ring", queue_idx,
++				      tsize, AXGBE_DESC_ALIGN, socket_id);
++	if (!tz) {
++		axgbe_tx_queue_release(txq);
++		return -ENOMEM;
++	}
++	memset(tz->addr, 0, tsize);
++	txq->ring_phys_addr = (uint64_t)tz->phys_addr;
++	txq->desc = tz->addr;
++	txq->queue_id = queue_idx;
++	txq->port_id = dev->data->port_id;
++	txq->dma_regs = pdata->xgmac_regs + DMA_CH_BASE +
++		(DMA_CH_INC * txq->queue_id);
++	txq->dma_tail_reg = (volatile uint32_t *)(txq->dma_regs +
++						  DMA_CH_TDTR_LO);
++	txq->cur = 0;
++	txq->dirty = 0;
++	txq->nb_desc_free = txq->nb_desc;
++	/* Allocate software ring */
++	tsize = txq->nb_desc * sizeof(struct rte_mbuf *);
++	txq->sw_ring = rte_zmalloc("tx_sw_ring", tsize,
++				   RTE_CACHE_LINE_SIZE);
++	if (!txq->sw_ring) {
++		axgbe_tx_queue_release(txq);
++		return -ENOMEM;
++	}
++	dev->data->tx_queues[queue_idx] = txq;
++	if (!pdata->tx_queues)
++		pdata->tx_queues = dev->data->tx_queues;
++
++	return 0;
++}
++
++void axgbe_dev_clear_queues(struct rte_eth_dev *dev)
++{
++	PMD_INIT_FUNC_TRACE();
++	uint8_t i;
++	struct axgbe_rx_queue *rxq;
++	struct axgbe_tx_queue *txq;
++
++	for (i = 0; i < dev->data->nb_rx_queues; i++) {
++		rxq = dev->data->rx_queues[i];
++
++		if (rxq) {
++			axgbe_rx_queue_release(rxq);
++			dev->data->rx_queues[i] = NULL;
++		}
++	}
++
++	for (i = 0; i < dev->data->nb_tx_queues; i++) {
++		txq = dev->data->tx_queues[i];
++
++		if (txq) {
++			axgbe_tx_queue_release(txq);
++			dev->data->tx_queues[i] = NULL;
++		}
++	}
++}
+diff --git a/drivers/net/axgbe/axgbe_rxtx.h b/drivers/net/axgbe/axgbe_rxtx.h
+new file mode 100644
+index 0000000..0d712f7
+--- /dev/null
++++ b/drivers/net/axgbe/axgbe_rxtx.h
+@@ -0,0 +1,289 @@
++/*-
++ *   Copyright(c) 2017 Advanced Micro Devices, Inc.
++ *   All rights reserved.
++ *
++ *   AMD 10Gb Ethernet driver
++ *
++ *   This file is available to you under your choice of the following two
++ *   licenses:
++ *
++ *   License 1: GPLv2
++ *
++ *   Copyright (c) 2017 Advanced Micro Devices, Inc.
++ *
++ *   This file is free software; you may copy, redistribute and/or modify
++ *   it under the terms of the GNU General Public License as published by
++ *   the Free Software Foundation, either version 2 of the License, or
++ *   (at your option) any later version.
++ *
++ *   This file is distributed in the hope that it will be useful, but
++ *   WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ *   General Public License for more details.
++ *
++ *   You should have received a copy of the GNU General Public License
++ *   along with this program. If not, see <http://www.gnu.org/licenses/>.
++ *
++ *   This file incorporates work covered by the following copyright and
++ *   permission notice:
++ *
++ *   Copyright (c) 2013 Synopsys, Inc.
++ *
++ *   The Synopsys DWC ETHER XGMAC Software Driver and documentation
++ *   (hereinafter "Software") is an unsupported proprietary work of Synopsys,
++ *   Inc. unless otherwise expressly agreed to in writing between Synopsys
++ *   and you.
++ *
++ *   The Software IS NOT an item of Licensed Software or Licensed Product
++ *   under any End User Software License Agreement or Agreement for Licensed
++ *   Product with Synopsys or any supplement thereto. Permission is hereby
++ *   granted, free of charge, to any person obtaining a copy of this software
++ *   annotated with this license and the Software, to deal in the Software
++ *   without restriction, including without limitation the rights to use,
++ *   copy, modify, merge, publish, distribute, sublicense, and/or sell copies
++ *   of the Software, and to permit persons to whom the Software is furnished
++ *   to do so, subject to the following conditions:
++ *
++ *   The above copyright notice and this permission notice shall be included
++ *   in all copies or substantial portions of the Software.
++ *
++ *   THIS SOFTWARE IS BEING DISTRIBUTED BY SYNOPSYS SOLELY ON AN "AS IS"
++ *   BASIS AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ *   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ *   PARTICULAR PURPOSE ARE HEREBY DISCLAIMED. IN NO EVENT SHALL SYNOPSYS
++ *   BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ *   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ *   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ *   INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ *   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ *   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++ *   THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ *   License 2: Modified BSD
++ *
++ *   Copyright (c) 2017 Advanced Micro Devices, Inc.
++ *   All rights reserved.
++ *
++ *   Redistribution and use in source and binary forms, with or without
++ *   modification, are permitted provided that the following conditions
++ *   are met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *       notice, this list of conditions and the following disclaimer in the
++ *       documentation and/or other materials provided with the distribution.
++ *     * Neither the name of Advanced Micro Devices, Inc. nor the
++ *       names of its contributors may be used to endorse or promote products
++ *       derived from this software without specific prior written permission.
++ *
++ *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
++ *   <COPYRIGHT HOLDER> BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ *   This file incorporates work covered by the following copyright and
++ *   permission notice:
++ *
++ *   Copyright (c) 2013 Synopsys, Inc.
++ *
++ *   The Synopsys DWC ETHER XGMAC Software Driver and documentation
++ *   (hereinafter "Software") is an unsupported proprietary work of Synopsys,
++ *   Inc. unless otherwise expressly agreed to in writing between Synopsys
++ *   and you.
++ *
++ *   The Software IS NOT an item of Licensed Software or Licensed Product
++ *   under any End User Software License Agreement or Agreement for Licensed
++ *   Product with Synopsys or any supplement thereto. Permission is hereby
++ *   granted, free of charge, to any person obtaining a copy of this software
++ *   annotated with this license and the Software, to deal in the Software
++ *   without restriction, including without limitation the rights to use,
++ *   copy, modify, merge, publish, distribute, sublicense, and/or sell copies
++ *   of the Software, and to permit persons to whom the Software is furnished
++ *   to do so, subject to the following conditions:
++ *
++ *   The above copyright notice and this permission notice shall be included
++ *   in all copies or substantial portions of the Software.
++ *
++ *   THIS SOFTWARE IS BEING DISTRIBUTED BY SYNOPSYS SOLELY ON AN "AS IS"
++ *   BASIS AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ *   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ *   PARTICULAR PURPOSE ARE HEREBY DISCLAIMED. IN NO EVENT SHALL SYNOPSYS
++ *   BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ *   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ *   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ *   INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ *   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ *   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++ *   THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef _AXGBE_RXTX_H_
++#define _AXGBE_RXTX_H_
++
++/* to suppress gcc warnings related to descriptor casting*/
++#ifdef RTE_TOOLCHAIN_GCC
++#pragma GCC diagnostic ignored "-Wcast-qual"
++#endif
++
++#ifdef RTE_TOOLCHAIN_CLANG
++#pragma GCC diagnostic ignored "-Wcast-qual"
++#endif
++
++/* Descriptor related defines */
++#define AXGBE_MAX_RING_DESC		4096 /*should be power of 2*/
++#define AXGBE_TX_DESC_MIN_FREE		(AXGBE_MAX_RING_DESC >> 3)
++#define AXGBE_TX_DESC_MAX_PROC		(AXGBE_MAX_RING_DESC >> 1)
++#define AXGBE_MIN_RING_DESC		32
++#define RTE_AXGBE_DESCS_PER_LOOP	4
++#define RTE_AXGBE_MAX_RX_BURST		32
++
++#define AXGBE_RX_FREE_THRESH		32
++#define AXGBE_TX_FREE_THRESH		32
++
++#define AXGBE_DESC_ALIGN		128
++#define AXGBE_DESC_OWN			0x80000000
++#define AXGBE_ERR_STATUS		0x000f0000
++#define AXGBE_L3_CSUM_ERR		0x00050000
++#define AXGBE_L4_CSUM_ERR		0x00060000
++
++#include "axgbe_common.h"
++
++#define AXGBE_GET_DESC_PT(_queue, _idx)			\
++	(((_queue)->desc) +				\
++	((_idx) & ((_queue)->nb_desc - 1)))
++
++#define AXGBE_GET_DESC_IDX(_queue, _idx)			\
++	((_idx) & ((_queue)->nb_desc - 1))			\
++
++/* Rx desc format */
++union axgbe_rx_desc {
++	struct {
++		uint64_t baddr;
++		uint32_t desc2;
++		uint32_t desc3;
++	} read;
++	struct {
++		uint32_t desc0;
++		uint32_t desc1;
++		uint32_t desc2;
++		uint32_t desc3;
++	} write;
++};
++
++struct axgbe_rx_queue {
++	/* membuf pool for rx buffers */
++	struct rte_mempool *mb_pool;
++	/* H/w Rx buffer size configured in DMA */
++	unsigned int buf_size;
++	/* CRC h/w offload */
++	uint16_t crc_len;
++	/* address of  s/w rx buffers */
++	struct rte_mbuf **sw_ring;
++	/* Port private data */
++	struct axgbe_port *pdata;
++	/* Number of Rx descriptors in queue */
++	uint16_t nb_desc;
++	/* max free RX desc to hold */
++	uint16_t free_thresh;
++	/* Index of descriptor to check for packet availability */
++	uint64_t cur;
++	/* Index of descriptor to check for buffer reallocation */
++	uint64_t dirty;
++	/* Software Rx descriptor ring*/
++	volatile union axgbe_rx_desc *desc;
++	/* Ring physical address */
++	uint64_t ring_phys_addr;
++	/* Dma Channel register address */
++	uint64_t dma_regs;
++	/* Dma channel tail register address*/
++	volatile uint32_t *dma_tail_reg;
++	/* DPDK queue index */
++	uint16_t queue_id;
++	/* dpdk port id*/
++	uint16_t port_id;
++	/* queue stats */
++	uint64_t pkts;
++	uint64_t bytes;
++	uint64_t errors;
++	/* Number of mbufs allocated from pool*/
++	uint64_t mbuf_alloc;
++
++} ____cacheline_aligned;
++
++/*Tx descriptor format */
++struct axgbe_tx_desc {
++	phys_addr_t baddr;
++	uint32_t desc2;
++	uint32_t desc3;
++};
++
++struct axgbe_tx_queue {
++	/* Port private data reference */
++	struct axgbe_port *pdata;
++	/* Number of Tx descriptors in queue*/
++	uint16_t nb_desc;
++	/* Start freeing TX buffers if there are less free descriptors than
++	 * this value
++	 */
++	uint16_t free_thresh;
++	/* Available descriptors for Tx processing*/
++	uint16_t nb_desc_free;
++	/* Batch of mbufs/descs to release */
++	uint16_t free_batch_cnt;
++	/* Flag for vector support */
++	uint16_t vector_disable;
++	/* Index of descriptor to be used for current transfer */
++	uint64_t cur;
++	/* Index of descriptor to check for transfer complete */
++	uint64_t dirty;
++	/* Virtual address of ring */
++	volatile struct axgbe_tx_desc *desc;
++	/* Physical address of ring */
++	uint64_t ring_phys_addr;
++	/* Dma channel register space */
++	uint64_t dma_regs;
++	/* Dma tail register address of ring*/
++	volatile uint32_t *dma_tail_reg;
++	/* Tx queue index/id*/
++	uint16_t queue_id;
++	/* Reference to hold Tx mbufs mapped to Tx descriptors freed
++	 * after transmission confirmation
++	 */
++	struct rte_mbuf **sw_ring;
++	/* dpdk port id*/
++	uint16_t port_id;
++	/* queue stats */
++	uint64_t pkts;
++	uint64_t bytes;
++	uint64_t errors;
++
++} __rte_cache_aligned;
++
++/*Queue related APIs */
++
++/*
++ * RX/TX function prototypes
++ */
++
++
++void axgbe_dev_tx_queue_release(void *txq);
++int  axgbe_dev_tx_queue_setup(struct rte_eth_dev *dev, uint16_t tx_queue_id,
++			      uint16_t nb_tx_desc, unsigned int socket_id,
++			      const struct rte_eth_txconf *tx_conf);
++
++void axgbe_dev_rx_queue_release(void *rxq);
++int  axgbe_dev_rx_queue_setup(struct rte_eth_dev *dev, uint16_t rx_queue_id,
++			      uint16_t nb_rx_desc, unsigned int socket_id,
++			      const struct rte_eth_rxconf *rx_conf,
++			      struct rte_mempool *mb_pool);
++void axgbe_dev_clear_queues(struct rte_eth_dev *dev);
++
++#endif /* _AXGBE_RXTX_H_ */
