@@ -7,6 +7,7 @@ SRCREV_meta_amdx86 ?= "803b8d600e45afa0375459bf599fe365571a3866"
 LINUX_VERSION_amdx86 ?= "4.9.21"
 
 SRC_URI_append_amdx86 += " \
+	file://upstream-backports.scc \
 	file://hid.cfg \
 	file://efi-partition.cfg \
 	file://usb-serial.cfg \
