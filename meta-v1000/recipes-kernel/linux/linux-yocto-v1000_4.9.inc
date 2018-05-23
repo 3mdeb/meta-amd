@@ -7,9 +7,6 @@ SRC_URI_append_v1000 += "file://v1000-user-features.scc \
     file://v1000-gpu-config.cfg \
     file://v1000-extra-config.cfg \
     file://logo.cfg \
-    file://console.cfg \
-    file://drm.cfg \
-    file://sound.cfg \
 "
 
 KERNEL_FEATURES_append_v1000 = " cfg/sound.scc"
