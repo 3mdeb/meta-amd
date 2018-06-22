@@ -34,7 +34,7 @@
 # Add common feartures to be supported for all machines here
 EXTRA_IMAGE_FEATURES += "amd-common-pkgs amd-feature-multimedia"
 
-GSTREAMER_PKGS = " \
+GSTREAMER_PKGS ?= " \
     ${@bb.utils.contains('DISTRO_FEATURES', 'x11',' \
     gstreamer1.0-meta-x11-base \
     gstreamer1.0-meta-audio \
