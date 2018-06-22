@@ -1,3 +1,5 @@
+require conf/machine/include/amd-features.inc
+
 POKY_DEFAULT_DISTRO_FEATURES_remove = "wayland"
 
 PREFERRED_PROVIDER_jpeg ?= "jpeg"
