@@ -34,7 +34,7 @@
 # Add common feartures to be supported for all machines here
 EXTRA_IMAGE_FEATURES += "amd-common-pkgs amd-feature-multimedia"
 
-GST_PACKAGES = " \
+GSTREAMER_PKGS = " \
     ${@bb.utils.contains('DISTRO_FEATURES', 'x11',' \
     gstreamer1.0-meta-x11-base \
     gstreamer1.0-meta-audio \
@@ -43,8 +43,8 @@ GST_PACKAGES = " \
     gstreamer1.0-omx \
     gstreamer1.0-vaapi', '', d)} \
 "
-VULKAN_COMPONENTS ?= ""
-CODEXL_COMPONENTS ?= ""
+VULKAN_PKGS ?= ""
+CODEXL_PKGS ?= ""
 
 # Additional packages can be added to the following feature specific
 # variables from each machine's config file
@@ -58,12 +58,12 @@ FEATURE_PACKAGES_amd-common-pkgs = "\
 "
 
 FEATURE_PACKAGES_amd-feature-multimedia = "\
-    ${@bb.utils.contains("DISTRO", "mel", "${GST_PACKAGES}", "", d)} \
+    ${@bb.utils.contains("DISTRO", "mel", "${GSTREAMER_PKGS}", "", d)} \
     ${AMD_FEATURE_MULTIMEDIA_PKGS} \
 "
 
 FEATURE_PACKAGES_amd-feature-graphics = "\
-    ${@bb.utils.contains("INCLUDE_VULKAN", "yes", "${VULKAN_COMPONENTS}", "", d)} \
+    ${@bb.utils.contains("INCLUDE_VULKAN", "yes", "${VULKAN_PKGS}", "", d)} \
     ${AMD_FEATURE_GRAPHICS_PKGS} \
 "
 FEATURE_PACKAGES_amd-feature-graphics_append_amdgpu = " mesa-demos"
@@ -75,6 +75,6 @@ FEATURE_PACKAGES_amd-feature-networking = "\
 "
 
 FEATURE_PACKAGES_amd-feature-debug-profile = "\
-    ${@bb.utils.contains("INCLUDE_CODEXL", "yes", "${CODEXL_COMPONENTS}", "", d)} \
+    ${@bb.utils.contains("INCLUDE_CODEXL", "yes", "${CODEXL_PKGS}", "", d)} \
     ${AMD_FEATURE_DEBUG_PROFILE_PKGS} \
 "
