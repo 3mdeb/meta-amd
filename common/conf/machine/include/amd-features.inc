@@ -35,13 +35,12 @@
 EXTRA_IMAGE_FEATURES += "amd-common-pkgs amd-feature-multimedia"
 
 GSTREAMER_PKGS ?= " \
-    ${@bb.utils.contains('DISTRO_FEATURES', 'x11',' \
-    gstreamer1.0-meta-x11-base \
-    gstreamer1.0-meta-audio \
+    ${@bb.utils.contains("IMAGE_FEATURES", "x11-base", "gstreamer1.0-meta-x11-base", "", d)} \
+    ${@bb.utils.contains("IMAGE_FEATURES", "tools-audio", "gstreamer1.0-meta-audio", "", d)} \
     gstreamer1.0-meta-debug \
     gstreamer1.0-meta-video \
     gstreamer1.0-omx \
-    gstreamer1.0-vaapi', '', d)} \
+    gstreamer1.0-vaapi \
 "
 VULKAN_PKGS ?= ""
 CODEXL_PKGS ?= ""
