@@ -63,11 +63,11 @@ FEATURE_PACKAGES_amd-feature-multimedia = "\
 "
 
 FEATURE_PACKAGES_amd-feature-graphics = "\
-    ${@bb.utils.contains("INCLUDE_VULKAN", "yes", "${VULKAN_PKGS}", "", d)} \
+    ${@bb.utils.contains("IMAGE_FEATURES", "x11-base", bb.utils.contains("INCLUDE_VULKAN", "yes", "${VULKAN_PKGS}", "", d), "", d)} \
     ${AMD_FEATURE_GRAPHICS_PKGS} \
 "
-FEATURE_PACKAGES_amd-feature-graphics_append_amdgpu = " mesa-demos"
-FEATURE_PACKAGES_amd-feature-graphics_append_radeon = " mesa-demos"
+FEATURE_PACKAGES_amd-feature-graphics_append_amdgpu = " ${@bb.utils.contains("IMAGE_FEATURES", "x11-base", "mesa-demos", "", d)}"
+FEATURE_PACKAGES_amd-feature-graphics_append_radeon = " ${@bb.utils.contains("IMAGE_FEATURES", "x11-base", "mesa-demos", "", d)}"
 
 FEATURE_PACKAGES_amd-feature-networking = "\
     ${@bb.utils.contains("DISTRO", "mel", "${DPDK_PKGS} strongswan", "", d)} \
