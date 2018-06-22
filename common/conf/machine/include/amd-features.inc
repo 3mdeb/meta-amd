@@ -45,6 +45,7 @@ GSTREAMER_PKGS ?= " \
 "
 VULKAN_PKGS ?= ""
 CODEXL_PKGS ?= ""
+DPDK_PKGS ?= ""
 
 # Additional packages can be added to the following feature specific
 # variables from each machine's config file
@@ -70,7 +71,7 @@ FEATURE_PACKAGES_amd-feature-graphics_append_amdgpu = " mesa-demos"
 FEATURE_PACKAGES_amd-feature-graphics_append_radeon = " mesa-demos"
 
 FEATURE_PACKAGES_amd-feature-networking = "\
-    ${@bb.utils.contains("DISTRO", "mel", "dpdk dpdk-examples dpdk-test strongswan", "", d)} \
+    ${@bb.utils.contains("DISTRO", "mel", "${DPDK_PKGS} strongswan", "", d)} \
     ${AMD_FEATURE_NETWORKING_PKGS} \
 "
 
