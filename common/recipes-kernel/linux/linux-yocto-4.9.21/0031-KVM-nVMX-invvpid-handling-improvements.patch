@@ -1,0 +1,102 @@
+From 1d5388c0b1e6eef66d7999451bb22cddf4cc5546 Mon Sep 17 00:00:00 2001
+From: Jan Dakinevich <jan.dakinevich@gmail.com>
+Date: Fri, 23 Feb 2018 11:42:18 +0100
+Subject: [PATCH 31/33] KVM: nVMX: invvpid handling improvements
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit bcdde302b8268ef7dbc4ddbdaffb5b44eafe9a1e upstream
+
+ - Expose all invalidation types to the L1
+
+ - Reject invvpid instruction, if L1 passed zero vpid value to single
+   context invalidations
+
+Signed-off-by: Jan Dakinevich <jan.dakinevich@gmail.com>
+Tested-by: Ladi Prosek <lprosek@redhat.com>
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+[jwang: port to 4.4]
+Signed-off-by: Jack Wang <jinpu.wang@profitbricks.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kvm/vmx.c | 36 ++++++++++++++++++++++++------------
+ 1 file changed, 24 insertions(+), 12 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 85078c7..f6c0568 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -142,6 +142,12 @@ module_param_named(preemption_timer, enable_preemption_timer, bool, S_IRUGO);
+ 
+ #define VMX_MISC_EMULATED_PREEMPTION_TIMER_RATE 5
+ 
++#define VMX_VPID_EXTENT_SUPPORTED_MASK		\
++	(VMX_VPID_EXTENT_INDIVIDUAL_ADDR_BIT |	\
++	VMX_VPID_EXTENT_SINGLE_CONTEXT_BIT |	\
++	VMX_VPID_EXTENT_GLOBAL_CONTEXT_BIT |	\
++	VMX_VPID_EXTENT_SINGLE_NON_GLOBAL_BIT)
++
+ /*
+  * These 2 parameters are used to config the controls for Pause-Loop Exiting:
+  * ple_gap:    upper bound on the amount of time between two successive
+@@ -2836,8 +2842,7 @@ static void nested_vmx_setup_ctls_msrs(struct vcpu_vmx *vmx)
+ 	 */
+ 	if (enable_vpid)
+ 		vmx->nested.nested_vmx_vpid_caps = VMX_VPID_INVVPID_BIT |
+-				VMX_VPID_EXTENT_SINGLE_CONTEXT_BIT |
+-				VMX_VPID_EXTENT_GLOBAL_CONTEXT_BIT;
++			VMX_VPID_EXTENT_SUPPORTED_MASK;
+ 	else
+ 		vmx->nested.nested_vmx_vpid_caps = 0;
+ 
+@@ -7671,7 +7676,8 @@ static int handle_invvpid(struct kvm_vcpu *vcpu)
+ 	vmx_instruction_info = vmcs_read32(VMX_INSTRUCTION_INFO);
+ 	type = kvm_register_readl(vcpu, (vmx_instruction_info >> 28) & 0xf);
+ 
+-	types = (vmx->nested.nested_vmx_vpid_caps >> 8) & 0x7;
++	types = (vmx->nested.nested_vmx_vpid_caps &
++			VMX_VPID_EXTENT_SUPPORTED_MASK) >> 8;
+ 
+ 	if (type >= 32 || !(types & (1 << type))) {
+ 		nested_vmx_failValid(vcpu,
+@@ -7693,21 +7699,27 @@ static int handle_invvpid(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	switch (type) {
++	case VMX_VPID_EXTENT_INDIVIDUAL_ADDR:
+ 	case VMX_VPID_EXTENT_SINGLE_CONTEXT:
+-		/*
+-		 * Old versions of KVM use the single-context version so we
+-		 * have to support it; just treat it the same as all-context.
+-		 */
++	case VMX_VPID_EXTENT_SINGLE_NON_GLOBAL:
++		if (!vpid) {
++			nested_vmx_failValid(vcpu,
++				VMXERR_INVALID_OPERAND_TO_INVEPT_INVVPID);
++			skip_emulated_instruction(vcpu);
++			return 1;
++		}
++		break;
+ 	case VMX_VPID_EXTENT_ALL_CONTEXT:
+-		__vmx_flush_tlb(vcpu, to_vmx(vcpu)->nested.vpid02);
+-		nested_vmx_succeed(vcpu);
+ 		break;
+ 	default:
+-		/* Trap individual address invalidation invvpid calls */
+-		BUG_ON(1);
+-		break;
++		WARN_ON_ONCE(1);
++		skip_emulated_instruction(vcpu);
++		return 1;
+ 	}
+ 
++	__vmx_flush_tlb(vcpu, vmx->nested.vpid02);
++	nested_vmx_succeed(vcpu);
++
+ 	skip_emulated_instruction(vcpu);
+ 	return 1;
+ }
+-- 
+2.7.4
+
