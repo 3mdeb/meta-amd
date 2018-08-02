@@ -6,8 +6,9 @@ HOMEPAGE = "http://llvm.org"
 LICENSE = "NCSA"
 LIC_FILES_CHKSUM = "file://LICENSE.TXT;md5=e825e017edc35cfd58e26116e5251771"
 
-DEPENDS = "libffi libxml2 libxml2-native llvm-common zlib ninja-native"
-RDEPENDS_${PN} += "ncurses-terminfo"
+DEPENDS = "libffi libxml2 zlib ninja-native"
+DEPENDS_append_class-target = " llvm-native"
+RDEPENDS_${PN}_append_class-target = " ncurses-terminfo"
 
 inherit perlnative pythonnative cmake
 
@@ -16,14 +17,14 @@ PROVIDES += "llvm"
 LLVM_RELEASE = "${PV}"
 LLVM_DIR = "llvm${LLVM_RELEASE}"
 
-SRCREV = "99469895318be8283586e314b145d1552cb687c6"
+SRCREV = "089d4c0c490687db6c75f1d074e99c4d42936a50"
 PV = "6.0"
 PATCH_VERSION = "0"
-SRC_URI = "git://llvm.org/git/llvm.git;branch=master;protocol=http \
-           file://0001-CrossCompile.cmake-adjust-build-for-OE.patch \
-           file://0002-CrossCompile.cmake-use-target-BuildVariables-include.patch \
-           file://0003-CMakeLists-don-t-use-a-version-suffix.patch \
-           file://0004-CrossCompile.cmake-strip-sysroot-info-from-build-var.patch \
+SRC_URI = "git://github.com/llvm-mirror/llvm.git;branch=release_60;protocol=http \
+        file://0001-llvm-TargetLibraryInfo-Undefine-libc-functions-if-th.patch \
+        file://0002-llvm-allow-env-override-of-exe-path.patch \
+        file://0001-Disable-generating-a-native-llvm-config.patch \
+        file://0001-llvm-config-allow-overriding-libdir-through-cmdline.patch \
 "
 S = "${WORKDIR}/git"
 
@@ -35,43 +36,38 @@ EXTRA_OECMAKE += "-DLLVM_ENABLE_ASSERTIONS=OFF \
                   -DLLVM_LINK_LLVM_DYLIB=ON \
                   -DLLVM_ENABLE_FFI=ON \
                   -DLLVM_OPTIMIZED_TABLEGEN=ON \
-                  -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86""
+                  -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" \
+                  -G Ninja"
 
-do_configure() {
+EXTRA_OECMAKE_append_class-target = "\
+    -DCMAKE_CROSSCOMPILING:BOOL=ON \
+    -DLLVM_TABLEGEN=${STAGING_BINDIR_NATIVE}/llvm-tblgen${PV} \
+"
+
+EXTRA_OECMAKE_append_class-nativesdk = "\
+    -DCMAKE_CROSSCOMPILING:BOOL=ON \
+    -DLLVM_TABLEGEN=${STAGING_BINDIR_NATIVE}/llvm-tblgen${PV} \
+"
+
+do_configure_prepend() {
     # Fix paths in llvm-config
     sed -i "s|sys::path::parent_path(CurrentPath))\.str()|sys::path::parent_path(sys::path::parent_path(CurrentPath))).str()|g" ${S}/tools/llvm-config/llvm-config.cpp
     sed -ri "s#/(bin|include|lib)(/?\")#/\1/${LLVM_DIR}\2#g" ${S}/tools/llvm-config/llvm-config.cpp
     sed -ri "s#lib/${LLVM_DIR}#${baselib}/${LLVM_DIR}#g" ${S}/tools/llvm-config/llvm-config.cpp
-    cd ${B}
-    cmake \
-      -G Ninja \
-      ${S} \
-      -DCMAKE_INSTALL_PREFIX:PATH=/usr \
-      -DCMAKE_INSTALL_BINDIR:PATH=bin \
-      -DCMAKE_INSTALL_SBINDIR:PATH=sbin \
-      -DCMAKE_INSTALL_LIBEXECDIR:PATH=libexec \
-      -DCMAKE_INSTALL_SYSCONFDIR:PATH=/etc \
-      -DCMAKE_INSTALL_SHAREDSTATEDIR:PATH=../com \
-      -DCMAKE_INSTALL_LOCALSTATEDIR:PATH=/var \
-      -DCMAKE_INSTALL_LIBDIR:PATH=lib64 \
-      -DCMAKE_INSTALL_INCLUDEDIR:PATH=include \
-      -DCMAKE_INSTALL_DATAROOTDIR:PATH=share \
-      -DCMAKE_INSTALL_SO_NO_EXE=0 \
-      -DCMAKE_TOOLCHAIN_FILE=${WORKDIR}/toolchain.cmake \
-      -DCMAKE_VERBOSE_MAKEFILE=1 \
-      -DCMAKE_NO_SYSTEM_FROM_IMPORTED=1 \
-      ${EXTRA_OECMAKE}
 }
 
 do_compile() {
-    cd ${B}
     NINJA_STATUS="[%p] " ninja -v
+}
+
+do_compile_class-native() {
+    NINJA_STATUS="[%p] " ninja -v ${PARALLEL_MAKE} llvm-config llvm-tblgen
 }
 
 do_install() {
     DESTDIR=${LLVM_INSTALL_DIR} ninja -v install
 
-    install ${B}/NATIVE/bin/llvm-config ${LLVM_INSTALL_DIR}/llvm-config-host
+    install -D -m 0755 ${B}/bin/llvm-config ${D}${libdir}/${LLVM_DIR}/llvm-config
 
     install -d ${D}${bindir}/${LLVM_DIR}
     cp -r ${LLVM_INSTALL_DIR}${bindir}/* ${D}${bindir}/${LLVM_DIR}/
@@ -100,11 +96,10 @@ do_install() {
     rm -rf ${D}${libdir}/${LLVM_DIR}/libLTO.so
 }
 
-SYSROOT_PREPROCESS_FUNCS += "llvm_sysroot_preprocess"
-
-llvm_sysroot_preprocess() {
-    install -d ${SYSROOT_DESTDIR}${bindir_crossscripts}
-    cp ${LLVM_INSTALL_DIR}/llvm-config-host ${SYSROOT_DESTDIR}${bindir_crossscripts}/llvm-config${PV}
+do_install_class-native() {
+    install -D -m 0755 ${B}/bin/llvm-tblgen ${D}${bindir}/llvm-tblgen${PV}
+    install -D -m 0755 ${B}/bin/llvm-config ${D}${bindir}/llvm-config${PV}
+    install -D -m 0755 ${B}/lib/libLLVM-${PV}.so ${D}${libdir}/libLLVM-${PV}.so
 }
 
 PACKAGES += "${PN}-bugpointpasses ${PN}-llvmhello"
@@ -161,3 +156,5 @@ python llvm_populate_packages() {
 }
 
 PACKAGESPLITFUNCS_prepend = "llvm_populate_packages "
+
+BBCLASSEXTEND = "native nativesdk"
