@@ -1,0 +1,69 @@
+From 6674d90dfbc5dec20f8214af48a539e17fa2e5f2 Mon Sep 17 00:00:00 2001
+From: Robin Murphy <robin.murphy@arm.com>
+Date: Mon, 16 Jan 2017 13:24:54 +0000
+Subject: [PATCH 4897/5855] iommu/dma: Stop getting dma_32bit_pfn wrong
+
+iommu_dma_init_domain() was originally written under the misconception
+that dma_32bit_pfn represented some sort of size limit for IOVA domains.
+Since the truth is almost the exact opposite of that, rework the logic
+and comments to reflect its real purpose of optimising lookups when
+allocating from a subset of the available 64-bit space.
+
+Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/dma-iommu.c | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/iommu/dma-iommu.c b/drivers/iommu/dma-iommu.c
+index 7195d46..6c6e70c 100644
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -203,6 +203,7 @@ int iommu_dma_init_domain(struct iommu_domain *domain, dma_addr_t base,
+ 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
+ 	struct iova_domain *iovad = &cookie->iovad;
+ 	unsigned long order, base_pfn, end_pfn;
++	bool pci = dev && dev_is_pci(dev);
+ 
+ 	if (!cookie || cookie->type != IOMMU_DMA_IOVA_COOKIE)
+ 		return -EINVAL;
+@@ -225,19 +226,31 @@ int iommu_dma_init_domain(struct iommu_domain *domain, dma_addr_t base,
+ 		end_pfn = min_t(unsigned long, end_pfn,
+ 				domain->geometry.aperture_end >> order);
+ 	}
++	/*
++	 * PCI devices may have larger DMA masks, but still prefer allocating
++	 * within a 32-bit mask to avoid DAC addressing. Such limitations don't
++	 * apply to the typical platform device, so for those we may as well
++	 * leave the cache limit at the top of their range to save an rb_last()
++	 * traversal on every allocation.
++	 */
++	if (pci)
++		end_pfn &= DMA_BIT_MASK(32) >> order;
+ 
+-	/* All we can safely do with an existing domain is enlarge it */
++	/* start_pfn is always nonzero for an already-initialised domain */
+ 	if (iovad->start_pfn) {
+ 		if (1UL << order != iovad->granule ||
+-		    base_pfn != iovad->start_pfn ||
+-		    end_pfn < iovad->dma_32bit_pfn) {
++		    base_pfn != iovad->start_pfn) {
+ 			pr_warn("Incompatible range for DMA domain\n");
+ 			return -EFAULT;
+ 		}
+-		iovad->dma_32bit_pfn = end_pfn;
++		/*
++		 * If we have devices with different DMA masks, move the free
++		 * area cache limit down for the benefit of the smaller one.
++		 */
++		iovad->dma_32bit_pfn = min(end_pfn, iovad->dma_32bit_pfn);
+ 	} else {
+ 		init_iova_domain(iovad, 1UL << order, base_pfn, end_pfn);
+-		if (dev && dev_is_pci(dev))
++		if (pci)
+ 			iova_reserve_pci_windows(to_pci_dev(dev), iovad);
+ 	}
+ 	return 0;
+-- 
+2.7.4
+

@@ -1,0 +1,188 @@
+From 38653d68f9f9730aa3a99c20aca880097a1f4845 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 12 Sep 2017 10:56:17 +0200
+Subject: [PATCH 3141/5855] drm/amdgpu: fix and cleanup amdgpu_bo_create v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We adjusted the BO flags for USWC handling, but those never took effect
+because the placement was passed in instead of generated inside this
+function.
+
+v2: better commit message
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+
+Change-Id: I6aec644160f09b2b2aec24b52107992d55746ddc
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 83 +++++++++---------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h |  8 ---
+ 2 files changed, 23 insertions(+), 68 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 8510c130..84a1e59 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -69,11 +69,12 @@ bool amdgpu_ttm_bo_is_amdgpu_bo(struct ttm_buffer_object *bo)
+ 	return false;
+ }
+ 
+-static void amdgpu_ttm_placement_init(struct amdgpu_device *adev,
+-				      struct ttm_placement *placement,
+-				      struct ttm_place *places,
+-				      u32 domain, u64 flags)
++void amdgpu_ttm_placement_from_domain(struct amdgpu_bo *abo, u32 domain)
+ {
++	struct amdgpu_device *adev = amdgpu_ttm_adev(abo->tbo.bdev);
++	struct ttm_placement *placement = &abo->placement;
++	struct ttm_place *places = abo->placements;
++	u64 flags = abo->flags;
+ 	u32 c = 0, i;
+ 
+ 	if ((domain & AMDGPU_GEM_DOMAIN_DGMA) && amdgpu_direct_gma_size) {
+@@ -176,27 +177,6 @@ static void amdgpu_ttm_placement_init(struct amdgpu_device *adev,
+ 	placement->busy_placement = places;
+ }
+ 
+-void amdgpu_ttm_placement_from_domain(struct amdgpu_bo *abo, u32 domain)
+-{
+-	struct amdgpu_device *adev = amdgpu_ttm_adev(abo->tbo.bdev);
+-
+-	amdgpu_ttm_placement_init(adev, &abo->placement, abo->placements,
+-				  domain, abo->flags);
+-}
+-
+-static void amdgpu_fill_placement_to_bo(struct amdgpu_bo *bo,
+-					struct ttm_placement *placement)
+-{
+-	BUG_ON(placement->num_placement > (AMDGPU_GEM_DOMAIN_MAX + 1));
+-
+-	memcpy(bo->placements, placement->placement,
+-	       placement->num_placement * sizeof(struct ttm_place));
+-	bo->placement.num_placement = placement->num_placement;
+-	bo->placement.num_busy_placement = placement->num_busy_placement;
+-	bo->placement.placement = bo->placements;
+-	bo->placement.busy_placement = bo->placements;
+-}
+-
+ /**
+  * amdgpu_bo_create_reserved - create reserved BO for kernel use
+  *
+@@ -328,14 +308,13 @@ void amdgpu_bo_free_kernel(struct amdgpu_bo **bo, u64 *gpu_addr,
+ 		*cpu_addr = NULL;
+ }
+ 
+-int amdgpu_bo_create_restricted(struct amdgpu_device *adev,
+-				unsigned long size, int byte_align,
+-				bool kernel, u32 domain, u64 flags,
+-				struct sg_table *sg,
+-				struct ttm_placement *placement,
+-				struct reservation_object *resv,
+-				uint64_t init_value,
+-				struct amdgpu_bo **bo_ptr)
++static int amdgpu_bo_do_create(struct amdgpu_device *adev,
++			       unsigned long size, int byte_align,
++			       bool kernel, u32 domain, u64 flags,
++			       struct sg_table *sg,
++			       struct reservation_object *resv,
++			       uint64_t init_value,
++			       struct amdgpu_bo **bo_ptr)
+ {
+ 	struct amdgpu_bo *bo;
+ 	enum ttm_bo_type type;
+@@ -408,10 +387,11 @@ int amdgpu_bo_create_restricted(struct amdgpu_device *adev,
+ 		bo->flags &= ~AMDGPU_GEM_CREATE_CPU_GTT_USWC;
+ #endif
+ 
+-	amdgpu_fill_placement_to_bo(bo, placement);
+-	/* Kernel allocation are uninterruptible */
++	bo->tbo.bdev = &adev->mman.bdev;
++	amdgpu_ttm_placement_from_domain(bo, domain);
+ 
+ 	initial_bytes_moved = atomic64_read(&adev->num_bytes_moved);
++	/* Kernel allocation are uninterruptible */
+ 	r = ttm_bo_init_reserved(&adev->mman.bdev, &bo->tbo, size, type,
+ 				 &bo->placement, page_align, !kernel, NULL,
+ 				 acc_size, sg, resv, &amdgpu_ttm_bo_destroy);
+@@ -478,27 +458,17 @@ static int amdgpu_bo_create_shadow(struct amdgpu_device *adev,
+ 				   unsigned long size, int byte_align,
+ 				   struct amdgpu_bo *bo)
+ {
+-	struct ttm_placement placement = {0};
+-	struct ttm_place placements[AMDGPU_GEM_DOMAIN_MAX + 1];
+ 	int r;
+ 
+ 	if (bo->shadow)
+ 		return 0;
+ 
+-	memset(&placements, 0, sizeof(placements));
+-	amdgpu_ttm_placement_init(adev, &placement, placements,
+-				  AMDGPU_GEM_DOMAIN_GTT,
+-				  AMDGPU_GEM_CREATE_CPU_GTT_USWC |
+-				  AMDGPU_GEM_CREATE_SHADOW);
+-
+-	r = amdgpu_bo_create_restricted(adev, size, byte_align, true,
+-					AMDGPU_GEM_DOMAIN_GTT,
+-					AMDGPU_GEM_CREATE_CPU_GTT_USWC |
+-					AMDGPU_GEM_CREATE_SHADOW,
+-					NULL, &placement,
+-					bo->tbo.resv,
+-					0,
+-					&bo->shadow);
++	r = amdgpu_bo_do_create(adev, size, byte_align, true,
++				AMDGPU_GEM_DOMAIN_GTT,
++				AMDGPU_GEM_CREATE_CPU_GTT_USWC |
++				AMDGPU_GEM_CREATE_SHADOW,
++				NULL, bo->tbo.resv, 0,
++				&bo->shadow);
+ 	if (!r) {
+ 		bo->shadow->parent = amdgpu_bo_ref(bo);
+ 		mutex_lock(&adev->shadow_list_lock);
+@@ -520,18 +490,11 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
+ 		     uint64_t init_value,
+ 		     struct amdgpu_bo **bo_ptr)
+ {
+-	struct ttm_placement placement = {0};
+-	struct ttm_place placements[AMDGPU_GEM_DOMAIN_MAX + 1];
+ 	uint64_t parent_flags = flags & ~AMDGPU_GEM_CREATE_SHADOW;
+ 	int r;
+ 
+-	memset(&placements, 0, sizeof(placements));
+-	amdgpu_ttm_placement_init(adev, &placement, placements,
+-				  domain, parent_flags);
+-
+-	r = amdgpu_bo_create_restricted(adev, size, byte_align, kernel, domain,
+-					parent_flags, sg, &placement, resv,
+-					init_value, bo_ptr);
++	r = amdgpu_bo_do_create(adev, size, byte_align, kernel, domain,
++				parent_flags, sg, resv, init_value, bo_ptr);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index 9e94c23..3523c3e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -207,14 +207,6 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
+ 			    struct reservation_object *resv,
+ 			    uint64_t init_value,
+ 			    struct amdgpu_bo **bo_ptr);
+-int amdgpu_bo_create_restricted(struct amdgpu_device *adev,
+-				unsigned long size, int byte_align,
+-				bool kernel, u32 domain, u64 flags,
+-				struct sg_table *sg,
+-				struct ttm_placement *placement,
+-			        struct reservation_object *resv,
+-				uint64_t init_value,
+-				struct amdgpu_bo **bo_ptr);
+ int amdgpu_bo_create_reserved(struct amdgpu_device *adev,
+ 			      unsigned long size, int align,
+ 			      u32 domain, struct amdgpu_bo **bo_ptr,
+-- 
+2.7.4
+

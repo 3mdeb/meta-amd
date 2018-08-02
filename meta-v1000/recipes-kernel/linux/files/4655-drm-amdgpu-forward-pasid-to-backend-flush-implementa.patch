@@ -1,0 +1,335 @@
+From e081c8f7fec1efae27a8528177aa06f96df05851 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 8 Jan 2018 14:48:11 +0100
+Subject: [PATCH 4655/5855] drm/amdgpu: forward pasid to backend flush
+ implementations
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+rd the pasid from the VM code to the emit_vm_flush function and update
+all implementations with the new parameter.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h      | 5 +++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c  | 2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h | 2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c   | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c    | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c    | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c    | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c    | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c    | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c   | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c   | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c   | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/si_dma.c      | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c    | 6 ++++--
+ drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c    | 6 ++++--
+ drivers/gpu/drm/amd/amdgpu/vce_v3_0.c    | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/vce_v4_0.c    | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c    | 6 ++++--
+ 18 files changed, 42 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 57066a6..0da78d1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1075,8 +1075,9 @@ struct amdgpu_job {
+ 	void			*owner;
+ 	uint64_t		fence_ctx; /* the fence_context this job uses */
+ 	bool                    vm_needs_flush;
+-	unsigned		vmid;
+ 	uint64_t		vm_pd_addr;
++	unsigned		vmid;
++	unsigned		pasid;
+ 	uint32_t		gds_base, gds_size;
+ 	uint32_t		gws_base, gws_size;
+ 	uint32_t		oa_base, oa_size;
+@@ -1856,7 +1857,7 @@ amdgpu_get_sdma_instance(struct amdgpu_ring *ring)
+ #define amdgpu_ring_set_wptr(r) (r)->funcs->set_wptr((r))
+ #define amdgpu_ring_emit_ib(r, ib, vmid, c) (r)->funcs->emit_ib((r), (ib), (vmid), (c))
+ #define amdgpu_ring_emit_pipeline_sync(r) (r)->funcs->emit_pipeline_sync((r))
+-#define amdgpu_ring_emit_vm_flush(r, vmid, addr) (r)->funcs->emit_vm_flush((r), (vmid), (addr))
++#define amdgpu_ring_emit_vm_flush(r, vmid, pasid, addr) (r)->funcs->emit_vm_flush((r), (vmid), (pasid), (addr))
+ #define amdgpu_ring_emit_fence(r, addr, seq, flags) (r)->funcs->emit_fence((r), (addr), (seq), (flags))
+ #define amdgpu_ring_emit_gds_switch(r, v, db, ds, wb, ws, ab, as) (r)->funcs->emit_gds_switch((r), (v), (db), (ds), (wb), (ws), (ab), (as))
+ #define amdgpu_ring_emit_hdp_flush(r) (r)->funcs->emit_hdp_flush((r))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c
+index 01bfd79..6ecf8ad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c
+@@ -241,6 +241,7 @@ static int amdgpu_vmid_grab_reserved_locked(struct amdgpu_vm *vm,
+ 		id->last_flush = NULL;
+ 	}
+ 	job->vmid = id - id_mgr->ids;
++	job->pasid = vm->pasid;
+ 	trace_amdgpu_vm_grab_id(vm, ring, job);
+ out:
+ 	return r;
+@@ -392,6 +393,7 @@ int amdgpu_vmid_grab(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 	list_move_tail(&id->list, &id_mgr->ids_lru);
+ 
+ 	job->vmid = id - id_mgr->ids;
++	job->pasid = vm->pasid;
+ 	trace_amdgpu_vm_grab_id(vm, ring, job);
+ 
+ error:
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+index 753db84..f66d014 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -127,7 +127,7 @@ struct amdgpu_ring_funcs {
+ 			   uint64_t seq, unsigned flags);
+ 	void (*emit_pipeline_sync)(struct amdgpu_ring *ring);
+ 	void (*emit_vm_flush)(struct amdgpu_ring *ring, unsigned vmid,
+-			      uint64_t pd_addr);
++			      unsigned pasid, uint64_t pd_addr);
+ 	void (*emit_hdp_flush)(struct amdgpu_ring *ring);
+ 	void (*emit_hdp_invalidate)(struct amdgpu_ring *ring);
+ 	void (*emit_gds_switch)(struct amdgpu_ring *ring, uint32_t vmid,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 3d16318..4924df2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -512,7 +512,8 @@ int amdgpu_vm_flush(struct amdgpu_ring *ring, struct amdgpu_job *job, bool need_
+ 		struct fence *fence;
+ 
+ 		trace_amdgpu_vm_flush(ring, job->vmid, job->vm_pd_addr);
+-		amdgpu_ring_emit_vm_flush(ring, job->vmid, job->vm_pd_addr);
++		amdgpu_ring_emit_vm_flush(ring, job->vmid, job->pasid,
++					  job->vm_pd_addr);
+ 
+ 		r = amdgpu_fence_emit(ring, &fence);
+ 		if (r)
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index e1b873a..ee672f0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -880,7 +880,8 @@ static void cik_sdma_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
+  * using sDMA (CIK).
+  */
+ static void cik_sdma_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					unsigned vmid, uint64_t pd_addr)
++					unsigned vmid, unsigned pasid,
++					uint64_t pd_addr)
+ {
+ 	u32 extra_bits = (SDMA_POLL_REG_MEM_EXTRA_OP(0) |
+ 			  SDMA_POLL_REG_MEM_EXTRA_FUNC(0)); /* always */
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
+index 9a5229a..e7a63f5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
+@@ -2354,7 +2354,8 @@ static void gfx_v6_0_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
+ }
+ 
+ static void gfx_v6_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					unsigned vmid, uint64_t pd_addr)
++					unsigned vmid, unsigned pasid,
++					uint64_t pd_addr)
+ {
+ 	int usepfp = (ring->funcs->type == AMDGPU_RING_TYPE_GFX);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index ce86e66..e5f4ff5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -3239,7 +3239,8 @@ static void gfx_v7_0_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
+  * using the CP (CIK).
+  */
+ static void gfx_v7_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					unsigned vmid, uint64_t pd_addr)
++					unsigned vmid, unsigned pasid,
++					uint64_t pd_addr)
+ {
+ 	int usepfp = (ring->funcs->type == AMDGPU_RING_TYPE_GFX);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 69cdc82..e7f3598 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -6330,7 +6330,8 @@ static void gfx_v8_0_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
+ }
+ 
+ static void gfx_v8_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					unsigned vmid, uint64_t pd_addr)
++					unsigned vmid, unsigned pasid,
++					uint64_t pd_addr)
+ {
+ 	int usepfp = (ring->funcs->type == AMDGPU_RING_TYPE_GFX);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index 0398905..75cf9c7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -3681,7 +3681,8 @@ static void gfx_v9_0_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
+ }
+ 
+ static void gfx_v9_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					unsigned vmid, uint64_t pd_addr)
++					unsigned vmid, unsigned pasid,
++					uint64_t pd_addr)
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	int usepfp = (ring->funcs->type == AMDGPU_RING_TYPE_GFX);
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index daf0e09..baf633d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -859,7 +859,8 @@ static void sdma_v2_4_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
+  * using sDMA (VI).
+  */
+ static void sdma_v2_4_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					 unsigned vmid, uint64_t pd_addr)
++					 unsigned vmid, unsigned pasid,
++					 uint64_t pd_addr)
+ {
+ 	amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_SRBM_WRITE) |
+ 			  SDMA_PKT_SRBM_WRITE_HEADER_BYTE_EN(0xf));
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index aae7a99..0fbafa2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -1125,7 +1125,8 @@ static void sdma_v3_0_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
+  * using sDMA (VI).
+  */
+ static void sdma_v3_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					 unsigned vmid, uint64_t pd_addr)
++					 unsigned vmid, unsigned pasid,
++					 uint64_t pd_addr)
+ {
+ 	amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_SRBM_WRITE) |
+ 			  SDMA_PKT_SRBM_WRITE_HEADER_BYTE_EN(0xf));
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+index 790f98f..7ee0ed3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+@@ -1133,7 +1133,8 @@ static void sdma_v4_0_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
+  * using sDMA (VEGA10).
+  */
+ static void sdma_v4_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					 unsigned vmid, uint64_t pd_addr)
++					 unsigned vmid, unsigned pasid,
++					 uint64_t pd_addr)
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gmc.gmc_funcs->get_invalidate_req(vmid);
+diff --git a/drivers/gpu/drm/amd/amdgpu/si_dma.c b/drivers/gpu/drm/amd/amdgpu/si_dma.c
+index 0d8f4b7..89e1209 100644
+--- a/drivers/gpu/drm/amd/amdgpu/si_dma.c
++++ b/drivers/gpu/drm/amd/amdgpu/si_dma.c
+@@ -473,7 +473,8 @@ static void si_dma_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
+  * using sDMA (VI).
+  */
+ static void si_dma_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-				      unsigned vmid, uint64_t pd_addr)
++				      unsigned vmid, unsigned pasid,
++				      uint64_t pd_addr)
+ {
+ 	amdgpu_ring_write(ring, DMA_PACKET(DMA_PACKET_SRBM_WRITE, 0, 0, 0, 0));
+ 	if (vmid < 8)
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+index a9649a7..42434d3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c
+@@ -1060,7 +1060,8 @@ static void uvd_v6_0_enc_ring_emit_ib(struct amdgpu_ring *ring,
+ }
+ 
+ static void uvd_v6_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					 unsigned vmid, uint64_t pd_addr)
++					unsigned vmid, unsigned pasid,
++					uint64_t pd_addr)
+ {
+ 	uint32_t reg;
+ 
+@@ -1127,7 +1128,8 @@ static void uvd_v6_0_enc_ring_insert_end(struct amdgpu_ring *ring)
+ }
+ 
+ static void uvd_v6_0_enc_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-        unsigned int vmid, uint64_t pd_addr)
++					    unsigned int vmid, unsigned pasid,
++					    uint64_t pd_addr)
+ {
+ 	amdgpu_ring_write(ring, HEVC_ENC_CMD_UPDATE_PTB);
+ 	amdgpu_ring_write(ring, vmid);
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c
+index 9db316bf..3b878da 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c
+@@ -1291,7 +1291,8 @@ static void uvd_v7_0_vm_reg_wait(struct amdgpu_ring *ring,
+ }
+ 
+ static void uvd_v7_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					unsigned vmid, uint64_t pd_addr)
++					unsigned vmid, unsigned pasid,
++					uint64_t pd_addr)
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gmc.gmc_funcs->get_invalidate_req(vmid);
+@@ -1343,7 +1344,8 @@ static void uvd_v7_0_enc_ring_insert_end(struct amdgpu_ring *ring)
+ }
+ 
+ static void uvd_v7_0_enc_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-			 unsigned int vmid, uint64_t pd_addr)
++					    unsigned int vmid, unsigned pasid,
++					    uint64_t pd_addr)
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gmc.gmc_funcs->get_invalidate_req(vmid);
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+index a5355eb..6d61601 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+@@ -844,7 +844,8 @@ static void vce_v3_0_ring_emit_ib(struct amdgpu_ring *ring,
+ }
+ 
+ static void vce_v3_0_emit_vm_flush(struct amdgpu_ring *ring,
+-			 unsigned int vmid, uint64_t pd_addr)
++				   unsigned int vmid, unsigned pasid,
++				   uint64_t pd_addr)
+ {
+ 	amdgpu_ring_write(ring, VCE_CMD_UPDATE_PTB);
+ 	amdgpu_ring_write(ring, vmid);
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
+index 4559de5..f225d50 100755
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
+@@ -965,7 +965,8 @@ static void vce_v4_0_ring_insert_end(struct amdgpu_ring *ring)
+ }
+ 
+ static void vce_v4_0_emit_vm_flush(struct amdgpu_ring *ring,
+-			 unsigned int vmid, uint64_t pd_addr)
++				   unsigned int vmid, unsigned pasid,
++				   uint64_t pd_addr)
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gmc.gmc_funcs->get_invalidate_req(vmid);
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
+index f76b55a..d7c4b5c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
+@@ -888,7 +888,8 @@ static void vcn_v1_0_dec_vm_reg_wait(struct amdgpu_ring *ring,
+ }
+ 
+ static void vcn_v1_0_dec_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					unsigned vmid, uint64_t pd_addr)
++					    unsigned vmid, unsigned pasid,
++					    uint64_t pd_addr)
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gmc.gmc_funcs->get_invalidate_req(vmid);
+@@ -1021,7 +1022,8 @@ static void vcn_v1_0_enc_ring_emit_ib(struct amdgpu_ring *ring,
+ }
+ 
+ static void vcn_v1_0_enc_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-			 unsigned int vmid, uint64_t pd_addr)
++					    unsigned int vmid, unsigned pasid,
++					    uint64_t pd_addr)
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gmc.gmc_funcs->get_invalidate_req(vmid);
+-- 
+2.7.4
+

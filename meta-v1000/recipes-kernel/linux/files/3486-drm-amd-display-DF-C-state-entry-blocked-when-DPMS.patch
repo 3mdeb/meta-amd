@@ -1,0 +1,203 @@
+From 77f8c0581a94c5b4cd1ae859577eee8ebf0adffa Mon Sep 17 00:00:00 2001
+From: Hersen Wu <hersenxs.wu@amd.com>
+Date: Thu, 24 Aug 2017 17:40:00 -0400
+Subject: [PATCH 3486/5855] drm/amd/display: DF C-state entry blocked when DPMS
+
+Change-Id: Iebdbc77d58dda5adbdf0ab1bb2441d9b2559c2fd
+Signed-off-by: Hersen Wu <hersenxs.wu@amd.com>
+Reviewed-by: Hersen Wu <hersenxs.wu@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |  4 ++
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    |  9 +++-
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  | 48 +++++++++++++++++++++-
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_mem_input.c |  9 ++++
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_resource.c  |  1 +
+ drivers/gpu/drm/amd/display/dc/inc/hw/mem_input.h  |  2 +
+ drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h  |  3 ++
+ 7 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 1b9c1c5..2d44892 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -832,6 +832,8 @@ static bool dc_commit_context_no_check(struct dc *dc, struct validate_context *c
+ 	if (!dcb->funcs->is_accelerated_mode(dcb))
+ 		dc->hwss.enable_accelerated_mode(dc);
+ 
++	dc->hwss.ready_shared_resources(dc);
++
+ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+ 		pipe = &context->res_ctx.pipe_ctx[i];
+ 		dc->hwss.wait_for_mpcc_disconnect(dc, dc->res_pool, pipe);
+@@ -881,6 +883,8 @@ static bool dc_commit_context_no_check(struct dc *dc, struct validate_context *c
+ 
+ 	dc_retain_validate_context(dc->current_context);
+ 
++	dc->hwss.optimize_shared_resources(dc);
++
+ 	return (result == DC_OK);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 371c499..86834ea 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -2722,6 +2722,10 @@ static void program_csc_matrix(struct pipe_ctx *pipe_ctx,
+ 	}
+ }
+ 
++static void ready_shared_resources(struct dc *dc) {}
++
++static void optimize_shared_resources(struct dc *dc) {}
++
+ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.program_gamut_remap = program_gamut_remap,
+ 	.program_csc_matrix = program_csc_matrix,
+@@ -2752,7 +2756,10 @@ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.prog_pixclk_crtc_otg = dce110_prog_pixclk_crtc_otg,
+ 	.setup_stereo = NULL,
+ 	.set_avmute = dce110_set_avmute,
+-	.wait_for_mpcc_disconnect = dce110_wait_for_mpcc_disconnect
++	.wait_for_mpcc_disconnect = dce110_wait_for_mpcc_disconnect,
++	.ready_shared_resources = ready_shared_resources,
++	.optimize_shared_resources = optimize_shared_resources,
++
+ };
+ 
+ bool dce110_hw_sequencer_construct(struct dc *dc)
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index d296ef9..3d166c1 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -793,6 +793,50 @@ static void power_on_plane(
+ 			"Un-gated front end for pipe %d\n", plane_id);
+ }
+ 
++static void undo_DEGVIDCN10_253_wa(struct dc *dc)
++{
++	struct dce_hwseq *hws = dc->hwseq;
++	struct mem_input *mi = dc->res_pool->mis[0];
++
++	mi->funcs->set_blank(mi, true);
++
++	REG_SET(DC_IP_REQUEST_CNTL, 0,
++			IP_REQUEST_EN, 1);
++
++	hubp_pg_control(hws, 0, false);
++	REG_SET(DC_IP_REQUEST_CNTL, 0,
++			IP_REQUEST_EN, 0);
++}
++
++static void ready_shared_resources(struct dc *dc)
++{
++	if (dc->current_context->stream_count == 0 &&
++			!dc->debug.disable_stutter)
++		undo_DEGVIDCN10_253_wa(dc);
++}
++
++static void apply_DEGVIDCN10_253_wa(struct dc *dc)
++{
++	struct dce_hwseq *hws = dc->hwseq;
++	struct mem_input *mi = dc->res_pool->mis[0];
++
++	REG_SET(DC_IP_REQUEST_CNTL, 0,
++			IP_REQUEST_EN, 1);
++
++	hubp_pg_control(hws, 0, true);
++	REG_SET(DC_IP_REQUEST_CNTL, 0,
++			IP_REQUEST_EN, 0);
++
++	mi->funcs->set_hubp_blank_en(mi, false);
++}
++
++static void optimize_shared_resources(struct dc *dc)
++{
++	if (dc->current_context->stream_count == 0 &&
++			!dc->debug.disable_stutter)
++		apply_DEGVIDCN10_253_wa(dc);
++}
++
+ static void bios_golden_init(struct dc *dc)
+ {
+ 	struct dc_bios *bp = dc->ctx->dc_bios;
+@@ -2908,7 +2952,9 @@ static const struct hw_sequencer_funcs dcn10_funcs = {
+ 	.setup_stereo = dcn10_setup_stereo,
+ 	.set_avmute = dce110_set_avmute,
+ 	.log_hw_state = dcn10_log_hw_state,
+-	.wait_for_mpcc_disconnect = dcn10_wait_for_mpcc_disconnect
++	.wait_for_mpcc_disconnect = dcn10_wait_for_mpcc_disconnect,
++	.ready_shared_resources = ready_shared_resources,
++	.optimize_shared_resources = optimize_shared_resources,
+ };
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mem_input.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mem_input.c
+index 0a47e6a..9008cd0 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mem_input.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mem_input.c
+@@ -56,6 +56,14 @@ static void min10_set_blank(struct mem_input *mem_input, bool blank)
+ 	}
+ }
+ 
++static void min10_set_hubp_blank_en(struct mem_input *mem_input, bool blank)
++{
++	struct dcn10_mem_input *mi = TO_DCN10_MEM_INPUT(mem_input);
++	uint32_t blank_en = blank ? 1 : 0;
++
++	REG_UPDATE(DCHUBP_CNTL, HUBP_BLANK_EN, blank_en);
++}
++
+ static void min10_vready_workaround(struct mem_input *mem_input,
+ 		struct _vcs_dpi_display_pipe_dest_params_st *pipe_dest)
+ {
+@@ -771,6 +779,7 @@ static struct mem_input_funcs dcn10_mem_input_funcs = {
+ 	.set_blank = min10_set_blank,
+ 	.dcc_control = min10_dcc_control,
+ 	.mem_program_viewport = min_set_viewport,
++	.set_hubp_blank_en = min10_set_hubp_blank_en,
+ };
+ 
+ /*****************************************/
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+index 4af40f5..d09ed13 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+@@ -439,6 +439,7 @@ static const struct dc_debug debug_defaults_diags = {
+ 		.force_abm_enable = false,
+ 		.timing_trace = true,
+ 		.clock_trace = true,
++		.disable_stutter = true,
+ #if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+ 		.disable_pplib_clock_request = true,
+ 		.disable_pplib_wm_range = true,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/mem_input.h b/drivers/gpu/drm/amd/display/dc/inc/hw/mem_input.h
+index 6f4f04d..6cef9ad 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/mem_input.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/mem_input.h
+@@ -161,6 +161,8 @@ struct mem_input_funcs {
+ 				struct dchub_init_data *dh_data);
+ 
+ 	void (*set_blank)(struct mem_input *mi, bool blank);
++	void (*set_hubp_blank_en)(struct mem_input *mi, bool blank);
++
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index c73dca9..01e4261 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -173,6 +173,9 @@ struct hw_sequencer_funcs {
+ 	void (*wait_for_mpcc_disconnect)(struct dc *dc,
+ 			struct resource_pool *res_pool,
+ 			struct pipe_ctx *pipe_ctx);
++
++	void (*ready_shared_resources)(struct dc *dc);
++	void (*optimize_shared_resources)(struct dc *dc);
+ };
+ 
+ void color_space_to_black_color(
+-- 
+2.7.4
+

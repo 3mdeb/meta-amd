@@ -1,0 +1,137 @@
+From 9d7b3c1c9bef91ce1631cbce364439bdb204b1d3 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Thu, 19 Oct 2017 14:29:46 -0400
+Subject: [PATCH 3712/5855] drm/amdgpu: Avoid accessing job->entity after the
+ job is scheduled.
+
+Bug: amdgpu_job_free_cb was accessing s_job->s_entity when the allocated
+amdgpu_ctx (and the entity inside it) were already deallocated from
+amdgpu_cs_parser_fini.
+
+Fix: Save job's priority on it's creation instead of accessing it from
+s_entity later on.
+
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Reviewed-by: Andres Rodriguez <andresx7@gmail.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c        |  3 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c       |  5 ++---
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c |  1 +
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h | 32 ++++++++++++---------------
+ 4 files changed, 18 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 5cac13b..2e1f3c6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -1174,8 +1174,7 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ 	cs->out.handle = amdgpu_ctx_add_fence(p->ctx, ring, p->fence);
+ 	job->uf_sequence = cs->out.handle;
+ 	amdgpu_job_free_resources(job);
+-	amdgpu_ring_priority_get(job->ring,
+-				 amd_sched_get_job_priority(&job->base));
++	amdgpu_ring_priority_get(job->ring, job->base.s_priority);
+ 
+ 	trace_amdgpu_cs_ioctl(job);
+ 	amd_sched_entity_push_job(&job->base);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index 58bf258..6a6a58a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -104,7 +104,7 @@ static void amdgpu_job_free_cb(struct amd_sched_job *s_job)
+ {
+ 	struct amdgpu_job *job = container_of(s_job, struct amdgpu_job, base);
+ 
+-        amdgpu_ring_priority_put(job->ring, amd_sched_get_job_priority(s_job));
++	amdgpu_ring_priority_put(job->ring, s_job->s_priority);
+ 	fence_put(job->fence);
+ 	amdgpu_sync_free(&job->sync);
+ 	amdgpu_sync_free(&job->dep_sync);
+@@ -141,8 +141,7 @@ int amdgpu_job_submit(struct amdgpu_job *job, struct amdgpu_ring *ring,
+ 	job->fence_ctx = entity->fence_context;
+ 	*f = fence_get(&job->base.s_fence->finished);
+ 	amdgpu_job_free_resources(job);
+-	amdgpu_ring_priority_get(job->ring,
+-				 amd_sched_get_job_priority(&job->base));
++	amdgpu_ring_priority_get(job->ring, job->base.s_priority);
+ 	amd_sched_entity_push_job(&job->base);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index 9369d7f..ef348ed 100755
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -528,6 +528,7 @@ int amd_sched_job_init(struct amd_sched_job *job,
+ {
+ 	job->sched = sched;
+ 	job->s_entity = entity;
++	job->s_priority = entity->rq - sched->sched_rq;
+ 	job->s_fence = amd_sched_fence_create(entity, owner);
+ 	if (!job->s_fence)
+ 		return -ENOMEM;
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index 10fb2b5..cd1443a 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -30,6 +30,19 @@
+ struct amd_gpu_scheduler;
+ struct amd_sched_rq;
+ 
++enum amd_sched_priority {
++	AMD_SCHED_PRIORITY_MIN,
++	AMD_SCHED_PRIORITY_LOW = AMD_SCHED_PRIORITY_MIN,
++	AMD_SCHED_PRIORITY_NORMAL,
++	AMD_SCHED_PRIORITY_HIGH_SW,
++	AMD_SCHED_PRIORITY_HIGH_HW,
++	AMD_SCHED_PRIORITY_KERNEL,
++	AMD_SCHED_PRIORITY_MAX,
++	AMD_SCHED_PRIORITY_INVALID = -1,
++	AMD_SCHED_PRIORITY_UNSET = -2
++};
++
++
+ /**
+  * A scheduler entity is a wrapper around a job queue or a group
+  * of other entities. Entities take turns emitting jobs from their
+@@ -83,6 +96,7 @@ struct amd_sched_job {
+ 	struct delayed_work		work_tdr;
+ 	uint64_t			id;
+ 	atomic_t karma;
++	enum amd_sched_priority s_priority;
+ };
+ 
+ extern const struct fence_ops amd_sched_fence_ops_scheduled;
+@@ -114,18 +128,6 @@ struct amd_sched_backend_ops {
+ 	void (*free_job)(struct amd_sched_job *sched_job);
+ };
+ 
+-enum amd_sched_priority {
+-	AMD_SCHED_PRIORITY_MIN,
+-	AMD_SCHED_PRIORITY_LOW = AMD_SCHED_PRIORITY_MIN,
+-	AMD_SCHED_PRIORITY_NORMAL,
+-	AMD_SCHED_PRIORITY_HIGH_SW,
+-	AMD_SCHED_PRIORITY_HIGH_HW,
+-	AMD_SCHED_PRIORITY_KERNEL,
+-	AMD_SCHED_PRIORITY_MAX,
+-	AMD_SCHED_PRIORITY_INVALID = -1,
+-	AMD_SCHED_PRIORITY_UNSET = -2
+-};
+-
+ /**
+  * One scheduler is implemented for each hardware ring
+ */
+@@ -176,10 +178,4 @@ bool amd_sched_dependency_optimized(struct fence* fence,
+ 				    struct amd_sched_entity *entity);
+ void amd_sched_job_kickout(struct amd_sched_job *s_job);
+ 
+-static inline enum amd_sched_priority
+-amd_sched_get_job_priority(struct amd_sched_job *job)
+-{
+-	return (job->s_entity->rq - job->sched->sched_rq);
+-}
+-
+ #endif
+-- 
+2.7.4
+

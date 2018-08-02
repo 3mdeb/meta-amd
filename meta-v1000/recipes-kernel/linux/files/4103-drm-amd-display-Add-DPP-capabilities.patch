@@ -1,0 +1,276 @@
+From c7fd26f0257ca273230df9c0368b126edfce0206 Mon Sep 17 00:00:00 2001
+From: Eric Bernstein <eric.bernstein@amd.com>
+Date: Mon, 2 Oct 2017 15:03:50 -0400
+Subject: [PATCH 4103/5855] drm/amd/display: Add DPP capabilities
+
+Signed-off-by: Eric Bernstein <eric.bernstein@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c   |  5 ++
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h   | 23 ++----
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c  | 84 ++--------------------
+ drivers/gpu/drm/amd/display/dc/inc/hw/transform.h  | 46 ++++++++++++
+ 4 files changed, 63 insertions(+), 95 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
+index 05df3b2..fb3c788 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
+@@ -444,6 +444,10 @@ static const struct transform_funcs dcn10_dpp_funcs = {
+ 		.set_cursor_position = dcn10_set_cursor_position,
+ };
+ 
++static struct dpp_caps dcn10_dpp_cap = {
++	.dscl_data_proc_format = DSCL_DATA_PRCESSING_FIXED_FORMAT,
++	.dscl_calc_lb_num_partitions = dscl1_calc_lb_num_partitions,
++};
+ 
+ /*****************************************/
+ /* Constructor, Destructor               */
+@@ -461,6 +465,7 @@ void dcn10_dpp_construct(
+ 
+ 	xfm->base.inst = inst;
+ 	xfm->base.funcs = &dcn10_dpp_funcs;
++	xfm->base.caps = &dcn10_dpp_cap;
+ 
+ 	xfm->tf_regs = tf_regs;
+ 	xfm->tf_shift = tf_shift;
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
+index 153aa3c..4cf18a5 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
+@@ -1264,23 +1264,6 @@ struct dcn10_dpp {
+ 	bool is_write_to_ram_a_safe;
+ };
+ 
+-
+-enum lb_memory_config {
+-	/* Enable all 3 pieces of memory */
+-	LB_MEMORY_CONFIG_0 = 0,
+-
+-	/* Enable only the first piece of memory */
+-	LB_MEMORY_CONFIG_1 = 1,
+-
+-	/* Enable only the second piece of memory */
+-	LB_MEMORY_CONFIG_2 = 2,
+-
+-	/* Only applicable in 4:2:0 mode, enable all 3 pieces of memory and the
+-	 * last piece of chroma memory used for the luma storage
+-	 */
+-	LB_MEMORY_CONFIG_3 = 3
+-};
+-
+ enum dcn10_input_csc_select {
+ 	INPUT_CSC_SELECT_BYPASS = 0,
+ 	INPUT_CSC_SELECT_ICSC,
+@@ -1292,6 +1275,12 @@ bool is_lb_conf_valid(
+ 		int num_partitions,
+ 		int vtaps);
+ 
++void dscl1_calc_lb_num_partitions(
++		const struct scaler_data *scl_data,
++		enum lb_memory_config lb_config,
++		int *num_part_y,
++		int *num_part_c);
++
+ void ippn10_degamma_ram_select(
+ 		struct transform *xfm_base,
+ 							bool use_ram_a);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c
+index 36787f5..0793c3f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c
+@@ -31,6 +31,7 @@
+ #include "dcn10_dpp.h"
+ #include "basics/conversion.h"
+ 
++
+ #define NUM_PHASES    64
+ #define HORZ_MAX_TAPS 8
+ #define VERT_MAX_TAPS 8
+@@ -168,11 +169,10 @@ static enum dscl_mode_sel get_dscl_mode(
+ 		const struct scaler_data *data,
+ 		bool dbg_always_scale)
+ {
+-	struct dcn10_dpp *xfm = TO_DCN10_DPP(xfm_base);
+ 	const long long one = dal_fixed31_32_one.value;
+ 
+-	if (xfm->tf_mask->PIXEL_DEPTH) {
+-		/* DSCL caps: LB data is fixed format */
++	if (xfm_base->caps->dscl_data_proc_format == DSCL_DATA_PRCESSING_FIXED_FORMAT) {
++		/* DSCL is processing data in fixed format */
+ 		if (data->format == PIXEL_FORMAT_FP16)
+ 			return DSCL_MODE_DSCL_BYPASS;
+ 	}
+@@ -204,8 +204,8 @@ static void dpp_set_lb(
+ 	enum lb_memory_config mem_size_config)
+ {
+ 	/* LB */
+-	if (xfm->tf_mask->PIXEL_DEPTH) {
+-		/* DSCL caps: LB data is fixed format */
++	if (xfm->base.caps->dscl_data_proc_format == DSCL_DATA_PRCESSING_FIXED_FORMAT) {
++		/* DSCL caps: pixel data processed in fixed format */
+ 		uint32_t pixel_depth = get_pixel_depth_val(lb_params->depth);
+ 		uint32_t dyn_pix_depth = lb_params->dynamic_pixel_depth;
+ 
+@@ -400,7 +400,7 @@ static int get_lb_depth_bpc(enum lb_pixel_depth depth)
+ 	}
+ }
+ 
+-static void dscl1_calc_lb_num_partitions(
++void dscl1_calc_lb_num_partitions(
+ 		const struct scaler_data *scl_data,
+ 		enum lb_memory_config lb_config,
+ 		int *num_part_y,
+@@ -457,78 +457,6 @@ bool is_lb_conf_valid(int ceil_vratio, int num_partitions, int vtaps)
+ 		return vtaps <= num_partitions;
+ }
+ 
+-/*find first match configuration which meets the min required lb size*/
+-static enum lb_memory_config dpp10_find_lb_memory_config(
+-		const struct scaler_data *scl_data)
+-{
+-	int num_part_y, num_part_c;
+-	int vtaps = scl_data->taps.v_taps;
+-	int vtaps_c = scl_data->taps.v_taps_c;
+-	int ceil_vratio = dal_fixed31_32_ceil(scl_data->ratios.vert);
+-	int ceil_vratio_c = dal_fixed31_32_ceil(scl_data->ratios.vert_c);
+-
+-	dscl1_calc_lb_num_partitions(
+-			scl_data, LB_MEMORY_CONFIG_1, &num_part_y, &num_part_c);
+-
+-	if (is_lb_conf_valid(ceil_vratio, num_part_y, vtaps)
+-			&& is_lb_conf_valid(ceil_vratio_c, num_part_c, vtaps_c))
+-		return LB_MEMORY_CONFIG_1;
+-
+-	dscl1_calc_lb_num_partitions(
+-			scl_data, LB_MEMORY_CONFIG_2, &num_part_y, &num_part_c);
+-
+-	if (is_lb_conf_valid(ceil_vratio, num_part_y, vtaps)
+-			&& is_lb_conf_valid(ceil_vratio_c, num_part_c, vtaps_c))
+-		return LB_MEMORY_CONFIG_2;
+-
+-	if (scl_data->format == PIXEL_FORMAT_420BPP8
+-			|| scl_data->format == PIXEL_FORMAT_420BPP10) {
+-		dscl1_calc_lb_num_partitions(
+-				scl_data, LB_MEMORY_CONFIG_3, &num_part_y, &num_part_c);
+-
+-		if (is_lb_conf_valid(ceil_vratio, num_part_y, vtaps)
+-				&& is_lb_conf_valid(ceil_vratio_c, num_part_c, vtaps_c))
+-			return LB_MEMORY_CONFIG_3;
+-	}
+-
+-	dscl1_calc_lb_num_partitions(
+-			scl_data, LB_MEMORY_CONFIG_0, &num_part_y, &num_part_c);
+-
+-	/*Ensure we can support the requested number of vtaps*/
+-	ASSERT(is_lb_conf_valid(ceil_vratio, num_part_y, vtaps)
+-			&& is_lb_conf_valid(ceil_vratio_c, num_part_c, vtaps_c));
+-
+-	return LB_MEMORY_CONFIG_0;
+-}
+-
+-/*find first match configuration which meets the min required lb size*/
+-static enum lb_memory_config find_lb_memory_config(struct dcn10_dpp *xfm,
+-		const struct scaler_data *scl_data)
+-{
+-	enum lb_memory_config mem_cfg = LB_MEMORY_CONFIG_0;
+-
+-	if (xfm->base.ctx->dc->debug.use_max_lb)
+-		return mem_cfg;
+-
+-	if (xfm->tf_mask->PIXEL_DEPTH) {
+-		/* DSCL caps: LB data is fixed format */
+-		mem_cfg = dpp10_find_lb_memory_config(scl_data);
+-	}
+-	return mem_cfg;
+-}
+-
+-/*find first match configuration which meets the min required lb size*/
+-static enum lb_memory_config find_lb_memory_config(struct dcn10_dpp *xfm,
+-		const struct scaler_data *scl_data)
+-{
+-	enum lb_memory_config mem_cfg = LB_MEMORY_CONFIG_0;
+-
+-	if (xfm->tf_mask->PIXEL_DEPTH) {
+-		mem_cfg = dpp10_find_lb_memory_config(scl_data);
+-	}
+-	return mem_cfg;
+-}
+-
+ void dpp_set_scaler_auto_scale(
+ 	struct transform *xfm_base,
+ 	const struct scaler_data *scl_data)
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h b/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
+index f95621df..7c08bc6 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
+@@ -38,6 +38,7 @@ struct transform {
+ 	const struct transform_funcs *funcs;
+ 	struct dc_context *ctx;
+ 	int inst;
++	struct dpp_caps *caps;
+ 	struct pwl_params regamma_params;
+ };
+ 
+@@ -109,6 +110,22 @@ enum graphics_gamut_adjust_type {
+ 	GRAPHICS_GAMUT_ADJUST_TYPE_SW /* use adjustments */
+ };
+ 
++enum lb_memory_config {
++	/* Enable all 3 pieces of memory */
++	LB_MEMORY_CONFIG_0 = 0,
++
++	/* Enable only the first piece of memory */
++	LB_MEMORY_CONFIG_1 = 1,
++
++	/* Enable only the second piece of memory */
++	LB_MEMORY_CONFIG_2 = 2,
++
++	/* Only applicable in 4:2:0 mode, enable all 3 pieces of memory and the
++	 * last piece of chroma memory used for the luma storage
++	 */
++	LB_MEMORY_CONFIG_3 = 3
++};
++
+ struct xfm_grph_csc_adjustment {
+ 	struct fixed31_32 temperature_matrix[CSC_TEMPERATURE_MATRIX_SIZE];
+ 	enum graphics_gamut_adjust_type gamut_adjust_type;
+@@ -262,4 +279,33 @@ const uint16_t *get_filter_6tap_64p(struct fixed31_32 ratio);
+ const uint16_t *get_filter_7tap_64p(struct fixed31_32 ratio);
+ const uint16_t *get_filter_8tap_64p(struct fixed31_32 ratio);
+ 
++
++/* Defines the pixel processing capability of the DSCL */
++enum dscl_data_processing_format {
++	DSCL_DATA_PRCESSING_FIXED_FORMAT,	/* The DSCL processes pixel data in fixed format */
++	DSCL_DATA_PRCESSING_FLOAT_FORMAT,	/* The DSCL processes pixel data in float format */
++};
++
++/*
++ * The DPP capabilities structure contains enumerations to specify the
++ * HW processing features and an associated function pointers to
++ * provide the function interface that can be overloaded for implementations
++ * based on different capabilities
++ */
++struct dpp_caps {
++	/* DSCL processing pixel data in fixed or float format */
++	enum dscl_data_processing_format dscl_data_proc_format;
++
++	/* Calculates the number of partitions in the line buffer.
++	 * The implementation of this function is overloaded for
++	 * different versions of DSCL LB.
++	 */
++	void (*dscl_calc_lb_num_partitions)(
++			const struct scaler_data *scl_data,
++			enum lb_memory_config lb_config,
++			int *num_part_y,
++			int *num_part_c);
++};
++
++
+ #endif
+-- 
+2.7.4
+

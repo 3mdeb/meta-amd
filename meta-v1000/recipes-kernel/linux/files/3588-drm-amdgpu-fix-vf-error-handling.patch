@@ -1,0 +1,267 @@
+From 7b350a7f2215be1e18a43adfbe1fdb75be3e0d08 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Thu, 28 Sep 2017 09:47:32 -0400
+Subject: [PATCH 3588/5855] drm/amdgpu: fix vf error handling
+
+The error handling for virtual functions assumed a single
+vf per VM and didn't properly account for bare metal.  Make
+the error arrays per device and add locking.
+
+Reviewed-by: Gavin Wan <gavin.wan@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c   | 23 ++++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.c | 54 +++++++++++++---------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.h |  5 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h     | 13 +++++++
+ 4 files changed, 54 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 3fd0c86..c65abf2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2118,6 +2118,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	mutex_init(&adev->srbm_mutex);
+ 	mutex_init(&adev->grbm_idx_mutex);
+ 	mutex_init(&adev->mn_lock);
++	mutex_init(&adev->virt.vf_errors.lock);
+ 	hash_init(adev->mn_hash);
+ 
+ 	amdgpu_check_arguments(adev);
+@@ -2202,7 +2203,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	r = amdgpu_atombios_init(adev);
+ 	if (r) {
+ 		dev_err(adev->dev, "amdgpu_atombios_init failed\n");
+-		amdgpu_vf_error_put(AMDGIM_ERROR_VF_ATOMBIOS_INIT_FAIL, 0, 0);
++		amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_ATOMBIOS_INIT_FAIL, 0, 0);
+ 		goto failed;
+ 	}
+ 
+@@ -2213,7 +2214,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	if (amdgpu_vpost_needed(adev)) {
+ 		if (!adev->bios) {
+ 			dev_err(adev->dev, "no vBIOS found\n");
+-			amdgpu_vf_error_put(AMDGIM_ERROR_VF_NO_VBIOS, 0, 0);
++			amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_NO_VBIOS, 0, 0);
+ 			r = -EINVAL;
+ 			goto failed;
+ 		}
+@@ -2221,7 +2222,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 		r = amdgpu_atom_asic_init(adev->mode_info.atom_context);
+ 		if (r) {
+ 			dev_err(adev->dev, "gpu post error!\n");
+-			amdgpu_vf_error_put(AMDGIM_ERROR_VF_GPU_POST_ERROR, 0, 0);
++			amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_GPU_POST_ERROR, 0, 0);
+ 			goto failed;
+ 		}
+ 	} else {
+@@ -2233,7 +2234,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 		r = amdgpu_atomfirmware_get_clock_info(adev);
+ 		if (r) {
+ 			dev_err(adev->dev, "amdgpu_atomfirmware_get_clock_info failed\n");
+-			amdgpu_vf_error_put(AMDGIM_ERROR_VF_ATOMBIOS_GET_CLOCK_FAIL, 0, 0);
++			amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_ATOMBIOS_GET_CLOCK_FAIL, 0, 0);
+ 			goto failed;
+ 		}
+ 	} else {
+@@ -2241,7 +2242,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 		r = amdgpu_atombios_get_clock_info(adev);
+ 		if (r) {
+ 			dev_err(adev->dev, "amdgpu_atombios_get_clock_info failed\n");
+-			amdgpu_vf_error_put(AMDGIM_ERROR_VF_ATOMBIOS_GET_CLOCK_FAIL, 0, 0);
++			amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_ATOMBIOS_GET_CLOCK_FAIL, 0, 0);
+ 			goto failed;
+ 		}
+ 		/* init i2c buses */
+@@ -2253,7 +2254,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	r = amdgpu_fence_driver_init(adev);
+ 	if (r) {
+ 		dev_err(adev->dev, "amdgpu_fence_driver_init failed\n");
+-		amdgpu_vf_error_put(AMDGIM_ERROR_VF_FENCE_INIT_FAIL, 0, 0);
++		amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_FENCE_INIT_FAIL, 0, 0);
+ 		goto failed;
+ 	}
+ 
+@@ -2263,7 +2264,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	r = amdgpu_init(adev);
+ 	if (r) {
+ 		dev_err(adev->dev, "amdgpu_init failed\n");
+-		amdgpu_vf_error_put(AMDGIM_ERROR_VF_AMDGPU_INIT_FAIL, 0, 0);
++		amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_AMDGPU_INIT_FAIL, 0, 0);
+ 		amdgpu_fini(adev);
+ 		goto failed;
+ 	}
+@@ -2283,7 +2284,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	r = amdgpu_ib_pool_init(adev);
+ 	if (r) {
+ 		dev_err(adev->dev, "IB initialization failed (%d).\n", r);
+-		amdgpu_vf_error_put(AMDGIM_ERROR_VF_IB_INIT_FAIL, 0, r);
++		amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_IB_INIT_FAIL, 0, r);
+ 		goto failed;
+ 	}
+ 
+@@ -2336,7 +2337,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	r = amdgpu_late_init(adev);
+ 	if (r) {
+ 		dev_err(adev->dev, "amdgpu_late_init failed\n");
+-		amdgpu_vf_error_put(AMDGIM_ERROR_VF_AMDGPU_LATE_INIT_FAIL, 0, r);
++		amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_AMDGPU_LATE_INIT_FAIL, 0, r);
+ 		goto failed;
+ 	}
+ 
+@@ -3040,7 +3041,7 @@ int amdgpu_gpu_reset(struct amdgpu_device *adev)
+ 		}
+ 	} else {
+ 		dev_err(adev->dev, "asic resume failed (%d).\n", r);
+-		amdgpu_vf_error_put(AMDGIM_ERROR_VF_ASIC_RESUME_FAIL, 0, r);
++		amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_ASIC_RESUME_FAIL, 0, r);
+ 		for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+ 			if (adev->rings[i] && adev->rings[i]->sched.thread) {
+ 				kthread_unpark(adev->rings[i]->sched.thread);
+@@ -3058,7 +3059,7 @@ int amdgpu_gpu_reset(struct amdgpu_device *adev)
+ 	if (r) {
+ 		/* bad news, how to tell it to userspace ? */
+ 		dev_info(adev->dev, "GPU reset failed\n");
+-		amdgpu_vf_error_put(AMDGIM_ERROR_VF_GPU_RESET_FAIL, 0, r);
++		amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_GPU_RESET_FAIL, 0, r);
+ 	}
+ 	else {
+ 		dev_info(adev->dev, "GPU reset successed!\n");
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.c
+index 45ac918..746b813 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.c
+@@ -25,30 +25,21 @@
+ #include "amdgpu_vf_error.h"
+ #include "mxgpu_ai.h"
+ 
+-#define AMDGPU_VF_ERROR_ENTRY_SIZE    16 
+-
+-/* struct error_entry - amdgpu VF error information. */
+-struct amdgpu_vf_error_buffer {
+-	int read_count;
+-	int write_count;
+-	uint16_t code[AMDGPU_VF_ERROR_ENTRY_SIZE];
+-	uint16_t flags[AMDGPU_VF_ERROR_ENTRY_SIZE];
+-	uint64_t data[AMDGPU_VF_ERROR_ENTRY_SIZE];
+-};
+-
+-struct amdgpu_vf_error_buffer admgpu_vf_errors;
+-
+-
+-void amdgpu_vf_error_put(uint16_t sub_error_code, uint16_t error_flags, uint64_t error_data)
++void amdgpu_vf_error_put(struct amdgpu_device *adev,
++			 uint16_t sub_error_code,
++			 uint16_t error_flags,
++			 uint64_t error_data)
+ {
+ 	int index;
+ 	uint16_t error_code = AMDGIM_ERROR_CODE(AMDGIM_ERROR_CATEGORY_VF, sub_error_code);
+ 
+-	index = admgpu_vf_errors.write_count % AMDGPU_VF_ERROR_ENTRY_SIZE;
+-	admgpu_vf_errors.code [index] = error_code;
+-	admgpu_vf_errors.flags [index] = error_flags;
+-	admgpu_vf_errors.data [index] = error_data;
+-	admgpu_vf_errors.write_count ++;
++	mutex_lock(&adev->virt.vf_errors.lock);
++	index = adev->virt.vf_errors.write_count % AMDGPU_VF_ERROR_ENTRY_SIZE;
++	adev->virt.vf_errors.code [index] = error_code;
++	adev->virt.vf_errors.flags [index] = error_flags;
++	adev->virt.vf_errors.data [index] = error_data;
++	adev->virt.vf_errors.write_count ++;
++	mutex_unlock(&adev->virt.vf_errors.lock);
+ }
+ 
+ 
+@@ -58,7 +49,8 @@ void amdgpu_vf_error_trans_all(struct amdgpu_device *adev)
+ 	u32 data1, data2, data3;
+ 	int index;
+ 
+-	if ((NULL == adev) || (!amdgpu_sriov_vf(adev)) || (!adev->virt.ops) || (!adev->virt.ops->trans_msg)) {
++	if ((NULL == adev) || (!amdgpu_sriov_vf(adev)) ||
++	    (!adev->virt.ops) || (!adev->virt.ops->trans_msg)) {
+ 		return;
+ 	}
+ /*
+@@ -68,18 +60,22 @@ void amdgpu_vf_error_trans_all(struct amdgpu_device *adev)
+ 		return;
+ 	}
+ */
++
++	mutex_lock(&adev->virt.vf_errors.lock);
+ 	/* The errors are overlay of array, correct read_count as full. */
+-	if (admgpu_vf_errors.write_count - admgpu_vf_errors.read_count > AMDGPU_VF_ERROR_ENTRY_SIZE) {
+-		admgpu_vf_errors.read_count = admgpu_vf_errors.write_count - AMDGPU_VF_ERROR_ENTRY_SIZE;
++	if (adev->virt.vf_errors.write_count - adev->virt.vf_errors.read_count > AMDGPU_VF_ERROR_ENTRY_SIZE) {
++		adev->virt.vf_errors.read_count = adev->virt.vf_errors.write_count - AMDGPU_VF_ERROR_ENTRY_SIZE;
+ 	}
+ 
+-	while (admgpu_vf_errors.read_count < admgpu_vf_errors.write_count) {
+-		index =admgpu_vf_errors.read_count % AMDGPU_VF_ERROR_ENTRY_SIZE;
+-		data1 = AMDGIM_ERROR_CODE_FLAGS_TO_MAILBOX (admgpu_vf_errors.code[index], admgpu_vf_errors.flags[index]);
+-		data2 = admgpu_vf_errors.data[index] & 0xFFFFFFFF;
+-		data3 = (admgpu_vf_errors.data[index] >> 32) & 0xFFFFFFFF;
++	while (adev->virt.vf_errors.read_count < adev->virt.vf_errors.write_count) {
++		index =adev->virt.vf_errors.read_count % AMDGPU_VF_ERROR_ENTRY_SIZE;
++		data1 = AMDGIM_ERROR_CODE_FLAGS_TO_MAILBOX(adev->virt.vf_errors.code[index],
++							   adev->virt.vf_errors.flags[index]);
++		data2 = adev->virt.vf_errors.data[index] & 0xFFFFFFFF;
++		data3 = (adev->virt.vf_errors.data[index] >> 32) & 0xFFFFFFFF;
+ 
+ 		adev->virt.ops->trans_msg(adev, IDH_LOG_VF_ERROR, data1, data2, data3);
+-		admgpu_vf_errors.read_count ++;
++		adev->virt.vf_errors.read_count ++;
+ 	}
++	mutex_unlock(&adev->virt.vf_errors.lock);
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.h
+index 2a3278e..6436bd0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.h
+@@ -56,7 +56,10 @@ enum AMDGIM_ERROR_CATEGORY {
+ 	AMDGIM_ERROR_CATEGORY_MAX
+ };
+ 
+-void amdgpu_vf_error_put(uint16_t sub_error_code, uint16_t error_flags, uint64_t error_data);
++void amdgpu_vf_error_put(struct amdgpu_device *adev,
++			 uint16_t sub_error_code,
++			 uint16_t error_flags,
++			 uint64_t error_data);
+ void amdgpu_vf_error_trans_all (struct amdgpu_device *adev);
+ 
+ #endif /* __VF_ERROR_H__ */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
+index afcfb8b..e5fd0ff 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
+@@ -36,6 +36,18 @@ struct amdgpu_mm_table {
+ 	uint64_t		gpu_addr;
+ };
+ 
++#define AMDGPU_VF_ERROR_ENTRY_SIZE    16
++
++/* struct error_entry - amdgpu VF error information. */
++struct amdgpu_vf_error_buffer {
++	struct mutex lock;
++	int read_count;
++	int write_count;
++	uint16_t code[AMDGPU_VF_ERROR_ENTRY_SIZE];
++	uint16_t flags[AMDGPU_VF_ERROR_ENTRY_SIZE];
++	uint64_t data[AMDGPU_VF_ERROR_ENTRY_SIZE];
++};
++
+ /**
+  * struct amdgpu_virt_ops - amdgpu device virt operations
+  */
+@@ -59,6 +71,7 @@ struct amdgpu_virt {
+ 	struct work_struct		flr_work;
+ 	struct amdgpu_mm_table		mm_table;
+ 	const struct amdgpu_virt_ops	*ops;
++	struct amdgpu_vf_error_buffer   vf_errors;
+ };
+ 
+ #define AMDGPU_CSA_SIZE    (8 * 1024)
+-- 
+2.7.4
+

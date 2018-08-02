@@ -1,0 +1,114 @@
+From 6e292b4f4d675f09e51345437caef33ef94e798b Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Mon, 16 Oct 2017 19:46:43 +0800
+Subject: [PATCH 3722/5855] drm/amdgpu:cleanup job reset routine(v2)
+
+merge the setting guilty on context into this function
+to avoid implement extra routine.
+
+v2:
+go through entity list and compare the fence_ctx
+before operate on the entity, otherwise the entity
+may be just a wild pointer
+
+Change-Id: I7a0063464fdc85d5ac9080046380e745565ff540
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Chunming Zhou <David1.Zhou@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c    |  4 ++--
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 31 ++++++++++++++++++++++++++-
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  2 +-
+ 3 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 590af8e..6961483 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2890,7 +2890,7 @@ int amdgpu_sriov_gpu_reset(struct amdgpu_device *adev, struct amdgpu_job *job)
+ 			amd_sched_job_kickout(&job->base);
+ 
+ 		/* only do job_reset on the hang ring if @job not NULL */
+-		amd_sched_hw_job_reset(&ring->sched);
++		amd_sched_hw_job_reset(&ring->sched, NULL);
+ 
+ 		/* after all hw jobs are reset, hw fence is meaningless, so force_completion */
+ 		amdgpu_fence_driver_force_completion(ring);
+@@ -3011,7 +3011,7 @@ int amdgpu_gpu_reset(struct amdgpu_device *adev)
+ 		if (!ring || !ring->sched.thread)
+ 			continue;
+ 		kthread_park(ring->sched.thread);
+-		amd_sched_hw_job_reset(&ring->sched);
++		amd_sched_hw_job_reset(&ring->sched, NULL);
+ 		/* after all hw jobs are reset, hw fence is meaningless, so force_completion */
+ 		amdgpu_fence_driver_force_completion(ring);
+ 	}
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index 002215d..6225567 100755
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -442,9 +442,18 @@ static void amd_sched_job_timedout(struct work_struct *work)
+ 	job->sched->ops->timedout_job(job);
+ }
+ 
+-void amd_sched_hw_job_reset(struct amd_gpu_scheduler *sched)
++static void amd_sched_set_guilty(struct amd_sched_job *s_job)
++{
++	if (atomic_inc_return(&s_job->karma) > s_job->sched->hang_limit)
++		if (s_job->s_entity->guilty)
++			atomic_set(s_job->s_entity->guilty, 1);
++}
++
++void amd_sched_hw_job_reset(struct amd_gpu_scheduler *sched, struct amd_sched_job *bad)
+ {
+ 	struct amd_sched_job *s_job;
++	struct amd_sched_entity *entity, *tmp;
++	int i;;
+ 
+ 	spin_lock(&sched->job_list_lock);
+ 	list_for_each_entry_reverse(s_job, &sched->ring_mirror_list, node) {
+@@ -457,6 +466,26 @@ void amd_sched_hw_job_reset(struct amd_gpu_scheduler *sched)
+ 		}
+ 	}
+ 	spin_unlock(&sched->job_list_lock);
++
++	if (bad) {
++		bool found = false;
++
++		for (i = AMD_SCHED_PRIORITY_MIN; i < AMD_SCHED_PRIORITY_MAX; i++ ) {
++			struct amd_sched_rq *rq = &sched->sched_rq[i];
++
++			spin_lock(&rq->lock);
++			list_for_each_entry_safe(entity, tmp, &rq->entities, list) {
++				if (bad->s_fence->scheduled.context == entity->fence_context) {
++					found = true;
++					amd_sched_set_guilty(bad);
++					break;
++				}
++			}
++			spin_unlock(&rq->lock);
++			if (found)
++				break;
++		}
++	}
+ }
+ 
+ void amd_sched_job_kickout(struct amd_sched_job *s_job)
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index e57b835..c045bfb 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -174,7 +174,7 @@ int amd_sched_job_init(struct amd_sched_job *job,
+ 		       struct amd_gpu_scheduler *sched,
+ 		       struct amd_sched_entity *entity,
+ 		       void *owner);
+-void amd_sched_hw_job_reset(struct amd_gpu_scheduler *sched);
++void amd_sched_hw_job_reset(struct amd_gpu_scheduler *sched, struct amd_sched_job *job);
+ void amd_sched_job_recovery(struct amd_gpu_scheduler *sched);
+ bool amd_sched_dependency_optimized(struct fence* fence,
+ 				    struct amd_sched_entity *entity);
+-- 
+2.7.4
+

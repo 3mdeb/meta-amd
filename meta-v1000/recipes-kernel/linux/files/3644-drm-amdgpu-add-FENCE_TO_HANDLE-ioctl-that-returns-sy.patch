@@ -1,0 +1,344 @@
+From bc3fe573a0c3dc8a1302b04a0019ab99d65bfa39 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Tue, 12 Sep 2017 16:49:54 +0200
+Subject: [PATCH 3644/5855] drm/amdgpu: add FENCE_TO_HANDLE ioctl that returns
+ syncobj or sync_file
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+for being able to convert an amdgpu fence into one of the handles.
+Mesa will use this.
+
+Signed-off-by: Marek Olšák <marek.olsak@amd.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+ Conflicts:
+	include/uapi/drm/amdgpu_drm.h
+
+Change-Id: Icad647d766c48e04338a12982be1a147392170b6
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  | 61 ++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c |  3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c |  1 +
+ drivers/gpu/drm/drm_syncobj.c           | 82 +++++++++++++++++++++++++--------
+ include/drm/drm_syncobj.h               |  5 ++
+ include/uapi/drm/amdgpu_drm.h           | 18 +++++++-
+ 7 files changed, 151 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 4b44ab4..c9b8fe1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1341,6 +1341,8 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
+ 			struct drm_file *filp);
+ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
++int amdgpu_cs_fence_to_handle_ioctl(struct drm_device *dev, void *data,
++				    struct drm_file *filp);
+ int amdgpu_cs_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
+ int amdgpu_cs_wait_fences_ioctl(struct drm_device *dev, void *data,
+ 				struct drm_file *filp);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 09358be..0d0b49a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -25,6 +25,7 @@
+  *    Jerome Glisse <glisse@freedesktop.org>
+  */
+ #include <linux/pagemap.h>
++#include <linux/sync_file.h>
+ #include <drm/drmP.h>
+ #include <drm/amdgpu_drm.h>
+ #include <drm/drm_syncobj.h>
+@@ -1312,6 +1313,66 @@ static struct fence *amdgpu_cs_get_fence(struct amdgpu_device *adev,
+ 	return fence;
+ }
+ 
++int amdgpu_cs_fence_to_handle_ioctl(struct drm_device *dev, void *data,
++				    struct drm_file *filp)
++{
++	struct amdgpu_device *adev = dev->dev_private;
++	struct amdgpu_fpriv *fpriv = filp->driver_priv;
++	union drm_amdgpu_fence_to_handle *info = data;
++	struct dma_fence *fence;
++	struct drm_syncobj *syncobj;
++	struct sync_file *sync_file;
++	int fd, r;
++
++	if (amdgpu_kms_vram_lost(adev, fpriv))
++		return -ENODEV;
++
++	fence = amdgpu_cs_get_fence(adev, filp, &info->in.fence);
++	if (IS_ERR(fence))
++		return PTR_ERR(fence);
++
++	switch (info->in.what) {
++	case AMDGPU_FENCE_TO_HANDLE_GET_SYNCOBJ:
++		r = drm_syncobj_create(&syncobj, 0, fence);
++		dma_fence_put(fence);
++		if (r)
++			return r;
++		r = drm_syncobj_get_handle(filp, syncobj, &info->out.handle);
++		drm_syncobj_put(syncobj);
++		return r;
++
++	case AMDGPU_FENCE_TO_HANDLE_GET_SYNCOBJ_FD:
++		r = drm_syncobj_create(&syncobj, 0, fence);
++		dma_fence_put(fence);
++		if (r)
++			return r;
++		r = drm_syncobj_get_fd(syncobj, (int*)&info->out.handle);
++		drm_syncobj_put(syncobj);
++		return r;
++
++	case AMDGPU_FENCE_TO_HANDLE_GET_SYNC_FILE_FD:
++		fd = get_unused_fd_flags(O_CLOEXEC);
++		if (fd < 0) {
++			dma_fence_put(fence);
++			return fd;
++		}
++
++		sync_file = sync_file_create(fence);
++		dma_fence_put(fence);
++		if (!sync_file) {
++			put_unused_fd(fd);
++			return -ENOMEM;
++		}
++
++		fd_install(fd, sync_file->file);
++		info->out.handle = fd;
++		return 0;
++
++	default:
++		return -EINVAL;
++	}
++}
++
+ /**
+  * amdgpu_cs_wait_all_fence - wait on all fences to signal
+  *
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 01dcadd..ebabac6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -70,9 +70,10 @@
+  * - 3.18.0 - Export gpu always on cu bitmap
+  * - 3.19.0 - Add support for UVD MJPEG decode
+  * - 3.20.0 - Add support for local BOs
++ * - 3.21.0 - Add DRM_AMDGPU_FENCE_TO_HANDLE ioctl
+  */
+ #define KMS_DRIVER_MAJOR	3
+-#define KMS_DRIVER_MINOR	20
++#define KMS_DRIVER_MINOR	21
+ #define KMS_DRIVER_PATCHLEVEL	0
+ 
+ int amdgpu_vram_limit = 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index fef6b32..18e68b0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -1104,6 +1104,7 @@ const struct drm_ioctl_desc amdgpu_ioctls_kms[] = {
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_CTX, amdgpu_ctx_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_VM, amdgpu_vm_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_BO_LIST, amdgpu_bo_list_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(AMDGPU_FENCE_TO_HANDLE, amdgpu_cs_fence_to_handle_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	/* KMS */
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_MMAP, amdgpu_gem_mmap_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_WAIT_IDLE, amdgpu_gem_wait_idle_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+diff --git a/drivers/gpu/drm/drm_syncobj.c b/drivers/gpu/drm/drm_syncobj.c
+index 3a24884..a134a2a 100644
+--- a/drivers/gpu/drm/drm_syncobj.c
++++ b/drivers/gpu/drm/drm_syncobj.c
+@@ -266,8 +266,14 @@ void drm_syncobj_free(struct kref *kref)
+ }
+ EXPORT_SYMBOL(drm_syncobj_free);
+ 
+-static int drm_syncobj_create(struct drm_file *file_private,
+-			      u32 *handle, uint32_t flags)
++/**
++ * drm_syncobj_create - create a new syncobj
++ * @out_syncobj: returned syncobj
++ * @flags: DRM_SYNCOBJ_* flags
++ * @fence: if non-NULL, the syncobj will represent this fence
++ */
++int drm_syncobj_create(struct drm_syncobj **out_syncobj, uint32_t flags,
++		       struct dma_fence *fence)
+ {
+ 	int ret;
+ 	struct drm_syncobj *syncobj;
+@@ -288,6 +294,25 @@ static int drm_syncobj_create(struct drm_file *file_private,
+ 		}
+ 	}
+ 
++	if (fence)
++		drm_syncobj_replace_fence(syncobj, fence);
++
++	*out_syncobj = syncobj;
++	return 0;
++}
++EXPORT_SYMBOL(drm_syncobj_create);
++
++/**
++ * drm_syncobj_get_handle - get a handle from a syncobj
++ */
++int drm_syncobj_get_handle(struct drm_file *file_private,
++			   struct drm_syncobj *syncobj, u32 *handle)
++{
++	int ret;
++
++	/* take a reference to put in the idr */
++	drm_syncobj_get(syncobj);
++
+ 	idr_preload(GFP_KERNEL);
+ 	spin_lock(&file_private->syncobj_table_lock);
+ 	ret = idr_alloc(&file_private->syncobj_idr, syncobj, 1, 0, GFP_NOWAIT);
+@@ -303,6 +328,22 @@ static int drm_syncobj_create(struct drm_file *file_private,
+ 	*handle = ret;
+ 	return 0;
+ }
++EXPORT_SYMBOL(drm_syncobj_get_handle);
++
++static int drm_syncobj_create_as_handle(struct drm_file *file_private,
++					u32 *handle, uint32_t flags)
++{
++	int ret;
++	struct drm_syncobj *syncobj;
++
++	ret = drm_syncobj_create(&syncobj, flags, NULL);
++	if (ret)
++		return ret;
++
++	ret = drm_syncobj_get_handle(file_private, syncobj, handle);
++	drm_syncobj_put(syncobj);
++	return ret;
++}
+ 
+ static int drm_syncobj_destroy(struct drm_file *file_private,
+ 			       u32 handle)
+@@ -352,33 +393,38 @@ static int drm_syncobj_alloc_file(struct drm_syncobj *syncobj)
+ 	return 0;
+ }
+ 
+-static int drm_syncobj_handle_to_fd(struct drm_file *file_private,
+-				    u32 handle, int *p_fd)
++int drm_syncobj_get_fd(struct drm_syncobj *syncobj, int *p_fd)
+ {
+-	struct drm_syncobj *syncobj = drm_syncobj_find(file_private, handle);
+ 	int ret;
+ 	int fd;
+ 
+-	if (!syncobj)
+-		return -EINVAL;
+-
+ 	fd = get_unused_fd_flags(O_CLOEXEC);
+-	if (fd < 0) {
+-		drm_syncobj_put(syncobj);
++	if (fd < 0)
+ 		return fd;
+-	}
+ 
+ 	if (!syncobj->file) {
+ 		ret = drm_syncobj_alloc_file(syncobj);
+-		if (ret)
+-			goto out_put_fd;
++		if (ret) {
++			put_unused_fd(fd);
++			return ret;
++		}
+ 	}
+ 	fd_install(fd, syncobj->file);
+-	drm_syncobj_put(syncobj);
+ 	*p_fd = fd;
+ 	return 0;
+-out_put_fd:
+-	put_unused_fd(fd);
++}
++EXPORT_SYMBOL(drm_syncobj_get_fd);
++
++static int drm_syncobj_handle_to_fd(struct drm_file *file_private,
++				    u32 handle, int *p_fd)
++{
++	struct drm_syncobj *syncobj = drm_syncobj_find(file_private, handle);
++	int ret;
++
++	if (!syncobj)
++		return -EINVAL;
++
++	ret = drm_syncobj_get_fd(syncobj, p_fd);
+ 	drm_syncobj_put(syncobj);
+ 	return ret;
+ }
+@@ -531,8 +577,8 @@ drm_syncobj_create_ioctl(struct drm_device *dev, void *data,
+ 	if (args->flags & ~DRM_SYNCOBJ_CREATE_SIGNALED)
+ 		return -EINVAL;
+ 
+-	return drm_syncobj_create(file_private,
+-				  &args->handle, args->flags);
++	return drm_syncobj_create_as_handle(file_private,
++					    &args->handle, args->flags);
+ }
+ 
+ int
+diff --git a/include/drm/drm_syncobj.h b/include/drm/drm_syncobj.h
+index e8b7f02..f36d525 100644
+--- a/include/drm/drm_syncobj.h
++++ b/include/drm/drm_syncobj.h
+@@ -138,5 +138,10 @@ int drm_syncobj_find_fence(struct drm_file *file_private,
+ 			  u32 handle,
+ 			  struct fence **fence);
+ void drm_syncobj_free(struct kref *kref);
++int drm_syncobj_create(struct drm_syncobj **out_syncobj, uint32_t flags,
++		       struct dma_fence *fence);
++int drm_syncobj_get_handle(struct drm_file *file_private,
++			   struct drm_syncobj *syncobj, u32 *handle);
++int drm_syncobj_get_fd(struct drm_syncobj *syncobj, int *p_fd);
+ 
+ #endif
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 9e444a5..63aff31 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -52,7 +52,7 @@ extern "C" {
+ #define DRM_AMDGPU_GEM_USERPTR		0x11
+ #define DRM_AMDGPU_WAIT_FENCES		0x12
+ #define DRM_AMDGPU_VM			0x13
+-#define DRM_AMDGPU_FREESYNC	        0x14
++#define DRM_AMDGPU_FENCE_TO_HANDLE      0x14
+ 
+ /* hybrid specific ioctls */
+ #define DRM_AMDGPU_SEM			0x5b
+@@ -74,7 +74,7 @@ extern "C" {
+ #define DRM_IOCTL_AMDGPU_GEM_USERPTR	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_USERPTR, struct drm_amdgpu_gem_userptr)
+ #define DRM_IOCTL_AMDGPU_WAIT_FENCES	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_WAIT_FENCES, union drm_amdgpu_wait_fences)
+ #define DRM_IOCTL_AMDGPU_VM		DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_VM, union drm_amdgpu_vm)
+-#define DRM_IOCTL_AMDGPU_FREESYNC	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_FREESYNC, struct drm_amdgpu_freesync)
++#define DRM_IOCTL_AMDGPU_FENCE_TO_HANDLE DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_FENCE_TO_HANDLE, union drm_amdgpu_fence_to_handle)
+ 
+ /* hybrid specific ioctls */
+ #define DRM_IOCTL_AMDGPU_GEM_DGMA      DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_DGMA, struct drm_amdgpu_gem_dgma)
+@@ -587,6 +587,20 @@ struct drm_amdgpu_cs_chunk_sem {
+ 	__u32 handle;
+ };
+ 
++#define AMDGPU_FENCE_TO_HANDLE_GET_SYNCOBJ	0
++#define AMDGPU_FENCE_TO_HANDLE_GET_SYNCOBJ_FD	1
++#define AMDGPU_FENCE_TO_HANDLE_GET_SYNC_FILE_FD	2
++
++union drm_amdgpu_fence_to_handle {
++	struct {
++		struct drm_amdgpu_fence fence;
++		__u32 what;
++	} in;
++	struct {
++		__u32 handle;
++	} out;
++};
++
+ struct drm_amdgpu_cs_chunk_data {
+ 	union {
+ 		struct drm_amdgpu_cs_chunk_ib		ib_data;
+-- 
+2.7.4
+

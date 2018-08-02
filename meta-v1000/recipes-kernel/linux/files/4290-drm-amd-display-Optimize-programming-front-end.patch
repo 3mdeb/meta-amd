@@ -1,0 +1,192 @@
+From bd608de4a05b977ece55409943b75f9cf1ac6912 Mon Sep 17 00:00:00 2001
+From: Yongqiang Sun <yongqiang.sun@amd.com>
+Date: Tue, 7 Nov 2017 11:01:34 -0500
+Subject: [PATCH 4290/5855] drm/amd/display: Optimize programming front end
+
+In case of update type is medium, optimize squence,
+reduce programing time.
+
+Signed-off-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           | 22 +++++-------
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  | 42 ++++++++++------------
+ 2 files changed, 27 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 2d6475c..3e611f4 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1316,7 +1316,7 @@ static void commit_planes_for_stream(struct dc *dc,
+ 	for (j = 0; j < dc->res_pool->pipe_count; j++) {
+ 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[j];
+ 
+-		if (update_type != UPDATE_TYPE_FULL || !pipe_ctx->plane_state)
++		if (update_type == UPDATE_TYPE_FAST || !pipe_ctx->plane_state)
+ 			continue;
+ 
+ 		if (!pipe_ctx->top_pipe &&
+@@ -1337,26 +1337,20 @@ static void commit_planes_for_stream(struct dc *dc,
+ 	for (i = 0; i < surface_count; i++) {
+ 		struct dc_plane_state *plane_state = srf_updates[i].surface;
+ 
+-		if (update_type == UPDATE_TYPE_MED)
+-			dc->hwss.apply_ctx_for_surface(
+-					dc, stream, surface_count, context);
+-
+ 		for (j = 0; j < dc->res_pool->pipe_count; j++) {
+ 			struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[j];
+ 
+-			if (pipe_ctx->plane_state != plane_state)
++			if (pipe_ctx->stream != stream)
+ 				continue;
+ 
+-			if (srf_updates[i].flip_addr)
+-				dc->hwss.update_plane_addr(dc, pipe_ctx);
+-
+-			if (update_type == UPDATE_TYPE_FAST)
++			if (pipe_ctx->plane_state != plane_state)
+ 				continue;
+ 
+-			/* work around to program degamma regs for split pipe after set mode. */
+-			if (srf_updates[i].in_transfer_func ||
+-			    (pipe_ctx->top_pipe && pipe_ctx->top_pipe->plane_state == pipe_ctx->plane_state))
+-				dc->hwss.set_input_transfer_func(pipe_ctx, pipe_ctx->plane_state);
++			if (update_type == UPDATE_TYPE_FAST) {
++				if (srf_updates[i].flip_addr)
++					dc->hwss.update_plane_addr(dc, pipe_ctx);
++				continue;
++			}
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 7cad354..c04dea0 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -608,7 +608,7 @@ static void reset_back_end_for_pipe(
+ 					pipe_ctx->pipe_idx, pipe_ctx->stream_res.tg->inst);
+ }
+ 
+-void dcn10_verify_allow_pstate_change_high(struct dc *dc)
++static void dcn10_verify_allow_pstate_change_high(struct dc *dc)
+ {
+ 	static bool should_log_hw_state; /* prevent hw state log by default */
+ 
+@@ -1390,7 +1390,7 @@ static void dcn10_enable_per_frame_crtc_position_reset(
+ 	DC_SYNC_INFO("Multi-display sync is complete\n");
+ }
+ 
+-static void print_rq_dlg_ttu(
++/*static void print_rq_dlg_ttu(
+ 		struct dc *core_dc,
+ 		struct pipe_ctx *pipe_ctx)
+ {
+@@ -1511,13 +1511,13 @@ static void print_rq_dlg_ttu(
+ 			pipe_ctx->rq_regs.rq_regs_l.pte_row_height_linear
+ 			);
+ }
++*/
+ 
+ static void dcn10_enable_plane(
+ 	struct dc *dc,
+ 	struct pipe_ctx *pipe_ctx,
+ 	struct dc_state *context)
+ {
+-	struct dc_plane_state *plane_state = pipe_ctx->plane_state;
+ 	struct dce_hwseq *hws = dc->hwseq;
+ 
+ 	if (dc->debug.sanity_checks) {
+@@ -1538,6 +1538,7 @@ static void dcn10_enable_plane(
+ 			OPP_PIPE_CLOCK_EN, 1);
+ 	/*TODO: REG_UPDATE(DENTIST_DISPCLK_CNTL, DENTIST_DPPCLK_WDIVIDER, 0x1f);*/
+ 
++/* TODO: enable/disable in dm as per update type.
+ 	if (plane_state) {
+ 		dm_logger_write(dc->ctx->logger, LOG_DC,
+ 				"Pipe:%d 0x%x: addr hi:0x%x, "
+@@ -1573,6 +1574,7 @@ static void dcn10_enable_plane(
+ 				pipe_ctx->plane_res.scl_data.recout.y);
+ 		print_rq_dlg_ttu(dc, pipe_ctx);
+ 	}
++*/
+ 
+ 	if (dc->debug.sanity_checks) {
+ 		dcn10_verify_allow_pstate_change_high(dc);
+@@ -2005,16 +2007,8 @@ static void program_all_pipe_in_tree(
+ 		struct pipe_ctx *pipe_ctx,
+ 		struct dc_state *context)
+ {
+-	unsigned int ref_clk_mhz = dc->res_pool->ref_clock_inKhz/1000;
+-
+ 	if (pipe_ctx->top_pipe == NULL) {
+ 
+-		/* lock otg_master_update to process all pipes associated with
+-		 * this OTG. this is done only one time.
+-		 */
+-		/* watermark is for all pipes */
+-		hubbub1_program_watermarks(dc->res_pool->hubbub, &context->bw.dcn.watermarks, ref_clk_mhz);
+-
+ 		if (dc->debug.sanity_checks) {
+ 			/* pstate stuck check after watermark update */
+ 			dcn10_verify_allow_pstate_change_high(dc);
+@@ -2037,17 +2031,6 @@ static void program_all_pipe_in_tree(
+ 
+ 		dcn10_enable_plane(dc, pipe_ctx, context);
+ 
+-		/* temporary dcn1 wa:
+-		 *   watermark update requires toggle after a/b/c/d sets are programmed
+-		 *   if hubp is pg then wm value doesn't get properaged to hubp
+-		 *   need to toggle after ungate to ensure wm gets to hubp.
+-		 *
+-		 * final solution:  we need to get SMU to do the toggle as
+-		 * DCHUBBUB_ARB_WATERMARK_CHANGE_REQUEST is owned by SMU we should have
+-		 * both driver and fw accessing same register
+-		 */
+-		hubbub1_toggle_watermark_change_req(dc->res_pool->hubbub);
+-
+ 		update_dchubp_dpp(dc, pipe_ctx, context);
+ 
+ 		/* TODO: this is a hack w/a for switching from mpo to pipe split */
+@@ -2159,6 +2142,7 @@ static void dcn10_apply_ctx_for_surface(
+ 	int i;
+ 	struct timing_generator *tg;
+ 	bool removed_pipe[4] = { false };
++	unsigned int ref_clk_mhz = dc->res_pool->ref_clock_inKhz/1000;
+ 
+ 	struct pipe_ctx *top_pipe_to_program =
+ 			find_top_pipe_for_stream(dc, context, stream);
+@@ -2221,7 +2205,6 @@ static void dcn10_apply_ctx_for_surface(
+ 
+ 	tg->funcs->unlock(tg);
+ 
+-
+ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+ 		struct pipe_ctx *old_pipe_ctx =
+ 				&dc->current_state->res_ctx.pipe_ctx[i];
+@@ -2230,6 +2213,19 @@ static void dcn10_apply_ctx_for_surface(
+ 			dcn10_disable_plane(dc, old_pipe_ctx);
+ 	}
+ 
++	if (dc->debug.sanity_checks) {
++		/* pstate stuck check after watermark update */
++		dcn10_verify_allow_pstate_change_high(dc);
++	}
++	/* watermark is for all pipes */
++	hubbub1_program_watermarks(dc->res_pool->hubbub,
++			&context->bw.dcn.watermarks, ref_clk_mhz);
++
++	if (dc->debug.sanity_checks) {
++		/* pstate stuck check after watermark update */
++		dcn10_verify_allow_pstate_change_high(dc);
++	}
++
+ 	dm_logger_write(dc->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 			"\n============== Watermark parameters ==============\n"
+ 			"a.urgent_ns: %d \n"
+-- 
+2.7.4
+

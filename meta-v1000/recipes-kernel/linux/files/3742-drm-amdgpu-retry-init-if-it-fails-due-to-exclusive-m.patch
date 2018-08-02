@@ -1,0 +1,96 @@
+From 900061b2e42183c8a5ffcfc108203e5797174387 Mon Sep 17 00:00:00 2001
+From: pding <Pixel.Ding@amd.com>
+Date: Mon, 23 Oct 2017 17:22:09 +0800
+Subject: [PATCH 3742/5855] drm/amdgpu: retry init if it fails due to exclusive
+ mode timeout (v3)
+
+The exclusive mode has real-time limitation in reality, such like being
+done in 300ms. It's easy observed if running many VF/VMs in single host
+with heavy CPU workload.
+
+If we find the init fails due to exclusive mode timeout, try it again.
+
+v2:
+ - rewrite the condition for readable value.
+
+v3:
+ - fix typo, add comments for sleep
+
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: pding <Pixel.Ding@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 10 ++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c    | 15 +++++++++++++--
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 207e8e8..4385cac 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2325,6 +2325,15 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 
+ 	r = amdgpu_init(adev);
+ 	if (r) {
++		/* failed in exclusive mode due to timeout */
++		if (amdgpu_sriov_vf(adev) &&
++		    !amdgpu_sriov_runtime(adev) &&
++		    amdgpu_virt_mmio_blocked(adev) &&
++		    !amdgpu_virt_wait_reset(adev)) {
++			dev_err(adev->dev, "VF exclusive mode timeout\n");
++			r = -EAGAIN;
++			goto failed;
++		}
+ 		dev_err(adev->dev, "amdgpu_init failed\n");
+ 		amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_AMDGPU_INIT_FAIL, 0, 0);
+ 		amdgpu_fini(adev);
+@@ -2412,6 +2421,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	amdgpu_vf_error_trans_all(adev);
+ 	if (runtime)
+ 		vga_switcheroo_fini_domain_pm_ops(adev->dev);
++
+ 	return r;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 4f420b1..8c38572 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -87,7 +87,7 @@ int amdgpu_driver_unload_kms(struct drm_device *dev)
+ int amdgpu_driver_load_kms(struct drm_device *dev, unsigned long flags)
+ {
+ 	struct amdgpu_device *adev;
+-	int r, acpi_status;
++	int r, acpi_status, retry = 0;
+ 
+ #ifdef CONFIG_DRM_AMDGPU_SI
+ 	if (!amdgpu_si_support) {
+@@ -123,6 +123,7 @@ int amdgpu_driver_load_kms(struct drm_device *dev, unsigned long flags)
+ 		}
+ 	}
+ #endif
++retry_init:
+ 
+ 	adev = kzalloc(sizeof(struct amdgpu_device), GFP_KERNEL);
+ 	if (adev == NULL) {
+@@ -144,7 +145,17 @@ int amdgpu_driver_load_kms(struct drm_device *dev, unsigned long flags)
+ 	 * VRAM allocation
+ 	 */
+ 	r = amdgpu_device_init(adev, dev, dev->pdev, flags);
+-	if (r) {
++	if (r == -EAGAIN && ++retry <= 3) {
++		adev->virt.caps &= ~AMDGPU_SRIOV_CAPS_RUNTIME;
++		adev->virt.ops = NULL;
++		amdgpu_device_fini(adev);
++		kfree(adev);
++		dev->dev_private = NULL;
++		/* Don't request EX mode too frequently which is attacking */
++		msleep(5000);
++		dev_err(&dev->pdev->dev, "retry init %d\n", retry);
++		goto retry_init;
++	} else if (r) {
+ 		dev_err(&dev->pdev->dev, "Fatal error during GPU init\n");
+ 		goto out;
+ 	}
+-- 
+2.7.4
+

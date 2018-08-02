@@ -1,0 +1,792 @@
+From 405f5dca01ee76766c96d46ed0ac0ae433cf4b37 Mon Sep 17 00:00:00 2001
+From: Andrew Jiang <Andrew.Jiang@amd.com>
+Date: Mon, 25 Sep 2017 18:03:14 -0400
+Subject: [PATCH 4065/5855] drm/amd/display: Move power control from link
+ encoder to hwsequencer
+
+A recent commit moved the backlight control code along with the register
+defines, but did not move the power control code. This along with
+remnant fields in the dce110_link_enc_registers struct made it so that
+the code still compiled, but any attempts to access the
+LVTMA_PWRSEQ_STATE register led to reading from an address of 0. This
+patch corrects that.
+
+Also, rename blacklight_control to edp_backlight_control (Typo fix).
+
+Signed-off-by: Andrew Jiang <Andrew.Jiang@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c      |  17 +-
+ drivers/gpu/drm/amd/display/dc/core/dc_link_hwss.c |   8 +-
+ drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.h     |  18 ++-
+ .../gpu/drm/amd/display/dc/dce/dce_link_encoder.c  | 171 +--------------------
+ .../gpu/drm/amd/display/dc/dce/dce_link_encoder.h  |   8 -
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    | 155 +++++++++++++++++--
+ .../amd/display/dc/dce110/dce110_hw_sequencer.h    |   6 +-
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  |   3 +-
+ .../gpu/drm/amd/display/dc/inc/hw/link_encoder.h   |   2 -
+ drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h  |   7 +-
+ drivers/gpu/drm/amd/display/dc/inc/link_hwss.h     |   4 +
+ .../amd/display/dc/virtual/virtual_link_encoder.c  |   5 -
+ 12 files changed, 190 insertions(+), 214 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index a58e61b..feb10be 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -78,14 +78,15 @@ static void destruct(struct dc_link *link)
+ 		dc_sink_release(link->remote_sinks[i]);
+ }
+ 
+-static struct gpio *get_hpd_gpio(const struct dc_link *link)
++struct gpio *get_hpd_gpio(struct dc_bios *dcb,
++		struct graphics_object_id link_id,
++		struct gpio_service *gpio_service)
+ {
+ 	enum bp_result bp_result;
+-	struct dc_bios *dcb = link->ctx->dc_bios;
+ 	struct graphics_object_hpd_info hpd_info;
+ 	struct gpio_pin_info pin_info;
+ 
+-	if (dcb->funcs->get_hpd_info(dcb, link->link_id, &hpd_info) != BP_RESULT_OK)
++	if (dcb->funcs->get_hpd_info(dcb, link_id, &hpd_info) != BP_RESULT_OK)
+ 		return NULL;
+ 
+ 	bp_result = dcb->funcs->get_gpio_pin_info(dcb,
+@@ -97,7 +98,7 @@ static struct gpio *get_hpd_gpio(const struct dc_link *link)
+ 	}
+ 
+ 	return dal_gpio_service_create_irq(
+-		link->ctx->gpio_service,
++		gpio_service,
+ 		pin_info.offset,
+ 		pin_info.mask);
+ }
+@@ -153,7 +154,7 @@ static bool program_hpd_filter(
+ 	}
+ 
+ 	/* Obtain HPD handle */
+-	hpd = get_hpd_gpio(link);
++	hpd = get_hpd_gpio(link->ctx->dc_bios, link->link_id, link->ctx->gpio_service);
+ 
+ 	if (!hpd)
+ 		return result;
+@@ -186,7 +187,7 @@ static bool detect_sink(struct dc_link *link, enum dc_connection_type *type)
+ 	struct gpio *hpd_pin;
+ 
+ 	/* todo: may need to lock gpio access */
+-	hpd_pin = get_hpd_gpio(link);
++	hpd_pin = get_hpd_gpio(link->ctx->dc_bios, link->link_id, link->ctx->gpio_service);
+ 	if (hpd_pin == NULL)
+ 		goto hpd_gpio_failure;
+ 
+@@ -795,7 +796,7 @@ static enum hpd_source_id get_hpd_line(
+ 	struct gpio *hpd;
+ 	enum hpd_source_id hpd_id = HPD_SOURCEID_UNKNOWN;
+ 
+-	hpd = get_hpd_gpio(link);
++	hpd = get_hpd_gpio(link->ctx->dc_bios, link->link_id, link->ctx->gpio_service);
+ 
+ 	if (hpd) {
+ 		switch (dal_irq_get_source(hpd)) {
+@@ -965,7 +966,7 @@ static bool construct(
+ 		goto create_fail;
+ 	}
+ 
+-	hpd_gpio = get_hpd_gpio(link);
++	hpd_gpio = get_hpd_gpio(link->ctx->dc_bios, link->link_id, link->ctx->gpio_service);
+ 
+ 	if (hpd_gpio != NULL)
+ 		link->irq_source_hpd = dal_irq_get_source(hpd_gpio);
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_hwss.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_hwss.c
+index fa22505..34b6d1c 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_hwss.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_hwss.c
+@@ -89,12 +89,12 @@ void dp_enable_link_phy(
+ 
+ 	if (dc_is_dp_sst_signal(signal)) {
+ 		if (signal == SIGNAL_TYPE_EDP) {
+-			link_enc->funcs->power_control(link_enc, true);
++			link->dc->hwss.edp_power_control(link->link_enc, true);
+ 			link_enc->funcs->enable_dp_output(
+ 						link_enc,
+ 						link_settings,
+ 						clock_source);
+-			link->dc->hwss.backlight_control(link, true);
++			link->dc->hwss.edp_backlight_control(link, true);
+ 		} else
+ 			link_enc->funcs->enable_dp_output(
+ 						link_enc,
+@@ -138,10 +138,10 @@ void dp_disable_link_phy(struct dc_link *link, enum signal_type signal)
+ 		dp_receiver_power_ctrl(link, false);
+ 
+ 	if (signal == SIGNAL_TYPE_EDP) {
+-		link->dc->hwss.backlight_control(link, false);
++		link->dc->hwss.edp_backlight_control(link, false);
+ 		edp_receiver_ready_T9(link);
+ 		link->link_enc->funcs->disable_output(link->link_enc, signal, link);
+-		link->link_enc->funcs->power_control(link->link_enc, false);
++		link->dc->hwss.edp_power_control(link->link_enc, false);
+ 	} else
+ 		link->link_enc->funcs->disable_output(link->link_enc, signal, link);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.h b/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.h
+index bb71fa6..9a04b87 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.h
+@@ -391,23 +391,27 @@ struct dce_hwseq_registers {
+ 	HWS_SF(BLND_, V_UPDATE_LOCK, BLND_DCP_GRPH_SURF_V_UPDATE_LOCK, mask_sh),\
+ 	HWS_SF(BLND_, CONTROL, BLND_MODE, mask_sh),\
+ 	HWS_SF(, LVTMA_PWRSEQ_CNTL, LVTMA_BLON, mask_sh),\
++	HWS_SF(, LVTMA_PWRSEQ_STATE, LVTMA_PWRSEQ_TARGET_STATE_R, mask_sh),\
+ 	HWSEQ_PIXEL_RATE_MASK_SH_LIST(mask_sh, CRTC0_)
+ 
+ #define HWSEQ_DCE10_MASK_SH_LIST(mask_sh)\
+ 	HWSEQ_DCEF_MASK_SH_LIST(mask_sh, DCFE_),\
+ 	HWSEQ_BLND_MASK_SH_LIST(mask_sh, BLND_),\
+ 	HWSEQ_PIXEL_RATE_MASK_SH_LIST(mask_sh, CRTC0_), \
+-	HWS_SF(, LVTMA_PWRSEQ_CNTL, LVTMA_BLON, mask_sh)
++	HWS_SF(, LVTMA_PWRSEQ_CNTL, LVTMA_BLON, mask_sh), \
++	HWS_SF(, LVTMA_PWRSEQ_STATE, LVTMA_PWRSEQ_TARGET_STATE_R, mask_sh)
+ 
+ #define HWSEQ_DCE11_MASK_SH_LIST(mask_sh)\
+ 	HWSEQ_DCE10_MASK_SH_LIST(mask_sh),\
+ 	SF(DCFEV_CLOCK_CONTROL, DCFEV_CLOCK_ENABLE, mask_sh),\
+ 	HWS_SF(, LVTMA_PWRSEQ_CNTL, LVTMA_BLON, mask_sh),\
++	HWS_SF(, LVTMA_PWRSEQ_STATE, LVTMA_PWRSEQ_TARGET_STATE_R, mask_sh),\
+ 	HWSEQ_PIXEL_RATE_MASK_SH_LIST(mask_sh, CRTC0_)
+ 
+ #define HWSEQ_DCE112_MASK_SH_LIST(mask_sh)\
+ 	HWSEQ_DCE10_MASK_SH_LIST(mask_sh),\
+ 	HWS_SF(, LVTMA_PWRSEQ_CNTL, LVTMA_BLON, mask_sh),\
++	HWS_SF(, LVTMA_PWRSEQ_STATE, LVTMA_PWRSEQ_TARGET_STATE_R, mask_sh),\
+ 	HWSEQ_PHYPLL_MASK_SH_LIST(mask_sh, CRTC0_)
+ 
+ #define HWSEQ_GFX9_DCHUB_MASK_SH_LIST(mask_sh)\
+@@ -416,7 +420,8 @@ struct dce_hwseq_registers {
+ 	SF(DCHUB_AGP_BASE, AGP_BASE, mask_sh),\
+ 	SF(DCHUB_AGP_BOT, AGP_BOT, mask_sh),\
+ 	SF(DCHUB_AGP_TOP, AGP_TOP, mask_sh), \
+-	HWS_SF(, LVTMA_PWRSEQ_CNTL, LVTMA_BLON, mask_sh)
++	HWS_SF(, LVTMA_PWRSEQ_CNTL, LVTMA_BLON, mask_sh), \
++	HWS_SF(, LVTMA_PWRSEQ_STATE, LVTMA_PWRSEQ_TARGET_STATE_R, mask_sh)
+ 
+ #define HWSEQ_DCE12_MASK_SH_LIST(mask_sh)\
+ 	HWSEQ_DCEF_MASK_SH_LIST(mask_sh, DCFE0_DCFE_),\
+@@ -424,7 +429,8 @@ struct dce_hwseq_registers {
+ 	HWSEQ_PIXEL_RATE_MASK_SH_LIST(mask_sh, CRTC0_),\
+ 	HWSEQ_PHYPLL_MASK_SH_LIST(mask_sh, CRTC0_),\
+ 	HWSEQ_GFX9_DCHUB_MASK_SH_LIST(mask_sh), \
+-	HWS_SF(, LVTMA_PWRSEQ_CNTL, LVTMA_BLON, mask_sh)
++	HWS_SF(, LVTMA_PWRSEQ_CNTL, LVTMA_BLON, mask_sh), \
++	HWS_SF(, LVTMA_PWRSEQ_STATE, LVTMA_PWRSEQ_TARGET_STATE_R, mask_sh)
+ 
+ #define HWSEQ_DCN_MASK_SH_LIST(mask_sh)\
+ 	HWSEQ_PIXEL_RATE_MASK_SH_LIST(mask_sh, OTG0_),\
+@@ -491,7 +497,8 @@ struct dce_hwseq_registers {
+ 	HWS_SF(, DOMAIN6_PG_STATUS, DOMAIN6_PGFSM_PWR_STATUS, mask_sh), \
+ 	HWS_SF(, DOMAIN7_PG_STATUS, DOMAIN7_PGFSM_PWR_STATUS, mask_sh), \
+ 	HWS_SF(, DC_IP_REQUEST_CNTL, IP_REQUEST_EN, mask_sh), \
+-	HWS_SF(, LVTMA_PWRSEQ_CNTL, LVTMA_BLON, mask_sh)
++	HWS_SF(, LVTMA_PWRSEQ_CNTL, LVTMA_BLON, mask_sh), \
++	HWS_SF(, LVTMA_PWRSEQ_STATE, LVTMA_PWRSEQ_TARGET_STATE_R, mask_sh)
+ 
+ #define HWSEQ_REG_FIELD_LIST(type) \
+ 	type DCFE_CLOCK_ENABLE; \
+@@ -522,7 +529,8 @@ struct dce_hwseq_registers {
+ 	type LOGICAL_ADDR; \
+ 	type ENABLE_L1_TLB;\
+ 	type SYSTEM_ACCESS_MODE;\
+-	type LVTMA_BLON;
++	type LVTMA_BLON;\
++	type LVTMA_PWRSEQ_TARGET_STATE_R;
+ 
+ #define HWSEQ_DCN_REG_FIELD_LIST(type) \
+ 	type VUPDATE_NO_LOCK_EVENT_CLEAR; \
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+index 1cb727b..0cf0fff 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+@@ -82,13 +82,6 @@
+ #define DCE110_DIG_FE_SOURCE_SELECT_DIGF 0x20
+ #define DCE110_DIG_FE_SOURCE_SELECT_DIGG 0x40
+ 
+-/* all values are in milliseconds */
+-/* For eDP, after power-up/power/down,
+- * 300/500 msec max. delay from LCDVCC to black video generation */
+-#define PANEL_POWER_UP_TIMEOUT 300
+-#define PANEL_POWER_DOWN_TIMEOUT 500
+-#define HPD_CHECK_INTERVAL 10
+-
+ /* Minimum pixel clock, in KHz. For TMDS signal is 25.00 MHz */
+ #define TMDS_MIN_PIXEL_CLOCK 25000
+ /* Maximum pixel clock, in KHz. For TMDS signal is 165.00 MHz */
+@@ -122,7 +115,6 @@ static const struct link_encoder_funcs dce110_lnk_enc_funcs = {
+ 	.psr_program_dp_dphy_fast_training =
+ 			dce110_psr_program_dp_dphy_fast_training,
+ 	.psr_program_secondary_packet = dce110_psr_program_secondary_packet,
+-	.power_control = dce110_link_encoder_edp_power_control,
+ 	.connect_dig_be_to_fe = dce110_link_encoder_connect_dig_be_to_fe,
+ 	.enable_hpd = dce110_link_encoder_enable_hpd,
+ 	.disable_hpd = dce110_link_encoder_disable_hpd,
+@@ -492,165 +484,6 @@ static void configure_encoder(
+ 	REG_UPDATE(DP_DPHY_SCRAM_CNTL, DPHY_SCRAMBLER_ADVANCE, 1);
+ }
+ 
+-static bool is_panel_powered_on(struct dce110_link_encoder *enc110)
+-{
+-	bool ret;
+-	uint32_t value;
+-
+-	REG_GET(LVTMA_PWRSEQ_STATE, LVTMA_PWRSEQ_TARGET_STATE_R, &value);
+-	ret = value;
+-
+-	return ret == 1;
+-}
+-
+-
+-/* TODO duplicate of dc_link.c version */
+-static struct gpio *get_hpd_gpio(const struct link_encoder *enc)
+-{
+-	enum bp_result bp_result;
+-	struct dc_bios *dcb = enc->ctx->dc_bios;
+-	struct graphics_object_hpd_info hpd_info;
+-	struct gpio_pin_info pin_info;
+-
+-	if (dcb->funcs->get_hpd_info(dcb, enc->connector, &hpd_info) != BP_RESULT_OK)
+-		return NULL;
+-
+-	bp_result = dcb->funcs->get_gpio_pin_info(dcb,
+-		hpd_info.hpd_int_gpio_uid, &pin_info);
+-
+-	if (bp_result != BP_RESULT_OK) {
+-		ASSERT(bp_result == BP_RESULT_NORECORD);
+-		return NULL;
+-	}
+-
+-	return dal_gpio_service_create_irq(
+-		enc->ctx->gpio_service,
+-		pin_info.offset,
+-		pin_info.mask);
+-}
+-
+-/*
+- * @brief
+- * eDP only.
+- */
+-static void link_encoder_edp_wait_for_hpd_ready(
+-	struct dce110_link_encoder *enc110,
+-	bool power_up)
+-{
+-	struct dc_context *ctx = enc110->base.ctx;
+-	struct graphics_object_id connector = enc110->base.connector;
+-	struct gpio *hpd;
+-	bool edp_hpd_high = false;
+-	uint32_t time_elapsed = 0;
+-	uint32_t timeout = power_up ?
+-		PANEL_POWER_UP_TIMEOUT : PANEL_POWER_DOWN_TIMEOUT;
+-
+-	if (dal_graphics_object_id_get_connector_id(connector) !=
+-		CONNECTOR_ID_EDP) {
+-		BREAK_TO_DEBUGGER();
+-		return;
+-	}
+-
+-	if (!power_up)
+-		/* from KV, we will not HPD low after turning off VCC -
+-		 * instead, we will check the SW timer in power_up(). */
+-		return;
+-
+-	/* when we power on/off the eDP panel,
+-	 * we need to wait until SENSE bit is high/low */
+-
+-	/* obtain HPD */
+-	/* TODO what to do with this? */
+-	hpd = get_hpd_gpio(&enc110->base);
+-
+-	if (!hpd) {
+-		BREAK_TO_DEBUGGER();
+-		return;
+-	}
+-
+-	dal_gpio_open(hpd, GPIO_MODE_INTERRUPT);
+-
+-	/* wait until timeout or panel detected */
+-
+-	do {
+-		uint32_t detected = 0;
+-
+-		dal_gpio_get_value(hpd, &detected);
+-
+-		if (!(detected ^ power_up)) {
+-			edp_hpd_high = true;
+-			break;
+-		}
+-
+-		msleep(HPD_CHECK_INTERVAL);
+-
+-		time_elapsed += HPD_CHECK_INTERVAL;
+-	} while (time_elapsed < timeout);
+-
+-	dal_gpio_close(hpd);
+-
+-	dal_gpio_destroy_irq(&hpd);
+-
+-	if (false == edp_hpd_high) {
+-		dm_logger_write(ctx->logger, LOG_ERROR,
+-				"%s: wait timed out!\n", __func__);
+-	}
+-}
+-
+-/*
+- * @brief
+- * eDP only. Control the power of the eDP panel.
+- */
+-void dce110_link_encoder_edp_power_control(
+-	struct link_encoder *enc,
+-	bool power_up)
+-{
+-	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
+-	struct dc_context *ctx = enc110->base.ctx;
+-	struct bp_transmitter_control cntl = { 0 };
+-	enum bp_result bp_result;
+-
+-	if (dal_graphics_object_id_get_connector_id(enc110->base.connector) !=
+-		CONNECTOR_ID_EDP) {
+-		BREAK_TO_DEBUGGER();
+-		return;
+-	}
+-
+-	if ((power_up && !is_panel_powered_on(enc110)) ||
+-		(!power_up && is_panel_powered_on(enc110))) {
+-
+-		/* Send VBIOS command to prompt eDP panel power */
+-
+-		dm_logger_write(ctx->logger, LOG_HW_RESUME_S3,
+-				"%s: Panel Power action: %s\n",
+-				__func__, (power_up ? "On":"Off"));
+-
+-		cntl.action = power_up ?
+-			TRANSMITTER_CONTROL_POWER_ON :
+-			TRANSMITTER_CONTROL_POWER_OFF;
+-		cntl.transmitter = enc110->base.transmitter;
+-		cntl.connector_obj_id = enc110->base.connector;
+-		cntl.coherent = false;
+-		cntl.lanes_number = LANE_COUNT_FOUR;
+-		cntl.hpd_sel = enc110->base.hpd_source;
+-
+-		bp_result = link_transmitter_control(enc110, &cntl);
+-
+-		if (BP_RESULT_OK != bp_result) {
+-
+-			dm_logger_write(ctx->logger, LOG_ERROR,
+-					"%s: Panel Power bp_result: %d\n",
+-					__func__, bp_result);
+-		}
+-	} else {
+-		dm_logger_write(ctx->logger, LOG_HW_RESUME_S3,
+-				"%s: Skipping Panel Power action: %s\n",
+-				__func__, (power_up ? "On":"Off"));
+-	}
+-
+-	link_encoder_edp_wait_for_hpd_ready(enc110, true);
+-}
+-
+ static void aux_initialize(
+ 	struct dce110_link_encoder *enc110)
+ {
+@@ -1018,7 +851,7 @@ void dce110_link_encoder_hw_init(
+ 		ASSERT(result == BP_RESULT_OK);
+ 
+ 	} else if (enc110->base.connector.id == CONNECTOR_ID_EDP) {
+-		enc->funcs->power_control(&enc110->base, true);
++		ctx->dc->hwss.edp_power_control(enc, true);
+ 	}
+ 	aux_initialize(enc110);
+ 
+@@ -1218,7 +1051,7 @@ void dce110_link_encoder_disable_output(
+ 		return;
+ 	}
+ 	if (enc110->base.connector.id == CONNECTOR_ID_EDP)
+-		ctx->dc->hwss.backlight_control(link, false);
++		ctx->dc->hwss.edp_backlight_control(link, false);
+ 	/* Power-down RX and disable GPU PHY should be paired.
+ 	 * Disabling PHY without powering down RX may cause
+ 	 * symbol lock loss, on which we will get DP Sink interrupt. */
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
+index c65def5..494067d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
+@@ -114,10 +114,6 @@ struct dce110_link_enc_hpd_registers {
+ };
+ 
+ struct dce110_link_enc_registers {
+-	/* Backlight registers */
+-	uint32_t LVTMA_PWRSEQ_CNTL;
+-	uint32_t LVTMA_PWRSEQ_STATE;
+-
+ 	/* DMCU registers */
+ 	uint32_t MASTER_COMM_DATA_REG1;
+ 	uint32_t MASTER_COMM_DATA_REG2;
+@@ -250,10 +246,6 @@ void dce110_link_encoder_update_mst_stream_allocation_table(
+ 	struct link_encoder *enc,
+ 	const struct link_mst_stream_allocation_table *table);
+ 
+-void dce110_link_encoder_edp_power_control(
+-	struct link_encoder *enc,
+-	bool power_up);
+-
+ void dce110_link_encoder_connect_dig_be_to_fe(
+ 	struct link_encoder *enc,
+ 	enum engine_id engine,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 97dbb11..a14039f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -32,6 +32,7 @@
+ #include "dce110_hw_sequencer.h"
+ #include "dce110_timing_generator.h"
+ #include "dce/dce_hwseq.h"
++#include "gpio_service_interface.h"
+ 
+ #ifdef ENABLE_FBC
+ #include "dce110_compressor.h"
+@@ -45,10 +46,10 @@
+ #include "transform.h"
+ #include "stream_encoder.h"
+ #include "link_encoder.h"
++#include "link_hwss.h"
+ #include "clock_source.h"
+ #include "abm.h"
+ #include "audio.h"
+-#include "dce/dce_hwseq.h"
+ #include "reg_helper.h"
+ 
+ /* include DCE11 register header files */
+@@ -56,6 +57,15 @@
+ #include "dce/dce_11_0_sh_mask.h"
+ #include "custom_float.h"
+ 
++/*
++ * All values are in milliseconds;
++ * For eDP, after power-up/power/down,
++ * 300/500 msec max. delay from LCDVCC to black video generation
++ */
++#define PANEL_POWER_UP_TIMEOUT 300
++#define PANEL_POWER_DOWN_TIMEOUT 500
++#define HPD_CHECK_INTERVAL 10
++
+ #define CTX \
+ 	hws->ctx
+ #define REG(reg)\
+@@ -780,25 +790,150 @@ static bool is_panel_backlight_on(struct dce_hwseq *hws)
+ 	return value;
+ }
+ 
++static bool is_panel_powered_on(struct dce_hwseq *hws)
++{
++	uint32_t value;
++
++	REG_GET(LVTMA_PWRSEQ_STATE, LVTMA_PWRSEQ_TARGET_STATE_R, &value);
++	return value == 1;
++}
++
+ static enum bp_result link_transmitter_control(
+-		struct dc_link *link,
++		struct dc_bios *bios,
+ 	struct bp_transmitter_control *cntl)
+ {
+ 	enum bp_result result;
+-	struct dc_bios *bp = link->dc->ctx->dc_bios;
+ 
+-	result = bp->funcs->transmitter_control(bp, cntl);
++	result = bios->funcs->transmitter_control(bios, cntl);
+ 
+ 	return result;
+ }
+ 
++/*
++ * @brief
++ * eDP only.
++ */
++void hwss_edp_wait_for_hpd_ready(
++	struct link_encoder *enc,
++	bool power_up)
++{
++	struct dc_context *ctx = enc->ctx;
++	struct graphics_object_id connector = enc->connector;
++	struct gpio *hpd;
++	bool edp_hpd_high = false;
++	uint32_t time_elapsed = 0;
++	uint32_t timeout = power_up ?
++		PANEL_POWER_UP_TIMEOUT : PANEL_POWER_DOWN_TIMEOUT;
++
++	if (dal_graphics_object_id_get_connector_id(connector)
++			!= CONNECTOR_ID_EDP) {
++		BREAK_TO_DEBUGGER();
++		return;
++	}
++
++	if (!power_up)
++		/*
++		 * From KV, we will not HPD low after turning off VCC -
++		 * instead, we will check the SW timer in power_up().
++		 */
++		return;
++
++	/*
++	 * When we power on/off the eDP panel,
++	 * we need to wait until SENSE bit is high/low.
++	 */
++
++	/* obtain HPD */
++	/* TODO what to do with this? */
++	hpd = get_hpd_gpio(ctx->dc_bios, connector, ctx->gpio_service);
++
++	if (!hpd) {
++		BREAK_TO_DEBUGGER();
++		return;
++	}
++
++	dal_gpio_open(hpd, GPIO_MODE_INTERRUPT);
++
++	/* wait until timeout or panel detected */
++
++	do {
++		uint32_t detected = 0;
++
++		dal_gpio_get_value(hpd, &detected);
++
++		if (!(detected ^ power_up)) {
++			edp_hpd_high = true;
++			break;
++		}
++
++		msleep(HPD_CHECK_INTERVAL);
++
++		time_elapsed += HPD_CHECK_INTERVAL;
++	} while (time_elapsed < timeout);
++
++	dal_gpio_close(hpd);
++
++	dal_gpio_destroy_irq(&hpd);
++
++	if (false == edp_hpd_high) {
++		dm_logger_write(ctx->logger, LOG_ERROR,
++				"%s: wait timed out!\n", __func__);
++	}
++}
++
++void hwss_edp_power_control(
++	struct link_encoder *enc,
++	bool power_up)
++{
++	struct dc_context *ctx = enc->ctx;
++	struct dce_hwseq *hwseq = ctx->dc->hwseq;
++	struct bp_transmitter_control cntl = { 0 };
++	enum bp_result bp_result;
++
++
++	if (dal_graphics_object_id_get_connector_id(enc->connector)
++			!= CONNECTOR_ID_EDP) {
++		BREAK_TO_DEBUGGER();
++		return;
++	}
++
++	if (power_up != is_panel_powered_on(hwseq)) {
++		/* Send VBIOS command to prompt eDP panel power */
++
++		dm_logger_write(ctx->logger, LOG_HW_RESUME_S3,
++				"%s: Panel Power action: %s\n",
++				__func__, (power_up ? "On":"Off"));
++
++		cntl.action = power_up ?
++			TRANSMITTER_CONTROL_POWER_ON :
++			TRANSMITTER_CONTROL_POWER_OFF;
++		cntl.transmitter = enc->transmitter;
++		cntl.connector_obj_id = enc->connector;
++		cntl.coherent = false;
++		cntl.lanes_number = LANE_COUNT_FOUR;
++		cntl.hpd_sel = enc->hpd_source;
++
++		bp_result = link_transmitter_control(ctx->dc_bios, &cntl);
++
++		if (bp_result != BP_RESULT_OK)
++			dm_logger_write(ctx->logger, LOG_ERROR,
++					"%s: Panel Power bp_result: %d\n",
++					__func__, bp_result);
++	} else {
++		dm_logger_write(ctx->logger, LOG_HW_RESUME_S3,
++				"%s: Skipping Panel Power action: %s\n",
++				__func__, (power_up ? "On":"Off"));
++	}
++
++	hwss_edp_wait_for_hpd_ready(enc, true);
++}
+ 
+ /*todo: cloned in stream enc, fix*/
+ /*
+  * @brief
+  * eDP only. Control the backlight of the eDP panel
+  */
+-void hwss_blacklight_control(
++void hwss_edp_backlight_control(
+ 	struct dc_link *link,
+ 	bool enable)
+ {
+@@ -828,6 +963,7 @@ void hwss_blacklight_control(
+ 	cntl.action = enable ?
+ 		TRANSMITTER_CONTROL_BACKLIGHT_ON :
+ 		TRANSMITTER_CONTROL_BACKLIGHT_OFF;
++
+ 	/*cntl.engine_id = ctx->engine;*/
+ 	cntl.transmitter = link->link_enc->transmitter;
+ 	cntl.connector_obj_id = link->link_enc->connector;
+@@ -846,7 +982,7 @@ void hwss_blacklight_control(
+ 	 * Enable it in the future if necessary.
+ 	 */
+ 	/* dc_service_sleep_in_milliseconds(50); */
+-	link_transmitter_control(link, &cntl);
++	link_transmitter_control(link->dc->ctx->dc_bios, &cntl);
+ }
+ 
+ void dce110_disable_stream(struct pipe_ctx *pipe_ctx)
+@@ -886,7 +1022,7 @@ void dce110_disable_stream(struct pipe_ctx *pipe_ctx)
+ 	/* blank at encoder level */
+ 	if (dc_is_dp_signal(pipe_ctx->stream->signal)) {
+ 		if (pipe_ctx->stream->sink->link->connector_signal == SIGNAL_TYPE_EDP)
+-			hwss_blacklight_control(link, false);
++			hwss_edp_backlight_control(link, false);
+ 		pipe_ctx->stream_res.stream_enc->funcs->dp_blank(pipe_ctx->stream_res.stream_enc);
+ 	}
+ 	link->link_enc->funcs->connect_dig_be_to_fe(
+@@ -908,7 +1044,7 @@ void dce110_unblank_stream(struct pipe_ctx *pipe_ctx,
+ 	params.link_settings.link_rate = link_settings->link_rate;
+ 	pipe_ctx->stream_res.stream_enc->funcs->dp_unblank(pipe_ctx->stream_res.stream_enc, &params);
+ 	if (link->connector_signal == SIGNAL_TYPE_EDP)
+-		hwss_blacklight_control(link, true);
++		hwss_edp_backlight_control(link, true);
+ }
+ 
+ 
+@@ -2843,7 +2979,8 @@ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.wait_for_mpcc_disconnect = dce110_wait_for_mpcc_disconnect,
+ 	.ready_shared_resources = ready_shared_resources,
+ 	.optimize_shared_resources = optimize_shared_resources,
+-	.backlight_control = hwss_blacklight_control
++	.edp_backlight_control = hwss_edp_backlight_control,
++	.edp_power_control = hwss_edp_power_control,
+ };
+ 
+ void dce110_hw_sequencer_construct(struct dc *dc)
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.h
+index 3e95f7f..a1e964a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.h
+@@ -69,7 +69,11 @@ uint32_t dce110_get_min_vblank_time_us(const struct dc_state *context);
+ 
+ void dp_receiver_power_ctrl(struct dc_link *link, bool on);
+ 
+-void hwss_blacklight_control(
++void hwss_edp_power_control(
++	struct link_encoder *enc,
++	bool power_up);
++
++void hwss_edp_backlight_control(
+ 	struct dc_link *link,
+ 	bool enable);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 49be5d7..88e7f97 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -2973,7 +2973,8 @@ static const struct hw_sequencer_funcs dcn10_funcs = {
+ 	.wait_for_mpcc_disconnect = dcn10_wait_for_mpcc_disconnect,
+ 	.ready_shared_resources = ready_shared_resources,
+ 	.optimize_shared_resources = optimize_shared_resources,
+-	.backlight_control = hwss_blacklight_control
++	.edp_backlight_control = hwss_edp_backlight_control,
++	.edp_power_control = hwss_edp_power_control
+ };
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+index 6cd6bc7d..3d33bcd 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+@@ -123,8 +123,6 @@ struct link_encoder_funcs {
+ 			bool exit_link_training_required);
+ 	void (*psr_program_secondary_packet)(struct link_encoder *enc,
+ 				unsigned int sdp_transmit_line_num_deadline);
+-	void (*power_control) (struct link_encoder *enc,
+-		bool power_up);
+ 	void (*connect_dig_be_to_fe)(struct link_encoder *enc,
+ 		enum engine_id engine,
+ 		bool connect);
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index 210874f..bf3ab5d 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -28,6 +28,7 @@
+ #include "dc_types.h"
+ #include "clock_source.h"
+ #include "inc/hw/timing_generator.h"
++#include "inc/hw/link_encoder.h"
+ #include "core_status.h"
+ 
+ enum pipe_gating_control {
+@@ -176,8 +177,10 @@ struct hw_sequencer_funcs {
+ 
+ 	void (*ready_shared_resources)(struct dc *dc, struct dc_state *context);
+ 	void (*optimize_shared_resources)(struct dc *dc);
+-
+-	void (*backlight_control)(
++	void (*edp_power_control)(
++			struct link_encoder *enc,
++			bool enable);
++	void (*edp_backlight_control)(
+ 			struct dc_link *link,
+ 			bool enable);
+ };
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/link_hwss.h b/drivers/gpu/drm/amd/display/dc/inc/link_hwss.h
+index f7994cf..f2b8c9a 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/link_hwss.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/link_hwss.h
+@@ -40,6 +40,10 @@ enum dc_status core_link_write_dpcd(
+ 	const uint8_t *data,
+ 	uint32_t size);
+ 
++struct gpio *get_hpd_gpio(struct dc_bios *dcb,
++		struct graphics_object_id link_id,
++		struct gpio_service *gpio_service);
++
+ void dp_enable_link_phy(
+ 	struct dc_link *link,
+ 	enum signal_type signal,
+diff --git a/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c b/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c
+index 4f40534..88c2bde 100644
+--- a/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c
+@@ -73,10 +73,6 @@ static void virtual_link_encoder_update_mst_stream_allocation_table(
+ 	struct link_encoder *enc,
+ 	const struct link_mst_stream_allocation_table *table) {}
+ 
+-static void virtual_link_encoder_edp_power_control(
+-	struct link_encoder *enc,
+-	bool power_up) {}
+-
+ static void virtual_link_encoder_connect_dig_be_to_fe(
+ 	struct link_encoder *enc,
+ 	enum engine_id engine,
+@@ -102,7 +98,6 @@ static const struct link_encoder_funcs virtual_lnk_enc_funcs = {
+ 	.dp_set_phy_pattern = virtual_link_encoder_dp_set_phy_pattern,
+ 	.update_mst_stream_allocation_table =
+ 		virtual_link_encoder_update_mst_stream_allocation_table,
+-	.power_control = virtual_link_encoder_edp_power_control,
+ 	.connect_dig_be_to_fe = virtual_link_encoder_connect_dig_be_to_fe,
+ 	.destroy = virtual_link_encoder_destroy
+ };
+-- 
+2.7.4
+

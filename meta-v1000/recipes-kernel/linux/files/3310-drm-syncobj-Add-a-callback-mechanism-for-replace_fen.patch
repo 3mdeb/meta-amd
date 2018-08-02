@@ -1,0 +1,201 @@
+From e9c5803345d4175b7bb68b10edb435de884f0539 Mon Sep 17 00:00:00 2001
+From: Jason Ekstrand <jason@jlekstrand.net>
+Date: Mon, 28 Aug 2017 07:39:25 -0700
+Subject: [PATCH 3310/5855] drm/syncobj: Add a callback mechanism for
+ replace_fence (v3)
+
+It is useful in certain circumstances to know when the fence is replaced
+in a syncobj.  Specifically, it may be useful to know when the fence
+goes from NULL to something valid.  This does make syncobj_replace_fence
+a little more expensive because it has to take a lock but, in the common
+case where there is no callback list, it spends a very short amount of
+time inside the lock.
+
+v2:
+ - Don't lock in drm_syncobj_fence_get.  We only really need to lock
+   around fence_replace to make the callback work.
+v3:
+ - Fix the cb_list comment to make kbuild happy
+
+Signed-off-by: Jason Ekstrand <jason@jlekstrand.net>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/drm_syncobj.c | 60 +++++++++++++++++++++++++++++++++++++++++--
+ include/drm/drm_syncobj.h     | 41 +++++++++++++++++++++++++++++
+ 2 files changed, 99 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_syncobj.c b/drivers/gpu/drm/drm_syncobj.c
+index e8beafd..11d9aed 100644
+--- a/drivers/gpu/drm/drm_syncobj.c
++++ b/drivers/gpu/drm/drm_syncobj.c
+@@ -80,6 +80,46 @@ struct drm_syncobj *drm_syncobj_find(struct drm_file *file_private,
+ }
+ EXPORT_SYMBOL(drm_syncobj_find);
+ 
++static void drm_syncobj_add_callback_locked(struct drm_syncobj *syncobj,
++					    struct drm_syncobj_cb *cb,
++					    drm_syncobj_func_t func)
++{
++	cb->func = func;
++	list_add_tail(&cb->node, &syncobj->cb_list);
++}
++
++/**
++ * drm_syncobj_add_callback - adds a callback to syncobj::cb_list
++ * @syncobj: Sync object to which to add the callback
++ * @cb: Callback to add
++ * @func: Func to use when initializing the drm_syncobj_cb struct
++ *
++ * This adds a callback to be called next time the fence is replaced
++ */
++void drm_syncobj_add_callback(struct drm_syncobj *syncobj,
++			      struct drm_syncobj_cb *cb,
++			      drm_syncobj_func_t func)
++{
++	spin_lock(&syncobj->lock);
++	drm_syncobj_add_callback_locked(syncobj, cb, func);
++	spin_unlock(&syncobj->lock);
++}
++EXPORT_SYMBOL(drm_syncobj_add_callback);
++
++/**
++ * drm_syncobj_add_callback - removes a callback to syncobj::cb_list
++ * @syncobj: Sync object from which to remove the callback
++ * @cb: Callback to remove
++ */
++void drm_syncobj_remove_callback(struct drm_syncobj *syncobj,
++				 struct drm_syncobj_cb *cb)
++{
++	spin_lock(&syncobj->lock);
++	list_del_init(&cb->node);
++	spin_unlock(&syncobj->lock);
++}
++EXPORT_SYMBOL(drm_syncobj_remove_callback);
++
+ /**
+  * drm_syncobj_replace_fence - replace fence in a sync object.
+  * @syncobj: Sync object to replace fence in
+@@ -91,11 +131,25 @@ void drm_syncobj_replace_fence(struct drm_syncobj *syncobj,
+ 			       struct fence *fence)
+ {
+ 	struct fence *old_fence;
++	struct drm_syncobj_cb *cur, *tmp;
+ 
+ 	if (fence)
+ 		fence_get(fence);
+-	old_fence = xchg(&syncobj->fence, fence);
+ 
++	spin_lock(&syncobj->lock);
++	
++	old_fence = syncobj->fence;
++	syncobj->fence = fence;
++
++	if (fence != old_fence) {
++		list_for_each_entry_safe(cur, tmp, &syncobj->cb_list, node) {
++			list_del_init(&cur->node);
++			cur->func(syncobj, cur);
++		}
++	}
++
++	spin_unlock(&syncobj->lock);
++		
+ 	fence_put(old_fence);
+ }
+ EXPORT_SYMBOL(drm_syncobj_replace_fence);
+@@ -130,7 +184,7 @@ void drm_syncobj_free(struct kref *kref)
+ 	struct drm_syncobj *syncobj = container_of(kref,
+ 						   struct drm_syncobj,
+ 						   refcount);
+-	fence_put(syncobj->fence);
++	drm_syncobj_replace_fence(syncobj, NULL);
+ 	kfree(syncobj);
+ }
+ EXPORT_SYMBOL(drm_syncobj_free);
+@@ -146,6 +200,8 @@ static int drm_syncobj_create(struct drm_file *file_private,
+ 		return -ENOMEM;
+ 
+ 	kref_init(&syncobj->refcount);
++	INIT_LIST_HEAD(&syncobj->cb_list);
++	spin_lock_init(&syncobj->lock);
+ 
+ 	idr_preload(GFP_KERNEL);
+ 	spin_lock(&file_private->syncobj_table_lock);
+diff --git a/include/drm/drm_syncobj.h b/include/drm/drm_syncobj.h
+index dd629d3..e8b7f02 100644
+--- a/include/drm/drm_syncobj.h
++++ b/include/drm/drm_syncobj.h
+@@ -28,6 +28,8 @@
+ 
+ #include "linux/fence.h"
+ 
++struct drm_syncobj_cb;
++
+ /**
+  * struct drm_syncobj - sync object.
+  *
+@@ -43,15 +45,49 @@ struct drm_syncobj {
+ 	/**
+ 	 * @fence:
+ 	 * NULL or a pointer to the fence bound to this object.
++	 *
++	 * This field should not be used directly.  Use drm_syncobj_fence_get
++	 * and drm_syncobj_replace_fence instead.
+ 	 */
+ 	struct fence *fence;
+ 	/**
++	 * @cb_list:
++	 * List of callbacks to call when the fence gets replaced
++	 */
++	struct list_head cb_list;
++	/**
++	 * @lock:
++	 * locks cb_list and write-locks fence.
++	 */
++	spinlock_t lock;
++	/**
+ 	 * @file:
+ 	 * a file backing for this syncobj.
+ 	 */
+ 	struct file *file;
+ };
+ 
++typedef void (*drm_syncobj_func_t)(struct drm_syncobj *syncobj,
++				   struct drm_syncobj_cb *cb);
++
++/**
++ * struct drm_syncobj_cb - callback for drm_syncobj_add_callback
++ * @node: used by drm_syncob_add_callback to append this struct to
++	syncobj::cb_list
++ * @func: drm_syncobj_func_t to call
++ *
++ * This struct will be initialized by drm_syncobj_add_callback, additional
++ * data can be passed along by embedding drm_syncobj_cb in another struct.
++ * The callback will get called the next time drm_syncobj_replace_fence is
++ * called.
++ */
++
++struct drm_syncobj_cb {
++	struct list_head node;
++	drm_syncobj_func_t func;
++};
++ 	
++
+ void drm_syncobj_free(struct kref *kref);
+ 
+ /**
+@@ -91,6 +127,11 @@ drm_syncobj_fence_get(struct drm_syncobj *syncobj)
+ 
+ struct drm_syncobj *drm_syncobj_find(struct drm_file *file_private,
+ 				     u32 handle);
++void drm_syncobj_add_callback(struct drm_syncobj *syncobj,
++			     struct drm_syncobj_cb *cb,
++			     drm_syncobj_func_t func);
++void drm_syncobj_remove_callback(struct drm_syncobj *syncobj,
++				struct drm_syncobj_cb *cb);
+ void drm_syncobj_replace_fence(struct drm_syncobj *syncobj,
+ 			       struct fence *fence);
+ int drm_syncobj_find_fence(struct drm_file *file_private,
+-- 
+2.7.4
+

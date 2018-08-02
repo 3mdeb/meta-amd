@@ -1,0 +1,143 @@
+From 978e9a68b275f7c8c91d912b3f6c5663d6d2bab6 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Tue, 13 Jun 2017 18:28:29 +0200
+Subject: [PATCH 5166/5855] x86/mce/AMD: Use saved threshold block info in
+ interrupt handler
+
+In the amd_threshold_interrupt() handler, we loop through every possible
+block in each bank and rediscover the block's address and if it's valid,
+e.g. valid, counter present and not locked.
+
+However, we already have the address saved in the threshold blocks list
+for each CPU and bank. The list only contains blocks that have passed
+all the valid checks.
+
+Besides the redundancy, there's also a smp_call_function* in
+get_block_address() which causes a warning when servicing the interrupt:
+
+ WARNING: CPU: 0 PID: 0 at kernel/smp.c:281 smp_call_function_single+0xdd/0xf0
+ ...
+ Call Trace:
+  <IRQ>
+  rdmsr_safe_on_cpu()
+  get_block_address.isra.2()
+  amd_threshold_interrupt()
+  smp_threshold_interrupt()
+  threshold_interrupt()
+
+because we do get called in an interrupt handler *with* interrupts
+disabled, which can result in a deadlock.
+
+Drop the redundant valid checks and move the overflow check, logging and
+block reset into a separate function.
+
+Check the first block then iterate over the rest. This procedure is
+needed since the first block is used as the head of the list.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tony Luck <tony.luck@intel.com>
+Cc: linux-edac <linux-edac@vger.kernel.org>
+Link: http://lkml.kernel.org/r/20170613162835.30750-3-bp@alien8.de
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Sudheesh Mavila <sudheesh.mavila@amd.com>
+---
+ arch/x86/kernel/cpu/mcheck/mce_amd.c | 66 +++++++++++++++++++-----------------
+ 1 file changed, 35 insertions(+), 31 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mcheck/mce_amd.c b/arch/x86/kernel/cpu/mcheck/mce_amd.c
+index a4e38c4..188f95b 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce_amd.c
++++ b/arch/x86/kernel/cpu/mcheck/mce_amd.c
+@@ -868,49 +868,53 @@ static void log_error_thresholding(unsigned int bank, u64 misc)
+ 	_log_error_bank(bank, msr_ops.status(bank), msr_ops.addr(bank), misc);
+ }
+ 
++static void log_and_reset_block(struct threshold_block *block)
++{
++	struct thresh_restart tr;
++	u32 low = 0, high = 0;
++
++	if (!block)
++		return;
++
++	if (rdmsr_safe(block->address, &low, &high))
++		return;
++
++	if (!(high & MASK_OVERFLOW_HI))
++		return;
++
++	/* Log the MCE which caused the threshold event. */
++	log_error_thresholding(block->bank, ((u64)high << 32) | low);
++
++	/* Reset threshold block after logging error. */
++	memset(&tr, 0, sizeof(tr));
++	tr.b = block;
++	threshold_restart_bank(&tr);
++}
++
+ /*
+  * Threshold interrupt handler will service THRESHOLD_APIC_VECTOR. The interrupt
+  * goes off when error_count reaches threshold_limit.
+  */
+ static void amd_threshold_interrupt(void)
+ {
+-	u32 low = 0, high = 0, address = 0;
+-	unsigned int bank, block, cpu = smp_processor_id();
+-	struct thresh_restart tr;
++	struct threshold_block *first_block = NULL, *block = NULL, *tmp = NULL;
++	unsigned int bank, cpu = smp_processor_id();
+ 
+ 	for (bank = 0; bank < mca_cfg.banks; ++bank) {
+ 		if (!(per_cpu(bank_map, cpu) & (1 << bank)))
+ 			continue;
+-		for (block = 0; block < NR_BLOCKS; ++block) {
+-			address = get_block_address(cpu, address, low, high, bank, block);
+-			if (!address)
+-				break;
+-
+-			if (rdmsr_safe(address, &low, &high))
+-				break;
+-
+-			if (!(high & MASK_VALID_HI)) {
+-				if (block)
+-					continue;
+-				else
+-					break;
+-			}
+-
+-			if (!(high & MASK_CNTP_HI)  ||
+-			     (high & MASK_LOCKED_HI))
+-				continue;
+-
+-			if (!(high & MASK_OVERFLOW_HI))
+-				continue;
+ 
+-			/* Log the MCE which caused the threshold event. */
+-			log_error_thresholding(bank, ((u64)high << 32) | low);
++		first_block = per_cpu(threshold_banks, cpu)[bank]->blocks;
++		if (!first_block)
++			continue;
+ 
+-			/* Reset threshold block after logging error. */
+-			memset(&tr, 0, sizeof(tr));
+-			tr.b = &per_cpu(threshold_banks, cpu)[bank]->blocks[block];
+-			threshold_restart_bank(&tr);
+-		}
++		/*
++		 * The first block is also the head of the list. Check it first
++		 * before iterating over the rest.
++		 */
++		log_and_reset_block(first_block);
++		list_for_each_entry_safe(block, tmp, &first_block->miscj, miscj)
++			log_and_reset_block(block);
+ 	}
+ }
+ 
+-- 
+2.7.4
+

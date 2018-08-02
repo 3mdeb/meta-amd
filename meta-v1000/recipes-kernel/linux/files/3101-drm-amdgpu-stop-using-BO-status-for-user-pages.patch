@@ -1,0 +1,125 @@
+From 4453228aa197f3a2da95b8469dbc19081e6f1c77 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 5 Sep 2017 14:30:05 +0200
+Subject: [PATCH 3101/5855] drm/amdgpu: stop using BO status for user pages
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead use a counter to figure out if we need to set new pages or not.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  | 11 +++++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 14 ++++++++++++++
+ 3 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 5b1a021..36b406d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1876,6 +1876,7 @@ bool amdgpu_ttm_tt_affect_userptr(struct ttm_tt *ttm, unsigned long start,
+ 				  unsigned long end);
+ bool amdgpu_ttm_tt_userptr_invalidated(struct ttm_tt *ttm,
+ 				       int *last_invalidated);
++bool amdgpu_ttm_tt_userptr_needs_pages(struct ttm_tt *ttm);
+ bool amdgpu_ttm_tt_is_readonly(struct ttm_tt *ttm);
+ uint64_t amdgpu_ttm_tt_pte_flags(struct amdgpu_device *adev, struct ttm_tt *ttm,
+ 				 struct ttm_mem_reg *mem);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 04ef679..4aaafd90 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -470,7 +470,8 @@ static int amdgpu_cs_list_validate(struct amdgpu_cs_parser *p,
+ 			return -EPERM;
+ 
+ 		/* Check if we have user pages and nobody bound the BO already */
+-		if (lobj->user_pages && bo->tbo.ttm->state != tt_bound) {
++		if (amdgpu_ttm_tt_userptr_needs_pages(bo->tbo.ttm) &&
++		    lobj->user_pages) {
+ 			amdgpu_ttm_tt_set_user_pages(bo->tbo.ttm,
+ 						     lobj->user_pages);
+ 			binding_userptr = true;
+@@ -538,23 +539,25 @@ static int amdgpu_cs_parser_bos(struct amdgpu_cs_parser *p,
+ 		INIT_LIST_HEAD(&need_pages);
+ 		for (i = p->bo_list->first_userptr;
+ 		     i < p->bo_list->num_entries; ++i) {
++			struct amdgpu_bo *bo;
+ 
+ 			e = &p->bo_list->array[i];
++			bo = e->robj;
+ 
+-			if (amdgpu_ttm_tt_userptr_invalidated(e->robj->tbo.ttm,
++			if (amdgpu_ttm_tt_userptr_invalidated(bo->tbo.ttm,
+ 				 &e->user_invalidated) && e->user_pages) {
+ 
+ 				/* We acquired a page array, but somebody
+ 				 * invalidated it. Free it and try again
+ 				 */
+ 				release_pages(e->user_pages,
+-					      e->robj->tbo.ttm->num_pages,
++					      bo->tbo.ttm->num_pages,
+ 					      false);
+ 				drm_free_large(e->user_pages);
+ 				e->user_pages = NULL;
+ 			}
+ 
+-			if (e->robj->tbo.ttm->state != tt_bound &&
++			if (amdgpu_ttm_tt_userptr_needs_pages(bo->tbo.ttm) &&
+ 			    !e->user_pages) {
+ 				list_del(&e->tv.head);
+ 				list_add(&e->tv.head, &need_pages);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 6cb904c..bdfabe9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -671,6 +671,7 @@ struct amdgpu_ttm_tt {
+ 	spinlock_t              guptasklock;
+ 	struct list_head        guptasks;
+ 	atomic_t		mmu_invalidations;
++	uint32_t		last_set_pages;
+ 	struct list_head        list;
+ };
+ 
+@@ -737,8 +738,10 @@ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages)
+ 
+ void amdgpu_ttm_tt_set_user_pages(struct ttm_tt *ttm, struct page **pages)
+ {
++	struct amdgpu_ttm_tt *gtt = (void *)ttm;
+ 	unsigned i;
+ 
++	gtt->last_set_pages = atomic_read(&gtt->mmu_invalidations);
+ 	for (i = 0; i < ttm->num_pages; ++i) {
+ 		if (ttm->pages[i])
+ 			put_page(ttm->pages[i]);
+@@ -1076,6 +1079,7 @@ int amdgpu_ttm_tt_set_userptr(struct ttm_tt *ttm, uint64_t addr,
+ 	spin_lock_init(&gtt->guptasklock);
+ 	INIT_LIST_HEAD(&gtt->guptasks);
+ 	atomic_set(&gtt->mmu_invalidations, 0);
++	gtt->last_set_pages = 0;
+ 
+ 	return 0;
+ }
+@@ -1131,6 +1135,16 @@ bool amdgpu_ttm_tt_userptr_invalidated(struct ttm_tt *ttm,
+ 	return prev_invalidated != *last_invalidated;
+ }
+ 
++bool amdgpu_ttm_tt_userptr_needs_pages(struct ttm_tt *ttm)
++{
++	struct amdgpu_ttm_tt *gtt = (void *)ttm;
++
++	if (gtt == NULL || !gtt->userptr)
++		return false;
++
++	return atomic_read(&gtt->mmu_invalidations) != gtt->last_set_pages;
++}
++
+ bool amdgpu_ttm_tt_is_readonly(struct ttm_tt *ttm)
+ {
+ 	struct amdgpu_ttm_tt *gtt = (void *)ttm;
+-- 
+2.7.4
+

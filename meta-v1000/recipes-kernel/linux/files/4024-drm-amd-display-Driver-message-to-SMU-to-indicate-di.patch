@@ -1,0 +1,134 @@
+From 329cca0ed9c5eaf5dad61afe0ef35105fc65495e Mon Sep 17 00:00:00 2001
+From: Hersen Wu <hersenxs.wu@amd.com>
+Date: Tue, 5 Sep 2017 12:20:39 -0400
+Subject: [PATCH 4024/5855] drm/amd/display: Driver message to SMU to indicate
+ display off
+
+Signed-off-by: Hersen Wu <hersenxs.wu@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |  2 +-
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    |  3 +-
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  | 38 ++++++++++++++--------
+ drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h  |  2 +-
+ 4 files changed, 28 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index a89c89f..6c5d112 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -763,7 +763,7 @@ static bool dc_commit_state_no_check(struct dc *dc, struct dc_state *context)
+ 	if (!dcb->funcs->is_accelerated_mode(dcb))
+ 		dc->hwss.enable_accelerated_mode(dc);
+ 
+-	dc->hwss.ready_shared_resources(dc);
++	dc->hwss.ready_shared_resources(dc, context);
+ 
+ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+ 		pipe = &context->res_ctx.pipe_ctx[i];
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index ead0677..250039a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -1886,6 +1886,7 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 			return status;
+ 	}
+ 
++	/* pplib is notified if disp_num changed */
+ 	dc->hwss.set_bandwidth(dc, context, true);
+ 
+ 	/* to save power */
+@@ -2705,7 +2706,7 @@ static void program_csc_matrix(struct pipe_ctx *pipe_ctx,
+ 	}
+ }
+ 
+-static void ready_shared_resources(struct dc *dc) {}
++static void ready_shared_resources(struct dc *dc, struct dc_state *context) {}
+ 
+ static void optimize_shared_resources(struct dc *dc) {}
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index b808cd5..30b4178 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -822,18 +822,14 @@ static void undo_DEGVIDCN10_253_wa(struct dc *dc)
+ 			IP_REQUEST_EN, 0);
+ }
+ 
+-static void ready_shared_resources(struct dc *dc)
+-{
+-	if (dc->current_state->stream_count == 0 &&
+-			!dc->debug.disable_stutter)
+-		undo_DEGVIDCN10_253_wa(dc);
+-}
+-
+ static void apply_DEGVIDCN10_253_wa(struct dc *dc)
+ {
+ 	struct dce_hwseq *hws = dc->hwseq;
+ 	struct mem_input *mi = dc->res_pool->mis[0];
+ 
++	if (dc->debug.disable_stutter)
++		return;
++
+ 	REG_SET(DC_IP_REQUEST_CNTL, 0,
+ 			IP_REQUEST_EN, 1);
+ 
+@@ -894,13 +890,6 @@ static void apply_DEGVIDCN10_253_wa(struct dc *dc)
+ 	mi->funcs->set_hubp_blank_en(mi, false);
+ }
+ 
+-static void optimize_shared_resources(struct dc *dc)
+-{
+-	if (dc->current_state->stream_count == 0 &&
+-			!dc->debug.disable_stutter)
+-		apply_DEGVIDCN10_253_wa(dc);
+-}
+-
+ static void bios_golden_init(struct dc *dc)
+ {
+ 	struct dc_bios *bp = dc->ctx->dc_bios;
+@@ -2517,6 +2506,27 @@ static void dcn10_pplib_apply_display_requirements(
+ 	dc->prev_display_config = *pp_display_cfg;
+ }
+ 
++static void optimize_shared_resources(struct dc *dc)
++{
++	if (dc->current_state->stream_count == 0) {
++		apply_DEGVIDCN10_253_wa(dc);
++		/* S0i2 message */
++		dcn10_pplib_apply_display_requirements(dc, dc->current_state);
++	}
++}
++
++static void ready_shared_resources(struct dc *dc, struct dc_state *context)
++{
++	if (dc->current_state->stream_count == 0 &&
++			!dc->debug.disable_stutter)
++		undo_DEGVIDCN10_253_wa(dc);
++
++	/* S0i2 message */
++	if (dc->current_state->stream_count == 0 &&
++			context->stream_count != 0)
++		dcn10_pplib_apply_display_requirements(dc, context);
++}
++
+ static void dcn10_apply_ctx_for_surface(
+ 		struct dc *dc,
+ 		const struct dc_stream_state *stream,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index aae7629..1fa2edc 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -174,7 +174,7 @@ struct hw_sequencer_funcs {
+ 			struct resource_pool *res_pool,
+ 			struct pipe_ctx *pipe_ctx);
+ 
+-	void (*ready_shared_resources)(struct dc *dc);
++	void (*ready_shared_resources)(struct dc *dc, struct dc_state *context);
+ 	void (*optimize_shared_resources)(struct dc *dc);
+ };
+ 
+-- 
+2.7.4
+

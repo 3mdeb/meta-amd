@@ -1,0 +1,122 @@
+From 774f67675b8731c4c78cbbea4eabd5e613c1599b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 5 Sep 2017 14:36:44 +0200
+Subject: [PATCH 3102/5855] drm/amdgpu: move userptr BOs to CPU domain during
+ CS v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead of moving them in the MMU notifier move them during CS.
+
+v2: still mark pages as accessed/dirty
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com> (v1)
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  |  6 ++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c  |  5 +----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 27 +++++++++++++++++++--------
+ 4 files changed, 27 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 36b406d..24cf4c3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1868,6 +1868,7 @@ void amdgpu_ttm_placement_from_domain(struct amdgpu_bo *abo, u32 domain);
+ bool amdgpu_ttm_bo_is_amdgpu_bo(struct ttm_buffer_object *bo);
+ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages);
+ void amdgpu_ttm_tt_set_user_pages(struct ttm_tt *ttm, struct page **pages);
++void amdgpu_ttm_tt_mark_user_pages(struct ttm_tt *ttm);
+ int amdgpu_ttm_tt_set_userptr(struct ttm_tt *ttm, uint64_t addr,
+ 				     uint32_t flags);
+ bool amdgpu_ttm_tt_has_userptr(struct ttm_tt *ttm);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 4aaafd90..09377a6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -472,6 +472,12 @@ static int amdgpu_cs_list_validate(struct amdgpu_cs_parser *p,
+ 		/* Check if we have user pages and nobody bound the BO already */
+ 		if (amdgpu_ttm_tt_userptr_needs_pages(bo->tbo.ttm) &&
+ 		    lobj->user_pages) {
++			amdgpu_ttm_placement_from_domain(bo,
++							 AMDGPU_GEM_DOMAIN_CPU);
++			r = ttm_bo_validate(&bo->tbo, &bo->placement, true,
++					    false);
++			if (r)
++				return r;
+ 			amdgpu_ttm_tt_set_user_pages(bo->tbo.ttm,
+ 						     lobj->user_pages);
+ 			binding_userptr = true;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+index 5d0a39e..dafabf2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+@@ -144,10 +144,7 @@ static void amdgpu_mn_invalidate_node(struct amdgpu_mn_node *node,
+ 		if (r <= 0)
+ 			DRM_ERROR("(%ld) failed to wait for user bo\n", r);
+ 
+-		amdgpu_ttm_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_CPU);
+-		r = ttm_bo_validate(&bo->tbo, &bo->placement, false, false);
+-		if (r)
+-			DRM_ERROR("(%ld) failed to validate user bo\n", r);
++		amdgpu_ttm_tt_mark_user_pages(bo->tbo.ttm);
+ 
+ 		amdgpu_bo_unreserve(bo);
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index bdfabe9..4f96b64 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -750,6 +750,24 @@ void amdgpu_ttm_tt_set_user_pages(struct ttm_tt *ttm, struct page **pages)
+ 	}
+ }
+ 
++void amdgpu_ttm_tt_mark_user_pages(struct ttm_tt *ttm)
++{
++	struct amdgpu_ttm_tt *gtt = (void *)ttm;
++	unsigned i;
++
++	for (i = 0; i < ttm->num_pages; ++i) {
++		struct page *page = ttm->pages[i];
++
++		if (!page)
++			continue;
++
++		if (!(gtt->userflags & AMDGPU_GEM_USERPTR_READONLY))
++			set_page_dirty(page);
++
++		mark_page_accessed(page);
++	}
++}
++
+ static void amdgpu_trace_dma_map(struct ttm_tt *ttm)
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(ttm->bdev);
+@@ -805,7 +823,6 @@ static void amdgpu_ttm_tt_unpin_userptr(struct ttm_tt *ttm)
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(ttm->bdev);
+ 	struct amdgpu_ttm_tt *gtt = (void *)ttm;
+-	struct sg_page_iter sg_iter;
+ 
+ 	int write = !(gtt->userflags & AMDGPU_GEM_USERPTR_READONLY);
+ 	enum dma_data_direction direction = write ?
+@@ -818,13 +835,7 @@ static void amdgpu_ttm_tt_unpin_userptr(struct ttm_tt *ttm)
+ 	/* free the sg table and pages again */
+ 	dma_unmap_sg(adev->dev, ttm->sg->sgl, ttm->sg->nents, direction);
+ 
+-	for_each_sg_page(ttm->sg->sgl, &sg_iter, ttm->sg->nents, 0) {
+-		struct page *page = sg_page_iter_page(&sg_iter);
+-		if (!(gtt->userflags & AMDGPU_GEM_USERPTR_READONLY))
+-			set_page_dirty(page);
+-
+-		mark_page_accessed(page);
+-	}
++	amdgpu_ttm_tt_mark_user_pages(ttm);
+ 
+ 	amdgpu_trace_dma_unmap(ttm);
+ 
+-- 
+2.7.4
+

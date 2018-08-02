@@ -1,0 +1,141 @@
+From 5163298b7930dd136b63f4fb909b9796a6a9c369 Mon Sep 17 00:00:00 2001
+From: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+Date: Fri, 24 Feb 2017 02:48:19 -0600
+Subject: [PATCH 4940/5855] x86/events, drivers/amd/iommu: Prepare for multiple
+ IOMMUs support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently, amd_iommu_pc_get_set_reg_val() cannot support multiple
+IOMMUs. Modify it to allow callers to specify an IOMMU. This is in
+preparation for supporting multiple IOMMUs.
+
+Signed-off-by: Suravee Suthikulpanit <Suravee.Suthikulpanit@amd.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Jörg Rödel <joro@8bytes.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vince Weaver <vincent.weaver@maine.edu>
+Cc: iommu@lists.linux-foundation.org
+Link: http://lkml.kernel.org/r/1487926102-13073-8-git-send-email-Suravee.Suthikulpanit@amd.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+---
+ drivers/iommu/amd_iommu_init.c  | 43 +++++++++++++++++++++++------------------
+ drivers/iommu/amd_iommu_proto.h |  5 -----
+ 2 files changed, 24 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/iommu/amd_iommu_init.c b/drivers/iommu/amd_iommu_init.c
+index 8fdf109..5a11328 100644
+--- a/drivers/iommu/amd_iommu_init.c
++++ b/drivers/iommu/amd_iommu_init.c
+@@ -256,10 +256,6 @@ static int amd_iommu_enable_interrupts(void);
+ static int __init iommu_go_to_state(enum iommu_init_state state);
+ static void init_device_table_dma(void);
+ 
+-static int iommu_pc_get_set_reg_val(struct amd_iommu *iommu,
+-				    u8 bank, u8 cntr, u8 fxn,
+-				    u64 *value, bool is_write);
+-
+ static inline void update_last_devid(u16 devid)
+ {
+ 	if (devid > amd_iommu_last_bdf)
+@@ -1484,6 +1480,8 @@ static int __init init_iommu_all(struct acpi_table_header *table)
+ 	return 0;
+ }
+ 
++static int iommu_pc_get_set_reg(struct amd_iommu *iommu, u8 bank, u8 cntr,
++				u8 fxn, u64 *value, bool is_write);
+ 
+ static void init_iommu_perf_ctr(struct amd_iommu *iommu)
+ {
+@@ -1495,8 +1493,8 @@ static void init_iommu_perf_ctr(struct amd_iommu *iommu)
+ 	amd_iommu_pc_present = true;
+ 
+ 	/* Check if the performance counters can be written to */
+-	if ((0 != iommu_pc_get_set_reg_val(iommu, 0, 0, 0, &val, true)) ||
+-	    (0 != iommu_pc_get_set_reg_val(iommu, 0, 0, 0, &val2, false)) ||
++	if ((iommu_pc_get_set_reg(iommu, 0, 0, 0, &val, true)) ||
++	    (iommu_pc_get_set_reg(iommu, 0, 0, 0, &val2, false)) ||
+ 	    (val != val2)) {
+ 		pr_err("AMD-Vi: Unable to write to IOMMU perf counter.\n");
+ 		amd_iommu_pc_present = false;
+@@ -2765,15 +2763,18 @@ u8 amd_iommu_pc_get_max_counters(unsigned int idx)
+ }
+ EXPORT_SYMBOL(amd_iommu_pc_get_max_counters);
+ 
+-static int iommu_pc_get_set_reg_val(struct amd_iommu *iommu,
+-				    u8 bank, u8 cntr, u8 fxn,
+-				    u64 *value, bool is_write)
++static int iommu_pc_get_set_reg(struct amd_iommu *iommu, u8 bank, u8 cntr,
++				u8 fxn, u64 *value, bool is_write)
+ {
+ 	u32 offset;
+ 	u32 max_offset_lim;
+ 
++	/* Make sure the IOMMU PC resource is available */
++	if (!amd_iommu_pc_present)
++		return -ENODEV;
++
+ 	/* Check for valid iommu and pc register indexing */
+-	if (WARN_ON((fxn > 0x28) || (fxn & 7)))
++	if (WARN_ON(!iommu || (fxn > 0x28) || (fxn & 7)))
+ 		return -ENODEV;
+ 
+ 	offset = (u32)(((0x40 | bank) << 12) | (cntr << 8) | fxn);
+@@ -2799,17 +2800,21 @@ static int iommu_pc_get_set_reg_val(struct amd_iommu *iommu,
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL(amd_iommu_pc_get_set_reg_val);
+ 
+-int amd_iommu_pc_get_set_reg_val(u16 devid, u8 bank, u8 cntr, u8 fxn,
+-				    u64 *value, bool is_write)
++int amd_iommu_pc_get_reg(struct amd_iommu *iommu, u8 bank, u8 cntr, u8 fxn, u64 *value)
+ {
+-	struct amd_iommu *iommu = amd_iommu_rlookup_table[devid];
++	if (!iommu)
++		return -EINVAL;
+ 
+-	/* Make sure the IOMMU PC resource is available */
+-	if (!amd_iommu_pc_present || iommu == NULL)
+-		return -ENODEV;
++	return iommu_pc_get_set_reg(iommu, bank, cntr, fxn, value, false);
++}
++EXPORT_SYMBOL(amd_iommu_pc_get_reg);
++
++int amd_iommu_pc_set_reg(struct amd_iommu *iommu, u8 bank, u8 cntr, u8 fxn, u64 *value)
++{
++	if (!iommu)
++		return -EINVAL;
+ 
+-	return iommu_pc_get_set_reg_val(iommu, bank, cntr, fxn,
+-					value, is_write);
++	return iommu_pc_get_set_reg(iommu, bank, cntr, fxn, value, true);
+ }
++EXPORT_SYMBOL(amd_iommu_pc_set_reg);
+diff --git a/drivers/iommu/amd_iommu_proto.h b/drivers/iommu/amd_iommu_proto.h
+index cd2257e..466260f 100644
+--- a/drivers/iommu/amd_iommu_proto.h
++++ b/drivers/iommu/amd_iommu_proto.h
+@@ -57,11 +57,6 @@ extern int amd_iommu_domain_set_gcr3(struct iommu_domain *dom, int pasid,
+ extern int amd_iommu_domain_clear_gcr3(struct iommu_domain *dom, int pasid);
+ extern struct iommu_domain *amd_iommu_get_v2_domain(struct pci_dev *pdev);
+ 
+-/* IOMMU Performance Counter functions */
+-extern bool amd_iommu_pc_supported(void);
+-extern int amd_iommu_pc_get_set_reg_val(u16 devid, u8 bank, u8 cntr, u8 fxn,
+-				    u64 *value, bool is_write);
+-
+ #ifdef CONFIG_IRQ_REMAP
+ extern int amd_iommu_create_irq_domain(struct amd_iommu *iommu);
+ #else
+-- 
+2.7.4
+

@@ -1,0 +1,182 @@
+From 9afba6374f73039bd92157b7a28edb09a7cd4f18 Mon Sep 17 00:00:00 2001
+From: Yongqiang Sun <yongqiang.sun@amd.com>
+Date: Tue, 3 Oct 2017 15:03:49 -0400
+Subject: [PATCH 4096/5855] drm/amd/display: Fixed switching mode half screen
+ gamma incorrect.
+
+	Half screen gamma setting and cursor are incorrect
+	when switching mode through win+p due to wrong programming
+	gamma sequence (In case of bottom pipe, gamma and cursor are
+	programmed before front end programmed, pipe is power gated).
+
+	change:
+	1. Cache curor attributes to stream
+	2. Move set gamma and cursor inside front end
+	   programming.
+
+Signed-off-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c                | 15 ---------------
+ drivers/gpu/drm/amd/display/dc/core/dc_stream.c         |  9 ++++++++-
+ drivers/gpu/drm/amd/display/dc/dc.h                     |  4 +++-
+ .../gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c | 10 ++++++++++
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c   | 17 +++++++++++++++++
+ 5 files changed, 38 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index c4f9e2c..688d636 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1268,10 +1268,6 @@ static void commit_planes_for_stream(struct dc *dc,
+ 	/* Full fe update*/
+ 	for (j = 0; j < dc->res_pool->pipe_count; j++) {
+ 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[j];
+-		struct pipe_ctx *cur_pipe_ctx = &dc->current_state->res_ctx.pipe_ctx[j];
+-		bool is_new_pipe_surface = cur_pipe_ctx->plane_state != pipe_ctx->plane_state;
+-		struct dc_cursor_position position = { 0 };
+-
+ 
+ 		if (update_type != UPDATE_TYPE_FULL || !pipe_ctx->plane_state)
+ 			continue;
+@@ -1282,17 +1278,6 @@ static void commit_planes_for_stream(struct dc *dc,
+ 			dc->hwss.apply_ctx_for_surface(
+ 					dc, pipe_ctx->stream, stream_status->plane_count, context);
+ 		}
+-
+-		/* TODO: this is a hack w/a for switching from mpo to pipe split */
+-		dc_stream_set_cursor_position(pipe_ctx->stream, &position);
+-
+-		if (is_new_pipe_surface) {
+-			dc->hwss.update_plane_addr(dc, pipe_ctx);
+-			dc->hwss.set_input_transfer_func(
+-					pipe_ctx, pipe_ctx->plane_state);
+-			dc->hwss.set_output_transfer_func(
+-					pipe_ctx, pipe_ctx->stream);
+-		}
+ 	}
+ 
+ 	if (update_type > UPDATE_TYPE_FAST)
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+index c19b478..3dd44be 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+@@ -173,7 +173,7 @@ struct dc_stream_status *dc_stream_get_status(
+  * Update the cursor attributes and set cursor surface address
+  */
+ bool dc_stream_set_cursor_attributes(
+-	const struct dc_stream_state *stream,
++	struct dc_stream_state *stream,
+ 	const struct dc_cursor_attributes *attributes)
+ {
+ 	int i;
+@@ -189,6 +189,11 @@ bool dc_stream_set_cursor_attributes(
+ 			return false;
+ 	}
+ 
++	if (attributes->address.quad_part == 0) {
++		dm_error("DC: Cursor address is 0!\n");
++		return false;
++	}
++
+ 	core_dc = stream->ctx->dc;
+ 	res_ctx = &core_dc->current_state->res_ctx;
+ 
+@@ -214,6 +219,8 @@ bool dc_stream_set_cursor_attributes(
+ 				pipe_ctx->plane_res.xfm, attributes);
+ 	}
+ 
++	stream->cursor_attributes = *attributes;
++
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 6d39a8b..b1115a1 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -590,6 +590,8 @@ struct dc_stream_state {
+ 
+ 	struct dc_stream_status status;
+ 
++	struct dc_cursor_attributes cursor_attributes;
++
+ 	/* from stream struct */
+         atomic_t ref_count;
+ };
+@@ -1066,7 +1068,7 @@ struct dc_sink *dc_sink_create(const struct dc_sink_init_data *init_params);
+  ******************************************************************************/
+ /* TODO: Deprecated once we switch to dc_set_cursor_position */
+ bool dc_stream_set_cursor_attributes(
+-	const struct dc_stream_state *stream,
++	struct dc_stream_state *stream,
+ 	const struct dc_cursor_attributes *attributes);
+ 
+ bool dc_stream_set_cursor_position(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 9eb0218..edf0219 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -2722,6 +2722,8 @@ static void dce110_program_front_end_for_pipe(
+ 	struct dc_plane_state *plane_state = pipe_ctx->plane_state;
+ 	struct xfm_grph_csc_adjustment adjust;
+ 	struct out_csc_color_matrix tbl_entry;
++	struct pipe_ctx *cur_pipe_ctx =
++					&dc->current_state->res_ctx.pipe_ctx[pipe_ctx->pipe_idx];
+ 	unsigned int i;
+ 
+ 	memset(&tbl_entry, 0, sizeof(tbl_entry));
+@@ -2812,6 +2814,14 @@ static void dce110_program_front_end_for_pipe(
+ 				&plane_state->tiling_info,
+ 				plane_state->rotation);
+ 
++	/* Moved programming gamma from dc to hwss */
++	if (cur_pipe_ctx->plane_state != pipe_ctx->plane_state) {
++		dc->hwss.set_input_transfer_func(
++				pipe_ctx, pipe_ctx->plane_state);
++		dc->hwss.set_output_transfer_func(
++				pipe_ctx, pipe_ctx->stream);
++	}
++
+ 	dm_logger_write(dc->ctx->logger, LOG_SURFACE,
+ 			"Pipe:%d 0x%x: addr hi:0x%x, "
+ 			"addr low:0x%x, "
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index a0d55ec..479dc16 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -2463,6 +2463,10 @@ static void program_all_pipe_in_tree(
+ 	}
+ 
+ 	if (pipe_ctx->plane_state != NULL) {
++		struct dc_cursor_position position = { 0 };
++		struct pipe_ctx *cur_pipe_ctx =
++				&dc->current_state->res_ctx.pipe_ctx[pipe_ctx->pipe_idx];
++
+ 		dcn10_power_on_fe(dc, pipe_ctx, context);
+ 
+ 		/* temporary dcn1 wa:
+@@ -2477,6 +2481,19 @@ static void program_all_pipe_in_tree(
+ 		toggle_watermark_change_req(dc->hwseq);
+ 
+ 		update_dchubp_dpp(dc, pipe_ctx, context);
++
++		/* TODO: this is a hack w/a for switching from mpo to pipe split */
++		dc_stream_set_cursor_position(pipe_ctx->stream, &position);
++
++		dc_stream_set_cursor_attributes(pipe_ctx->stream,
++				&pipe_ctx->stream->cursor_attributes);
++
++		if (cur_pipe_ctx->plane_state != pipe_ctx->plane_state) {
++			dc->hwss.set_input_transfer_func(
++					pipe_ctx, pipe_ctx->plane_state);
++			dc->hwss.set_output_transfer_func(
++					pipe_ctx, pipe_ctx->stream);
++		}
+ 	}
+ 
+ 	if (dc->debug.sanity_checks) {
+-- 
+2.7.4
+

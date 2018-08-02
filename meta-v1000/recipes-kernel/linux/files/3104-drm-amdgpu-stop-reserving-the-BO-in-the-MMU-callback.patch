@@ -1,0 +1,204 @@
+From 9700f850af2d0ec42072e8aa564f953c4d5f70c3 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 11 Sep 2017 18:23:08 -0400
+Subject: [PATCH 3104/5855] drm/amdgpu: stop reserving the BO in the MMU
+ callback v3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead take the callback lock during the final parts of CS.
+
+This should solve the last remaining locking order problems with BO reservations.
+
+v2: rebase, make dummy functions static inline
+v3: add one more missing inline and comments
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu.h
+	drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+
+Change-Id: Ibb3b260369279334723d1eab765e3a2e1495c260
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    | 11 +++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c | 26 +++++++++++++++++++++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c | 29 +++++++++++++++++++++--------
+ 3 files changed, 53 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 24cf4c3..42e709c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -183,6 +183,7 @@ struct amdgpu_job;
+ struct amdgpu_irq_src;
+ struct amdgpu_fpriv;
+ struct kfd_vm_fault_info;
++struct amdgpu_mn;
+ 
+ enum amdgpu_cp_irq {
+ 	AMDGPU_CP_IRQ_GFX_EOP = 0,
+@@ -1083,6 +1084,7 @@ struct amdgpu_cs_parser {
+ 	/* buffer objects */
+ 	struct ww_acquire_ctx		ticket;
+ 	struct amdgpu_bo_list		*bo_list;
++	struct amdgpu_mn                *mn;
+ 	struct amdgpu_bo_list_entry	vm_pd;
+ 	struct list_head		validated;
+ 	struct fence			*fence;
+@@ -1224,9 +1226,18 @@ void amdgpu_test_moves(struct amdgpu_device *adev);
+  * MMU Notifier
+  */
+ #if defined(CONFIG_MMU_NOTIFIER)
++struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev);
+ int amdgpu_mn_register(struct amdgpu_bo *bo, unsigned long addr);
+ void amdgpu_mn_unregister(struct amdgpu_bo *bo);
++void amdgpu_mn_lock(struct amdgpu_mn *mn);
++void amdgpu_mn_unlock(struct amdgpu_mn *mn);
+ #else
++static inline void amdgpu_mn_lock(struct amdgpu_mn *mn) {}
++static inline void amdgpu_mn_unlock(struct amdgpu_mn *mn) {}
++static inline struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev)
++{
++	return NULL;
++}
+ static inline int amdgpu_mn_register(struct amdgpu_bo *bo, unsigned long addr)
+ {
+ 	return -ENODEV;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 09377a6..5da2630 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -515,6 +515,8 @@ static int amdgpu_cs_parser_bos(struct amdgpu_cs_parser *p,
+ 		need_mmap_lock = p->bo_list->first_userptr !=
+ 			p->bo_list->num_entries;
+ 		amdgpu_bo_list_get_list(p->bo_list, &p->validated);
++		if (p->bo_list->first_userptr != p->bo_list->num_entries)
++			p->mn = amdgpu_mn_get(p->adev);
+ 	}
+ 
+ 	INIT_LIST_HEAD(&duplicates);
+@@ -727,11 +729,7 @@ static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser, int error, bo
+ {
+ 	unsigned i;
+ 
+-	if (!error)
+-		ttm_eu_fence_buffer_objects(&parser->ticket,
+-					    &parser->validated,
+-					    parser->fence);
+-	else if (backoff)
++	if (error && backoff)
+ 		ttm_eu_backoff_reservation(&parser->ticket,
+ 					   &parser->validated);
+ 	fence_put(parser->fence);
+@@ -1050,14 +1048,29 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ 	struct amdgpu_ring *ring = p->job->ring;
+ 	struct amd_sched_entity *entity = &p->ctx->rings[ring->idx].entity;
+ 	struct amdgpu_job *job;
++	unsigned i;
+ 	int r;
+ 
++	amdgpu_mn_lock(p->mn);
++	if (p->bo_list) {
++		for (i = p->bo_list->first_userptr;
++		     i < p->bo_list->num_entries; ++i) {
++			struct amdgpu_bo *bo = p->bo_list->array[i].robj;
++
++			if (amdgpu_ttm_tt_userptr_needs_pages(bo->tbo.ttm)) {
++				amdgpu_mn_unlock(p->mn);
++				return -ERESTARTSYS;
++			}
++		}
++	}
++
+ 	job = p->job;
+ 	p->job = NULL;
+ 
+ 	r = amd_sched_job_init(&job->base, &ring->sched, entity, p->filp);
+ 	if (r) {
+ 		amdgpu_job_free(job);
++		amdgpu_mn_unlock(p->mn);
+ 		return r;
+ 	}
+ 
+@@ -1071,6 +1084,9 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ 	trace_amdgpu_cs_ioctl(job);
+ 	amd_sched_entity_push_job(&job->base);
+ 
++	ttm_eu_fence_buffer_objects(&p->ticket, &p->validated, p->fence);
++	amdgpu_mn_unlock(p->mn);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+index 7c218be..f6b03c5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+@@ -113,6 +113,25 @@ static void amdgpu_mn_release(struct mmu_notifier *mn,
+ 	schedule_work(&rmn->work);
+ }
+ 
++
++/**
++ * amdgpu_mn_lock - take the write side lock for this mn
++ */
++void amdgpu_mn_lock(struct amdgpu_mn *mn)
++{
++	if (mn)
++		down_write(&mn->lock);
++}
++
++/**
++ * amdgpu_mn_unlock - drop the write side lock for this mn
++ */
++void amdgpu_mn_unlock(struct amdgpu_mn *mn)
++{
++	if (mn)
++		up_write(&mn->lock);
++}
++
+ /**
+  * amdgpu_mn_invalidate_node - unmap all BOs of a node
+  *
+@@ -133,12 +152,6 @@ static void amdgpu_mn_invalidate_node(struct amdgpu_mn_node *node,
+ 		if (!amdgpu_ttm_tt_affect_userptr(bo->tbo.ttm, start, end))
+ 			continue;
+ 
+-		r = amdgpu_bo_reserve(bo, true);
+-		if (r) {
+-			DRM_ERROR("(%ld) failed to reserve user bo\n", r);
+-			continue;
+-		}
+-
+ 		r = reservation_object_wait_timeout_rcu(bo->tbo.resv,
+ 			true, false, MAX_SCHEDULE_TIMEOUT);
+ 		if (r <= 0)
+@@ -146,7 +159,6 @@ static void amdgpu_mn_invalidate_node(struct amdgpu_mn_node *node,
+ 
+ 		amdgpu_ttm_tt_mark_user_pages(bo->tbo.ttm);
+ 
+-		amdgpu_bo_unreserve(bo);
+ 	}
+ }
+ 
+@@ -316,7 +328,7 @@ static const struct mmu_notifier_ops amdgpu_mn_ops[] = {
+  *
+  * Creates a notifier context for current->mm.
+  */
+-static struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev,
++struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev,
+ 				      enum amdgpu_mn_type type)
+ {
+ 	struct mm_struct *mm = current->mm;
+@@ -466,3 +478,4 @@ void amdgpu_mn_unregister(struct amdgpu_bo *bo)
+ 	up_write(&rmn->lock);
+ 	mutex_unlock(&adev->mn_lock);
+ }
++
+-- 
+2.7.4
+

@@ -1,0 +1,345 @@
+From 82c77c9c3dc79696bc1f7f8e837e8c84c77514f0 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Thu, 21 Sep 2017 16:26:41 -0400
+Subject: [PATCH 3575/5855] drm/amdgpu: Handle GPUVM fault storms
+
+When many wavefronts cause VM faults at the same time, it can
+overwhelm the interrupt handler and cause IH ring overflows before
+the driver can notify or kill the faulting application.
+
+As a workaround I'm introducing limited per-VM fault credit. After
+that number of VM faults have occurred, further VM faults are
+filtered out at the prescreen stage of processing.
+
+This depends on the PASID in the interrupt packet, so it currently
+only works for KFD contexts.
+
+V2 : rebased vega10_ih.c to applay patch cleanly
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c  | 31 +++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h  |  7 ++-
+ drivers/gpu/drm/amd/amdgpu/cik_ih.c     | 19 +++++++-
+ drivers/gpu/drm/amd/amdgpu/cz_ih.c      | 19 +++++++-
+ drivers/gpu/drm/amd/amdgpu/iceland_ih.c | 19 +++++++-
+ drivers/gpu/drm/amd/amdgpu/tonga_ih.c   | 19 +++++++-
+ drivers/gpu/drm/amd/amdgpu/vega10_ih.c  | 82 ++++++++++++++++++++++++++++++---
+ 7 files changed, 180 insertions(+), 16 deletions(-)
+ mode change 100644 => 100755 drivers/gpu/drm/amd/amdgpu/vega10_ih.c
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index d64b378..5b762c0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -2728,6 +2728,7 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+                 vm->pasid = pasid;
+         }
+ 
++        vm->fault_credit = 16;
+ 
+ 	return 0;
+ 
+@@ -2834,6 +2835,36 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ }
+ 
+ /**
++ * amdgpu_vm_pasid_fault_credit - Check fault credit for given PASID
++ *
++ * @adev: amdgpu_device pointer
++ * @pasid: PASID do identify the VM
++ *
++ * This function is expected to be called in interrupt context. Returns
++ * true if there was fault credit, false otherwise
++ */
++bool amdgpu_vm_pasid_fault_credit(struct amdgpu_device *adev,
++				  unsigned int pasid)
++{
++	struct amdgpu_vm *vm;
++
++	spin_lock(&adev->vm_manager.pasid_lock);
++	vm = idr_find(&adev->vm_manager.pasid_idr, pasid);
++	spin_unlock(&adev->vm_manager.pasid_lock);
++	if (!vm)
++		/* VM not found, can't track fault credit */
++		return true;
++
++	/* No lock needed. only accessed by IRQ handler */
++	if (!vm->fault_credit)
++		/* Too many faults in this VM */
++		return false;
++
++	vm->fault_credit--;
++	return true;
++}
++
++/**
+  * amdgpu_vm_manager_init - init the VM manager
+  *
+  * @adev: amdgpu_device pointer
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index ae17c7f..86eb570 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -163,7 +163,10 @@ struct amdgpu_vm {
+ 	bool                    use_cpu_for_update;
+ 
+ 	/* Flag to indicate ATS support from PTE for GFX9 */
+-	bool                    pte_support_ats;	
++	bool                    pte_support_ats;
++
++        /* Limit non-retry fault storms */
++        unsigned int            fault_credit;	
+ };
+ 
+ struct amdgpu_vm_id {
+@@ -245,6 +248,8 @@ void amdgpu_vm_manager_fini(struct amdgpu_device *adev);
+ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+                    int vm_context, unsigned int pasid);
+ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm);
++bool amdgpu_vm_pasid_fault_credit(struct amdgpu_device *adev,
++				  unsigned int pasid);
+ void amdgpu_vm_get_pd_bo(struct amdgpu_vm *vm,
+ 			 struct list_head *validated,
+ 			 struct amdgpu_bo_list_entry *entry);
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_ih.c b/drivers/gpu/drm/amd/amdgpu/cik_ih.c
+index 4d8debf..58a70a0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_ih.c
+@@ -237,8 +237,23 @@ static u32 cik_ih_get_wptr(struct amdgpu_device *adev)
+  */
+ static bool cik_ih_prescreen_iv(struct amdgpu_device *adev)
+ {
+-        /* Process all interrupts */
+-        return true;
++        u32 ring_index = adev->irq.ih.rptr >> 2;
++        u16 pasid;
++
++        switch (le32_to_cpu(adev->irq.ih.ring[ring_index]) & 0xff) {
++        case 146:
++        case 147:
++                pasid = le32_to_cpu(adev->irq.ih.ring[ring_index + 2]) >> 16;
++                if (!pasid || amdgpu_vm_pasid_fault_credit(adev, pasid))
++                        return true;
++                break;
++        default:
++                /* Not a VM fault */
++                return true;
++        }
++ 
++        adev->irq.ih.rptr += 16;
++        return false;
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/cz_ih.c b/drivers/gpu/drm/amd/amdgpu/cz_ih.c
+index 2410104..26c4059 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cz_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/cz_ih.c
+@@ -216,8 +216,23 @@ static u32 cz_ih_get_wptr(struct amdgpu_device *adev)
+  */
+ static bool cz_ih_prescreen_iv(struct amdgpu_device *adev)
+ {
+-        /* Process all interrupts */
+-        return true;
++        u32 ring_index = adev->irq.ih.rptr >> 2;
++        u16 pasid;
++
++        switch (le32_to_cpu(adev->irq.ih.ring[ring_index]) & 0xff) {
++        case 146:
++        case 147:
++                pasid = le32_to_cpu(adev->irq.ih.ring[ring_index + 2]) >> 16;
++                if (!pasid || amdgpu_vm_pasid_fault_credit(adev, pasid))
++                        return true;
++                break;
++        default:
++                /* Not a VM fault */
++                return true;
++        }
++
++        adev->irq.ih.rptr += 16;
++        return false;
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/iceland_ih.c b/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
+index 49c7b17..a534810 100644
+--- a/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
+@@ -216,8 +216,23 @@ static u32 iceland_ih_get_wptr(struct amdgpu_device *adev)
+  */
+ static bool iceland_ih_prescreen_iv(struct amdgpu_device *adev)
+ {
+-        /* Process all interrupts */
+-        return true;
++        u32 ring_index = adev->irq.ih.rptr >> 2;
++        u16 pasid;
++ 
++        switch (le32_to_cpu(adev->irq.ih.ring[ring_index]) & 0xff) {
++        case 146:
++        case 147:
++                pasid = le32_to_cpu(adev->irq.ih.ring[ring_index + 2]) >> 16;
++                if (!pasid || amdgpu_vm_pasid_fault_credit(adev, pasid))
++                        return true;
++                break;
++        default:
++                /* Not a VM fault */
++                return true;
++        }
++ 
++        adev->irq.ih.rptr += 16;
++        return false;
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/tonga_ih.c b/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
+index 4228070..bc47179 100644
+--- a/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
+@@ -227,8 +227,23 @@ static u32 tonga_ih_get_wptr(struct amdgpu_device *adev)
+  */
+ static bool tonga_ih_prescreen_iv(struct amdgpu_device *adev)
+ {
+-        /* Process all interrupts */
+-        return true;
++        u32 ring_index = adev->irq.ih.rptr >> 2;
++        u16 pasid;
++ 
++        switch (le32_to_cpu(adev->irq.ih.ring[ring_index]) & 0xff) {
++        case 146:
++        case 147:
++                pasid = le32_to_cpu(adev->irq.ih.ring[ring_index + 2]) >> 16;
++                if (!pasid || amdgpu_vm_pasid_fault_credit(adev, pasid))
++                        return true;
++                break;
++        default:
++                /* Not a VM fault */
++                return true;
++        }
++ 
++        adev->irq.ih.rptr += 16;
++        return false;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/vega10_ih.c b/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
+old mode 100644
+new mode 100755
+index c169940..ef38d23
+--- a/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
+@@ -219,14 +219,14 @@ static u32 vega10_ih_get_wptr(struct amdgpu_device *adev)
+ 			wptr, adev->irq.ih.rptr, tmp);
+ 		adev->irq.ih.rptr = tmp;
+ 
+-                tmp = RREG32_NO_KIQ(SOC15_REG_OFFSET(OSSSYS, 0, mmIH_RB_CNTL));
++		tmp = RREG32_NO_KIQ(SOC15_REG_OFFSET(OSSSYS, 0, mmIH_RB_CNTL));
+ 		tmp = REG_SET_FIELD(tmp, IH_RB_CNTL, WPTR_OVERFLOW_CLEAR, 1);
+-                WREG32_NO_KIQ(SOC15_REG_OFFSET(OSSSYS, 0, mmIH_RB_CNTL), tmp);
++		WREG32_NO_KIQ(SOC15_REG_OFFSET(OSSSYS, 0, mmIH_RB_CNTL), tmp);
+ 	}
+ 	return (wptr & adev->irq.ih.ptr_mask);
+ }
+ 
+- /**
++/**
+  * vega10_ih_prescreen_iv - prescreen an interrupt vector
+  *
+  * @adev: amdgpu_device pointer
+@@ -235,10 +235,78 @@ static u32 vega10_ih_get_wptr(struct amdgpu_device *adev)
+  */
+ static bool vega10_ih_prescreen_iv(struct amdgpu_device *adev)
+ {
+-        /* TODO: Filter known pending page faults */
+-        return true;
+-}
++	u32 ring_index = adev->irq.ih.rptr >> 2;
++	u32 dw0, dw3, dw4, dw5;
++	u16 pasid;
++	u64 addr, key;
++	struct amdgpu_vm *vm;
++	int r;
++
++	dw0 = le32_to_cpu(adev->irq.ih.ring[ring_index + 0]);
++	dw3 = le32_to_cpu(adev->irq.ih.ring[ring_index + 3]);
++	dw4 = le32_to_cpu(adev->irq.ih.ring[ring_index + 4]);
++	dw5 = le32_to_cpu(adev->irq.ih.ring[ring_index + 5]);
++
++	/* Filter retry page faults, let only the first one pass. If
++	 * there are too many outstanding faults, ignore them until
++	 * some faults get cleared.
++	 */
++	switch (dw0 & 0xff) {
++	case AMDGPU_IH_CLIENTID_VMC:
++	case AMDGPU_IH_CLIENTID_UTCL2:
++		break;
++	default:
++		/* Not a VM fault */
++		return true;
++	}
++
++	pasid = dw3 & 0xffff;
++	/* No PASID, can't identify faulting process */
++	if (!pasid)
++		return true;
++
++	/* Not a retry fault, check fault credit */
++	if (!(dw5 & 0x80)) {
++		if (!amdgpu_vm_pasid_fault_credit(adev, pasid))
++			goto ignore_iv;
++		return true;
++	}
+ 
++	addr = ((u64)(dw5 & 0xf) << 44) | ((u64)dw4 << 12);
++	key = AMDGPU_VM_FAULT(pasid, addr);
++	r = amdgpu_ih_add_fault(adev, key);
++
++	/* Hash table is full or the fault is already being processed,
++	 * ignore further page faults
++	 */
++	if (r != 0)
++		goto ignore_iv;
++
++	/* Track retry faults in per-VM fault FIFO. */
++	spin_lock(&adev->vm_manager.pasid_lock);
++	vm = idr_find(&adev->vm_manager.pasid_idr, pasid);
++	spin_unlock(&adev->vm_manager.pasid_lock);
++	if (WARN_ON_ONCE(!vm)) {
++		/* VM not found, process it normally */
++		amdgpu_ih_clear_fault(adev, key);
++		return true;
++	}
++	/* No locking required with single writer and single reader */
++
++	r = kfifo_put(&vm->faults, key);
++	if (!r) {
++		/* FIFO is full. Ignore it until there is space */
++		amdgpu_ih_clear_fault(adev, key);
++		goto ignore_iv;
++	}
++
++	/* It's the first fault for this address, process it normally */
++	return true;
++
++ignore_iv:
++	adev->irq.ih.rptr += 32;
++	return false;
++}
+ 
+ /**
+  * vega10_ih_decode_iv - decode an interrupt vector
+@@ -424,7 +492,7 @@ const struct amd_ip_funcs vega10_ih_ip_funcs = {
+ 
+ static const struct amdgpu_ih_funcs vega10_ih_funcs = {
+ 	.get_wptr = vega10_ih_get_wptr,
+-        .prescreen_iv = vega10_ih_prescreen_iv,
++	.prescreen_iv = vega10_ih_prescreen_iv,
+ 	.decode_iv = vega10_ih_decode_iv,
+ 	.set_rptr = vega10_ih_set_rptr
+ };
+-- 
+2.7.4
+

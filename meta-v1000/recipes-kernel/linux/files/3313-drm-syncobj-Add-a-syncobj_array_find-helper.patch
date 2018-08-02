@@ -1,0 +1,145 @@
+From 5507159c29b52a7796a9bac2f5cef71a454eeefb Mon Sep 17 00:00:00 2001
+From: Jason Ekstrand <jason@jlekstrand.net>
+Date: Fri, 25 Aug 2017 10:52:26 -0700
+Subject: [PATCH 3313/5855] drm/syncobj: Add a syncobj_array_find helper
+
+The wait ioctl has a bunch of code to read an syncobj handle array from
+userspace and turn it into an array of syncobj pointers.  We're about to
+add two new IOCTLs which will need to work with arrays of syncobj
+handles so let's make some helpers.
+
+Signed-off-by: Jason Ekstrand <jason@jlekstrand.net>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/drm_syncobj.c | 88 ++++++++++++++++++++++++++++---------------
+ 1 file changed, 58 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_syncobj.c b/drivers/gpu/drm/drm_syncobj.c
+index cf48988..c8e61b4 100644
+--- a/drivers/gpu/drm/drm_syncobj.c
++++ b/drivers/gpu/drm/drm_syncobj.c
+@@ -803,58 +803,44 @@ static int drm_syncobj_array_wait(struct drm_device *dev,
+ 	return 0;
+ }
+ 
+-int
+-drm_syncobj_wait_ioctl(struct drm_device *dev, void *data,
+-		       struct drm_file *file_private)
++static int drm_syncobj_array_find(struct drm_file *file_private,
++				 void *user_handles, uint32_t count_handles,
++				 struct drm_syncobj ***syncobjs_out)
+ {
+-	struct drm_syncobj_wait *args = data;
+-	uint32_t *handles;
++	uint32_t i, *handles;
+ 	struct drm_syncobj **syncobjs;
+-	int ret = 0;
+-	uint32_t i;
+-
+-	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ))
+-		return -ENODEV;
+-
+-	if (args->flags & ~(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
+-			    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT))
+-		return -EINVAL;
+ 
+-	if (args->count_handles == 0)
+-		return -EINVAL;
++	int ret;
+ 
+-	/* Get the handles from userspace */
+-	handles = kmalloc_array(args->count_handles, sizeof(uint32_t),
+-				GFP_KERNEL);
++	handles = kmalloc_array(count_handles, sizeof(*handles), GFP_KERNEL);		
+ 	if (handles == NULL)
+ 		return -ENOMEM;
+ 
+-	if (copy_from_user(handles,
+-			   u64_to_user_ptr(args->handles),
+-			   sizeof(uint32_t) * args->count_handles)) {
++	if (copy_from_user(handles, user_handles,
++			   sizeof(uint32_t) * count_handles)) {
+ 		ret = -EFAULT;
+ 		goto err_free_handles;
+ 	}
+ 
+-	syncobjs = kcalloc(args->count_handles,
+-			   sizeof(struct drm_syncobj *), GFP_KERNEL);
+-	if (!syncobjs) {
++	syncobjs = kmalloc_array(count_handles, sizeof(*syncobjs), GFP_KERNEL);
++	if (syncobjs == NULL) {
+ 		ret = -ENOMEM;
+ 		goto err_free_handles;
+ 	}
+ 
+-	for (i = 0; i < args->count_handles; i++) {
++	for (i = 0; i < count_handles; i++) {
+ 		syncobjs[i] = drm_syncobj_find(file_private, handles[i]);
+ 		if (!syncobjs[i]) {
+ 			ret = -ENOENT;
+-			goto err_free_fence_array;
++			goto err_put_syncobjs;
+ 		}
+ 	}
+ 
+-	ret = drm_syncobj_array_wait(dev, file_private,
+-				     args, syncobjs);	
++	kfree(handles);
++	*syncobjs_out = syncobjs;
++	return 0;
+ 
+-err_free_fence_array:
++err_put_syncobjs:
+ 	while (i-- > 0)
+ 		drm_syncobj_put(syncobjs[i]);
+ 	kfree(syncobjs);
+@@ -863,3 +849,45 @@ drm_syncobj_wait_ioctl(struct drm_device *dev, void *data,
+ 
+ 	return ret;
+ }
++
++static void drm_syncobj_array_free(struct drm_syncobj **syncobjs,
++				   uint32_t count)
++{
++	uint32_t i;
++	for (i = 0; i < count; i++)
++		drm_syncobj_put(syncobjs[i]);
++	kfree(syncobjs);
++}
++
++int
++drm_syncobj_wait_ioctl(struct drm_device *dev, void *data,
++		       struct drm_file *file_private)
++{
++	struct drm_syncobj_wait *args = data;
++	struct drm_syncobj **syncobjs;
++	int ret = 0;
++
++	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ))
++		return -ENODEV;
++
++	if (args->flags & ~(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
++			    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT))
++		return -EINVAL;
++
++	if (args->count_handles == 0)
++		return -EINVAL;
++
++	ret = drm_syncobj_array_find(file_private,
++				     u64_to_user_ptr(args->handles),
++				     args->count_handles,
++				     &syncobjs);
++	if (ret < 0)
++		return ret;
++
++	ret = drm_syncobj_array_wait(dev, file_private,
++				     args, syncobjs);
++
++	drm_syncobj_array_free(syncobjs, args->count_handles);
++
++	return ret;
++}
+-- 
+2.7.4
+

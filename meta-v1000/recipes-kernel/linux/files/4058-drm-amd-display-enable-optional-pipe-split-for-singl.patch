@@ -1,0 +1,146 @@
+From 75394db8a092ee497ffd603e99e69002cb7e07b5 Mon Sep 17 00:00:00 2001
+From: Tony Cheng <tony.cheng@amd.com>
+Date: Mon, 25 Sep 2017 10:52:07 -0400
+Subject: [PATCH 4058/5855] drm/amd/display: enable optional pipe split for
+ single display
+
+also refactor debug option.  now pipe_split_policy are
+dynamic = no hack around dcn_calcs.  will split based on HW recommendation
+avoid = avoid split if we can support the config with higher voltage
+avoid_multi_display = allow split with single display output.
+
+force_single_disp_pipe_split
+force single display to pipe split to improve stutter efficiency
+by using DET buffers using 2 HUBP.
+
+Signed-off-by: Tony Cheng <tony.cheng@amd.com>
+Reviewed-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c   | 44 ++++++++++++++++++++--
+ drivers/gpu/drm/amd/display/dc/dc.h                |  9 ++++-
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_resource.c  |  8 +---
+ 3 files changed, 51 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c b/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c
+index 319450d..aa56243 100644
+--- a/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c
++++ b/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c
+@@ -720,6 +720,46 @@ static bool dcn_bw_apply_registry_override(struct dc *dc)
+ 	return updated;
+ }
+ 
++void hack_disable_optional_pipe_split(struct dcn_bw_internal_vars *v)
++{
++	/*
++	 * disable optional pipe split by lower dispclk bounding box
++	 * at DPM0
++	 */
++	v->max_dispclk[0] = v->max_dppclk_vmin0p65;
++}
++
++void hack_force_pipe_split(struct dcn_bw_internal_vars *v,
++		unsigned int pixel_rate_khz)
++{
++	/*
++	 * force enabling pipe split by lower dpp clock for DPM0 to just
++	 * below the specify pixel_rate, so bw calc would split pipe.
++	 */
++	v->max_dppclk[0] = pixel_rate_khz / 1000;
++}
++
++void hack_bounding_box(struct dcn_bw_internal_vars *v,
++		struct dc_debug *dbg,
++		struct dc_state *context)
++{
++	if (dbg->pipe_split_policy == MPC_SPLIT_AVOID) {
++		hack_disable_optional_pipe_split(v);
++	}
++
++	if (dbg->pipe_split_policy == MPC_SPLIT_AVOID_MULT_DISP &&
++		context->stream_count >= 2) {
++		hack_disable_optional_pipe_split(v);
++	}
++
++	if (context->stream_count == 1 &&
++			dbg->force_single_disp_pipe_split) {
++		struct dc_stream_state *stream0 = context->streams[0];
++
++		hack_force_pipe_split(v, stream0->timing.pix_clk_khz);
++	}
++}
++
+ bool dcn_validate_bandwidth(
+ 		struct dc *dc,
+ 		struct dc_state *context)
+@@ -851,9 +891,7 @@ bool dcn_validate_bandwidth(
+ 	v->phyclk_per_state[1] = v->phyclkv_mid0p72;
+ 	v->phyclk_per_state[0] = v->phyclkv_min0p65;
+ 
+-	if (dc->debug.disable_pipe_split) {
+-		v->max_dispclk[0] = v->max_dppclk_vmin0p65;
+-	}
++	hack_bounding_box(v, &dc->debug, context);
+ 
+ 	if (v->voltage_override == dcn_bw_v_max0p9) {
+ 		v->voltage_override_level = number_of_states - 1;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 713e5e7..1b8c026 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -162,6 +162,12 @@ struct dc_config {
+ 	bool disable_disp_pll_sharing;
+ };
+ 
++enum pipe_split_policy {
++	MPC_SPLIT_DYNAMIC = 0,
++	MPC_SPLIT_AVOID = 1,
++	MPC_SPLIT_AVOID_MULT_DISP = 2,
++};
++
+ struct dc_debug {
+ 	bool surface_visual_confirm;
+ 	bool sanity_checks;
+@@ -177,7 +183,8 @@ struct dc_debug {
+ 	bool disable_hubp_power_gate;
+ 	bool disable_pplib_wm_range;
+ 	bool use_dml_wm;
+-	bool disable_pipe_split;
++	enum pipe_split_policy pipe_split_policy;
++	bool force_single_disp_pipe_split;
+ 	unsigned int min_disp_clk_khz;
+ 	int sr_exit_time_dpm0_ns;
+ 	int sr_enter_plus_exit_time_dpm0_ns;
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+index 10d1409..ee4488d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+@@ -425,10 +425,9 @@ static const struct dc_debug debug_defaults_drv = {
+ 
+ 		.disable_pplib_clock_request = true,
+ 		.disable_pplib_wm_range = false,
+-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+ 		.use_dml_wm = false,
+-		.disable_pipe_split = true
+-#endif
++
++		.pipe_split_policy = MPC_SPLIT_AVOID_MULT_DISP,
+ };
+ 
+ static const struct dc_debug debug_defaults_diags = {
+@@ -437,12 +436,9 @@ static const struct dc_debug debug_defaults_diags = {
+ 		.timing_trace = true,
+ 		.clock_trace = true,
+ 		.disable_stutter = true,
+-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+ 		.disable_pplib_clock_request = true,
+ 		.disable_pplib_wm_range = true,
+ 		.use_dml_wm = false,
+-		.disable_pipe_split = false
+-#endif
+ };
+ 
+ static void dcn10_dpp_destroy(struct transform **xfm)
+-- 
+2.7.4
+
