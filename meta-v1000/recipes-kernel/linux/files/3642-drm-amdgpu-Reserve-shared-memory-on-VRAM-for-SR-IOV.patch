@@ -1,0 +1,214 @@
+From 603eb65229917e84f2d3500ca0cd2b888fbe4799 Mon Sep 17 00:00:00 2001
+From: Horace Chen <horace.chen@amd.com>
+Date: Fri, 29 Sep 2017 14:41:57 +0800
+Subject: [PATCH 3642/5855] drm/amdgpu: Reserve shared memory on VRAM for
+ SR-IOV
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+SR-IOV need to reserve a piece of shared VRAM at the exact place
+to exchange data betweem PF and VF. The start address and size of
+the shared mem are passed to guest through VBIOS structure
+VRAM_UsageByFirmware.
+
+VRAM_UsageByFirmware is a general feature in VBIOS, it indicates
+that VBIOS need to reserve a piece of memory on the VRAM.
+
+Because the mem address is specified. Reserve it early in
+amdgpu_ttm_init to make sure that it can monoplize the space.
+
+Signed-off-by: Horace Chen <horace.chen@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h          | 14 +++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c | 18 ++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c   | 76 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c      |  9 ++++
+ 4 files changed, 116 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 31a3259..4b44ab4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1424,6 +1424,18 @@ struct amdgpu_atcs {
+ };
+ 
+ /*
++ * Firmware VRAM reservation
++ */
++struct amdgpu_fw_vram_usage {
++	u64 start_offset;
++	u64 size;
++	struct amdgpu_bo *reserved_bo;
++	void *va;
++};
++
++int amdgpu_fw_reserve_vram_init(struct amdgpu_device *adev);
++
++/*
+  * CGS
+  */
+ struct cgs_device *amdgpu_cgs_create_device(struct amdgpu_device *adev);
+@@ -1662,6 +1674,8 @@ struct amdgpu_device {
+ 	struct delayed_work     late_init_work;
+ 
+ 	struct amdgpu_virt	virt;
++	/* firmware VRAM reservation */
++	struct amdgpu_fw_vram_usage fw_vram_usage;
+ 
+ 	/* link all shadow bo */
+ 	struct list_head                shadow_list;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
+index ce44358..f66d33e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
+@@ -1807,6 +1807,8 @@ int amdgpu_atombios_allocate_fb_scratch(struct amdgpu_device *adev)
+ 	uint16_t data_offset;
+ 	int usage_bytes = 0;
+ 	struct _ATOM_VRAM_USAGE_BY_FIRMWARE *firmware_usage;
++	u64 start_addr;
++	u64 size;
+ 
+ 	if (amdgpu_atom_parse_data_header(ctx, index, NULL, NULL, NULL, &data_offset)) {
+ 		firmware_usage = (struct _ATOM_VRAM_USAGE_BY_FIRMWARE *)(ctx->bios + data_offset);
+@@ -1815,7 +1817,21 @@ int amdgpu_atombios_allocate_fb_scratch(struct amdgpu_device *adev)
+ 			  le32_to_cpu(firmware_usage->asFirmwareVramReserveInfo[0].ulStartAddrUsedByFirmware),
+ 			  le16_to_cpu(firmware_usage->asFirmwareVramReserveInfo[0].usFirmwareUseInKb));
+ 
+-		usage_bytes = le16_to_cpu(firmware_usage->asFirmwareVramReserveInfo[0].usFirmwareUseInKb) * 1024;
++		start_addr = firmware_usage->asFirmwareVramReserveInfo[0].ulStartAddrUsedByFirmware;
++		size = firmware_usage->asFirmwareVramReserveInfo[0].usFirmwareUseInKb;
++
++		if ((uint32_t)(start_addr & ATOM_VRAM_OPERATION_FLAGS_MASK) ==
++			(uint32_t)(ATOM_VRAM_BLOCK_SRIOV_MSG_SHARE_RESERVATION <<
++			ATOM_VRAM_OPERATION_FLAGS_SHIFT)) {
++			/* Firmware request VRAM reservation for SR-IOV */
++			adev->fw_vram_usage.start_offset = (start_addr &
++				(~ATOM_VRAM_OPERATION_FLAGS_MASK)) << 10;
++			adev->fw_vram_usage.size = size << 10;
++			/* Use the default scratch size */
++			usage_bytes = 0;
++		} else {
++			usage_bytes = le16_to_cpu(firmware_usage->asFirmwareVramReserveInfo[0].usFirmwareUseInKb) * 1024;
++		}
+ 	}
+ 	ctx->scratch_size_bytes = 0;
+ 	if (usage_bytes == 0)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index c65abf2..d887c17 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -658,6 +658,81 @@ void amdgpu_gart_location(struct amdgpu_device *adev, struct amdgpu_mc *mc)
+ }
+ 
+ /*
++ * Firmware Reservation functions
++ */
++/**
++ * amdgpu_fw_reserve_vram_fini - free fw reserved vram
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * free fw reserved vram if it has been reserved.
++ */
++void amdgpu_fw_reserve_vram_fini(struct amdgpu_device *adev)
++{
++	amdgpu_bo_free_kernel(&adev->fw_vram_usage.reserved_bo,
++		NULL, &adev->fw_vram_usage.va);
++}
++
++/**
++ * amdgpu_fw_reserve_vram_init - create bo vram reservation from fw
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * create bo vram reservation from fw.
++ */
++int amdgpu_fw_reserve_vram_init(struct amdgpu_device *adev)
++{
++	int r = 0;
++	u64 gpu_addr;
++	u64 vram_size = adev->mc.visible_vram_size;
++
++	adev->fw_vram_usage.va = NULL;
++	adev->fw_vram_usage.reserved_bo = NULL;
++
++	if (adev->fw_vram_usage.size > 0 &&
++		adev->fw_vram_usage.size <= vram_size) {
++
++		r = amdgpu_bo_create(adev, adev->fw_vram_usage.size,
++			PAGE_SIZE, true, 0,
++			AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED |
++			AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS, NULL, NULL, 0,
++			&adev->fw_vram_usage.reserved_bo);
++		if (r)
++			goto error_create;
++
++		r = amdgpu_bo_reserve(adev->fw_vram_usage.reserved_bo, false);
++		if (r)
++			goto error_reserve;
++		r = amdgpu_bo_pin_restricted(adev->fw_vram_usage.reserved_bo,
++			AMDGPU_GEM_DOMAIN_VRAM,
++			adev->fw_vram_usage.start_offset,
++			(adev->fw_vram_usage.start_offset +
++			adev->fw_vram_usage.size), &gpu_addr);
++		if (r)
++			goto error_pin;
++		r = amdgpu_bo_kmap(adev->fw_vram_usage.reserved_bo,
++			&adev->fw_vram_usage.va);
++		if (r)
++			goto error_kmap;
++
++		amdgpu_bo_unreserve(adev->fw_vram_usage.reserved_bo);
++	}
++	return r;
++
++error_kmap:
++	amdgpu_bo_unpin(adev->fw_vram_usage.reserved_bo);
++error_pin:
++	amdgpu_bo_unreserve(adev->fw_vram_usage.reserved_bo);
++error_reserve:
++	amdgpu_bo_unref(&adev->fw_vram_usage.reserved_bo);
++error_create:
++	adev->fw_vram_usage.va = NULL;
++	adev->fw_vram_usage.reserved_bo = NULL;
++	return r;
++}
++
++
++/*
+  * GPU helpers function.
+  */
+ /**
+@@ -2369,6 +2444,7 @@ void amdgpu_device_fini(struct amdgpu_device *adev)
+ 	/* evict vram memory */
+ 	amdgpu_bo_evict_vram(adev);
+ 	amdgpu_ib_pool_fini(adev);
++	amdgpu_fw_reserve_vram_fini(adev);
+ 	amdgpu_fence_driver_fini(adev);
+ 	amdgpu_fbdev_fini(adev);
+ 	r = amdgpu_fini(adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 466b8995..27ce87f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1491,6 +1491,15 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
+ 	/* Change the size here instead of the init above so only lpfn is affected */
+ 	amdgpu_ttm_set_active_vram_size(adev, adev->mc.visible_vram_size);
+ 
++	/*
++	 *The reserved vram for firmware must be pinned to the specified
++	 *place on the VRAM, so reserve it early.
++	 */
++	r = amdgpu_fw_reserve_vram_init(adev);
++	if (r) {
++		return r;
++	}
++
+ 	r = amdgpu_bo_create_kernel(adev, adev->mc.stolen_size, PAGE_SIZE,
+ 				    AMDGPU_GEM_DOMAIN_VRAM,
+ 				    &adev->stolen_vga_memory,
+-- 
+2.7.4
+

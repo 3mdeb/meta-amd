@@ -1,0 +1,152 @@
+From a21f0ce5647dd4750571658ec974e58a7c74a90d Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Mon, 6 Jun 2016 21:25:04 -0400
+Subject: [PATCH 5234/5855] drm/amdkfd: Add kfd/hqds entry to debugfs
+
+This dumps all HQDs on all GPUs for KFD-controlled compute and
+SDMA RLC queues.
+
+Change-Id: I89f18a9f9b65ce1761ccef6bbc5712fbb71a001a
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c            |  6 +++
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 61 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h              |  2 +
+ drivers/gpu/drm/amd/amdkfd/kfd_topology.c          | 25 +++++++++
+ 4 files changed, 94 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 97256bb..d0f5af0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -365,6 +365,12 @@ static void kfd_debugfs_init(struct kfd_dev *kfd)
+ 				  &kfd_debugfs_fops);
+ 	if (ent == NULL)
+ 		dev_warn(kfd_device, "Failed to create mqds in kfd debugfs\n");
++
++	ent = debugfs_create_file("hqds", S_IFREG | S_IRUGO, kfd->debugfs_root,
++				  kfd_debugfs_hqds_by_device,
++				  &kfd_debugfs_fops);
++	if (ent == NULL)
++		dev_warn(kfd_device, "Failed to create hqds in kfd debugfs\n");
+ }
+ 
+ static void kfd_debugfs_fini(struct kfd_dev *kfd)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 1a1f2fd..df7f8aa 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -1564,3 +1564,64 @@ int kfd_process_vm_fault(struct device_queue_manager *dqm,
+         return ret;
+ }
+ 
++static void seq_reg_dump(struct seq_file *m,
++                        uint32_t (*dump)[2], uint32_t n_regs)
++{
++       uint32_t i, count;
++
++       for (i = 0, count = 0; i < n_regs; i++) {
++               if (count == 0 ||
++                   dump[i-1][0] + sizeof(uint32_t) != dump[i][0]) {
++                       seq_printf(m, "%s    %08x: %08x",
++                                  i ? "\n" : "",
++                                  dump[i][0], dump[i][1]);
++                       count = 7;
++               } else {
++                       seq_printf(m, " %08x", dump[i][1]);
++                       count--;
++               }
++       }
++
++       seq_puts(m, "\n");
++}
++
++int device_queue_manager_debugfs_hqds(struct seq_file *m, void *data)
++{
++       struct device_queue_manager *dqm = data;
++       uint32_t (*dump)[2], n_regs;
++       int pipe, queue;
++       int r = 0;
++
++       for (pipe = 0; pipe < get_pipes_per_mec(dqm); pipe++) {
++               for (queue = 0; queue < get_queues_per_pipe(dqm); queue++) {
++                       r = dqm->dev->kfd2kgd->hqd_dump(
++                               dqm->dev->kgd, pipe, queue, &dump, &n_regs);
++                       if (r != 0)
++                               break;
++
++                       seq_printf(m, "  CP Pipe %d, Queue %d\n",
++                                 pipe, queue);
++                       seq_reg_dump(m, dump, n_regs);
++
++                       kfree(dump);
++               }
++       }
++
++       for (pipe = 0; pipe < CIK_SDMA_ENGINE_NUM; pipe++) {
++               for (queue = 0; queue < CIK_SDMA_QUEUES_PER_ENGINE; queue++) {
++                       r = dqm->dev->kfd2kgd->hqd_sdma_dump(
++                               dqm->dev->kgd, pipe, queue, &dump, &n_regs);
++                       if (r != 0)
++                               break;
++
++                       seq_printf(m, "  SDMA Engine %d, RLC %d\n",
++                                 pipe, queue);
++                       seq_reg_dump(m, dump, n_regs);
++
++                       kfree(dump);
++               }
++       }
++
++       return r;
++}
++
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 6279e78..2220af4 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -922,6 +922,8 @@ void kfd_close_peer_direct(void);
+ 
+ int kfd_debugfs_mqds_by_process(struct seq_file *m, void *data);
+ int pqm_debugfs_mqds(struct seq_file *m, void *data);
++int kfd_debugfs_hqds_by_device(struct seq_file *m, void *data);
++int device_queue_manager_debugfs_hqds(struct seq_file *m, void *data);
+ 
+ #endif
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+index ba12d00..9d1976c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+@@ -1240,3 +1240,28 @@ int kfd_get_proximity_domain(const struct pci_bus *bus)
+ 
+ 	return proximity_domain;
+ }
++
++int kfd_debugfs_hqds_by_device(struct seq_file *m, void *data)
++{
++	struct kfd_topology_device *dev;
++	unsigned i = 0;
++	int r = 0;
++
++	down_read(&topology_lock);
++
++	list_for_each_entry(dev, &topology_device_list, list) {
++		if (!dev->gpu) {
++			i++;
++			continue;
++		}
++
++		seq_printf(m, "Node %u, gpu_id %x:\n", i++, dev->gpu->id);
++		r = device_queue_manager_debugfs_hqds(m, dev->gpu->dqm);
++		if (r != 0)
++			break;
++	}
++
++	up_read(&topology_lock);
++
++	return r;
++}
+-- 
+2.7.4
+

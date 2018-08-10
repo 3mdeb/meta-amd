@@ -1,0 +1,326 @@
+From a800522bb9f94a41cb22e2bffb8abc9a53219f69 Mon Sep 17 00:00:00 2001
+From: Jay Cornwall <Jay.Cornwall@amd.com>
+Date: Tue, 2 May 2017 17:39:37 -0500
+Subject: [PATCH 5613/5855] drm/amdkfd: Add wavefront context save state
+ retrieval ioctl
+
+Wavefront context save data is of interest to userspace clients for
+debugging static wavefront state. The MQD contains two parameters
+required to parse the control stack and the control stack itself
+is kept in the MQD from gfx9 onwards.
+
+Add an ioctl to fetch the context save area and control stack offsets
+and to copy the control stack to a userspace address if it is kept in
+the MQD.
+
+Change-Id: I51145096e07e99511a9af67d5aa5cda28f344751
+Signed-off-by: Jay Cornwall <Jay.Cornwall@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c           | 23 +++++++++++++-
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 37 ++++++++++++++++++++++
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.h  |  8 +++++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h       |  8 +++++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c    | 24 ++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c    | 23 ++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h              |  5 +++
+ .../gpu/drm/amd/amdkfd/kfd_process_queue_manager.c | 22 +++++++++++++
+ 8 files changed, 149 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 0027014..ef324ba 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -2001,6 +2001,24 @@ static int kfd_ioctl_cross_memory_copy(struct file *filep,
+ }
+ #endif
+ 
++static int kfd_ioctl_get_queue_wave_state(struct file *filep,
++					  struct kfd_process *p, void *data)
++{
++	struct kfd_ioctl_get_queue_wave_state_args *args = data;
++	int r;
++
++	down_read(&p->lock);
++
++	r = pqm_get_wave_state(&p->pqm, args->queue_id,
++			       (void __user *)args->ctl_stack_address,
++			       &args->ctl_stack_used_size,
++			       &args->save_area_used_size);
++
++	up_read(&p->lock);
++
++	return r;
++}
++
+ #define AMDKFD_IOCTL_DEF(ioctl, _func, _flags) \
+ 	[_IOC_NR(ioctl)] = {.cmd = ioctl, .func = _func, .flags = _flags, \
+ 			    .cmd_drv = 0, .name = #ioctl}
+@@ -2101,7 +2119,10 @@ static const struct amdkfd_ioctl_desc amdkfd_ioctls[] = {
+ 				kfd_ioctl_ipc_export_handle, 0),
+ 
+ 	AMDKFD_IOCTL_DEF(AMDKFD_IOC_CROSS_MEMORY_COPY,
+-				kfd_ioctl_cross_memory_copy, 0)
++				kfd_ioctl_cross_memory_copy, 0),
++
++	AMDKFD_IOCTL_DEF(AMDKFD_IOC_GET_QUEUE_WAVE_STATE,
++				kfd_ioctl_get_queue_wave_state, 0)
+ 
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index a9314e6..3954637 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -1445,6 +1445,41 @@ static int process_termination_nocpsch(struct device_queue_manager *dqm,
+ 	return retval;
+ }
+ 
++static int get_wave_state(struct device_queue_manager *dqm,
++			  struct queue *q,
++			  void __user *ctl_stack,
++			  u32 *ctl_stack_used_size,
++			  u32 *save_area_used_size)
++{
++	struct mqd_manager *mqd;
++	int r;
++
++	mutex_lock(&dqm->lock);
++
++	if (q->properties.type != KFD_QUEUE_TYPE_COMPUTE ||
++	    q->properties.is_active || !q->device->cwsr_enabled) {
++		r = -EINVAL;
++		goto dqm_unlock;
++	}
++
++	mqd = dqm->ops.get_mqd_manager(dqm, KFD_MQD_TYPE_COMPUTE);
++	if (!mqd) {
++		r = -ENOMEM;
++		goto dqm_unlock;
++	}
++
++	if (!mqd->get_wave_state) {
++		r = -EINVAL;
++		goto dqm_unlock;
++	}
++
++	r = mqd->get_wave_state(mqd, q->mqd, ctl_stack, ctl_stack_used_size,
++				save_area_used_size);
++
++dqm_unlock:
++	mutex_unlock(&dqm->lock);
++	return r;
++}
+ 
+ static int process_termination_cpsch(struct device_queue_manager *dqm,
+ 		struct qcm_process_device *qpd)
+@@ -1549,6 +1584,7 @@ struct device_queue_manager *device_queue_manager_init(struct kfd_dev *dev)
+ 		dqm->ops.set_cache_memory_policy = set_cache_memory_policy;
+ 		dqm->ops.set_trap_handler = set_trap_handler;
+ 		dqm->ops.process_termination = process_termination_cpsch;
++		dqm->ops.get_wave_state = get_wave_state;
+ 		break;
+ 	case KFD_SCHED_POLICY_NO_HWS:
+ 		/* initialize dqm for no cp scheduling */
+@@ -1565,6 +1601,7 @@ struct device_queue_manager *device_queue_manager_init(struct kfd_dev *dev)
+ 		dqm->ops.set_cache_memory_policy = set_cache_memory_policy;
+ 		dqm->ops.set_trap_handler = set_trap_handler;
+ 		dqm->ops.process_termination = process_termination_nocpsch;
++		dqm->ops.get_wave_state = get_wave_state;
+ 		break;
+ 	default:
+ 		pr_err("Invalid scheduling policy %d\n", dqm->sched_policy);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+index be02895..2fb44cb 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+@@ -85,6 +85,8 @@ struct device_process_node {
+  *
+  * @process_termination: Clears all process queues belongs to that device.
+  *
++ * @get_wave_state: Retrieves context save state and optionally copies the
++ * control stack, if kept in the MQD, to the given userspace address.
+  */
+ 
+ struct device_queue_manager_ops {
+@@ -136,6 +138,12 @@ struct device_queue_manager_ops {
+ 
+ 	int (*process_termination)(struct device_queue_manager *dqm,
+ 			struct qcm_process_device *qpd);
++
++	int	(*get_wave_state)(struct device_queue_manager *dqm,
++				  struct queue *q,
++				  void __user *ctl_stack,
++				  u32 *ctl_stack_used_size,
++				  u32 *save_area_used_size);
+ };
+ 
+ struct device_queue_manager_asic_ops {
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+index 6f33b79..dcaeda8 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+@@ -43,6 +43,9 @@
+  *
+  * @is_occupied: Checks if the relevant HQD slot is occupied.
+  *
++ * @get_wave_state: Retrieves context save state and optionally copies the
++ * control stack, if kept in the MQD, to the given userspace address.
++ *
+  * @mqd_mutex: Mqd manager mutex.
+  *
+  * @dev: The kfd device structure coupled with this module.
+@@ -86,6 +89,11 @@ struct mqd_manager {
+ 				uint64_t queue_address,	uint32_t pipe_id,
+ 				uint32_t queue_id);
+ 
++	int	(*get_wave_state)(struct mqd_manager *mm, void *mqd,
++				  void __user *ctl_stack,
++				  u32 *ctl_stack_used_size,
++				  u32 *save_area_used_size);
++
+ #if defined(CONFIG_DEBUG_FS)
+ 	int	(*debugfs_show_mqd)(struct seq_file *m, void *data);
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c
+index 7327cda..1e956ff 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c
+@@ -23,6 +23,7 @@
+ 
+ #include <linux/printk.h>
+ #include <linux/slab.h>
++#include <linux/uaccess.h>
+ #include "kfd_priv.h"
+ #include "kfd_mqd_manager.h"
+ #include "v9_structs.h"
+@@ -292,6 +293,28 @@ static bool is_occupied(struct mqd_manager *mm, void *mqd,
+ 		pipe_id, queue_id);
+ }
+ 
++static int get_wave_state(struct mqd_manager *mm, void *mqd,
++			  void __user *ctl_stack,
++			  u32 *ctl_stack_used_size,
++			  u32 *save_area_used_size)
++{
++	struct v9_mqd *m;
++
++	/* Control stack is located one page after MQD. */
++	void *mqd_ctl_stack = (void *)((uintptr_t)mqd + PAGE_SIZE);
++
++	m = get_mqd(mqd);
++
++	*ctl_stack_used_size = m->cp_hqd_cntl_stack_size -
++		m->cp_hqd_cntl_stack_offset;
++	*save_area_used_size = m->cp_hqd_wg_state_offset;
++
++	if (copy_to_user(ctl_stack, mqd_ctl_stack, m->cp_hqd_cntl_stack_size))
++		return -EFAULT;
++
++	return 0;
++}
++
+ static int init_mqd_hiq(struct mqd_manager *mm, void **mqd,
+ 			struct kfd_mem_obj **mqd_mem_obj, uint64_t *gart_addr,
+ 			struct queue_properties *q)
+@@ -468,6 +491,7 @@ struct mqd_manager *mqd_manager_init_v9(enum KFD_MQD_TYPE type,
+ 		mqd->update_mqd = update_mqd;
+ 		mqd->destroy_mqd = destroy_mqd;
+ 		mqd->is_occupied = is_occupied;
++		mqd->get_wave_state = get_wave_state;
+ #if defined(CONFIG_DEBUG_FS)
+ 		mqd->debugfs_show_mqd = debugfs_show_mqd;
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+index c1d35f4..670bbba9 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -309,6 +309,28 @@ static bool is_occupied(struct mqd_manager *mm, void *mqd,
+ 		pipe_id, queue_id);
+ }
+ 
++static int get_wave_state(struct mqd_manager *mm, void *mqd,
++			  void __user *ctl_stack,
++			  u32 *ctl_stack_used_size,
++			  u32 *save_area_used_size)
++{
++	struct vi_mqd *m;
++
++	m = get_mqd(mqd);
++
++	*ctl_stack_used_size = m->cp_hqd_cntl_stack_size -
++		m->cp_hqd_cntl_stack_offset;
++	*save_area_used_size = m->cp_hqd_wg_state_offset -
++		m->cp_hqd_cntl_stack_size;
++
++	/* Control stack is not copied to user mode for GFXv8 because
++	 * it's part of the context save area that is already
++	 * accessible to user mode
++	 */
++
++	return 0;
++}
++
+ static int init_mqd_hiq(struct mqd_manager *mm, void **mqd,
+ 			struct kfd_mem_obj **mqd_mem_obj, uint64_t *gart_addr,
+ 			struct queue_properties *q)
+@@ -480,6 +502,7 @@ struct mqd_manager *mqd_manager_init_vi(enum KFD_MQD_TYPE type,
+ 		mqd->update_mqd = update_mqd;
+ 		mqd->destroy_mqd = destroy_mqd;
+ 		mqd->is_occupied = is_occupied;
++		mqd->get_wave_state = get_wave_state;
+ #if defined(CONFIG_DEBUG_FS)
+ 		mqd->debugfs_show_mqd = debugfs_show_mqd;
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 5d719d3..4c9a9383 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -935,6 +935,11 @@ int pqm_set_cu_mask(struct process_queue_manager *pqm, unsigned int qid,
+ 			struct queue_properties *p);
+ struct kernel_queue *pqm_get_kernel_queue(struct process_queue_manager *pqm,
+ 						unsigned int qid);
++int pqm_get_wave_state(struct process_queue_manager *pqm,
++		       unsigned int qid,
++		       void __user *ctl_stack,
++		       u32 *ctl_stack_used_size,
++		       u32 *save_area_used_size);
+ int kgd2kfd_quiesce_mm(struct kfd_dev *kfd, struct mm_struct *mm);
+ int kgd2kfd_resume_mm(struct kfd_dev *kfd, struct mm_struct *mm);
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+index 9f8fe6d..0e85e2e 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -421,6 +421,28 @@ struct kernel_queue *pqm_get_kernel_queue(
+ 	return NULL;
+ }
+ 
++int pqm_get_wave_state(struct process_queue_manager *pqm,
++		       unsigned int qid,
++		       void __user *ctl_stack,
++		       u32 *ctl_stack_used_size,
++		       u32 *save_area_used_size)
++{
++	struct process_queue_node *pqn;
++
++	pqn = get_queue_by_qid(pqm, qid);
++	if (!pqn) {
++		pr_debug("amdkfd: No queue %d exists for operation\n",
++			 qid);
++		return -EFAULT;
++	}
++
++	return pqn->q->device->dqm->ops.get_wave_state(pqn->q->device->dqm,
++						       pqn->q,
++						       ctl_stack,
++						       ctl_stack_used_size,
++						       save_area_used_size);
++}
++
+ #if defined(CONFIG_DEBUG_FS)
+ 
+ int pqm_debugfs_mqds(struct seq_file *m, void *data)
+-- 
+2.7.4
+

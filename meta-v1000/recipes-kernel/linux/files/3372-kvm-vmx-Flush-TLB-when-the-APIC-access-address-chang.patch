@@ -1,0 +1,95 @@
+From c14d6eae38a349d37c505ca33b4525f78cb7dd38 Mon Sep 17 00:00:00 2001
+From: Jim Mattson <jmattson@google.com>
+Date: Thu, 16 Mar 2017 13:53:59 -0700
+Subject: [PATCH 3372/5855] kvm: vmx: Flush TLB when the APIC-access address
+ changes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit fb6c8198431311027c3434d4e94ab8bc040f7aea ]
+
+Quoting from the Intel SDM, volume 3, section 28.3.3.4: Guidelines for
+Use of the INVEPT Instruction:
+
+If EPT was in use on a logical processor at one time with EPTP X, it
+is recommended that software use the INVEPT instruction with the
+"single-context" INVEPT type and with EPTP X in the INVEPT descriptor
+before a VM entry on the same logical processor that enables EPT with
+EPTP X and either (a) the "virtualize APIC accesses" VM-execution
+control was changed from 0 to 1; or (b) the value of the APIC-access
+address was changed.
+
+In the nested case, the burden falls on L1, unless L0 enables EPT in
+vmcs02 when L1 doesn't enable EPT in vmcs12.
+
+Signed-off-by: Jim Mattson <jmattson@google.com>
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sudheesh Mavila <sudheesh.mavila@amd.com>
+---
+ arch/x86/kvm/vmx.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index d64dd20..0934055 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -3820,6 +3820,12 @@ static void vmx_flush_tlb(struct kvm_vcpu *vcpu)
+ 	__vmx_flush_tlb(vcpu, to_vmx(vcpu)->vpid);
+ }
+ 
++static void vmx_flush_tlb_ept_only(struct kvm_vcpu *vcpu)
++{
++	if (enable_ept)
++		vmx_flush_tlb(vcpu);
++}
++
+ static void vmx_decache_cr0_guest_bits(struct kvm_vcpu *vcpu)
+ {
+ 	ulong cr0_guest_owned_bits = vcpu->arch.cr0_guest_owned_bits;
+@@ -8488,6 +8494,7 @@ static void vmx_set_virtual_x2apic_mode(struct kvm_vcpu *vcpu, bool set)
+ 	} else {
+ 		sec_exec_control &= ~SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE;
+ 		sec_exec_control |= SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES;
++		vmx_flush_tlb_ept_only(vcpu);
+ 	}
+ 	vmcs_write32(SECONDARY_VM_EXEC_CONTROL, sec_exec_control);
+ 
+@@ -8513,8 +8520,10 @@ static void vmx_set_apic_access_page_addr(struct kvm_vcpu *vcpu, hpa_t hpa)
+ 	 */
+ 	if (!is_guest_mode(vcpu) ||
+ 	    !nested_cpu_has2(get_vmcs12(&vmx->vcpu),
+-			     SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES))
++			     SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES)) {
+ 		vmcs_write64(APIC_ACCESS_ADDR, hpa);
++		vmx_flush_tlb_ept_only(vcpu);
++	}
+ }
+ 
+ static void vmx_hwapic_isr_update(struct kvm_vcpu *vcpu, int max_isr)
+@@ -10078,6 +10087,9 @@ static void prepare_vmcs02(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+ 	if (nested_cpu_has_ept(vmcs12)) {
+ 		kvm_mmu_unload(vcpu);
+ 		nested_ept_init_mmu_context(vcpu);
++	} else if (nested_cpu_has2(vmcs12,
++				   SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES)) {
++		vmx_flush_tlb_ept_only(vcpu);
+ 	}
+ 
+ 	if (vmcs12->vm_entry_controls & VM_ENTRY_LOAD_IA32_EFER)
+@@ -10818,6 +10830,10 @@ static void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+ 		vmx->nested.change_vmcs01_virtual_x2apic_mode = false;
+ 		vmx_set_virtual_x2apic_mode(vcpu,
+ 				vcpu->arch.apic_base & X2APIC_ENABLE);
++	} else if (!nested_cpu_has_ept(vmcs12) &&
++		   nested_cpu_has2(vmcs12,
++				   SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES)) {
++		vmx_flush_tlb_ept_only(vcpu);
+ 	}
+ 
+ 	/* This is needed for same reason as it was needed in prepare_vmcs02 */
+-- 
+2.7.4
+

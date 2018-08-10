@@ -1,0 +1,334 @@
+From 35b1d41ee7e0e9b3937d64f5332093a2c8f07175 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Date: Mon, 13 Nov 2017 14:47:52 -0500
+Subject: [PATCH 4343/5855] drm/amdgpu: Get rid of dep_sync as a seperate
+ object.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead mark fence as explicit in it's amdgpu_sync_entry.
+
+v2:
+Fix use after free bug and add new parameter description.
+Signed-off-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+Change-Id: I4e53b939b05856576b34d0c9aeadb808aac8b58e
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h      |  1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c   | 14 +++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c  | 21 ++++++++++-----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c | 15 ++++++++++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c   | 12 ++++++------
+ 7 files changed, 36 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 615e08e..d91c492 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1145,7 +1145,6 @@ struct amdgpu_job {
+ 	struct amdgpu_vm	*vm;
+ 	struct amdgpu_ring	*ring;
+ 	struct amdgpu_sync	sync;
+-	struct amdgpu_sync	dep_sync;
+ 	struct amdgpu_sync      sched_sync;
+ 	struct amdgpu_ib	*ibs;
+ 	struct fence		*fence; /* the hw fence */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 28502b6..7390073 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -786,7 +786,7 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p)
+ 		return r;
+ 
+ 	r = amdgpu_sync_fence(adev, &p->job->sync,
+-			      fpriv->prt_va->last_pt_update);
++			      fpriv->prt_va->last_pt_update, false);
+ 	if (r)
+ 		return r;
+ 
+@@ -800,7 +800,7 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p)
+ 			return r;
+ 
+ 		f = bo_va->last_pt_update;
+-		r = amdgpu_sync_fence(adev, &p->job->sync, f);
++		r = amdgpu_sync_fence(adev, &p->job->sync, f, false);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -823,7 +823,7 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p)
+ 				return r;
+ 
+ 			f = bo_va->last_pt_update;
+-			r = amdgpu_sync_fence(adev, &p->job->sync, f);
++			r = amdgpu_sync_fence(adev, &p->job->sync, f, false);
+ 			if (r)
+ 				return r;
+ 		}
+@@ -834,7 +834,7 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p)
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_sync_fence(adev, &p->job->sync, vm->last_update);
++	r = amdgpu_sync_fence(adev, &p->job->sync, vm->last_update, false);
+ 	if (r)
+ 		return r;
+ 
+@@ -1038,8 +1038,8 @@ static int amdgpu_cs_process_fence_dep(struct amdgpu_cs_parser *p,
+ 			amdgpu_ctx_put(ctx);
+ 			return r;
+ 		} else if (fence) {
+-			r = amdgpu_sync_fence(p->adev, &p->job->dep_sync,
+-					      fence);
++			r = amdgpu_sync_fence(p->adev, &p->job->sync, fence,
++					true);
+ 			fence_put(fence);
+ 			amdgpu_ctx_put(ctx);
+ 			if (r)
+@@ -1058,7 +1058,7 @@ static int amdgpu_syncobj_lookup_and_add_to_sync(struct amdgpu_cs_parser *p,
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_sync_fence(p->adev, &p->job->dep_sync, fence);
++	r = amdgpu_sync_fence(p->adev, &p->job->sync, fence, true);
+ 	fence_put(fence);
+ 
+ 	return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index b834bb5..1368362 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -170,7 +170,7 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 	}
+ 
+ 	if (ring->funcs->emit_pipeline_sync && job &&
+-	    ((tmp = amdgpu_sync_get_fence(&job->sched_sync)) ||
++	    ((tmp = amdgpu_sync_get_fence(&job->sched_sync, NULL)) ||
+ 	     amdgpu_vm_need_pipeline_sync(ring, job))) {
+ 		need_pipe_sync = true;
+ 		fence_put(tmp);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index 312e260..32d68ea 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -60,7 +60,6 @@ int amdgpu_job_alloc(struct amdgpu_device *adev, unsigned num_ibs,
+ 	(*job)->num_ibs = num_ibs;
+ 
+ 	amdgpu_sync_create(&(*job)->sync);
+-	amdgpu_sync_create(&(*job)->dep_sync);
+ 	amdgpu_sync_create(&(*job)->sched_sync);
+ 	(*job)->vram_lost_counter = atomic_read(&adev->vram_lost_counter);
+ 
+@@ -104,7 +103,6 @@ static void amdgpu_job_free_cb(struct amd_sched_job *s_job)
+ 	amdgpu_ring_priority_put(job->ring, s_job->s_priority);
+ 	fence_put(job->fence);
+ 	amdgpu_sync_free(&job->sync);
+-	amdgpu_sync_free(&job->dep_sync);
+ 	amdgpu_sync_free(&job->sched_sync);
+ 	kfree(job);
+ }
+@@ -115,7 +113,6 @@ void amdgpu_job_free(struct amdgpu_job *job)
+ 
+ 	fence_put(job->fence);
+ 	amdgpu_sync_free(&job->sync);
+-	amdgpu_sync_free(&job->dep_sync);
+ 	amdgpu_sync_free(&job->sched_sync);
+ 	kfree(job);
+ }
+@@ -150,16 +147,18 @@ static struct fence *amdgpu_job_dependency(struct amd_sched_job *sched_job,
+ 	struct amdgpu_job *job = to_amdgpu_job(sched_job);
+ 	struct amdgpu_vm *vm = job->vm;
+ 
+-	struct fence *fence = amdgpu_sync_get_fence(&job->dep_sync);
++	bool explicit = false;
+ 	int r;
+ 
+-	if (amd_sched_dependency_optimized(fence, s_entity)) {
+-		r = amdgpu_sync_fence(job->adev, &job->sched_sync, fence);
+-		if (r)
+-			DRM_ERROR("Error adding fence to sync (%d)\n", r);
++	struct dma_fence *fence = amdgpu_sync_get_fence(&job->sync, &explicit);
++
++	if (fence && explicit) {
++		if (amd_sched_dependency_optimized(fence, s_entity)) {
++			r = amdgpu_sync_fence(job->adev, &job->sched_sync, fence, false);
++			if (r)
++				DRM_ERROR("Error adding fence to sync (%d)\n", r);
++		}
+ 	}
+-	if (!fence)
+-		fence = amdgpu_sync_get_fence(&job->sync);
+ 
+ 	while (fence == NULL && vm && !job->vm_id) {
+ 		struct amdgpu_ring *ring = job->ring;
+@@ -170,7 +169,7 @@ static struct fence *amdgpu_job_dependency(struct amd_sched_job *sched_job,
+ 		if (r)
+ 			DRM_ERROR("Error getting VM ID (%d)\n", r);
+ 
+-		fence = amdgpu_sync_get_fence(&job->sync);
++		fence = amdgpu_sync_get_fence(&job->sync, NULL);
+ 	}
+ 
+ 	return fence;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+index 9897533..70e77a45 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+@@ -36,6 +36,7 @@
+ struct amdgpu_sync_entry {
+ 	struct hlist_node	node;
+ 	struct fence		*fence;
++	bool    explicit;
+ };
+ 
+ static struct kmem_cache *amdgpu_sync_slab;
+@@ -149,7 +150,7 @@ static bool amdgpu_sync_add_later(struct amdgpu_sync *sync, struct fence *f)
+  *
+  */
+ int amdgpu_sync_fence(struct amdgpu_device *adev, struct amdgpu_sync *sync,
+-		      struct fence *f)
++		     struct dma_fence *f, bool explicit)
+ {
+ 	struct amdgpu_sync_entry *e;
+ 
+@@ -167,6 +168,8 @@ int amdgpu_sync_fence(struct amdgpu_device *adev, struct amdgpu_sync *sync,
+ 	if (!e)
+ 		return -ENOMEM;
+ 
++	e->explicit = explicit;
++
+ 	hash_add(sync->fences, &e->node, f->context);
+ 	e->fence = fence_get(f);
+ 	return 0;
+@@ -198,7 +201,7 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 
+ 	/* always sync to the exclusive fence */
+ 	f = reservation_object_get_excl(resv);
+-	r = amdgpu_sync_fence(adev, sync, f);
++	r = amdgpu_sync_fence(adev, sync, f, false);
+ 
+ 	if (explicit_sync)
+ 		return r;
+@@ -233,7 +236,7 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 				continue;
+ 		}
+ 
+-		r = amdgpu_sync_fence(adev, sync, f);
++		r = amdgpu_sync_fence(adev, sync, f, false);
+ 		if (r)
+ 			break;
+ 	}
+@@ -244,7 +247,7 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+  * amdgpu_sync_peek_fence - get the next fence not signaled yet
+  *
+  * @sync: the sync object
+- * @ring: optional ring to use for test
++ * @explicit: true if the next fence is explicit
+  *
+  * Returns the next fence not signaled yet without removing it from the sync
+  * object.
+@@ -291,7 +294,7 @@ struct fence *amdgpu_sync_peek_fence(struct amdgpu_sync *sync,
+  *
+  * Get and removes the next fence from the sync object not signaled yet.
+  */
+-struct fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync)
++struct fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync, bool *explicit)
+ {
+ 	struct amdgpu_sync_entry *e;
+ 	struct hlist_node *tmp;
+@@ -301,6 +304,8 @@ struct fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync)
+ 	hash_for_each_safe(sync->fences, i, tmp, e, node) {
+ 
+ 		f = e->fence;
++		if (explicit)
++			*explicit = e->explicit;
+ 
+ 		hash_del(&e->node);
+ 		kmem_cache_free(amdgpu_sync_slab, e);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h
+index 3dd9ddc..cc21ed4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h
+@@ -41,7 +41,7 @@ struct amdgpu_sync {
+ 
+ void amdgpu_sync_create(struct amdgpu_sync *sync);
+ int amdgpu_sync_fence(struct amdgpu_device *adev, struct amdgpu_sync *sync,
+-		      struct fence *f);
++		      struct fence *f, bool explicit);
+ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 		     struct amdgpu_sync *sync,
+ 		     struct reservation_object *resv,
+@@ -49,7 +49,7 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+                      bool explicit_sync);
+ struct fence *amdgpu_sync_peek_fence(struct amdgpu_sync *sync,
+ 				     struct amdgpu_ring *ring);
+-struct fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync);
++struct fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync, bool *explicit);
+ int amdgpu_sync_clone(struct amdgpu_device *adev, struct amdgpu_sync *source,
+ 					 struct amdgpu_sync *clone);
+ int amdgpu_sync_wait(struct amdgpu_sync *sync, bool intr);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index c05767d..1385f77 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -491,7 +491,7 @@ static int amdgpu_vm_grab_reserved_vmid_locked(struct amdgpu_vm *vm,
+ 		id->pd_gpu_addr = 0;
+ 		tmp = amdgpu_sync_peek_fence(&id->active, ring);
+ 		if (tmp) {
+-			r = amdgpu_sync_fence(adev, sync, tmp);
++			r = amdgpu_sync_fence(adev, sync, tmp, false);
+ 			return r;
+ 		}
+ 	}
+@@ -499,7 +499,7 @@ static int amdgpu_vm_grab_reserved_vmid_locked(struct amdgpu_vm *vm,
+ 	/* Good we can use this VMID. Remember this submission as
+ 	* user of the VMID.
+ 	*/
+-	r = amdgpu_sync_fence(ring->adev, &id->active, fence);
++	r = amdgpu_sync_fence(ring->adev, &id->active, fence, false);
+ 	if (r)
+ 		goto out;
+ 
+@@ -586,7 +586,7 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 		}
+ 
+ 
+-		r = amdgpu_sync_fence(ring->adev, sync, &array->base);
++		r = amdgpu_sync_fence(ring->adev, sync, &array->base, false);
+ 		fence_put(&array->base);
+ 		if (r)
+ 			goto error;
+@@ -629,7 +629,7 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 		/* Good we can use this VMID. Remember this submission as
+ 		 * user of the VMID.
+ 		 */
+-		r = amdgpu_sync_fence(ring->adev, &id->active, fence);
++		r = amdgpu_sync_fence(ring->adev, &id->active, fence, false);
+ 		if (r)
+ 			goto error;
+ 
+@@ -649,7 +649,7 @@ int amdgpu_vm_grab_id(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 	id = idle;
+ 
+ 	/* Remember this submission as user of the VMID */
+-	r = amdgpu_sync_fence(ring->adev, &id->active, fence);
++	r = amdgpu_sync_fence(ring->adev, &id->active, fence, false);
+ 	if (r)
+ 		goto error;
+ 
+@@ -1662,7 +1662,7 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 		addr = 0;
+ 	}
+ 
+-	r = amdgpu_sync_fence(adev, &job->sync, exclusive);
++	r = amdgpu_sync_fence(adev, &job->sync, exclusive, false);
+ 	if (r)
+ 		goto error_free;
+ 
+-- 
+2.7.4
+

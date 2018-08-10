@@ -1,0 +1,88 @@
+From f5cfa3bf2ee33930798f80c68e8e10fb8ddbb402 Mon Sep 17 00:00:00 2001
+From: Sudheesh Mavila <sudheesh.mavila@amd.com>
+Date: Fri, 6 Apr 2018 18:38:11 +0530
+Subject: [PATCH 3392/5855] KVM: X86: Fix softlockup when get the current
+ kvmclock MIME-Version: 1.0 Content-Type: text/plain; charset=UTF-8
+ Content-Transfer-Encoding: 8bit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit e70b57a6ce4e8b92a56a615ae79bdb2bd66035e7 ]
+
+ watchdog: BUG: soft lockup - CPU#6 stuck for 22s! [qemu-system-x86:10185]
+ CPU: 6 PID: 10185 Comm: qemu-system-x86 Tainted: G           OE   4.14.0-rc4+ #4
+ RIP: 0010:kvm_get_time_scale+0x4e/0xa0 [kvm]
+ Call Trace:
+  get_time_ref_counter+0x5a/0x80 [kvm]
+  kvm_hv_process_stimers+0x120/0x5f0 [kvm]
+  kvm_arch_vcpu_ioctl_run+0x4b4/0x1690 [kvm]
+  kvm_vcpu_ioctl+0x33a/0x620 [kvm]
+  do_vfs_ioctl+0xa1/0x5d0
+  SyS_ioctl+0x79/0x90
+  entry_SYSCALL_64_fastpath+0x1e/0xa9
+
+This can be reproduced when running kvm-unit-tests/hyperv_stimer.flat and
+cpu-hotplug stress simultaneously. __this_cpu_read(cpu_tsc_khz) returns 0
+(set in kvmclock_cpu_down_prep()) when the pCPU is unhotplug which results
+in kvm_get_time_scale() gets into an infinite loop.
+
+This patch fixes it by treating the unhotplug pCPU as not using master clock.
+
+Reviewed-by: Radim Krčmář <rkrcmar@redhat.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Radim Krčmář <rkrcmar@redhat.com>
+Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Signed-off-by: Sudheesh Mavila <sudheesh.mavila@amd.com>
+---
+ arch/x86/kvm/x86.c | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+ mode change 100644 => 100755 arch/x86/kvm/x86.c
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+old mode 100644
+new mode 100755
+index 064fb3c..184d8d7
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1736,6 +1736,7 @@ static u64 __get_kvmclock_ns(struct kvm *kvm)
+ {
+ 	struct kvm_arch *ka = &kvm->arch;
+ 	struct pvclock_vcpu_time_info hv_clock;
++	u64 ret;
+ 
+ 	spin_lock(&ka->pvclock_gtod_sync_lock);
+ 	if (!ka->use_master_clock) {
+@@ -1747,10 +1748,20 @@ static u64 __get_kvmclock_ns(struct kvm *kvm)
+ 	hv_clock.system_time = ka->master_kernel_ns + ka->kvmclock_offset;
+ 	spin_unlock(&ka->pvclock_gtod_sync_lock);
+ 
+-	kvm_get_time_scale(NSEC_PER_SEC, __this_cpu_read(cpu_tsc_khz) * 1000LL,
+-			   &hv_clock.tsc_shift,
+-			   &hv_clock.tsc_to_system_mul);
+-	return __pvclock_read_cycles(&hv_clock, rdtsc());
++	/* both __this_cpu_read() and rdtsc() should be on the same cpu */
++	get_cpu();
++
++	if (__this_cpu_read(cpu_tsc_khz)) {
++		kvm_get_time_scale(NSEC_PER_SEC, __this_cpu_read(cpu_tsc_khz) * 1000LL,
++				   &hv_clock.tsc_shift,
++				   &hv_clock.tsc_to_system_mul);
++		ret = __pvclock_read_cycles(&hv_clock, rdtsc());
++	} else
++		ret = ktime_get_boot_ns() + ka->kvmclock_offset;
++
++	put_cpu();
++
++	return ret;
+ }
+ 
+ u64 get_kvmclock_ns(struct kvm *kvm)
+-- 
+2.7.4
+

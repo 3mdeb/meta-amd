@@ -1,0 +1,186 @@
+From dc5eb68bf4beba105491c3a7e4b5310caa1afa9b Mon Sep 17 00:00:00 2001
+From: Andrew Jiang <Andrew.Jiang@amd.com>
+Date: Wed, 20 Dec 2017 10:07:42 -0500
+Subject: [PATCH 4616/5855] drm/amd/display: Fix check for setting input TF
+
+We no longer change the plane state pointer for full updates, and as
+such, we weren't setting the input transfer function and programming the
+degamma registers when we are supposed to. Check for a full update, an
+input TF change, or a gamma change in the update flags instead to correct
+this.
+
+Signed-off-by: Andrew Jiang <Andrew.Jiang@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c                    |  9 +++++++--
+ drivers/gpu/drm/amd/display/dc/dc.h                         |  3 ++-
+ drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.c              |  4 ++--
+ drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.h              |  2 +-
+ drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c | 10 ++++++----
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c   |  9 ++++-----
+ 6 files changed, 22 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 65c96b1..770a6f8 100755
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -29,6 +29,7 @@
+ #include "core_status.h"
+ #include "core_types.h"
+ #include "hw_sequencer.h"
++#include "dce/dce_hwseq.h"
+ 
+ #include "resource.h"
+ 
+@@ -997,6 +998,9 @@ static enum surface_update_type get_plane_info_update_type(const struct dc_surfa
+ 		 */
+ 		update_flags->bits.bpp_change = 1;
+ 
++	if (u->gamma && dce_use_lut(u->plane_info->format))
++		update_flags->bits.gamma_change = 1;
++
+ 	if (memcmp(&u->plane_info->tiling_info, &u->surface->tiling_info,
+ 			sizeof(union dc_tiling_info)) != 0) {
+ 		update_flags->bits.swizzle_change = 1;
+@@ -1012,6 +1016,7 @@ static enum surface_update_type get_plane_info_update_type(const struct dc_surfa
+ 
+ 	if (update_flags->bits.rotation_change
+ 			|| update_flags->bits.stereo_format_change
++			|| update_flags->bits.gamma_change
+ 			|| update_flags->bits.bpp_change
+ 			|| update_flags->bits.bandwidth_change)
+ 		return UPDATE_TYPE_FULL;
+@@ -1092,12 +1097,12 @@ static enum surface_update_type det_surface_update(const struct dc *dc,
+ 	elevate_update_type(&overall_type, type);
+ 
+ 	if (u->in_transfer_func)
+-		update_flags->bits.in_transfer_func = 1;
++		update_flags->bits.in_transfer_func_change = 1;
+ 
+ 	if (u->input_csc_color_matrix)
+ 		update_flags->bits.input_csc_change = 1;
+ 
+-	if (update_flags->bits.in_transfer_func
++	if (update_flags->bits.in_transfer_func_change
+ 			|| update_flags->bits.input_csc_change) {
+ 		type = UPDATE_TYPE_MED;
+ 		elevate_update_type(&overall_type, type);
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 4012580..f8571c4 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -399,12 +399,13 @@ union surface_update_flags {
+ 		uint32_t swizzle_change:1;
+ 		uint32_t scaling_change:1;
+ 		uint32_t position_change:1;
+-		uint32_t in_transfer_func:1;
++		uint32_t in_transfer_func_change:1;
+ 		uint32_t input_csc_change:1;
+ 
+ 		/* Full updates */
+ 		uint32_t new_plane:1;
+ 		uint32_t bpp_change:1;
++		uint32_t gamma_change:1;
+ 		uint32_t bandwidth_change:1;
+ 		uint32_t clock_change:1;
+ 		uint32_t stereo_format_change:1;
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.c b/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.c
+index d2e66b1..4b8e7ce 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.c
+@@ -197,9 +197,9 @@ void dce_crtc_switch_to_clk_src(struct dce_hwseq *hws,
+ }
+ 
+ /* Only use LUT for 8 bit formats */
+-bool dce_use_lut(const struct dc_plane_state *plane_state)
++bool dce_use_lut(enum surface_pixel_format format)
+ {
+-	switch (plane_state->format) {
++	switch (format) {
+ 	case SURFACE_PIXEL_FORMAT_GRPH_ARGB8888:
+ 	case SURFACE_PIXEL_FORMAT_GRPH_ABGR8888:
+ 		return true;
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.h b/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.h
+index af96538..c9a45d5 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.h
+@@ -607,5 +607,5 @@ void dce_crtc_switch_to_clk_src(struct dce_hwseq *hws,
+ 		struct clock_source *clk_src,
+ 		unsigned int tg_inst);
+ 
+-bool dce_use_lut(const struct dc_plane_state *plane_state);
++bool dce_use_lut(enum surface_pixel_format format);
+ #endif   /*__DCE_HWSEQ_H__*/
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 7de3ecc..b58c941 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -275,7 +275,7 @@ dce110_set_input_transfer_func(struct pipe_ctx *pipe_ctx,
+ 	build_prescale_params(&prescale_params, plane_state);
+ 	ipp->funcs->ipp_program_prescale(ipp, &prescale_params);
+ 
+-	if (plane_state->gamma_correction && dce_use_lut(plane_state))
++	if (plane_state->gamma_correction && dce_use_lut(plane_state->format))
+ 		ipp->funcs->ipp_program_input_lut(ipp, plane_state->gamma_correction);
+ 
+ 	if (tf == NULL) {
+@@ -2657,7 +2657,6 @@ static void dce110_program_front_end_for_pipe(
+ 	struct dc_plane_state *plane_state = pipe_ctx->plane_state;
+ 	struct xfm_grph_csc_adjustment adjust;
+ 	struct out_csc_color_matrix tbl_entry;
+-	struct pipe_ctx *cur_pipe_ctx = &dc->current_state->res_ctx.pipe_ctx[pipe_ctx->pipe_idx];
+ 	unsigned int i;
+ 
+ 	memset(&tbl_entry, 0, sizeof(tbl_entry));
+@@ -2726,10 +2725,13 @@ static void dce110_program_front_end_for_pipe(
+ 				plane_state->rotation);
+ 
+ 	/* Moved programming gamma from dc to hwss */
+-	if (cur_pipe_ctx->plane_state != pipe_ctx->plane_state) {
++	if (pipe_ctx->plane_state->update_flags.bits.full_update ||
++			pipe_ctx->plane_state->update_flags.bits.in_transfer_func_change ||
++			pipe_ctx->plane_state->update_flags.bits.gamma_change)
+ 		dc->hwss.set_input_transfer_func(pipe_ctx, pipe_ctx->plane_state);
++
++	if (pipe_ctx->plane_state->update_flags.bits.full_update)
+ 		dc->hwss.set_output_transfer_func(pipe_ctx, pipe_ctx->stream);
+-	}
+ 
+ 	dm_logger_write(dc->ctx->logger, LOG_SURFACE,
+ 			"Pipe:%d 0x%x: addr hi:0x%x, "
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 4e27420..8dff527 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -984,7 +984,7 @@ static bool dcn10_set_input_transfer_func(struct pipe_ctx *pipe_ctx,
+ 	if (plane_state->in_transfer_func)
+ 		tf = plane_state->in_transfer_func;
+ 
+-	if (plane_state->gamma_correction && dce_use_lut(plane_state))
++	if (plane_state->gamma_correction && dce_use_lut(plane_state->format))
+ 		dpp_base->funcs->dpp_program_input_lut(dpp_base, plane_state->gamma_correction);
+ 
+ 	if (tf == NULL)
+@@ -1858,15 +1858,14 @@ static void program_all_pipe_in_tree(
+ 	}
+ 
+ 	if (pipe_ctx->plane_state != NULL) {
+-		struct pipe_ctx *cur_pipe_ctx =
+-				&dc->current_state->res_ctx.pipe_ctx[pipe_ctx->pipe_idx];
+-
+ 		if (pipe_ctx->plane_state->update_flags.bits.full_update)
+ 			dcn10_enable_plane(dc, pipe_ctx, context);
+ 
+ 		update_dchubp_dpp(dc, pipe_ctx, context);
+ 
+-		if (cur_pipe_ctx->plane_state != pipe_ctx->plane_state)
++		if (pipe_ctx->plane_state->update_flags.bits.full_update ||
++				pipe_ctx->plane_state->update_flags.bits.in_transfer_func_change ||
++				pipe_ctx->plane_state->update_flags.bits.gamma_change)
+ 			dc->hwss.set_input_transfer_func(pipe_ctx, pipe_ctx->plane_state);
+ 
+ 		/* dcn10_translate_regamma_to_hw_format takes 750us to finish
+-- 
+2.7.4
+

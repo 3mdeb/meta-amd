@@ -1,0 +1,214 @@
+From a59bab1e8d6e5ae522a3cddd5a81012bc7591d26 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Fri, 27 Oct 2017 17:55:03 -0400
+Subject: [PATCH 4260/5855] drm/amd/display: cache pwl params and scl_data to
+ avoid extra programming
+
+This saves us about 5000 reg writes per full update. This translates to about
+40000 writes over the course of single eDP bootup.
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c   | 41 ++++++++++------------
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h   |  6 ++--
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c  |  3 ++
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  | 10 +++---
+ drivers/gpu/drm/amd/display/dc/inc/hw/dpp.h        |  8 ++---
+ 5 files changed, 30 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
+index 54af12f..bea190e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
+@@ -178,31 +178,13 @@ void dpp_reset(struct dpp *dpp_base)
+ 	dpp->filter_h = NULL;
+ 	dpp->filter_v = NULL;
+ 
+-	/* set boundary mode to 0 */
+-	REG_SET(DSCL_CONTROL, 0, SCL_BOUNDARY_MODE, 0);
++	memset(&dpp->scl_data, 0, sizeof(dpp->scl_data));
++	memset(&dpp->pwl_data, 0, sizeof(dpp->pwl_data));
+ }
+ 
+ 
+ static void dpp1_cm_set_regamma_pwl(
+-	struct dpp *dpp_base, const struct pwl_params *params)
+-{
+-	struct dcn10_dpp *dpp = TO_DCN10_DPP(dpp_base);
+-
+-	dpp1_cm_power_on_regamma_lut(dpp_base, true);
+-	dpp1_cm_configure_regamma_lut(dpp_base, dpp->is_write_to_ram_a_safe);
+-
+-	if (dpp->is_write_to_ram_a_safe)
+-		dpp1_cm_program_regamma_luta_settings(dpp_base, params);
+-	else
+-		dpp1_cm_program_regamma_lutb_settings(dpp_base, params);
+-
+-	dpp1_cm_program_regamma_lut(
+-			dpp_base, params->rgb_resulted, params->hw_points_num);
+-}
+-
+-static void dpp1_cm_set_regamma_mode(
+-	struct dpp *dpp_base,
+-	enum opp_regamma mode)
++	struct dpp *dpp_base, const struct pwl_params *params, enum opp_regamma mode)
+ {
+ 	struct dcn10_dpp *dpp = TO_DCN10_DPP(dpp_base);
+ 	uint32_t re_mode = 0;
+@@ -220,13 +202,27 @@ static void dpp1_cm_set_regamma_mode(
+ 		re_mode = 2;
+ 		break;
+ 	case OPP_REGAMMA_USER:
++		if (memcmp(&dpp->pwl_data, params, sizeof(*params)) == 0)
++			return;
++
++		dpp1_cm_power_on_regamma_lut(dpp_base, true);
++		dpp1_cm_configure_regamma_lut(dpp_base, dpp->is_write_to_ram_a_safe);
++
++		if (dpp->is_write_to_ram_a_safe)
++			dpp1_cm_program_regamma_luta_settings(dpp_base, params);
++		else
++			dpp1_cm_program_regamma_lutb_settings(dpp_base, params);
++
++		dpp1_cm_program_regamma_lut(
++				dpp_base, params->rgb_resulted, params->hw_points_num);
++		dpp->pwl_data = *params;
++
+ 		re_mode = dpp->is_write_to_ram_a_safe ? 3 : 4;
+ 		dpp->is_write_to_ram_a_safe = !dpp->is_write_to_ram_a_safe;
+ 		break;
+ 	default:
+ 		break;
+ 	}
+-
+ 	REG_SET(CM_RGAM_CONTROL, 0, CM_RGAM_LUT_MODE, re_mode);
+ 	REG_UPDATE_2(OBUF_CONTROL,
+ 			OBUF_BYPASS, obuf_bypass,
+@@ -453,7 +449,6 @@ static const struct dpp_funcs dcn10_dpp_funcs = {
+ 		.opp_program_regamma_lutb_settings = dpp1_cm_program_regamma_lutb_settings,
+ 		.opp_program_regamma_luta_settings = dpp1_cm_program_regamma_luta_settings,
+ 		.opp_program_regamma_pwl = dpp1_cm_set_regamma_pwl,
+-		.opp_set_regamma_mode = dpp1_cm_set_regamma_mode,
+ 		.ipp_program_bias_and_scale = dpp1_program_bias_and_scale,
+ 		.ipp_set_degamma = dpp1_set_degamma,
+ 		.ipp_program_input_lut		= dpp1_program_input_lut,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
+index 49c2695..9c1809a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
+@@ -54,7 +54,6 @@
+ 	SRI(LB_MEMORY_CTRL, DSCL, id), \
+ 	SRI(DSCL_AUTOCAL, DSCL, id), \
+ 	SRI(SCL_BLACK_OFFSET, DSCL, id), \
+-	SRI(DSCL_CONTROL, DSCL, id), \
+ 	SRI(SCL_TAP_CONTROL, DSCL, id), \
+ 	SRI(SCL_COEF_RAM_TAP_SELECT, DSCL, id), \
+ 	SRI(SCL_COEF_RAM_TAP_DATA, DSCL, id), \
+@@ -188,7 +187,6 @@
+ 	TF_SF(DSCL0_DSCL_AUTOCAL, AUTOCAL_PIPE_ID, mask_sh),\
+ 	TF_SF(DSCL0_SCL_BLACK_OFFSET, SCL_BLACK_OFFSET_RGB_Y, mask_sh),\
+ 	TF_SF(DSCL0_SCL_BLACK_OFFSET, SCL_BLACK_OFFSET_CBCR, mask_sh),\
+-	TF_SF(DSCL0_DSCL_CONTROL, SCL_BOUNDARY_MODE, mask_sh),\
+ 	TF_SF(DSCL0_SCL_TAP_CONTROL, SCL_V_NUM_TAPS, mask_sh),\
+ 	TF_SF(DSCL0_SCL_TAP_CONTROL, SCL_H_NUM_TAPS, mask_sh),\
+ 	TF_SF(DSCL0_SCL_TAP_CONTROL, SCL_V_NUM_TAPS_C, mask_sh),\
+@@ -443,7 +441,6 @@
+ 	type AUTOCAL_PIPE_ID; \
+ 	type SCL_BLACK_OFFSET_RGB_Y; \
+ 	type SCL_BLACK_OFFSET_CBCR; \
+-	type SCL_BOUNDARY_MODE; \
+ 	type SCL_V_NUM_TAPS; \
+ 	type SCL_H_NUM_TAPS; \
+ 	type SCL_V_NUM_TAPS_C; \
+@@ -1047,7 +1044,6 @@ struct dcn_dpp_registers {
+ 	uint32_t LB_MEMORY_CTRL;
+ 	uint32_t DSCL_AUTOCAL;
+ 	uint32_t SCL_BLACK_OFFSET;
+-	uint32_t DSCL_CONTROL;
+ 	uint32_t SCL_TAP_CONTROL;
+ 	uint32_t SCL_COEF_RAM_TAP_SELECT;
+ 	uint32_t SCL_COEF_RAM_TAP_DATA;
+@@ -1293,6 +1289,8 @@ struct dcn10_dpp {
+ 	int lb_memory_size;
+ 	int lb_bits_per_entry;
+ 	bool is_write_to_ram_a_safe;
++	struct scaler_data scl_data;
++	struct pwl_params pwl_data;
+ };
+ 
+ enum dcn10_input_csc_select {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c
+index 591c1a82..2576de3 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c
+@@ -648,6 +648,8 @@ void dpp1_dscl_set_scaler_manual_scale(
+ 	bool ycbcr = scl_data->format >= PIXEL_FORMAT_VIDEO_BEGIN
+ 				&& scl_data->format <= PIXEL_FORMAT_VIDEO_END;
+ 
++	if (memcmp(&dpp->scl_data, scl_data, sizeof(*scl_data)) == 0)
++		return;
+ 	/* Recout */
+ 	dpp1_dscl_set_recout(dpp, &scl_data->recout);
+ 
+@@ -699,4 +701,5 @@ void dpp1_dscl_set_scaler_manual_scale(
+ 		SCL_H_NUM_TAPS_C, scl_data->taps.h_taps_c - 1);
+ 
+ 	dpp1_dscl_set_scl_filter(dpp, scl_data, ycbcr);
++	dpp->scl_data = *scl_data;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index c9f4e19..1d00fe6 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -1294,13 +1294,12 @@ static bool dcn10_set_output_transfer_func(
+ 			TF_TYPE_PREDEFINED &&
+ 		stream->out_transfer_func->tf ==
+ 			TRANSFER_FUNCTION_SRGB) {
+-		dpp->funcs->opp_set_regamma_mode(dpp, OPP_REGAMMA_SRGB);
++		dpp->funcs->opp_program_regamma_pwl(dpp, NULL, OPP_REGAMMA_SRGB);
+ 	} else if (dcn10_translate_regamma_to_hw_format(
+ 				stream->out_transfer_func, &dpp->regamma_params)) {
+-			dpp->funcs->opp_program_regamma_pwl(dpp, &dpp->regamma_params);
+-			dpp->funcs->opp_set_regamma_mode(dpp, OPP_REGAMMA_USER);
++			dpp->funcs->opp_program_regamma_pwl(dpp, &dpp->regamma_params, OPP_REGAMMA_USER);
+ 	} else {
+-		dpp->funcs->opp_set_regamma_mode(dpp, OPP_REGAMMA_BYPASS);
++		dpp->funcs->opp_program_regamma_pwl(dpp, NULL, OPP_REGAMMA_BYPASS);
+ 	}
+ 
+ 	return true;
+@@ -2176,8 +2175,7 @@ static void dcn10_apply_ctx_for_surface(
+ 
+ 	if (num_planes == 0) {
+ 		for (i = dc->res_pool->pipe_count - 1; i >= 0 ; i--) {
+-			struct pipe_ctx *old_pipe_ctx =
+-							&dc->current_state->res_ctx.pipe_ctx[i];
++			struct pipe_ctx *old_pipe_ctx = &dc->current_state->res_ctx.pipe_ctx[i];
+ 
+ 			if (old_pipe_ctx->stream_res.tg && old_pipe_ctx->stream_res.tg->inst == be_idx) {
+ 				old_pipe_ctx->stream_res.tg->funcs->set_blank(old_pipe_ctx->stream_res.tg, true);
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/dpp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/dpp.h
+index 6eca959..71078d1 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/dpp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/dpp.h
+@@ -92,11 +92,9 @@ struct dpp_funcs {
+ 			const struct pwl_params *params);
+ 
+ 	void (*opp_program_regamma_pwl)(
+-		struct dpp *dpp, const struct pwl_params *params);
+-
+-	void (*opp_set_regamma_mode)(
+-			struct dpp *dpp_base,
+-			enum opp_regamma mode);
++		struct dpp *dpp,
++		const struct pwl_params *params,
++		enum opp_regamma mode);
+ 
+ 	void (*ipp_program_bias_and_scale)(
+ 			struct dpp *dpp,
+-- 
+2.7.4
+

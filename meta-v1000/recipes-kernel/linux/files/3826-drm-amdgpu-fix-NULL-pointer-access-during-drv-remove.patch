@@ -1,0 +1,177 @@
+From 0a551b494e32da67afa2807049e4d6c42276c941 Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Tue, 14 Nov 2017 11:55:50 +0800
+Subject: [PATCH 3826/5855] drm/amdgpu:fix NULL pointer access during drv
+ remove
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+NULL pointer is because original logic will step into
+set_pde_pte() even after the gart.ptr is freed due to
+there are twice gart_unbind() on all gart area.
+
+also, there are other minor fixes:
+1,since gart_init only create dummy page, the corresponding
+gart_fini shouldn't do more like unbinding all GART, this is
+unnecessary because in driver fini stage all GART unbinding
+had already been done during each IP's SW_FINI (GMC's
+SW_FINI is the last one called), so remove the step
+for the GART unbinding in gart_fini().
+
+2,gart_fini() is already invoked during each GMC IP's gart_fini
+routine,e.g. gmc_vx_0_gart_fini(), so no need to manually
+call it during ttm_fini().
+
+3,amdgpu_gem_force_release() should be put ahead of
+amdgpu_vm_manager_fini()
+
+Change-Id: Ib1f31a2cf6bfbb9b54c7cc2a8cf9e4e3160bcfa0
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        | 1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c   | 9 +--------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    | 2 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c      | 2 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c      | 2 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c      | 2 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c      | 2 +-
+ 8 files changed, 7 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index d36402e..364128d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1455,6 +1455,7 @@ struct amdgpu_fw_vram_usage {
+ };
+ 
+ int amdgpu_fw_reserve_vram_init(struct amdgpu_device *adev);
++void amdgpu_fw_reserve_vram_fini(struct amdgpu_device *adev);
+ 
+ /*
+  * CGS
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 1ae695b..156f676 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2471,7 +2471,6 @@ void amdgpu_device_fini(struct amdgpu_device *adev)
+ 	/* evict vram memory */
+ 	amdgpu_bo_evict_vram(adev);
+ 	amdgpu_ib_pool_fini(adev);
+-	amdgpu_fw_reserve_vram_fini(adev);
+ 	amdgpu_fence_driver_fini(adev);
+ 	amdgpu_fbdev_fini(adev);
+ 	r = amdgpu_fini(adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
+index 626970c..d76dd62 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
+@@ -250,10 +250,8 @@ int amdgpu_gart_init(struct amdgpu_device *adev)
+ #ifdef CONFIG_DRM_AMDGPU_GART_DEBUGFS
+ 	/* Allocate pages table */
+ 	adev->gart.pages = vzalloc(sizeof(void *) * adev->gart.num_cpu_pages);
+-	if (adev->gart.pages == NULL) {
+-		amdgpu_gart_fini(adev);
++	if (adev->gart.pages == NULL)
+ 		return -ENOMEM;
+-	}
+ #endif
+ 
+ 	return 0;
+@@ -268,11 +266,6 @@ int amdgpu_gart_init(struct amdgpu_device *adev)
+  */
+ void amdgpu_gart_fini(struct amdgpu_device *adev)
+ {
+-	if (adev->gart.ready) {
+-		/* unbind pages */
+-		amdgpu_gart_unbind(adev, 0, adev->gart.num_cpu_pages);
+-	}
+-	adev->gart.ready = false;
+ #ifdef CONFIG_DRM_AMDGPU_GART_DEBUGFS
+ 	vfree(adev->gart.pages);
+ 	adev->gart.pages = NULL;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 214fcfe..8d326cd 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1645,6 +1645,7 @@ void amdgpu_ttm_fini(struct amdgpu_device *adev)
+ 	amdgpu_ttm_debugfs_fini(adev);
+ 
+ 	amdgpu_bo_free_kernel(&adev->stolen_vga_memory, NULL, NULL);
++	amdgpu_fw_reserve_vram_fini(adev);
+ 
+ 	amdgpu_ssg_fini(adev);
+ 	amdgpu_direct_gma_fini(adev);
+@@ -1658,7 +1659,6 @@ void amdgpu_ttm_fini(struct amdgpu_device *adev)
+ 	if (adev->gds.oa.total_size)
+ 		ttm_bo_clean_mm(&adev->mman.bdev, AMDGPU_PL_OA);
+ 	ttm_bo_device_release(&adev->mman.bdev);
+-	amdgpu_gart_fini(adev);
+ 	amdgpu_ttm_global_fini(adev);
+ 	adev->mman.initialized = false;
+ 	DRM_INFO("amdgpu: ttm finalized\n");
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+index 1e6e50a..34ba39b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+@@ -893,9 +893,9 @@ static int gmc_v6_0_sw_fini(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
++	amdgpu_gem_force_release(adev);
+ 	amdgpu_vm_manager_fini(adev);
+ 	gmc_v6_0_gart_fini(adev);
+-	amdgpu_gem_force_release(adev);
+ 	amdgpu_bo_fini(adev);
+ 	release_firmware(adev->mc.fw);
+ 	adev->mc.fw = NULL;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index 2e0cc17..57d4fdc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -1052,9 +1052,9 @@ static int gmc_v7_0_sw_fini(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	kfree(adev->mc.vm_fault_info);
++	amdgpu_gem_force_release(adev);
+ 	amdgpu_vm_manager_fini(adev);
+ 	gmc_v7_0_gart_fini(adev);
+-	amdgpu_gem_force_release(adev);
+ 	amdgpu_bo_fini(adev);
+ 	release_firmware(adev->mc.fw);
+ 	adev->mc.fw = NULL;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index 4529af5..b5ed774 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -1153,9 +1153,9 @@ static int gmc_v8_0_sw_fini(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	kfree(adev->mc.vm_fault_info);
++	amdgpu_gem_force_release(adev);
+ 	amdgpu_vm_manager_fini(adev);
+ 	gmc_v8_0_gart_fini(adev);
+-	amdgpu_gem_force_release(adev);
+ 	amdgpu_bo_fini(adev);
+ 	release_firmware(adev->mc.fw);
+ 	adev->mc.fw = NULL;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 67f18b4..ec746e2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -880,9 +880,9 @@ static int gmc_v9_0_sw_fini(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
++	amdgpu_gem_force_release(adev);
+ 	amdgpu_vm_manager_fini(adev);
+ 	gmc_v9_0_gart_fini(adev);
+-	amdgpu_gem_force_release(adev);
+ 	amdgpu_bo_fini(adev);
+ 
+ 	return 0;
+-- 
+2.7.4
+

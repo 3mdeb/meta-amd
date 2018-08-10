@@ -1,0 +1,314 @@
+From 2dd6d3647f3457bbaf7d7c18f99366fe56a685b1 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Mon, 31 Jul 2017 17:26:06 -0400
+Subject: [PATCH 5416/5855] drm/amdkfd: Improve topology error handling
+
+* Properly handle and report errors both when creating and parsing
+  CRAT tables
+* Release temporary device lists after errors
+* Update sys_props.num_devices not when devices are created but when
+  they are added to the global topology device list
+* Refactor code to avoid duplication between
+  kfd_release_topology_device_list and kfd_release_live_view
+* Make kfd_release_live_view static and move locking out to its caller
+
+Change-Id: If190c88b7f41d2e12b582e7555f27713225728d2
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_crat.c     | 26 ++++++----
+ drivers/gpu/drm/amd/amdkfd/kfd_topology.c | 80 +++++++++++++++----------------
+ drivers/gpu/drm/amd/amdkfd/kfd_topology.h |  2 +-
+ 3 files changed, 57 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+index ac7eaac..5f597a6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+@@ -420,7 +420,7 @@ int kfd_parse_crat_table(void *crat_image,
+ 	struct kfd_topology_device *top_dev = NULL;
+ 	struct crat_subtype_generic *sub_type_hdr;
+ 	uint16_t node_id;
+-	int ret;
++	int ret = 0;
+ 	struct crat_header *crat_table = (struct crat_header *)crat_image;
+ 	uint16_t num_nodes;
+ 	uint32_t image_len;
+@@ -429,8 +429,10 @@ int kfd_parse_crat_table(void *crat_image,
+ 	if (!crat_image)
+ 		return -EINVAL;
+ 
+-	if (!list_empty(device_list))
++	if (!list_empty(device_list)) {
+ 		pr_warn("Error device list should be empty\n");
++		return -EINVAL;
++	}
+ 
+ 	num_nodes = crat_table->num_domains;
+ 	image_len = crat_table->length;
+@@ -444,8 +446,10 @@ int kfd_parse_crat_table(void *crat_image,
+ 		top_dev->proximity_domain = proximity_domain++;
+ 	}
+ 
+-	if (!top_dev)
+-		return -ENOMEM;
++	if (!top_dev) {
++		ret = -ENOMEM;
++		goto err;
++	}
+ 
+ 	memcpy(top_dev->oem_id, crat_table->oem_id, CRAT_OEMID_LENGTH);
+ 	memcpy(top_dev->oem_table_id, crat_table->oem_table_id,
+@@ -475,7 +479,7 @@ int kfd_parse_crat_table(void *crat_image,
+ 		if (sub_type_hdr->flags & CRAT_SUBTYPE_FLAGS_ENABLED) {
+ 			ret = kfd_parse_subtype(sub_type_hdr, device_list);
+ 			if (ret != 0)
+-				return ret;
++				break;
+ 		}
+ 
+ 		last_header_type = sub_type_hdr->type;
+@@ -484,7 +488,11 @@ int kfd_parse_crat_table(void *crat_image,
+ 				sub_type_hdr->length);
+ 	}
+ 
+-	return 0;
++err:
++	if (ret)
++		kfd_release_topology_device_list(device_list);
++
++	return ret;
+ }
+ 
+ /* Helper function. See kfd_fill_gpu_cache_info for parameter description */
+@@ -1240,7 +1248,7 @@ static int kfd_create_vcrat_image_gpu(void *pcrat_image,
+ int kfd_create_crat_image_virtual(void **crat_image, size_t *size,
+ 		int flags, struct kfd_dev *kdev, uint32_t proximity_domain)
+ {
+-	void *pcrat_image;
++	void *pcrat_image = NULL;
+ 	int ret = 0;
+ 
+ 	if (!crat_image)
+@@ -1280,8 +1288,10 @@ int kfd_create_crat_image_virtual(void **crat_image, size_t *size,
+ 		ret = -EINVAL;
+ 	}
+ 
+-	if (ret == 0)
++	if (!ret)
+ 		*crat_image = pcrat_image;
++	else
++		kfree(pcrat_image);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+index 89876bb..b2dde30 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+@@ -159,21 +159,22 @@ static void kfd_release_topology_device(struct kfd_topology_device *dev)
+ #endif
+ 
+ 	kfree(dev);
+-
+-	sys_props.num_devices--;
+ }
+ 
+-void kfd_release_live_view(void)
++void kfd_release_topology_device_list(struct list_head *device_list)
+ {
+ 	struct kfd_topology_device *dev;
+ 
+-	down_write(&topology_lock);
+-	while (topology_device_list.next != &topology_device_list) {
+-		dev = container_of(topology_device_list.next,
+-				 struct kfd_topology_device, list);
++	while (!list_empty(device_list)) {
++		dev = list_first_entry(device_list,
++				       struct kfd_topology_device, list);
+ 		kfd_release_topology_device(dev);
+ 	}
+-	up_write(&topology_lock);
++}
++
++static void kfd_release_live_view(void)
++{
++	kfd_release_topology_device_list(&topology_device_list);
+ 	memset(&sys_props, 0, sizeof(sys_props));
+ }
+ 
+@@ -196,7 +197,6 @@ struct kfd_topology_device *kfd_create_topology_device(
+ #endif
+ 
+ 	list_add_tail(&dev->list, device_list);
+-	sys_props.num_devices++;
+ 
+ 	return dev;
+ }
+@@ -872,16 +872,13 @@ static void kfd_topology_release_sysfs(void)
+ }
+ 
+ /* Called with write topology_lock acquired */
+-static int kfd_topology_update_device_list(struct list_head *temp_list,
++static void kfd_topology_update_device_list(struct list_head *temp_list,
+ 					struct list_head *master_list)
+ {
+-	int num = 0;
+-
+ 	while (!list_empty(temp_list)) {
+ 		list_move_tail(temp_list->next, master_list);
+-		num++;
++		sys_props.num_devices++;
+ 	}
+-	return num;
+ }
+ 
+ static void kfd_debug_print_topology(void)
+@@ -1006,14 +1003,6 @@ static bool kfd_is_acpi_crat_invalid(struct list_head *device_list)
+ 	pr_info("Ignoring ACPI CRAT on non-APU system\n");
+ 	return true;
+ }
+-
+-static void kfd_delete_topology_device_list(struct list_head *device_list)
+-{
+-	struct kfd_topology_device *dev, *tmp;
+-
+-	list_for_each_entry_safe(dev, tmp, device_list, list)
+-		kfd_release_topology_device(dev);
+-}
+ #endif
+ 
+ int kfd_topology_init(void)
+@@ -1025,7 +1014,6 @@ int kfd_topology_init(void)
+ 	int cpu_only_node = 0;
+ 	struct kfd_topology_device *kdev;
+ 	int proximity_domain;
+-	int num_nodes;
+ 
+ 	/* topology_device_list - Master list of all topology devices
+ 	 * temp_topology_device_list - temporary list created while parsing CRAT
+@@ -1062,9 +1050,8 @@ int kfd_topology_init(void)
+ 		if (ret ||
+ 			kfd_is_acpi_crat_invalid(&temp_topology_device_list)) {
+ 
+-			kfd_delete_topology_device_list(
++			kfd_release_topology_device_list(
+ 				&temp_topology_device_list);
+-			INIT_LIST_HEAD(&temp_topology_device_list);
+ 			kfd_destroy_crat_image(crat_image);
+ 			crat_image = NULL;
+ 		}
+@@ -1075,13 +1062,16 @@ int kfd_topology_init(void)
+ 				COMPUTE_UNIT_CPU, NULL,
+ 				proximity_domain);
+ 		cpu_only_node = 1;
++		if (ret) {
++			pr_err("Error creating VCRAT table for CPU\n");
++			return ret;
++		}
+ 
+-		if (ret == 0)
+-			ret = kfd_parse_crat_table(crat_image,
++		ret = kfd_parse_crat_table(crat_image,
+ 				&temp_topology_device_list,
+ 				proximity_domain);
+-		else {
+-			pr_err("Error getting/creating CRAT table\n");
++		if (ret) {
++			pr_err("Error parsing VCRAT table for CPU\n");
+ 			goto err;
+ 		}
+ 	}
+@@ -1093,9 +1083,9 @@ int kfd_topology_init(void)
+ #endif
+ 
+ 	down_write(&topology_lock);
+-	num_nodes = kfd_topology_update_device_list(&temp_topology_device_list,
+-						    &topology_device_list);
+-	atomic_set(&topology_crat_proximity_domain, num_nodes-1);
++	kfd_topology_update_device_list(&temp_topology_device_list,
++					    &topology_device_list);
++	atomic_set(&topology_crat_proximity_domain, sys_props.num_devices-1);
+ 	ret = kfd_topology_update_sysfs();
+ 	up_write(&topology_lock);
+ 
+@@ -1128,8 +1118,8 @@ void kfd_topology_shutdown(void)
+ {
+ 	down_write(&topology_lock);
+ 	kfd_topology_release_sysfs();
+-	up_write(&topology_lock);
+ 	kfd_release_live_view();
++	up_write(&topology_lock);
+ }
+ 
+ static uint32_t kfd_generate_gpu_id(struct kfd_dev *gpu)
+@@ -1269,11 +1259,16 @@ int kfd_topology_add_device(struct kfd_dev *gpu)
+ 		res = kfd_create_crat_image_virtual(&crat_image, &image_size,
+ 				COMPUTE_UNIT_GPU,
+ 				gpu, proximity_domain);
+-		if (res == 0)
+-			res = kfd_parse_crat_table(crat_image,
++		if (res) {
++			pr_err("Error creating VCRAT for GPU (ID: 0x%x)\n",
++			       gpu_id);
++			return res;
++		}
++		res = kfd_parse_crat_table(crat_image,
+ 				&temp_topology_device_list, proximity_domain);
+-		else {
+-			pr_err("Error in VCRAT for GPU (ID: 0x%x)\n", gpu_id);
++		if (res) {
++			pr_err("Error parsing VCRAT for GPU (ID: 0x%x)\n",
++			       gpu_id);
+ 			goto err;
+ 		}
+ 
+@@ -1368,27 +1363,28 @@ int kfd_topology_add_device(struct kfd_dev *gpu)
+ 	}
+ 
+ 	kfd_debug_print_topology();
+-err:
+-	if (res == 0)
+-		kfd_notify_gpu_change(gpu_id, 1);
+ 
++	if (!res)
++		kfd_notify_gpu_change(gpu_id, 1);
++err:
+ 	kfd_destroy_crat_image(crat_image);
+ 	return res;
+ }
+ 
+ int kfd_topology_remove_device(struct kfd_dev *gpu)
+ {
+-	struct kfd_topology_device *dev;
++	struct kfd_topology_device *dev, *tmp;
+ 	uint32_t gpu_id;
+ 	int res = -ENODEV;
+ 
+ 	down_write(&topology_lock);
+ 
+-	list_for_each_entry(dev, &topology_device_list, list)
++	list_for_each_entry_safe(dev, tmp, &topology_device_list, list)
+ 		if (dev->gpu == gpu) {
+ 			gpu_id = dev->gpu_id;
+ 			kfd_remove_sysfs_node_entry(dev);
+ 			kfd_release_topology_device(dev);
++			sys_props.num_devices--;
+ 			res = 0;
+ 			if (kfd_topology_update_sysfs() < 0)
+ 				kfd_topology_release_sysfs();
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_topology.h b/drivers/gpu/drm/amd/amdkfd/kfd_topology.h
+index 44f0fc7..b59b32c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_topology.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_topology.h
+@@ -193,7 +193,7 @@ struct kfd_system_properties {
+ 
+ struct kfd_topology_device *kfd_create_topology_device(
+ 		struct list_head *device_list);
+-void kfd_release_live_view(void);
++void kfd_release_topology_device_list(struct list_head *device_list);
+ 
+ #if defined(CONFIG_AMD_IOMMU_V2_MODULE) || defined(CONFIG_AMD_IOMMU_V2)
+ extern bool amd_iommu_pc_supported(void);
+-- 
+2.7.4
+

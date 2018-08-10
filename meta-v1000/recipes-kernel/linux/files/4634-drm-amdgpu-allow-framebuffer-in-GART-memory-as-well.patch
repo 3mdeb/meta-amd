@@ -1,0 +1,164 @@
+From ee65dad9e0b564dfc5e1b18d8272d13df6613420 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 26 Oct 2017 18:06:23 +0200
+Subject: [PATCH 4634/5855] drm/amdgpu: allow framebuffer in GART memory as
+ well
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On CZ and newer APUs we can pin the fb into GART as well as VRAM.
+
+v2: Don't enable gpu_vm_support for Raven yet since it leads to
+    a black screen. Need to debug this further before enabling.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Samuel Li <samuel.li@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_display.c       | 14 +++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_display.h       |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c            | 10 ++++++----
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 11 +++++++++--
+ 4 files changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+index da7c0f4..044f455 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+@@ -29,6 +29,7 @@
+ #include "amdgpu_i2c.h"
+ #include "atom.h"
+ #include "amdgpu_connectors.h"
++#include "amdgpu_display.h"
+ #include <asm/div64.h>
+ 
+ #include <linux/pm_runtime.h>
+@@ -194,7 +195,7 @@ int amdgpu_crtc_page_flip_target(struct drm_crtc *crtc,
+ 		goto cleanup;
+ 	}
+ 
+-	r = amdgpu_bo_pin(new_abo, AMDGPU_GEM_DOMAIN_VRAM, &base);
++	r = amdgpu_bo_pin(new_abo, amdgpu_display_framebuffer_domains(adev), &base);
+ 	if (unlikely(r != 0)) {
+ 		DRM_ERROR("failed to pin new abo buffer before flip\n");
+ 		goto unreserve;
+@@ -506,6 +507,17 @@ static const struct drm_framebuffer_funcs amdgpu_fb_funcs = {
+ 	.create_handle = amdgpu_user_framebuffer_create_handle,
+ };
+ 
++uint32_t amdgpu_display_framebuffer_domains(struct amdgpu_device *adev)
++{
++	uint32_t domain = AMDGPU_GEM_DOMAIN_VRAM;
++
++	if (adev->asic_type >= CHIP_CARRIZO && adev->asic_type < CHIP_RAVEN &&
++	    adev->flags & AMD_IS_APU)
++		domain |= AMDGPU_GEM_DOMAIN_GTT;
++
++	return domain;
++}
++
+ int
+ amdgpu_framebuffer_init(struct drm_device *dev,
+ 			struct amdgpu_framebuffer *rfb,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.h
+index 11ae4ab..c42a627 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.h
+@@ -23,6 +23,7 @@
+ #ifndef __AMDGPU_DISPLAY_H__
+ #define __AMDGPU_DISPLAY_H__
+ 
++uint32_t amdgpu_display_framebuffer_domains(struct amdgpu_device *adev);
+ struct drm_framebuffer *
+ amdgpu_user_framebuffer_create(struct drm_device *dev,
+ 			       struct drm_file *file_priv,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c
+index 2af9699..5ae55e4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c
+@@ -38,6 +38,8 @@
+ 
+ #include <linux/vga_switcheroo.h>
+ 
++#include "amdgpu_display.h"
++
+ /* object hierarchy -
+    this contains a helper + a amdgpu fb
+    the helper contains a pointer to amdgpu framebuffer baseclass.
+@@ -124,7 +126,7 @@ static int amdgpufb_create_pinned_object(struct amdgpu_fbdev *rfbdev,
+ 	struct drm_gem_object *gobj = NULL;
+ 	struct amdgpu_bo *abo = NULL;
+ 	bool fb_tiled = false; /* useful for testing */
+-	u32 tiling_flags = 0;
++	u32 tiling_flags = 0, domain;
+ 	int ret;
+ 	int aligned_size, size;
+ 	int height = mode_cmd->height;
+@@ -135,12 +137,12 @@ static int amdgpufb_create_pinned_object(struct amdgpu_fbdev *rfbdev,
+ 	/* need to align pitch with crtc limits */
+ 	mode_cmd->pitches[0] = amdgpu_align_pitch(adev, mode_cmd->width, cpp,
+ 						  fb_tiled);
++	domain = amdgpu_display_framebuffer_domains(adev);
+ 
+ 	height = ALIGN(mode_cmd->height, 8);
+ 	size = mode_cmd->pitches[0] * height;
+ 	aligned_size = ALIGN(size, PAGE_SIZE);
+-	ret = amdgpu_gem_object_create(adev, aligned_size, 0,
+-				       AMDGPU_GEM_DOMAIN_VRAM,
++	ret = amdgpu_gem_object_create(adev, aligned_size, 0, domain,
+ 				       AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED |
+ 				       AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS |
+ 				       AMDGPU_GEM_CREATE_VRAM_CLEARED,
+@@ -166,7 +168,7 @@ static int amdgpufb_create_pinned_object(struct amdgpu_fbdev *rfbdev,
+ 	}
+ 
+ 
+-	ret = amdgpu_bo_pin(abo, AMDGPU_GEM_DOMAIN_VRAM, NULL);
++	ret = amdgpu_bo_pin(abo, domain, NULL);
+ 	if (ret) {
+ 		amdgpu_bo_unreserve(abo);
+ 		goto out_unref;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index bc1b789..527ca16 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -3039,11 +3039,13 @@ static int dm_plane_helper_prepare_fb(
+ {
+ 	struct amdgpu_framebuffer *afb;
+ 	struct drm_gem_object *obj;
++	struct amdgpu_device *adev;
+ 	struct amdgpu_bo *rbo;
+ 	uint64_t chroma_addr = 0;
+-	int r;
+ 	struct dm_plane_state *dm_plane_state_new, *dm_plane_state_old;
+ 	unsigned int awidth;
++	uint32_t domain;
++	int r;
+ 
+ 	dm_plane_state_old = to_dm_plane_state(plane->state);
+ 	dm_plane_state_new = to_dm_plane_state(new_state);
+@@ -3057,12 +3059,17 @@ static int dm_plane_helper_prepare_fb(
+ 
+ 	obj = afb->obj;
+ 	rbo = gem_to_amdgpu_bo(obj);
++	adev = amdgpu_ttm_adev(rbo->tbo.bdev);
+ 	r = amdgpu_bo_reserve(rbo, false);
+ 	if (unlikely(r != 0))
+ 		return r;
+ 
+-	r = amdgpu_bo_pin(rbo, AMDGPU_GEM_DOMAIN_VRAM, &afb->address);
++	if (plane->type != DRM_PLANE_TYPE_CURSOR)
++		domain = amdgpu_display_framebuffer_domains(adev);
++	else
++		domain = AMDGPU_GEM_DOMAIN_VRAM;
+ 
++	r = amdgpu_bo_pin(rbo, domain, &afb->address);
+ 
+ 	amdgpu_bo_unreserve(rbo);
+ 
+-- 
+2.7.4
+

@@ -1,0 +1,170 @@
+From e97ce472cf1a20c187606d480f4ec158fb9ce094 Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <harish.kasiviswanathan@amd.com>
+Date: Fri, 8 Dec 2017 23:08:51 -0500
+Subject: [PATCH 5822/5855] drm/amdkfd: Reorganize CRAT fetching from ACPI
+
+Reorganize and rename kfd_topology_get_crat_acpi function. In this way
+acpi_get_table(..) needs to be called only once. This will also aid in
+dGPU topology implementation.
+
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Signed-off-by: Kent Russell <kent.russell@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_crat.c     | 41 +++++++++++++++++++++++++------
+ drivers/gpu/drm/amd/amdkfd/kfd_crat.h     |  3 ++-
+ drivers/gpu/drm/amd/amdkfd/kfd_topology.c | 40 ++++++++++++++----------------
+ 3 files changed, 54 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+index f2dda60..aa754c1 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+@@ -319,17 +319,29 @@ int kfd_parse_crat_table(void *crat_image)
+ 	return 0;
+ }
+ 
+-int kfd_topology_get_crat_acpi(void *crat_image, size_t *size)
++/*
++ * kfd_create_crat_image_acpi - Allocates memory for CRAT image and
++ * copies CRAT from ACPI (if available).
++ * NOTE: Call kfd_destroy_crat_image to free CRAT image memory
++ *
++ *	@crat_image: CRAT read from ACPI. If no CRAT in ACPI then
++ *		     crat_image will be NULL
++ *	@size: [OUT] size of crat_image
++ *
++ *	Return 0 if successful else return error code
++ */
++int kfd_create_crat_image_acpi(void **crat_image, size_t *size)
+ {
+ 	struct acpi_table_header *crat_table;
+ 	acpi_status status;
++	void *pcrat_image;
+ 
+-	if (!size)
++	if (!crat_image)
+ 		return -EINVAL;
+ 
+-	/*
+-	 * Fetch the CRAT table from ACPI
+-	 */
++	*crat_image = NULL;
++
++	/* Fetch the CRAT table from ACPI */
+ 	status = acpi_get_table(CRAT_SIGNATURE, 0, &crat_table);
+ 	if (status == AE_NOT_FOUND) {
+ 		pr_warn("CRAT table not found\n");
+@@ -341,10 +353,25 @@ int kfd_topology_get_crat_acpi(void *crat_image, size_t *size)
+ 		return -EINVAL;
+ 	}
+ 
+-	if (*size >= crat_table->length && crat_image != NULL)
+-		memcpy(crat_image, crat_table, crat_table->length);
++	pcrat_image = kmalloc(crat_table->length, GFP_KERNEL);
++	if (!pcrat_image)
++		return -ENOMEM;
++
++	memcpy(pcrat_image, crat_table, crat_table->length);
+ 
++	*crat_image = pcrat_image;
+ 	*size = crat_table->length;
+ 
+ 	return 0;
+ }
++
++/*
++ * kfd_destroy_crat_image
++ *
++ *	@crat_image: [IN] - crat_image from kfd_create_crat_image_xxx(..)
++ *
++ */
++void kfd_destroy_crat_image(void *crat_image)
++{
++	kfree(crat_image);
++}
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_crat.h b/drivers/gpu/drm/amd/amdkfd/kfd_crat.h
+index 920697b..da83105 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_crat.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_crat.h
+@@ -291,7 +291,8 @@ struct cdit_header {
+ 
+ #pragma pack()
+ 
+-int kfd_topology_get_crat_acpi(void *crat_image, size_t *size);
++int kfd_create_crat_image_acpi(void **crat_image, size_t *size);
++void kfd_destroy_crat_image(void *crat_image);
+ int kfd_parse_crat_table(void *crat_image);
+ 
+ #endif /* KFD_CRAT_H_INCLUDED */
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+index b6cf785..35da4af 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+@@ -699,35 +699,31 @@ int kfd_topology_init(void)
+ 	/*
+ 	 * Get the CRAT image from the ACPI
+ 	 */
+-	ret = kfd_topology_get_crat_acpi(crat_image, &image_size);
+-	if (ret == 0 && image_size > 0) {
+-		pr_info("Found CRAT image with size=%zd\n", image_size);
+-		crat_image = kmalloc(image_size, GFP_KERNEL);
+-		if (!crat_image) {
+-			ret = -ENOMEM;
+-			pr_err("No memory for allocating CRAT image\n");
++	ret = kfd_create_crat_image_acpi(&crat_image, &image_size);
++	if (!ret) {
++		ret = kfd_parse_crat_table(crat_image);
++		if (ret)
+ 			goto err;
+-		}
+-		ret = kfd_topology_get_crat_acpi(crat_image, &image_size);
+-
+-		if (ret == 0) {
+-			down_write(&topology_lock);
+-			ret = kfd_parse_crat_table(crat_image);
+-			if (ret == 0)
+-				ret = kfd_topology_update_sysfs();
+-			up_write(&topology_lock);
+-		} else {
+-			pr_err("Couldn't get CRAT table size from ACPI\n");
+-		}
+-		kfree(crat_image);
+ 	} else if (ret == -ENODATA) {
++		/* TODO: Create fake CRAT table */
+ 		ret = 0;
++		goto err;
+ 	} else {
+ 		pr_err("Couldn't get CRAT table size from ACPI\n");
++		goto err;
+ 	}
+ 
++	down_write(&topology_lock);
++	ret = kfd_topology_update_sysfs();
++	up_write(&topology_lock);
++
++	if (!ret)
++		pr_info("Finished initializing topology\n");
++	else
++		pr_err("Failed to update topology in sysfs ret=%d\n", ret);
++
+ err:
+-	pr_info("Finished initializing topology ret=%d\n", ret);
++	kfd_destroy_crat_image(crat_image);
+ 	return ret;
+ }
+ 
+@@ -747,7 +743,7 @@ static void kfd_debug_print_topology(void)
+ 		pr_info("Node: %d\n", i);
+ 		pr_info("\tGPU assigned: %s\n", (dev->gpu ? "yes" : "no"));
+ 		pr_info("\tCPU count: %d\n", dev->node_props.cpu_cores_count);
+-		pr_info("\tSIMD count: %d", dev->node_props.simd_count);
++		pr_info("\tSIMD count: %d\n", dev->node_props.simd_count);
+ 		i++;
+ 	}
+ }
+-- 
+2.7.4
+

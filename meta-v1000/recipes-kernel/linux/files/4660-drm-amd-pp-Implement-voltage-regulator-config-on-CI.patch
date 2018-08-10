@@ -1,0 +1,127 @@
+From aaf5bcd8f2b4a9fe86ebb589b54d0df019640d9b Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Wed, 3 Jan 2018 17:05:35 +0800
+Subject: [PATCH 4660/5855] drm/amd/pp: Implement voltage regulator config on
+ CI
+
+Store the voltage regulator configuration
+so we can properly query the voltage
+
+Change-Id: Icf916cfedbc2e5ac3037ef6f4f19b9a76ee36fff
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+---
+ drivers/gpu/drm/amd/powerplay/inc/smu7.h          | 19 ++++++++++++
+ drivers/gpu/drm/amd/powerplay/inc/smu7_discrete.h |  3 +-
+ drivers/gpu/drm/amd/powerplay/smumgr/ci_smumgr.c  | 37 +++++++++++++++++++++++
+ 3 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/smu7.h b/drivers/gpu/drm/amd/powerplay/inc/smu7.h
+index 75a380a..e14072d 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/smu7.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/smu7.h
+@@ -82,6 +82,25 @@
+ #define SCRATCH_B_CURR_SAMU_INDEX_MASK  (0x7<<SCRATCH_B_CURR_SAMU_INDEX_SHIFT)
+ 
+ 
++/* Voltage Regulator Configuration */
++/* VR Config info is contained in dpmTable */
++
++#define VRCONF_VDDC_MASK         0x000000FF
++#define VRCONF_VDDC_SHIFT        0
++#define VRCONF_VDDGFX_MASK       0x0000FF00
++#define VRCONF_VDDGFX_SHIFT      8
++#define VRCONF_VDDCI_MASK        0x00FF0000
++#define VRCONF_VDDCI_SHIFT       16
++#define VRCONF_MVDD_MASK         0xFF000000
++#define VRCONF_MVDD_SHIFT        24
++
++#define VR_MERGED_WITH_VDDC      0
++#define VR_SVI2_PLANE_1          1
++#define VR_SVI2_PLANE_2          2
++#define VR_SMIO_PATTERN_1        3
++#define VR_SMIO_PATTERN_2        4
++#define VR_STATIC_VOLTAGE        5
++
+ struct SMU7_PIDController
+ {
+     uint32_t Ki;
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/smu7_discrete.h b/drivers/gpu/drm/amd/powerplay/inc/smu7_discrete.h
+index 0b0b404..ee87674 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/smu7_discrete.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/smu7_discrete.h
+@@ -316,7 +316,8 @@ struct SMU7_Discrete_DpmTable
+     uint8_t                             AcpLevelCount;
+     uint8_t                             SamuLevelCount;
+     uint8_t                             MasterDeepSleepControl;
+-    uint32_t                            Reserved[5];
++    uint32_t                            VRConfig;
++    uint32_t                            Reserved[4];
+ //    uint32_t                            SamuDefaultLevel;
+ 
+     SMU7_Discrete_GraphicsLevel         GraphicsLevel           [SMU7_MAX_LEVELS_GRAPHICS];
+diff --git a/drivers/gpu/drm/amd/powerplay/smumgr/ci_smumgr.c b/drivers/gpu/drm/amd/powerplay/smumgr/ci_smumgr.c
+index 0b4a556..03b5f10 100644
+--- a/drivers/gpu/drm/amd/powerplay/smumgr/ci_smumgr.c
++++ b/drivers/gpu/drm/amd/powerplay/smumgr/ci_smumgr.c
+@@ -1941,6 +1941,37 @@ static int ci_start_smc(struct pp_hwmgr *hwmgr)
+ 	return 0;
+ }
+ 
++static int ci_populate_vr_config(struct pp_hwmgr *hwmgr, SMU7_Discrete_DpmTable *table)
++{
++	struct smu7_hwmgr *data = (struct smu7_hwmgr *)(hwmgr->backend);
++	uint16_t config;
++
++	config = VR_SVI2_PLANE_1;
++	table->VRConfig |= (config<<VRCONF_VDDGFX_SHIFT);
++
++	if (SMU7_VOLTAGE_CONTROL_BY_SVID2 == data->voltage_control) {
++		config = VR_SVI2_PLANE_2;
++		table->VRConfig |= config;
++	} else {
++		pr_info("VDDCshould be on SVI2 controller!");
++	}
++
++	if (SMU7_VOLTAGE_CONTROL_BY_SVID2 == data->vddci_control) {
++		config = VR_SVI2_PLANE_2;
++		table->VRConfig |= (config<<VRCONF_VDDCI_SHIFT);
++	} else if (SMU7_VOLTAGE_CONTROL_BY_GPIO == data->vddci_control) {
++		config = VR_SMIO_PATTERN_1;
++		table->VRConfig |= (config<<VRCONF_VDDCI_SHIFT);
++	}
++
++	if (SMU7_VOLTAGE_CONTROL_BY_GPIO == data->mvdd_control) {
++		config = VR_SMIO_PATTERN_2;
++		table->VRConfig |= (config<<VRCONF_MVDD_SHIFT);
++	}
++
++	return 0;
++}
++
+ static int ci_init_smc_table(struct pp_hwmgr *hwmgr)
+ {
+ 	int result;
+@@ -2064,6 +2095,11 @@ static int ci_init_smc_table(struct pp_hwmgr *hwmgr)
+ 	table->PCIeBootLinkLevel = (uint8_t)data->dpm_table.pcie_speed_table.count;
+ 	table->PCIeGenInterval = 1;
+ 
++	result = ci_populate_vr_config(hwmgr, table);
++	PP_ASSERT_WITH_CODE(0 == result,
++			"Failed to populate VRConfig setting!", return result);
++	data->vr_config = table->VRConfig;
++
+ 	ci_populate_smc_svi2_config(hwmgr, table);
+ 
+ 	for (i = 0; i < SMU7_MAX_ENTRIES_SMIO; i++)
+@@ -2084,6 +2120,7 @@ static int ci_init_smc_table(struct pp_hwmgr *hwmgr)
+ 	table->AcDcGpio = SMU7_UNUSED_GPIO_PIN;
+ 
+ 	CONVERT_FROM_HOST_TO_SMC_UL(table->SystemFlags);
++	CONVERT_FROM_HOST_TO_SMC_UL(table->VRConfig);
+ 	CONVERT_FROM_HOST_TO_SMC_UL(table->SmioMaskVddcVid);
+ 	CONVERT_FROM_HOST_TO_SMC_UL(table->SmioMaskVddcPhase);
+ 	CONVERT_FROM_HOST_TO_SMC_UL(table->SmioMaskVddciVid);
+-- 
+2.7.4
+

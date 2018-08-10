@@ -1,0 +1,203 @@
+From 766b4c6f19895ccf04df80377f7726619d4bac0d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 24 Jan 2018 19:58:45 +0100
+Subject: [PATCH 4791/5855] drm/amdgpu: revert "Add support for filling a
+ buffer with 64 bit value"
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This reverts commit 7bdc53f925af085ffa0580f10489f82b36cc2f1c and commit
+330df03b3abf944f8f5180f2abc61367749984c0.
+
+Neither are needed any more.
+
+Change-Id: I71d1214263aa7aae51524b42305dac15bd3480d1
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  7 -------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 17 +++++------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c  |  5 ++---
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c   |  3 ---
+ drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c  |  3 ---
+ drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c  |  4 ----
+ drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c  |  3 ---
+ drivers/gpu/drm/amd/amdgpu/si_dma.c     |  3 ---
+ 9 files changed, 8 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 5b29aae..d19f40a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -324,13 +324,6 @@ struct amdgpu_vm_pte_funcs {
+ 	void (*write_pte)(struct amdgpu_ib *ib, uint64_t pe,
+ 			  uint64_t value, unsigned count,
+ 			  uint32_t incr);
+-
+-	/* maximum nums of PTEs/PDEs in a single operation */
+-	uint32_t	set_max_nums_pte_pde;
+-
+-	/* number of dw to reserve per operation */
+-	unsigned	set_pte_pde_num_dw;
+-
+ 	/* for linear pte/pde updates without addr mapping */
+ 	void (*set_pte_pde)(struct amdgpu_ib *ib,
+ 			    uint64_t pe,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 8e2e7be..de34d3d 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1969,13 +1969,12 @@ int amdgpu_copy_buffer(struct amdgpu_ring *ring, uint64_t src_offset,
+ }
+ 
+ int amdgpu_fill_buffer(struct amdgpu_bo *bo,
+-		       uint64_t src_data,
++		       uint32_t src_data,
+ 		       struct reservation_object *resv,
+ 		       struct fence **fence)
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+-	uint32_t max_bytes = 8 *
+-			adev->vm_manager.vm_pte_funcs->set_max_nums_pte_pde;
++	uint32_t max_bytes = adev->mman.buffer_funcs->fill_max_bytes;
+ 	struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
+ 
+ 	struct drm_mm_node *mm_node;
+@@ -2006,9 +2005,7 @@ int amdgpu_fill_buffer(struct amdgpu_bo *bo,
+ 		num_pages -= mm_node->size;
+ 		++mm_node;
+ 	}
+-
+-	/* num of dwords for each SDMA_OP_PTEPDE cmd */
+-	num_dw = num_loops * adev->vm_manager.vm_pte_funcs->set_pte_pde_num_dw;
++	num_dw = num_loops * adev->mman.buffer_funcs->fill_num_dw;
+ 
+ 	/* for IB padding */
+ 	num_dw += 64;
+@@ -2033,16 +2030,12 @@ int amdgpu_fill_buffer(struct amdgpu_bo *bo,
+ 		uint32_t byte_count = mm_node->size << PAGE_SHIFT;
+ 		uint64_t dst_addr;
+ 
+-		WARN_ONCE(byte_count & 0x7, "size should be a multiple of 8");
+-
+ 		dst_addr = amdgpu_mm_node_addr(&bo->tbo, mm_node, &bo->tbo.mem);
+ 		while (byte_count) {
+ 			uint32_t cur_size_in_bytes = min(byte_count, max_bytes);
+ 
+-			amdgpu_vm_set_pte_pde(adev, &job->ibs[0],
+-					dst_addr, 0,
+-					cur_size_in_bytes >> 3, 0,
+-					src_data);
++			amdgpu_emit_fill_buffer(adev, &job->ibs[0], src_data,
++						dst_addr, cur_size_in_bytes);
+ 
+ 			dst_addr += cur_size_in_bytes;
+ 			byte_count -= cur_size_in_bytes;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 2ec9f5a..a50ca65 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -90,7 +90,7 @@ int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
+ 			       struct reservation_object *resv,
+ 			       struct fence **f);
+ int amdgpu_fill_buffer(struct amdgpu_bo *bo,
+-			uint64_t src_data,
++			uint32_t src_data,
+ 			struct reservation_object *resv,
+ 			struct fence **fence);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index eccccb8..b6b9e16 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1243,11 +1243,10 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 
+ 	} else {
+ 		/* set page commands needed */
+-		ndw += ncmds * adev->vm_manager.vm_pte_funcs->set_pte_pde_num_dw;
++		ndw += ncmds * 10;
+ 
+ 		/* extra commands for begin/end fragments */
+-		ndw += 2 * adev->vm_manager.vm_pte_funcs->set_pte_pde_num_dw
+-				* adev->vm_manager.fragment_size;
++		ndw += 2 * 10 * adev->vm_manager.fragment_size;
+ 
+ 		params.func = amdgpu_vm_do_set_ptes;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 181bd8b..2d4327f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -1382,9 +1382,6 @@ static const struct amdgpu_vm_pte_funcs cik_sdma_vm_pte_funcs = {
+ 	.copy_pte = cik_sdma_vm_copy_pte,
+ 
+ 	.write_pte = cik_sdma_vm_write_pte,
+-
+-	.set_max_nums_pte_pde = 0x1fffff >> 3,
+-	.set_pte_pde_num_dw = 10,
+ 	.set_pte_pde = cik_sdma_vm_set_pte_pde,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+index d4f0edf..7188047 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c
+@@ -1306,9 +1306,6 @@ static const struct amdgpu_vm_pte_funcs sdma_v2_4_vm_pte_funcs = {
+ 	.copy_pte = sdma_v2_4_vm_copy_pte,
+ 
+ 	.write_pte = sdma_v2_4_vm_write_pte,
+-
+-	.set_max_nums_pte_pde = 0x1fffff >> 3,
+-	.set_pte_pde_num_dw = 10,
+ 	.set_pte_pde = sdma_v2_4_vm_set_pte_pde,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+index d73d12e..492ce0b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c
+@@ -1739,10 +1739,6 @@ static const struct amdgpu_vm_pte_funcs sdma_v3_0_vm_pte_funcs = {
+ 	.copy_pte = sdma_v3_0_vm_copy_pte,
+ 
+ 	.write_pte = sdma_v3_0_vm_write_pte,
+-
+-	/* not 0x3fffff due to HW limitation */
+-	.set_max_nums_pte_pde = 0x3fffe0 >> 3,
+-	.set_pte_pde_num_dw = 10,
+ 	.set_pte_pde = sdma_v3_0_vm_set_pte_pde,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+index fd410f5..aa7d8f3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+@@ -1687,9 +1687,6 @@ static const struct amdgpu_vm_pte_funcs sdma_v4_0_vm_pte_funcs = {
+ 	.copy_pte = sdma_v4_0_vm_copy_pte,
+ 
+ 	.write_pte = sdma_v4_0_vm_write_pte,
+-
+-	.set_max_nums_pte_pde = 0x400000 >> 3,
+-	.set_pte_pde_num_dw = 10,
+ 	.set_pte_pde = sdma_v4_0_vm_set_pte_pde,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/si_dma.c b/drivers/gpu/drm/amd/amdgpu/si_dma.c
+index e3d8a4a..6f8e9f8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/si_dma.c
++++ b/drivers/gpu/drm/amd/amdgpu/si_dma.c
+@@ -875,9 +875,6 @@ static const struct amdgpu_vm_pte_funcs si_dma_vm_pte_funcs = {
+ 	.copy_pte = si_dma_vm_copy_pte,
+ 
+ 	.write_pte = si_dma_vm_write_pte,
+-
+-	.set_max_nums_pte_pde = 0xffff8 >> 3,
+-	.set_pte_pde_num_dw = 9,
+ 	.set_pte_pde = si_dma_vm_set_pte_pde,
+ };
+ 
+-- 
+2.7.4
+

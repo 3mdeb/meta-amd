@@ -1,0 +1,206 @@
+From cbbe04ae1a1d93c8151cdd73c68a038860d3c175 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Wed, 7 Sep 2016 18:06:52 -0400
+Subject: [PATCH 5272/5855] drm/amdkfd: Fix IB freeing without DIQ
+ synchronization
+
+When DIQ IBs are submitted without synchronization, it's not safe
+to release the IB memory. Avoid the need to explicitly free the IB
+by allocating it inline in the ring buffer, packaged inside a NOP
+packet.
+
+Change-Id: Ife4d527fbcca369bdb45d5a09b1ae72da3231045
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c       | 25 ++++++++-----------
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c | 36 ++++++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.h | 10 ++++++++
+ 3 files changed, 55 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c b/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
+index 74109d0..9de73ce 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
+@@ -373,8 +373,8 @@ static int dbgdev_address_watch_diq(struct kfd_dbgdev *dbgdev,
+ 	/* we do not control the vmid in DIQ mode, just a place holder */
+ 	unsigned int vmid = 0;
+ 
+-	struct kfd_mem_obj *mem_obj;
+ 	uint32_t *packet_buff_uint = NULL;
++	uint64_t packet_buff_gpu_addr = 0;
+ 
+ 	struct pm4__set_config_reg *packets_vec = NULL;
+ 
+@@ -398,13 +398,13 @@ static int dbgdev_address_watch_diq(struct kfd_dbgdev *dbgdev,
+ 			break;
+ 		}
+ 
+-		status = kfd_gtt_sa_allocate(dbgdev->dev, ib_size, &mem_obj);
++		status = dbgdev->kq->ops.acquire_inline_ib(dbgdev->kq,
++				ib_size/sizeof(uint32_t),
++				&packet_buff_uint, &packet_buff_gpu_addr);
+ 
+ 		if (status != 0)
+ 			break;
+ 
+-		packet_buff_uint = mem_obj->cpu_ptr;
+-
+ 		memset(packet_buff_uint, 0, ib_size);
+ 
+ 		packets_vec = (struct pm4__set_config_reg *) (packet_buff_uint);
+@@ -499,7 +499,7 @@ static int dbgdev_address_watch_diq(struct kfd_dbgdev *dbgdev,
+ 			status = dbgdev_diq_submit_ib(
+ 						dbgdev,
+ 						adw_info->process->pasid,
+-						mem_obj->gpu_addr,
++						packet_buff_gpu_addr,
+ 						packet_buff_uint,
+ 						ib_size, true);
+ 
+@@ -511,8 +511,6 @@ static int dbgdev_address_watch_diq(struct kfd_dbgdev *dbgdev,
+ 		}
+ 
+ 	} while (false);
+-	if (packet_buff_uint != NULL)
+-		kfd_gtt_sa_free(dbgdev->dev, mem_obj);
+ 
+ 	return status;
+ 
+@@ -632,8 +630,8 @@ static int dbgdev_wave_control_diq(struct kfd_dbgdev *dbgdev,
+ 	int status = 0;
+ 	union SQ_CMD_BITS reg_sq_cmd;
+ 	union GRBM_GFX_INDEX_BITS reg_gfx_index;
+-	struct kfd_mem_obj *mem_obj;
+ 	uint32_t *packet_buff_uint = NULL;
++	uint64_t packet_buff_gpu_addr = 0;
+ 	struct pm4__set_config_reg *packets_vec = NULL;
+ 	size_t ib_size = sizeof(struct pm4__set_config_reg) * 3;
+ 
+@@ -674,13 +672,13 @@ static int dbgdev_wave_control_diq(struct kfd_dbgdev *dbgdev,
+ 
+ 		pr_debug("\t\t %30s\n", "* * * * * * * * * * * * * * * * * *");
+ 
+-		status = kfd_gtt_sa_allocate(dbgdev->dev, ib_size, &mem_obj);
++		status = dbgdev->kq->ops.acquire_inline_ib(dbgdev->kq,
++				ib_size / sizeof(uint32_t),
++				&packet_buff_uint, &packet_buff_gpu_addr);
+ 
+ 		if (status != 0)
+ 			break;
+ 
+-		packet_buff_uint = mem_obj->cpu_ptr;
+-
+ 		memset(packet_buff_uint, 0, ib_size);
+ 
+ 		packets_vec =  (struct pm4__set_config_reg *) packet_buff_uint;
+@@ -715,7 +713,7 @@ static int dbgdev_wave_control_diq(struct kfd_dbgdev *dbgdev,
+ 		status = dbgdev_diq_submit_ib(
+ 				dbgdev,
+ 				wac_info->process->pasid,
+-				mem_obj->gpu_addr,
++				packet_buff_gpu_addr,
+ 				packet_buff_uint,
+ 				ib_size, false);
+ 
+@@ -724,9 +722,6 @@ static int dbgdev_wave_control_diq(struct kfd_dbgdev *dbgdev,
+ 
+ 	} while (false);
+ 
+-	if (packet_buff_uint != NULL)
+-		kfd_gtt_sa_free(dbgdev->dev, mem_obj);
+-
+ 	return status;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+index 9eaa040..162a83f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+@@ -219,7 +219,7 @@ static int acquire_packet_buffer(struct kernel_queue *kq,
+ 	 * the opposite. So we can only use up to queue_size_dwords - 1 dwords.
+ 	 */
+ 	rptr = *kq->rptr_kernel;
+-	wptr = *kq->wptr_kernel;
++	wptr = kq->pending_wptr;
+ 	queue_address = (unsigned int *)kq->pq_kernel_addr;
+ 	queue_size_dwords = kq->queue->properties.queue_size / sizeof(uint32_t);
+ 
+@@ -258,6 +258,39 @@ static int acquire_packet_buffer(struct kernel_queue *kq,
+ 	return 0;
+ }
+ 
++static int acquire_inline_ib(struct kernel_queue *kq,
++			     size_t size_in_dwords,
++			     unsigned int **buffer_ptr,
++			     uint64_t *gpu_addr)
++{
++	int ret;
++	unsigned int *buf;
++	union PM4_MES_TYPE_3_HEADER nop;
++
++	if (size_in_dwords >= (1 << 14))
++		return -EINVAL;
++
++	/* Allocate size_in_dwords on the ring, plus an extra dword
++	 * for a NOP packet header
++	 */
++	ret = acquire_packet_buffer(kq, size_in_dwords + 1,  &buf);
++	if (ret)
++		return ret;
++
++	/* Build a NOP packet that contains the IB as "payload". */
++	nop.u32all = 0;
++	nop.opcode = IT_NOP;
++	nop.count = size_in_dwords - 1;
++	nop.type = PM4_TYPE_3;
++
++	*buf = nop.u32all;
++	*buffer_ptr = buf + 1;
++	*gpu_addr = kq->pq_gpu_addr + ((unsigned long)*buffer_ptr -
++				       (unsigned long)kq->pq_kernel_addr);
++
++	return 0;
++}
++
+ static void submit_packet(struct kernel_queue *kq)
+ {
+ #ifdef DEBUG
+@@ -300,6 +333,7 @@ struct kernel_queue *kernel_queue_init(struct kfd_dev *dev,
+ 	kq->ops.initialize = initialize;
+ 	kq->ops.uninitialize = uninitialize;
+ 	kq->ops.acquire_packet_buffer = acquire_packet_buffer;
++	kq->ops.acquire_inline_ib = acquire_inline_ib;
+ 	kq->ops.submit_packet = submit_packet;
+ 	kq->ops.rollback_packet = rollback_packet;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.h b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.h
+index 5940531..a217f42 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.h
+@@ -42,6 +42,12 @@
+  * pending write pointer to that location so subsequent calls to
+  * acquire_packet_buffer will get a correct write pointer
+  *
++ * @acquire_inline_ib: Returns a pointer to the location in the kernel
++ * queue ring buffer where the calling function can write an inline IB. It is
++ * Guaranteed that there is enough space for that IB. It also updates the
++ * pending write pointer to that location so subsequent calls to
++ * acquire_packet_buffer will get a correct write pointer
++ *
+  * @submit_packet: Update the write pointer and doorbell of a kernel queue.
+  *
+  * @sync_with_hw: Wait until the write pointer and the read pointer of a kernel
+@@ -59,6 +65,10 @@ struct kernel_queue_ops {
+ 	int	(*acquire_packet_buffer)(struct kernel_queue *kq,
+ 					size_t packet_size_in_dwords,
+ 					unsigned int **buffer_ptr);
++	int	(*acquire_inline_ib)(struct kernel_queue *kq,
++				     size_t packet_size_in_dwords,
++				     unsigned int **buffer_ptr,
++				     uint64_t *gpu_addr);
+ 
+ 	void	(*submit_packet)(struct kernel_queue *kq);
+ 	void	(*rollback_packet)(struct kernel_queue *kq);
+-- 
+2.7.4
+

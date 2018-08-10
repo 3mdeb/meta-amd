@@ -1,0 +1,222 @@
+From 0d7b89c0f9bc8b62b6ccbf4ee43dfb909d766877 Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Mon, 25 Sep 2017 20:46:37 +0800
+Subject: [PATCH 3582/5855] drm/amdgpu: create powerplay by cgs interface
+
+Change-Id: I9bb59de415bda44eccfa1b52c936b5494274b11c
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c     | 30 +-------
+ drivers/gpu/drm/amd/powerplay/amd_powerplay.c     | 84 +++++++++++++----------
+ drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h |  5 --
+ 3 files changed, 51 insertions(+), 68 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
+index eb88665..1649b1e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
+@@ -34,24 +34,6 @@
+ #include "cik_dpm.h"
+ #include "vi_dpm.h"
+ 
+-static int amdgpu_create_pp_handle(struct amdgpu_device *adev)
+-{
+-	struct amd_pp_init pp_init;
+-	struct amd_powerplay *amd_pp;
+-	int ret;
+-
+-	amd_pp = &(adev->powerplay);
+-	pp_init.chip_family = adev->family;
+-	pp_init.chip_id = adev->asic_type;
+-	pp_init.pm_en = (amdgpu_dpm != 0 && !amdgpu_sriov_vf(adev)) ? true : false;
+-	pp_init.feature_mask = amdgpu_pp_feature_mask;
+-	pp_init.device = amd_pp->cgs_device;
+-	ret = amd_powerplay_create(&pp_init, &(amd_pp->pp_handle));
+-	if (ret)
+-		return -EINVAL;
+-	return 0;
+-}
+-
+ static int amdgpu_pp_early_init(void *handle)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+@@ -73,8 +55,6 @@ static int amdgpu_pp_early_init(void *handle)
+ 	case CHIP_VEGA10:
+ 	case CHIP_RAVEN:
+ 		amd_pp->cgs_device = amdgpu_cgs_create_device(adev);
+-		if (amdgpu_create_pp_handle(adev))
+-			return -EINVAL;
+ 		amd_pp->ip_funcs = &pp_ip_funcs;
+ 		amd_pp->pp_funcs = &pp_dpm_funcs;
+ 		break;
+@@ -97,8 +77,6 @@ static int amdgpu_pp_early_init(void *handle)
+ 			amd_pp->pp_funcs = &ci_dpm_funcs;
+ 		} else {
+ 			amd_pp->cgs_device = amdgpu_cgs_create_device(adev);
+-			if (amdgpu_create_pp_handle(adev))
+-				return -EINVAL;
+ 			amd_pp->ip_funcs = &pp_ip_funcs;
+ 			amd_pp->pp_funcs = &pp_dpm_funcs;
+ 		}
+@@ -117,7 +95,8 @@ static int amdgpu_pp_early_init(void *handle)
+ 
+ 	if (adev->powerplay.ip_funcs->early_init)
+ 		ret = adev->powerplay.ip_funcs->early_init(
+-					adev->powerplay.pp_handle);
++					amd_pp->cgs_device ? amd_pp->cgs_device :
++					amd_pp->pp_handle);
+ 
+ 	if (ret == PP_DPM_DISABLED) {
+ 		adev->pm.dpm_enabled = false;
+@@ -206,11 +185,8 @@ static void amdgpu_pp_late_fini(void *handle)
+ 		adev->powerplay.ip_funcs->late_fini(
+ 			  adev->powerplay.pp_handle);
+ 
+-
+-	if (adev->powerplay.cgs_device) {
+-		amd_powerplay_destroy(adev->powerplay.pp_handle);
++	if (adev->powerplay.cgs_device)
+ 		amdgpu_cgs_destroy_device(adev->powerplay.cgs_device);
+-	}
+ }
+ 
+ static int amdgpu_pp_suspend(void *handle)
+diff --git a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+index a52dac0..3ffbe2a 100644
+--- a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
++++ b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+@@ -50,10 +50,50 @@ static inline int pp_check(struct pp_instance *handle)
+ 	return 0;
+ }
+ 
++static int amd_powerplay_create(struct amd_pp_init *pp_init,
++				void **handle)
++{
++	struct pp_instance *instance;
++
++	if (pp_init == NULL || handle == NULL)
++		return -EINVAL;
++
++	instance = kzalloc(sizeof(struct pp_instance), GFP_KERNEL);
++	if (instance == NULL)
++		return -ENOMEM;
++
++	instance->pp_valid = PP_VALID;
++	instance->chip_family = pp_init->chip_family;
++	instance->chip_id = pp_init->chip_id;
++	instance->pm_en = pp_init->pm_en;
++	instance->feature_mask = pp_init->feature_mask;
++	instance->device = pp_init->device;
++	mutex_init(&instance->pp_lock);
++	*handle = instance;
++	return 0;
++}
++
++static int amd_powerplay_destroy(void *handle)
++{
++	struct pp_instance *instance = (struct pp_instance *)handle;
++
++	kfree(instance->hwmgr);
++	instance->hwmgr = NULL;
++
++	kfree(instance);
++	instance = NULL;
++	return 0;
++}
++
+ static int pp_early_init(void *handle)
+ {
+ 	int ret;
+-	struct pp_instance *pp_handle = (struct pp_instance *)handle;
++	struct pp_instance *pp_handle = NULL;
++
++	pp_handle = cgs_register_pp_handle(handle, amd_powerplay_create);
++
++	if (!pp_handle)
++		return -EINVAL;
+ 
+ 	ret = hwmgr_early_init(pp_handle);
+ 	if (ret)
+@@ -162,6 +202,12 @@ static int pp_late_init(void *handle)
+ 	return 0;
+ }
+ 
++static void pp_late_fini(void *handle)
++{
++	amd_powerplay_destroy(handle);
++}
++
++
+ static bool pp_is_idle(void *handle)
+ {
+ 	return false;
+@@ -275,6 +321,7 @@ const struct amd_ip_funcs pp_ip_funcs = {
+ 	.sw_fini = pp_sw_fini,
+ 	.hw_init = pp_hw_init,
+ 	.hw_fini = pp_hw_fini,
++	.late_fini = pp_late_fini,
+ 	.suspend = pp_suspend,
+ 	.resume = pp_resume,
+ 	.is_idle = pp_is_idle,
+@@ -1138,41 +1185,6 @@ const struct amd_pm_funcs pp_dpm_funcs = {
+ 	.switch_power_profile = pp_dpm_switch_power_profile,
+ };
+ 
+-int amd_powerplay_create(struct amd_pp_init *pp_init,
+-				void **handle)
+-{
+-	struct pp_instance *instance;
+-
+-	if (pp_init == NULL || handle == NULL)
+-		return -EINVAL;
+-
+-	instance = kzalloc(sizeof(struct pp_instance), GFP_KERNEL);
+-	if (instance == NULL)
+-		return -ENOMEM;
+-
+-	instance->pp_valid = PP_VALID;
+-	instance->chip_family = pp_init->chip_family;
+-	instance->chip_id = pp_init->chip_id;
+-	instance->pm_en = pp_init->pm_en;
+-	instance->feature_mask = pp_init->feature_mask;
+-	instance->device = pp_init->device;
+-	mutex_init(&instance->pp_lock);
+-	*handle = instance;
+-	return 0;
+-}
+-
+-int amd_powerplay_destroy(void *handle)
+-{
+-	struct pp_instance *instance = (struct pp_instance *)handle;
+-
+-	kfree(instance->hwmgr);
+-	instance->hwmgr = NULL;
+-
+-	kfree(instance);
+-	instance = NULL;
+-	return 0;
+-}
+-
+ int amd_powerplay_reset(void *handle)
+ {
+ 	struct pp_instance *instance = (struct pp_instance *)handle;
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+index 437d785..916b6c4 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+@@ -274,11 +274,6 @@ struct amd_powerplay {
+ 	const struct amd_pm_funcs *pp_funcs;
+ };
+ 
+-int amd_powerplay_create(struct amd_pp_init *pp_init,
+-				void **handle);
+-
+-int amd_powerplay_destroy(void *handle);
+-
+ int amd_powerplay_reset(void *handle);
+ 
+ int amd_powerplay_display_configuration_change(void *handle,
+-- 
+2.7.4
+

@@ -1,0 +1,233 @@
+From 745afc4f7c51a2cc5f396a76441deae5cfefdf75 Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Tue, 16 Jan 2018 18:35:15 +0800
+Subject: [PATCH 4715/5855] drm/amd/pp: Add edit/commit/show OD clock/voltage
+ support in sysfs
+
+when cat pp_od_clk_voltage it show
+OD_SCLK:
+0:        300Mhz        800 mV
+1:        466Mhz        818 mV
+2:        751Mhz        824 mV
+3:       1019Mhz        987 mV
+4:       1074Mhz       1037 mV
+5:       1126Mhz       1087 mV
+6:       1169Mhz       1137 mV
+7:       1206Mhz       1150 mV
+OD_MCLK:
+0:        300Mhz        800 mV
+1:       1650Mhz       1000 mV
+
+echo "s/m level clock voltage" to change
+sclk/mclk's  clock and voltage
+
+echo "r" to restore default value.
+echo "c" to commit the user setting.
+
+Change-Id: I4b45c09ff376caa53c1bf8333cf63f35b2839016
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_dpm.h        |  4 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c         | 98 +++++++++++++++++++++++++-
+ drivers/gpu/drm/amd/include/kgd_pp_interface.h |  1 +
+ drivers/gpu/drm/amd/powerplay/amd_powerplay.c  | 19 +++++
+ 4 files changed, 121 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_dpm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_dpm.h
+index 986f1d5..4b5755e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dpm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dpm.h
+@@ -374,6 +374,10 @@ enum amdgpu_pcie_gen {
+ 		((adev)->powerplay.pp_funcs->set_power_profile_mode(\
+ 			(adev)->powerplay.pp_handle, parameter, size))
+ 
++#define amdgpu_dpm_odn_edit_dpm_table(adev, type, parameter, size) \
++		((adev)->powerplay.pp_funcs->odn_edit_dpm_table(\
++			(adev)->powerplay.pp_handle, type, parameter, size))
++
+ struct amdgpu_dpm {
+ 	struct amdgpu_ps        *ps;
+ 	/* number of valid power states */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
+index a869d6b..af2b690 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
+@@ -358,6 +358,90 @@ static ssize_t amdgpu_set_pp_table(struct device *dev,
+ 	return count;
+ }
+ 
++static ssize_t amdgpu_set_pp_od_clk_voltage(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf,
++		size_t count)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	int ret;
++	uint32_t parameter_size = 0;
++	long parameter[64];
++	char buf_cpy[128];
++	char *tmp_str;
++	char *sub_str;
++	const char delimiter[3] = {' ', '\n', '\0'};
++	uint32_t type;
++
++	if (count > 127)
++		return -EINVAL;
++
++	if (*buf == 's')
++		type = PP_OD_EDIT_SCLK_VDDC_TABLE;
++	else if (*buf == 'm')
++		type = PP_OD_EDIT_MCLK_VDDC_TABLE;
++	else if(*buf == 'r')
++		type = PP_OD_RESTORE_DEFAULT_TABLE;
++	else if (*buf == 'c')
++		type = PP_OD_COMMIT_DPM_TABLE;
++	else
++		return -EINVAL;
++
++	memcpy(buf_cpy, buf, count+1);
++
++	tmp_str = buf_cpy;
++
++	while (isspace(*++tmp_str));
++
++	while (tmp_str[0]) {
++		sub_str = strsep(&tmp_str, delimiter);
++		ret = kstrtol(sub_str, 0, &parameter[parameter_size]);
++		if (ret)
++			return -EINVAL;
++		parameter_size++;
++
++		while (isspace(*tmp_str))
++			tmp_str++;
++	}
++
++	if (adev->powerplay.pp_funcs->odn_edit_dpm_table)
++		ret = amdgpu_dpm_odn_edit_dpm_table(adev, type,
++						parameter, parameter_size);
++
++	if (ret)
++		return -EINVAL;
++
++	if (type == PP_OD_COMMIT_DPM_TABLE) {
++		if (adev->powerplay.pp_funcs->dispatch_tasks) {
++			amdgpu_dpm_dispatch_task(adev, AMD_PP_TASK_READJUST_POWER_STATE, NULL);
++			return count;
++		} else {
++			return -EINVAL;
++		}
++	}
++
++	return count;
++}
++
++static ssize_t amdgpu_get_pp_od_clk_voltage(struct device *dev,
++		struct device_attribute *attr,
++		char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	uint32_t size = 0;
++
++	if (adev->powerplay.pp_funcs->print_clock_levels) {
++		size = amdgpu_dpm_print_clock_levels(adev, OD_SCLK, buf);
++		size += amdgpu_dpm_print_clock_levels(adev, OD_MCLK, buf+size);
++		return size;
++	} else {
++		return snprintf(buf, PAGE_SIZE, "\n");
++	}
++
++}
++
+ static ssize_t amdgpu_get_pp_dpm_sclk(struct device *dev,
+ 		struct device_attribute *attr,
+ 		char *buf)
+@@ -840,6 +924,10 @@ static DEVICE_ATTR(pp_compute_power_profile, S_IRUGO | S_IWUSR,
+ static DEVICE_ATTR(pp_power_profile_mode, S_IRUGO | S_IWUSR,
+ 		amdgpu_get_pp_power_profile_mode,
+ 		amdgpu_set_pp_power_profile_mode);
++static DEVICE_ATTR(pp_od_clk_voltage, S_IRUGO | S_IWUSR,
++		amdgpu_get_pp_od_clk_voltage,
++		amdgpu_set_pp_od_clk_voltage);
++
+ static ssize_t amdgpu_hwmon_show_temp(struct device *dev,
+ 				      struct device_attribute *attr,
+ 				      char *buf)
+@@ -1478,7 +1566,13 @@ int amdgpu_pm_sysfs_init(struct amdgpu_device *adev)
+ 				"pp_power_profile_mode\n");
+ 		return ret;
+ 	}
+-
++	ret = device_create_file(adev->dev,
++			&dev_attr_pp_od_clk_voltage);
++	if (ret) {
++		DRM_ERROR("failed to create device file	"
++				"pp_od_clk_voltage\n");
++		return ret;
++	}
+ 	ret = amdgpu_debugfs_pm_init(adev);
+ 	if (ret) {
+ 		DRM_ERROR("Failed to register debugfs file for dpm!\n");
+@@ -1516,6 +1610,8 @@ void amdgpu_pm_sysfs_fini(struct amdgpu_device *adev)
+ 			&dev_attr_pp_compute_power_profile);
+ 	device_remove_file(adev->dev,
+ 			&dev_attr_pp_power_profile_mode);
++	device_remove_file(adev->dev,
++			&dev_attr_pp_od_clk_voltage);
+ }
+ 
+ void amdgpu_pm_compute_clocks(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/include/kgd_pp_interface.h b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+index e35dcd0..b9aa9f4 100644
+--- a/drivers/gpu/drm/amd/include/kgd_pp_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+@@ -310,6 +310,7 @@ struct amd_pm_funcs {
+ 		struct amd_pp_simple_clock_info *clocks);
+ 	int (*get_power_profile_mode)(void *handle, char *buf);
+ 	int (*set_power_profile_mode)(void *handle, long *input, uint32_t size);
++	int (*odn_edit_dpm_table)(void *handle, uint32_t type, long *input, uint32_t size);
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+index 30beee5..1c6c8ec 100644
+--- a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
++++ b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+@@ -1122,6 +1122,24 @@ static int pp_set_power_profile_mode(void *handle, long *input, uint32_t size)
+ 	return hwmgr->hwmgr_func->set_power_profile_mode(hwmgr, input, size);
+ }
+ 
++static int pp_odn_edit_dpm_table(void *handle, uint32_t type, long *input, uint32_t size)
++{
++	struct pp_hwmgr *hwmgr;
++	struct pp_instance *pp_handle = (struct pp_instance *)handle;
++
++	if (pp_check(pp_handle))
++		return -EINVAL;
++
++	hwmgr = pp_handle->hwmgr;
++
++	if (hwmgr->hwmgr_func->odn_edit_dpm_table == NULL) {
++		pr_info("%s was not implemented.\n", __func__);
++		return -EINVAL;
++	}
++
++	return hwmgr->hwmgr_func->odn_edit_dpm_table(hwmgr, type, input, size);
++}
++
+ static int pp_dpm_set_power_profile_state(void *handle,
+ 		struct amd_pp_profile *request)
+ {
+@@ -1513,6 +1531,7 @@ const struct amd_pm_funcs pp_dpm_funcs = {
+         .notify_smu_memory_info = pp_dpm_notify_smu_memory_info,
+ 	.get_power_profile_mode = pp_get_power_profile_mode,
+ 	.set_power_profile_mode = pp_set_power_profile_mode,
++	.odn_edit_dpm_table = pp_odn_edit_dpm_table,
+ /* export to DC */
+         .get_sclk = pp_dpm_get_sclk,
+         .get_mclk = pp_dpm_get_mclk,
+-- 
+2.7.4
+

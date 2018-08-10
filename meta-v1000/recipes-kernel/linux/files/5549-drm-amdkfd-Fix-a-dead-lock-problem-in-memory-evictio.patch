@@ -1,0 +1,72 @@
+From af2b20ad804ed9e85fbf91a19b4d446f610d756a Mon Sep 17 00:00:00 2001
+From: Yong Zhao <yong.zhao@amd.com>
+Date: Mon, 19 Dec 2016 16:23:32 -0500
+Subject: [PATCH 5549/5855] drm/amdkfd: Fix a dead lock problem in memory
+ eviction
+
+In kfd_restore_bo_worker(), we should not call
+kfd_schedule_restore_bos_and_queues(), which in turn call
+cancel_delayed_work_sync(), because a workqueue thread can not call
+cancel_delayed_work_sync() to cancel itself.
+
+Change-Id: I703cda5b27b2f2f7375b12fdbd910e54bd01546c
+Signed-off-by: Yong Zhao <yong.zhao@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c | 27 ++++++---------------------
+ 1 file changed, 6 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index ff71d34..f850a51 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -759,25 +759,6 @@ static int resume_process_mm(struct kfd_process *p)
+ 	return ret;
+ }
+ 
+-/** kfd_schedule_restore_bos_and_queues - Schedules work queue that will
+- *   restore all BOs that belong to given process and then restore its queues
+- *
+- * @mm: mm_struct that identifies the KFD process
+- *
+- */
+-static int kfd_schedule_restore_bos_and_queues(struct kfd_process *p)
+-{
+-	if (delayed_work_pending(&p->restore_work)) {
+-		WARN(1, "Trying to evict an unrestored process\n");
+-		cancel_delayed_work_sync(&p->restore_work);
+-	}
+-
+-	/* During process initialization restore_work is initialized
+-	 * to kfd_restore_bo_worker
+-	 */
+-	schedule_delayed_work(&p->restore_work, PROCESS_RESTORE_TIME_MS);
+-	return 0;
+-}
+ 
+ void kfd_restore_bo_worker(struct work_struct *work)
+ {
+@@ -806,7 +787,10 @@ void kfd_restore_bo_worker(struct work_struct *work)
+ 
+ 	ret = pdd->dev->kfd2kgd->restore_process_bos(p->process_info);
+ 	if (ret) {
+-		kfd_schedule_restore_bos_and_queues(p);
++		pr_info("restore_process_bos() failed, try again after 1 sec\n");
++		ret = schedule_delayed_work(&p->restore_work,
++				PROCESS_BACK_OFF_TIME_MS);
++		WARN(!ret, "reschedule restore work failed\n");
+ 		return;
+ 	}
+ 
+@@ -887,7 +871,8 @@ void kfd_evict_bo_worker(struct work_struct *work)
+ 	ret = quiesce_process_mm(p);
+ 	if (!ret) {
+ 		fence_signal(eviction_work->eviction_fence);
+-		kfd_schedule_restore_bos_and_queues(p);
++		schedule_delayed_work(&p->restore_work,
++					PROCESS_RESTORE_TIME_MS);
+ 	} else
+ 		pr_err("Failed to quiesce user queues. Cannot evict BOs\n");
+ 
+-- 
+2.7.4
+

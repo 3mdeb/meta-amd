@@ -1,0 +1,194 @@
+From be7a20e322f6ee4483869079af2a56b901f2e74c Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Date: Tue, 24 Oct 2017 13:30:16 -0400
+Subject: [PATCH 3733/5855] drm/amdgpu: Remove job->s_entity to avoid keeping
+ reference to stale pointer.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c          |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c         |  7 ++++---
+ drivers/gpu/drm/amd/scheduler/gpu_sched_trace.h |  9 ++++-----
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c   | 19 +++++++++----------
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h   |  7 ++++---
+ 5 files changed, 22 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 65569ae..773e812 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -1183,7 +1183,7 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ 	amdgpu_ring_priority_get(job->ring, job->base.s_priority);
+ 
+ 	trace_amdgpu_cs_ioctl(job);
+-	amd_sched_entity_push_job(&job->base);
++	amd_sched_entity_push_job(&job->base, entity);
+ 
+ 	ttm_eu_fence_buffer_objects(&p->ticket, &p->validated, p->fence);
+ 	amdgpu_mn_unlock(p->mn);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index 6a6a58a..5fdc873 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -142,12 +142,13 @@ int amdgpu_job_submit(struct amdgpu_job *job, struct amdgpu_ring *ring,
+ 	*f = fence_get(&job->base.s_fence->finished);
+ 	amdgpu_job_free_resources(job);
+ 	amdgpu_ring_priority_get(job->ring, job->base.s_priority);
+-	amd_sched_entity_push_job(&job->base);
++	amd_sched_entity_push_job(&job->base, entity);
+ 
+ 	return 0;
+ }
+ 
+-static struct fence *amdgpu_job_dependency(struct amd_sched_job *sched_job)
++static struct fence *amdgpu_job_dependency(struct amd_sched_job *sched_job,
++					  struct amd_sched_entity *s_entity)
+ {
+ 	struct amdgpu_job *job = to_amdgpu_job(sched_job);
+ 	struct amdgpu_vm *vm = job->vm;
+@@ -155,7 +156,7 @@ static struct fence *amdgpu_job_dependency(struct amd_sched_job *sched_job)
+ 	struct fence *fence = amdgpu_sync_get_fence(&job->dep_sync);
+ 	int r;
+ 
+-	if (amd_sched_dependency_optimized(fence, sched_job->s_entity)) {
++	if (amd_sched_dependency_optimized(fence, s_entity)) {
+ 		r = amdgpu_sync_fence(job->adev, &job->sched_sync, fence);
+ 		if (r)
+ 			DRM_ERROR("Error adding fence to sync (%d)\n", r);
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_sched_trace.h b/drivers/gpu/drm/amd/scheduler/gpu_sched_trace.h
+index 72e72f5..fa3c13f 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_sched_trace.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_sched_trace.h
+@@ -12,8 +12,8 @@
+ #define TRACE_INCLUDE_FILE gpu_sched_trace
+ 
+ TRACE_EVENT(amd_sched_job,
+-	    TP_PROTO(struct amd_sched_job *sched_job),
+-	    TP_ARGS(sched_job),
++	    TP_PROTO(struct amd_sched_job *sched_job, struct amd_sched_entity *entity),
++	    TP_ARGS(sched_job, entity),
+ 	    TP_STRUCT__entry(
+ 			     __field(struct amd_sched_entity *, entity)
+ 			     __field(struct fence *, fence)
+@@ -24,12 +24,11 @@ TRACE_EVENT(amd_sched_job,
+ 			     ),
+ 
+ 	    TP_fast_assign(
+-			   __entry->entity = sched_job->s_entity;
++			   __entry->entity = entity;
+ 			   __entry->id = sched_job->id;
+ 			   __entry->fence = &sched_job->s_fence->finished;
+ 			   __entry->name = sched_job->sched->name;
+-			   __entry->job_count = spsc_queue_count(
+-				   &sched_job->s_entity->job_queue);
++			   __entry->job_count = spsc_queue_count(&entity->job_queue);
+ 			   __entry->hw_job_count = atomic_read(
+ 				   &sched_job->sched->hw_rq_count);
+ 			   ),
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index 4be569d..56789b5 100755
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -340,11 +340,10 @@ amd_sched_entity_pop_job(struct amd_sched_entity *entity)
+ 	if (!sched_job)
+ 		return NULL;
+ 
+-	while ((entity->dependency = sched->ops->dependency(sched_job)))
++	while ((entity->dependency = sched->ops->dependency(sched_job, entity)))
+ 		if (amd_sched_entity_add_dependency_cb(entity))
+ 			return NULL;
+ 
+-	sched_job->s_entity = NULL;
+ 	spsc_queue_pop(&entity->job_queue);
+ 	return sched_job;
+ }
+@@ -356,13 +355,13 @@ amd_sched_entity_pop_job(struct amd_sched_entity *entity)
+  *
+  * Returns 0 for success, negative error code otherwise.
+  */
+-void amd_sched_entity_push_job(struct amd_sched_job *sched_job)
++void amd_sched_entity_push_job(struct amd_sched_job *sched_job,
++			       struct amd_sched_entity *entity)
+ {
+ 	struct amd_gpu_scheduler *sched = sched_job->sched;
+-	struct amd_sched_entity *entity = sched_job->s_entity;
+ 	bool first = false;
+ 
+-	trace_amd_sched_job(sched_job);
++	trace_amd_sched_job(sched_job, entity);
+ 
+ 	spin_lock(&entity->queue_lock);
+ 	first = spsc_queue_push(&entity->job_queue, &sched_job->queue_node);
+@@ -440,11 +439,12 @@ static void amd_sched_job_timedout(struct work_struct *work)
+ 	job->sched->ops->timedout_job(job);
+ }
+ 
+-static void amd_sched_set_guilty(struct amd_sched_job *s_job)
++static void amd_sched_set_guilty(struct amd_sched_job *s_job,
++				 struct amd_sched_entity *s_entity)
+ {
+ 	if (atomic_inc_return(&s_job->karma) > s_job->sched->hang_limit)
+-		if (s_job->s_entity->guilty)
+-			atomic_set(s_job->s_entity->guilty, 1);
++		if (s_entity->guilty)
++			atomic_set(s_entity->guilty, 1);
+ }
+ 
+ void amd_sched_hw_job_reset(struct amd_gpu_scheduler *sched, struct amd_sched_job *bad)
+@@ -475,7 +475,7 @@ void amd_sched_hw_job_reset(struct amd_gpu_scheduler *sched, struct amd_sched_jo
+ 			list_for_each_entry_safe(entity, tmp, &rq->entities, list) {
+ 				if (bad->s_fence->scheduled.context == entity->fence_context) {
+ 					found = true;
+-					amd_sched_set_guilty(bad);
++					amd_sched_set_guilty(bad, entity);
+ 					break;
+ 				}
+ 			}
+@@ -539,7 +539,6 @@ int amd_sched_job_init(struct amd_sched_job *job,
+ 		       void *owner)
+ {
+ 	job->sched = sched;
+-	job->s_entity = entity;
+ 	job->s_priority = entity->rq - sched->sched_rq;
+ 	job->s_fence = amd_sched_fence_create(entity, owner);
+ 	if (!job->s_fence)
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index a165aad..fddea56 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -90,7 +90,6 @@ struct amd_sched_fence {
+ struct amd_sched_job {
+ 	struct spsc_node queue_node;
+ 	struct amd_gpu_scheduler        *sched;
+-	struct amd_sched_entity         *s_entity;
+ 	struct amd_sched_fence          *s_fence;
+ 	struct fence_cb			finish_cb;
+ 	struct work_struct		finish_work;
+@@ -124,7 +123,8 @@ static inline bool amd_sched_invalidate_job(struct amd_sched_job *s_job, int thr
+  * these functions should be implemented in driver side
+ */
+ struct amd_sched_backend_ops {
+-	struct fence *(*dependency)(struct amd_sched_job *sched_job);
++	struct fence *(*dependency)(struct amd_sched_job *sched_job,
++				    struct amd_sched_entity *s_entity);
+ 	struct fence *(*run_job)(struct amd_sched_job *sched_job);
+ 	void (*timedout_job)(struct amd_sched_job *sched_job);
+ 	void (*free_job)(struct amd_sched_job *sched_job);
+@@ -160,7 +160,8 @@ int amd_sched_entity_init(struct amd_gpu_scheduler *sched,
+ 			  uint32_t jobs, atomic_t* guilty);
+ void amd_sched_entity_fini(struct amd_gpu_scheduler *sched,
+ 			   struct amd_sched_entity *entity);
+-void amd_sched_entity_push_job(struct amd_sched_job *sched_job);
++void amd_sched_entity_push_job(struct amd_sched_job *sched_job,
++			       struct amd_sched_entity *entity);
+ void amd_sched_entity_set_rq(struct amd_sched_entity *entity,
+ 			     struct amd_sched_rq *rq);
+ 
+-- 
+2.7.4
+

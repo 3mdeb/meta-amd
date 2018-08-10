@@ -1,0 +1,415 @@
+From fe010d4c11e623f9ac4466a125eb1f9da4de328e Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Mon, 28 Aug 2017 14:25:01 -0400
+Subject: [PATCH 3213/5855] drm/amd/display: Move dis_clk into dc_state.
+
+dis_clk is single instance across pipes.
+
+Change-Id: I88b678e2b9574787d2b8f8f6c7f0ae872d31b428
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Reviewed-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |  7 +++
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c      | 38 +++++++-----
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c  | 10 +++-
+ drivers/gpu/drm/amd/display/dc/dc.h                |  5 ++
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    | 67 ++++++++++------------
+ .../drm/amd/display/dc/dce110/dce110_resource.c    |  1 -
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h    |  7 ++-
+ 7 files changed, 78 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index b257d57..8864660 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -575,6 +575,8 @@ static bool construct(struct dc *dc,
+ 	if (!dc->res_pool)
+ 		goto fail;
+ 
++	dc_resource_state_construct(dc, dc->current_state);
++
+ 	if (!create_links(dc, init_params->num_virtual_links))
+ 		goto fail;
+ 
+@@ -679,6 +681,8 @@ bool dc_validate_guaranteed(
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+ 
++	dc_resource_state_construct(dc, dc->current_state);
++
+ 	atomic_inc(&context->ref_count);
+ 
+ 	result = dc->res_pool->funcs->validate_guaranteed(
+@@ -1644,6 +1648,8 @@ void dc_set_power_state(
+ 
+ 	switch (power_state) {
+ 	case DC_ACPI_CM_POWER_STATE_D0:
++		dc_resource_state_construct(dc, dc->current_state);
++
+ 		dc->hwss.init_hw(dc);
+ 		break;
+ 	default:
+@@ -1662,6 +1668,7 @@ void dc_set_power_state(
+ 		dc_resource_state_destruct(dc->current_state);
+ 		memset(dc->current_state, 0,
+ 				sizeof(*dc->current_state));
++
+ 		dc->current_state->ref_count = ref_count;
+ 
+ 		break;
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index 65e1261..b95b58d 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -1181,7 +1181,9 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
+ 			&downspread.raw, sizeof(downspread));
+ }
+ 
+-static enum dc_status enable_link_dp(struct pipe_ctx *pipe_ctx)
++static enum dc_status enable_link_dp(
++		struct dc_state *state,
++		struct pipe_ctx *pipe_ctx)
+ {
+ 	struct dc_stream_state *stream = pipe_ctx->stream;
+ 	enum dc_status status;
+@@ -1201,14 +1203,14 @@ static enum dc_status enable_link_dp(struct pipe_ctx *pipe_ctx)
+ 		max_link_rate = LINK_RATE_HIGH3;
+ 
+ 	if (link_settings.link_rate == max_link_rate) {
+-		if (pipe_ctx->dis_clk->funcs->set_min_clocks_state) {
+-			if (pipe_ctx->dis_clk->cur_min_clks_state < DM_PP_CLOCKS_STATE_NOMINAL)
+-				pipe_ctx->dis_clk->funcs->set_min_clocks_state(
+-					pipe_ctx->dis_clk, DM_PP_CLOCKS_STATE_NOMINAL);
++		if (state->dis_clk->funcs->set_min_clocks_state) {
++			if (state->dis_clk->cur_min_clks_state < DM_PP_CLOCKS_STATE_NOMINAL)
++				state->dis_clk->funcs->set_min_clocks_state(
++					state->dis_clk, DM_PP_CLOCKS_STATE_NOMINAL);
+ 		} else {
+ 			uint32_t dp_phyclk_in_khz;
+ 			const struct clocks_value clocks_value =
+-					pipe_ctx->dis_clk->cur_clocks_value;
++					state->dis_clk->cur_clocks_value;
+ 
+ 			/* 27mhz = 27000000hz= 27000khz */
+ 			dp_phyclk_in_khz = link_settings.link_rate * 27000;
+@@ -1216,8 +1218,8 @@ static enum dc_status enable_link_dp(struct pipe_ctx *pipe_ctx)
+ 			if (((clocks_value.max_non_dp_phyclk_in_khz != 0) &&
+ 				(dp_phyclk_in_khz > clocks_value.max_non_dp_phyclk_in_khz)) ||
+ 				(dp_phyclk_in_khz > clocks_value.max_dp_phyclk_in_khz)) {
+-				pipe_ctx->dis_clk->funcs->apply_clock_voltage_request(
+-						pipe_ctx->dis_clk,
++				state->dis_clk->funcs->apply_clock_voltage_request(
++						state->dis_clk,
+ 						DM_PP_CLOCK_TYPE_DISPLAYPHYCLK,
+ 						dp_phyclk_in_khz,
+ 						false,
+@@ -1256,7 +1258,9 @@ static enum dc_status enable_link_dp(struct pipe_ctx *pipe_ctx)
+ 	return status;
+ }
+ 
+-static enum dc_status enable_link_dp_mst(struct pipe_ctx *pipe_ctx)
++static enum dc_status enable_link_dp_mst(
++		struct dc_state *state,
++		struct pipe_ctx *pipe_ctx)
+ {
+ 	struct dc_link *link = pipe_ctx->stream->sink->link;
+ 
+@@ -1269,7 +1273,7 @@ static enum dc_status enable_link_dp_mst(struct pipe_ctx *pipe_ctx)
+ 	/* set the sink to MST mode before enabling the link */
+ 	dp_enable_mst_on_sink(link, true);
+ 
+-	return enable_link_dp(pipe_ctx);
++	return enable_link_dp(state, pipe_ctx);
+ }
+ 
+ static bool get_ext_hdmi_settings(struct pipe_ctx *pipe_ctx,
+@@ -1709,16 +1713,18 @@ static void enable_link_hdmi(struct pipe_ctx *pipe_ctx)
+ }
+ 
+ /****************************enable_link***********************************/
+-static enum dc_status enable_link(struct pipe_ctx *pipe_ctx)
++static enum dc_status enable_link(
++		struct dc_state *state,
++		struct pipe_ctx *pipe_ctx)
+ {
+ 	enum dc_status status = DC_ERROR_UNEXPECTED;
+ 	switch (pipe_ctx->stream->signal) {
+ 	case SIGNAL_TYPE_DISPLAY_PORT:
+ 	case SIGNAL_TYPE_EDP:
+-		status = enable_link_dp(pipe_ctx);
++		status = enable_link_dp(state, pipe_ctx);
+ 		break;
+ 	case SIGNAL_TYPE_DISPLAY_PORT_MST:
+-		status = enable_link_dp_mst(pipe_ctx);
++		status = enable_link_dp_mst(state, pipe_ctx);
+ 		msleep(200);
+ 		break;
+ 	case SIGNAL_TYPE_DVI_SINGLE_LINK:
+@@ -2285,11 +2291,13 @@ static enum dc_status deallocate_mst_payload(struct pipe_ctx *pipe_ctx)
+ 	return DC_OK;
+ }
+ 
+-void core_link_enable_stream(struct pipe_ctx *pipe_ctx)
++void core_link_enable_stream(
++		struct dc_state *state,
++		struct pipe_ctx *pipe_ctx)
+ {
+ 	struct dc  *core_dc = pipe_ctx->stream->ctx->dc;
+ 
+-	enum dc_status status = enable_link(pipe_ctx);
++	enum dc_status status = enable_link(state, pipe_ctx);
+ 
+ 	if (status != DC_OK) {
+ 			dm_logger_write(pipe_ctx->stream->ctx->logger,
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 660d606..3b8f380 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -1033,7 +1033,6 @@ static int acquire_first_split_pipe(
+ 			pipe_ctx->plane_res.ipp = pool->ipps[i];
+ 			pipe_ctx->plane_res.xfm = pool->transforms[i];
+ 			pipe_ctx->stream_res.opp = pool->opps[i];
+-			pipe_ctx->dis_clk = pool->display_clock;
+ 			pipe_ctx->pipe_idx = i;
+ 
+ 			pipe_ctx->stream = stream;
+@@ -1368,7 +1367,6 @@ static int acquire_first_free_pipe(
+ 			pipe_ctx->plane_res.ipp = pool->ipps[i];
+ 			pipe_ctx->plane_res.xfm = pool->transforms[i];
+ 			pipe_ctx->stream_res.opp = pool->opps[i];
+-			pipe_ctx->dis_clk = pool->display_clock;
+ 			pipe_ctx->pipe_idx = i;
+ 
+ 
+@@ -1714,6 +1712,14 @@ void dc_resource_state_copy_construct_current(
+ 	dc_resource_state_copy_construct(dc->current_state, dst_ctx);
+ }
+ 
++
++void dc_resource_state_construct(
++		const struct dc *dc,
++		struct dc_state *dst_ctx)
++{
++	dst_ctx->dis_clk = dc->res_pool->display_clock;
++}
++
+ bool dc_validate_global_state(
+ 		struct dc *dc,
+ 		struct dc_state *new_ctx)
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index af83b30..ef9c3c5 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -695,6 +695,11 @@ bool dc_validate_global_state(
+  *   No hardware is programmed for call.  Only validation is done.
+  */
+ 
++
++void dc_resource_state_construct(
++		const struct dc *dc,
++		struct dc_state *dst_ctx);
++
+ void dc_resource_state_copy_construct(
+ 		const struct dc_state *src_ctx,
+ 		struct dc_state *dst_ctx);
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index c5a9f8e..73bc2c3 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -828,6 +828,7 @@ static enum audio_dto_source translate_to_dto_source(enum controller_id crtc_id)
+ }
+ 
+ static void build_audio_output(
++	struct dc_state *state,
+ 	const struct pipe_ctx *pipe_ctx,
+ 	struct audio_output *audio_output)
+ {
+@@ -889,8 +890,8 @@ static void build_audio_output(
+ 	if (pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT ||
+ 			pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT_MST) {
+ 		audio_output->pll_info.dp_dto_source_clock_in_khz =
+-				pipe_ctx->dis_clk->funcs->get_dp_ref_clk_frequency(
+-						pipe_ctx->dis_clk);
++				state->dis_clk->funcs->get_dp_ref_clk_frequency(
++						state->dis_clk);
+ 	}
+ 
+ 	audio_output->pll_info.feed_back_divider =
+@@ -1109,7 +1110,7 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 	resource_build_info_frame(pipe_ctx);
+ 	dce110_update_info_frame(pipe_ctx);
+ 	if (!pipe_ctx_old->stream) {
+-		core_link_enable_stream(pipe_ctx);
++		core_link_enable_stream(context, pipe_ctx);
+ 
+ 
+ 		if (dc_is_dp_signal(pipe_ctx->stream->signal))
+@@ -1461,42 +1462,34 @@ static void apply_min_clocks(
+ 	bool pre_mode_set)
+ {
+ 	struct state_dependent_clocks req_clocks = {0};
+-	struct pipe_ctx *pipe_ctx;
+-	int i;
+-
+-	for (i = 0; i < MAX_PIPES; i++) {
+-		pipe_ctx = &context->res_ctx.pipe_ctx[i];
+-		if (pipe_ctx->dis_clk != NULL)
+-			break;
+-	}
+ 
+ 	if (!pre_mode_set) {
+ 		/* set clock_state without verification */
+-		if (pipe_ctx->dis_clk->funcs->set_min_clocks_state) {
+-			pipe_ctx->dis_clk->funcs->set_min_clocks_state(
+-						pipe_ctx->dis_clk, *clocks_state);
++		if (context->dis_clk->funcs->set_min_clocks_state) {
++			context->dis_clk->funcs->set_min_clocks_state(
++						context->dis_clk, *clocks_state);
+ 			return;
+ 		}
+ 
+ 		/* TODO: This is incorrect. Figure out how to fix. */
+-		pipe_ctx->dis_clk->funcs->apply_clock_voltage_request(
+-				pipe_ctx->dis_clk,
++		context->dis_clk->funcs->apply_clock_voltage_request(
++				context->dis_clk,
+ 				DM_PP_CLOCK_TYPE_DISPLAY_CLK,
+-				pipe_ctx->dis_clk->cur_clocks_value.dispclk_in_khz,
++				context->dis_clk->cur_clocks_value.dispclk_in_khz,
+ 				pre_mode_set,
+ 				false);
+ 
+-		pipe_ctx->dis_clk->funcs->apply_clock_voltage_request(
+-				pipe_ctx->dis_clk,
++		context->dis_clk->funcs->apply_clock_voltage_request(
++				context->dis_clk,
+ 				DM_PP_CLOCK_TYPE_PIXELCLK,
+-				pipe_ctx->dis_clk->cur_clocks_value.max_pixelclk_in_khz,
++				context->dis_clk->cur_clocks_value.max_pixelclk_in_khz,
+ 				pre_mode_set,
+ 				false);
+ 
+-		pipe_ctx->dis_clk->funcs->apply_clock_voltage_request(
+-				pipe_ctx->dis_clk,
++		context->dis_clk->funcs->apply_clock_voltage_request(
++				context->dis_clk,
+ 				DM_PP_CLOCK_TYPE_DISPLAYPHYCLK,
+-				pipe_ctx->dis_clk->cur_clocks_value.max_non_dp_phyclk_in_khz,
++				context->dis_clk->cur_clocks_value.max_non_dp_phyclk_in_khz,
+ 				pre_mode_set,
+ 				false);
+ 		return;
+@@ -1510,28 +1503,28 @@ static void apply_min_clocks(
+ 	req_clocks.pixel_clk_khz = get_max_pixel_clock_for_all_paths(
+ 			dc, context, true);
+ 
+-	if (pipe_ctx->dis_clk->funcs->get_required_clocks_state) {
+-		*clocks_state = pipe_ctx->dis_clk->funcs->get_required_clocks_state(
+-				pipe_ctx->dis_clk, &req_clocks);
+-		pipe_ctx->dis_clk->funcs->set_min_clocks_state(
+-			pipe_ctx->dis_clk, *clocks_state);
++	if (context->dis_clk->funcs->get_required_clocks_state) {
++		*clocks_state = context->dis_clk->funcs->get_required_clocks_state(
++				context->dis_clk, &req_clocks);
++		context->dis_clk->funcs->set_min_clocks_state(
++			context->dis_clk, *clocks_state);
+ 	} else {
+-		pipe_ctx->dis_clk->funcs->apply_clock_voltage_request(
+-				pipe_ctx->dis_clk,
++		context->dis_clk->funcs->apply_clock_voltage_request(
++				context->dis_clk,
+ 				DM_PP_CLOCK_TYPE_DISPLAY_CLK,
+ 				req_clocks.display_clk_khz,
+ 				pre_mode_set,
+ 				false);
+ 
+-		pipe_ctx->dis_clk->funcs->apply_clock_voltage_request(
+-				pipe_ctx->dis_clk,
++		context->dis_clk->funcs->apply_clock_voltage_request(
++				context->dis_clk,
+ 				DM_PP_CLOCK_TYPE_PIXELCLK,
+ 				req_clocks.pixel_clk_khz,
+ 				pre_mode_set,
+ 				false);
+ 
+-		pipe_ctx->dis_clk->funcs->apply_clock_voltage_request(
+-				pipe_ctx->dis_clk,
++		context->dis_clk->funcs->apply_clock_voltage_request(
++				context->dis_clk,
+ 				DM_PP_CLOCK_TYPE_DISPLAYPHYCLK,
+ 				req_clocks.pixel_clk_khz,
+ 				pre_mode_set,
+@@ -1806,7 +1799,7 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 		if (pipe_ctx->stream_res.audio != NULL) {
+ 			struct audio_output audio_output;
+ 
+-			build_audio_output(pipe_ctx, &audio_output);
++			build_audio_output(context, pipe_ctx, &audio_output);
+ 
+ 			pipe_ctx->stream_res.audio->funcs->wall_dto_setup(
+ 				pipe_ctx->stream_res.audio,
+@@ -1834,7 +1827,7 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 			if (pipe_ctx->stream_res.audio != NULL) {
+ 				struct audio_output audio_output;
+ 
+-				build_audio_output(pipe_ctx, &audio_output);
++				build_audio_output(context, pipe_ctx, &audio_output);
+ 
+ 				pipe_ctx->stream_res.audio->funcs->wall_dto_setup(
+ 					pipe_ctx->stream_res.audio,
+@@ -1868,7 +1861,7 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 
+ 			struct audio_output audio_output;
+ 
+-			build_audio_output(pipe_ctx, &audio_output);
++			build_audio_output(context, pipe_ctx, &audio_output);
+ 
+ 			if (dc_is_dp_signal(pipe_ctx->stream->signal))
+ 				pipe_ctx->stream_res.stream_enc->funcs->dp_audio_setup(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+index 94b6eb8..4942460 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+@@ -971,7 +971,6 @@ static struct pipe_ctx *dce110_acquire_underlay(
+ 	/*pipe_ctx->plane_res.ipp = res_ctx->pool->ipps[underlay_idx];*/
+ 	pipe_ctx->plane_res.xfm = pool->transforms[underlay_idx];
+ 	pipe_ctx->stream_res.opp = pool->opps[underlay_idx];
+-	pipe_ctx->dis_clk = pool->display_clock;
+ 	pipe_ctx->pipe_idx = underlay_idx;
+ 
+ 	pipe_ctx->stream = stream;
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index 71eb985..915d5c1 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -70,7 +70,9 @@ enum dc_status dc_link_validate_mode_timing(
+ 
+ void core_link_resume(struct dc_link *link);
+ 
+-void core_link_enable_stream(struct pipe_ctx *pipe_ctx);
++void core_link_enable_stream(
++		struct dc_state *state,
++		struct pipe_ctx *pipe_ctx);
+ 
+ void core_link_disable_stream(struct pipe_ctx *pipe_ctx);
+ 
+@@ -188,7 +190,6 @@ struct pipe_ctx {
+ 	struct plane_resource plane_res;
+ 	struct stream_resource stream_res;
+ 
+-	struct display_clock *dis_clk;
+ 	struct clock_source *clock_source;
+ 
+ 	struct pll_settings pll_settings;
+@@ -268,6 +269,8 @@ struct dc_state {
+ 	struct dcn_bw_internal_vars dcn_bw_vars;
+ #endif
+ 
++	struct display_clock *dis_clk;
++
+ 	atomic_t ref_count;
+ };
+ 
+-- 
+2.7.4
+

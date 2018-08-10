@@ -1,0 +1,354 @@
+From b90bebc718f3c56a41927da199f20d6fe425de06 Mon Sep 17 00:00:00 2001
+From: Andres Rodriguez <andresx7@gmail.com>
+Date: Mon, 9 Oct 2017 17:12:24 -0400
+Subject: [PATCH 3654/5855] drm/amdgpu: add interface for editing a foreign
+ process's priority v3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The AMDGPU_SCHED_OP_PROCESS_PRIORITY_OVERRIDE ioctls are used to set
+the priority of a different process in the current system.
+
+When a request is dropped, the process's contexts will be
+restored to the priority specified at context creation time.
+
+A request can be dropped by setting the override priority to
+AMDGPU_CTX_PRIORITY_UNSET.
+
+An fd is used to identify the remote process. This is simpler than
+passing a pid number, which is vulnerable to re-use, etc.
+
+This functionality is limited to DRM_MASTER since abuse of this
+interface can have a negative impact on the system's performance.
+
+v2: removed unused output structure
+v3: change refcounted interface for a regular set operation
+
+Signed-off-by: Andres Rodriguez <andresx7@gmail.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/Makefile
+	include/uapi/drm/amdgpu_drm.h
+
+Change-Id: Ic7b6bcea39100fe6c2c3f0c9c4a50de7260399cd
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile       |   2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c   |  21 +-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c   |   2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c | 109 ++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sched.h |  34 ++++++++++
+ include/uapi/drm/amdgpu_drm.h             |  37 +++++++++-
+ 6 files changed, 182 insertions(+), 23 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_sched.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index c675f42..2b853b5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -31,7 +31,7 @@ amdgpu-y += amdgpu_device.o amdgpu_kms.o \
+ 	amdgpu_prime.o amdgpu_vm.o amdgpu_ib.o amdgpu_pll.o \
+ 	amdgpu_ucode.o amdgpu_bo_list.o amdgpu_ctx.o amdgpu_sync.o \
+ 	amdgpu_gtt_mgr.o amdgpu_vram_mgr.o amdgpu_virt.o amdgpu_atomfirmware.o \
+-	amdgpu_sem.o amdgpu_amdkfd_fence.o amdgpu_queue_mgr.o amdgpu_vf_error.o
++	amdgpu_sem.o amdgpu_amdkfd_fence.o amdgpu_sched.o amdgpu_queue_mgr.o amdgpu_vf_error.o
+ 
+ # add asic specific block
+ amdgpu-$(CONFIG_DRM_AMDGPU_CIK)+= cik.o cik_ih.o kv_smc.o kv_dpm.o \
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index 68ee67c..282931e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -25,6 +25,7 @@
+ #include <drm/drmP.h>
+ #include <drm/drm_auth.h>
+ #include "amdgpu.h"
++#include "amdgpu_sched.h"
+ 
+ static int amdgpu_ctx_priority_permit(struct drm_file *filp,
+ 				      enum amd_sched_priority priority)
+@@ -241,26 +242,6 @@ static int amdgpu_ctx_query(struct amdgpu_device *adev,
+ 	return 0;
+ }
+ 
+-static enum amd_sched_priority amdgpu_to_sched_priority(int amdgpu_priority)
+-{
+-	switch (amdgpu_priority) {
+-	case AMDGPU_CTX_PRIORITY_HIGH_HW:
+-		return AMD_SCHED_PRIORITY_HIGH_HW;
+-	case AMDGPU_CTX_PRIORITY_HIGH_SW:
+-		return AMD_SCHED_PRIORITY_HIGH_SW;
+-	case AMDGPU_CTX_PRIORITY_NORMAL:
+-		return AMD_SCHED_PRIORITY_NORMAL;
+-	case AMDGPU_CTX_PRIORITY_LOW_SW:
+-	case AMDGPU_CTX_PRIORITY_LOW_HW:
+-		return AMD_SCHED_PRIORITY_LOW;
+-	case AMDGPU_CTX_PRIORITY_UNSET:
+-		return AMD_SCHED_PRIORITY_UNSET;
+-	default:
+-		WARN(1, "Invalid context priority %d\n", amdgpu_priority);
+-		return AMD_SCHED_PRIORITY_INVALID;
+-	}
+-}
+-
+ int amdgpu_ctx_ioctl(struct drm_device *dev, void *data,
+ 		     struct drm_file *filp)
+ {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 18e68b0..897fafc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -28,6 +28,7 @@
+ #include <drm/drmP.h>
+ #include "amdgpu.h"
+ #include <drm/amdgpu_drm.h>
++#include "amdgpu_sched.h"
+ #include "amdgpu_uvd.h"
+ #include "amdgpu_vce.h"
+ 
+@@ -1103,6 +1104,7 @@ const struct drm_ioctl_desc amdgpu_ioctls_kms[] = {
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_CREATE, amdgpu_gem_create_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_CTX, amdgpu_ctx_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_VM, amdgpu_vm_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(AMDGPU_SCHED, amdgpu_sched_ioctl, DRM_MASTER),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_BO_LIST, amdgpu_bo_list_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_FENCE_TO_HANDLE, amdgpu_cs_fence_to_handle_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	/* KMS */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+new file mode 100644
+index 0000000..cd12330
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
+@@ -0,0 +1,109 @@
++/*
++ * Copyright 2017 Valve Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: Andres Rodriguez <andresx7@gmail.com>
++ */
++
++#include <linux/fdtable.h>
++#include <linux/pid.h>
++#include <drm/amdgpu_drm.h>
++#include "amdgpu.h"
++
++#include "amdgpu_vm.h"
++
++enum amd_sched_priority amdgpu_to_sched_priority(int amdgpu_priority)
++{
++	switch (amdgpu_priority) {
++	case AMDGPU_CTX_PRIORITY_HIGH_HW:
++		return AMD_SCHED_PRIORITY_HIGH_HW;
++	case AMDGPU_CTX_PRIORITY_HIGH_SW:
++		return AMD_SCHED_PRIORITY_HIGH_SW;
++	case AMDGPU_CTX_PRIORITY_NORMAL:
++		return AMD_SCHED_PRIORITY_NORMAL;
++	case AMDGPU_CTX_PRIORITY_LOW_SW:
++	case AMDGPU_CTX_PRIORITY_LOW_HW:
++		return AMD_SCHED_PRIORITY_LOW;
++	case AMDGPU_CTX_PRIORITY_UNSET:
++		return AMD_SCHED_PRIORITY_UNSET;
++	default:
++		WARN(1, "Invalid context priority %d\n", amdgpu_priority);
++		return AMD_SCHED_PRIORITY_INVALID;
++	}
++}
++
++static int amdgpu_sched_process_priority_override(struct amdgpu_device *adev,
++						  int fd,
++						  enum amd_sched_priority priority)
++{
++	struct file *filp = fcheck(fd);
++	struct drm_file *file;
++	struct pid *pid;
++	struct amdgpu_fpriv *fpriv;
++	struct amdgpu_ctx *ctx;
++	uint32_t id;
++
++	if (!filp)
++		return -EINVAL;
++
++	pid = get_pid(((struct drm_file *)filp->private_data)->pid);
++
++	mutex_lock(&adev->ddev->filelist_mutex);
++	list_for_each_entry(file, &adev->ddev->filelist, lhead) {
++		if (file->pid != pid)
++			continue;
++
++		fpriv = file->driver_priv;
++		idr_for_each_entry(&fpriv->ctx_mgr.ctx_handles, ctx, id)
++				amdgpu_ctx_priority_override(ctx, priority);
++	}
++	mutex_unlock(&adev->ddev->filelist_mutex);
++
++	put_pid(pid);
++
++	return 0;
++}
++
++int amdgpu_sched_ioctl(struct drm_device *dev, void *data,
++		       struct drm_file *filp)
++{
++	union drm_amdgpu_sched *args = data;
++	struct amdgpu_device *adev = dev->dev_private;
++	enum amd_sched_priority priority;
++	int r;
++
++	priority = amdgpu_to_sched_priority(args->in.priority);
++	if (args->in.flags || priority == AMD_SCHED_PRIORITY_INVALID)
++		return -EINVAL;
++
++	switch (args->in.op) {
++	case AMDGPU_SCHED_OP_PROCESS_PRIORITY_OVERRIDE:
++		r = amdgpu_sched_process_priority_override(adev,
++							   args->in.fd,
++							   priority);
++		break;
++	default:
++		DRM_ERROR("Invalid sched op specified: %d\n", args->in.op);
++		r = -EINVAL;
++		break;
++	}
++
++	return r;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.h
+new file mode 100644
+index 0000000..b28c067
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.h
+@@ -0,0 +1,34 @@
++/*
++ * Copyright 2017 Valve Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: Andres Rodriguez <andresx7@gmail.com>
++ */
++
++#ifndef __AMDGPU_SCHED_H__
++#define __AMDGPU_SCHED_H__
++
++#include <drm/drmP.h>
++
++enum amd_sched_priority amdgpu_to_sched_priority(int amdgpu_priority);
++int amdgpu_sched_ioctl(struct drm_device *dev, void *data,
++		       struct drm_file *filp);
++
++#endif // __AMDGPU_SCHED_H__
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 25b4877..99c741b 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -53,8 +53,9 @@ extern "C" {
+ #define DRM_AMDGPU_WAIT_FENCES		0x12
+ #define DRM_AMDGPU_VM			0x13
+ #define DRM_AMDGPU_FENCE_TO_HANDLE      0x14
++#define DRM_AMDGPU_SCHED                0x15
+ 
+-/* hybrid specific ioctls */
++/*  specific ioctls */
+ #define DRM_AMDGPU_SEM			0x5b
+ #define DRM_AMDGPU_GEM_DGMA		0x5c
+ #define DRM_AMDGPU_FREESYNC		0x5d
+@@ -75,6 +76,7 @@ extern "C" {
+ #define DRM_IOCTL_AMDGPU_WAIT_FENCES	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_WAIT_FENCES, union drm_amdgpu_wait_fences)
+ #define DRM_IOCTL_AMDGPU_VM		DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_VM, union drm_amdgpu_vm)
+ #define DRM_IOCTL_AMDGPU_FENCE_TO_HANDLE DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_FENCE_TO_HANDLE, union drm_amdgpu_fence_to_handle)
++#define DRM_IOCTL_AMDGPU_SCHED         DRM_IOW(DRM_COMMAND_BASE + DRM_AMDGPU_SCHED, union drm_amdgpu_sched)
+ 
+ /* hybrid specific ioctls */
+ #define DRM_IOCTL_AMDGPU_GEM_DGMA      DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_DGMA, struct drm_amdgpu_gem_dgma)
+@@ -108,7 +110,7 @@ extern "C" {
+ /* Flag that BO sharing will be explicitly synchronized */
+ #define AMDGPU_GEM_CREATE_EXPLICIT_SYNC                (1 << 7)
+ 
+-/* hybrid specific */
++/* hybrid
+ /* Flag that the memory should be in SPARSE resource */
+ #define AMDGPU_GEM_CREATE_SPARSE		(1ULL << 29)
+ /* Flag that the memory allocation should be from top of domain */
+@@ -249,6 +251,22 @@ union drm_amdgpu_vm {
+ 	struct drm_amdgpu_vm_out out;
+ };
+ 
++/* sched ioctl */
++#define AMDGPU_SCHED_OP_PROCESS_PRIORITY_OVERRIDE      1
++
++struct drm_amdgpu_sched_in {
++        /* AMDGPU_SCHED_OP_* */
++        __u32   op;
++        __u32   fd;
++        __s32   priority;
++        __u32   flags;
++};
++
++union drm_amdgpu_sched {
++        struct drm_amdgpu_sched_in in;
++};
++
++
+ /* sem related */
+ #define AMDGPU_SEM_OP_CREATE_SEM        1
+ #define AMDGPU_SEM_OP_WAIT_SEM	        2
+@@ -278,6 +296,21 @@ union drm_amdgpu_sem {
+ 	union drm_amdgpu_sem_out out;
+ };
+ 
++/* sched ioctl */
++#define AMDGPU_SCHED_OP_PROCESS_PRIORITY_OVERRIDE	1
++
++struct drm_amdgpu_sched_in {
++	/* AMDGPU_SCHED_OP_* */
++	__u32	op;
++	__u32	fd;
++	__s32	priority;
++	__u32	flags;
++};
++
++union drm_amdgpu_sched {
++	struct drm_amdgpu_sched_in in;
++};
++
+ /*
+  * This is not a reliable API and you should expect it to fail for any
+  * number of reasons and have fallback path that do not use userptr to
+-- 
+2.7.4
+

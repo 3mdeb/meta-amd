@@ -1,0 +1,72 @@
+From b5a234bc09c4565c5fb47367665f0f672499d007 Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Date: Thu, 13 Jul 2017 12:00:20 -0400
+Subject: [PATCH 5396/5855] drm/amdkfd: Support registering third pary device
+ memory
+
+Register userptr that corresponds to third party device memory for GPU
+access. Instead of userptr BO a doorbell BO will be created using the
+physical address of the third party device memory. User space will treat
+the doorbell BO as a regular userptr BO
+
+BUG: KFD-351
+Change-Id: I7ff5ded4ab0a90e01f984c1e0dc8067f09a35baa
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c | 26 +++++++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 62829e8..21e4021 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1194,7 +1194,9 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
+ 	struct kfd_dev *dev;
+ 	int idr_handle;
+ 	long err;
+-	uint64_t offset;
++	uint64_t offset = args->mmap_offset;
++	uint32_t flags = args->flags;
++	struct vm_area_struct *vma;
+ 
+ 	if (args->size == 0)
+ 		return -EINVAL;
+@@ -1209,17 +1211,31 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
+ 	if (IS_ERR(pdd))
+ 		return PTR_ERR(pdd);
+ 
+-	if (args->flags & KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL) {
++	if (flags & KFD_IOC_ALLOC_MEM_FLAGS_USERPTR) {
++		/* Check if the userptr corresponds to another (or third-party)
++		 * device local memory. If so treat is as a doorbell. User
++		 * space will be oblivious of this and will use this doorbell
++		 * BO as a regular userptr BO
++		 */
++		vma = find_vma(current->mm, args->mmap_offset);
++		if (vma && (vma->vm_flags & VM_IO)) {
++			unsigned long pfn;
++
++			follow_pfn(vma, args->mmap_offset, &pfn);
++			flags |= KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL;
++			flags &= ~KFD_IOC_ALLOC_MEM_FLAGS_USERPTR;
++			offset = (pfn << PAGE_SHIFT);
++		}
++	} else if (flags & KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL) {
+ 		if (args->size != kfd_doorbell_process_slice(dev))
+ 			return -EINVAL;
+ 		offset = kfd_get_process_doorbells(dev, p);
+-	} else
+-		offset = args->mmap_offset;
++	}
+ 
+ 	err = dev->kfd2kgd->alloc_memory_of_gpu(
+ 		dev->kgd, args->va_addr, args->size,
+ 		pdd->vm, (struct kgd_mem **) &mem, &offset,
+-		NULL, args->flags);
++		NULL, flags);
+ 
+ 	if (err != 0)
+ 		return err;
+-- 
+2.7.4
+

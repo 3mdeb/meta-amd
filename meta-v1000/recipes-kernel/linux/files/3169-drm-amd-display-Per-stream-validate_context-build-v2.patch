@@ -1,0 +1,1841 @@
+From 7c9c211aea10148b2de163afb3789b277ba83594 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Date: Mon, 31 Jul 2017 11:29:25 -0400
+Subject: [PATCH 3169/5855] drm/amd/display: Per stream validate_context build
+ v2.
+
+Until now new context would start as empty, then populated
+with exsisting pipes + new. Now we start with duplication
+of existing context and then add/delete from the context
+pipes as needed.
+
+This allows to do a per stream resource
+population, start discarding dc_validation_set
+and by this brings DC closer to to DRM.
+
+v2: Add some fixes and rebase.
+
+Signed-off-by: Andrey Grodzovsky <Andrey.Grodzovsky@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c  |  68 ++-
+ drivers/gpu/drm/amd/display/dc/core/dc.c           | 108 +----
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c  | 468 +++++++++++++++------
+ drivers/gpu/drm/amd/display/dc/dc.h                |  32 +-
+ .../drm/amd/display/dc/dce100/dce100_resource.c    |  78 +---
+ .../drm/amd/display/dc/dce110/dce110_resource.c    |  86 +---
+ .../drm/amd/display/dc/dce112/dce112_resource.c    | 143 +++----
+ .../drm/amd/display/dc/dce112/dce112_resource.h    |   5 +
+ .../drm/amd/display/dc/dce120/dce120_resource.c    |   4 +-
+ .../gpu/drm/amd/display/dc/dce80/dce80_resource.c  |  79 +---
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_resource.c  |  85 ++--
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h    |  19 +-
+ drivers/gpu/drm/amd/display/dc/inc/resource.h      |   6 +-
+ 13 files changed, 577 insertions(+), 604 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 38245fd..8c70796 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -25,6 +25,7 @@
+ 
+ #include "dm_services_types.h"
+ #include "dc.h"
++#include "dc/inc/core_types.h"
+ 
+ #include "vid.h"
+ #include "amdgpu.h"
+@@ -815,13 +816,33 @@ struct drm_atomic_state *
+ dm_atomic_state_alloc(struct drm_device *dev)
+ {
+ 	struct dm_atomic_state *state = kzalloc(sizeof(*state), GFP_KERNEL);
++	struct validate_context *new_ctx;
++	struct amdgpu_device *adev = dev->dev_private;
++	struct dc *dc = adev->dm.dc;
+ 
+-	if (!state || drm_atomic_state_init(dev, &state->base) < 0) {
+-		kfree(state);
++	if (!state)
+ 		return NULL;
+-	}
++
++	if (drm_atomic_state_init(dev, &state->base) < 0)
++		goto fail;
++
++	/* copy existing configuration */
++	new_ctx = dm_alloc(sizeof(*new_ctx));
++
++	if (!new_ctx)
++		goto fail;
++
++	atomic_inc(&new_ctx->ref_count);
++
++	dc_resource_validate_ctx_copy_construct_current(dc, new_ctx);
++
++	state->context = new_ctx;
+ 
+ 	return &state->base;
++
++fail:
++	kfree(state);
++	return NULL;
+ }
+ 
+ static void
+@@ -4756,7 +4777,6 @@ static int do_aquire_global_lock(
+ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 			struct drm_atomic_state *state)
+ {
+-	struct dm_atomic_state *dm_state;
+ 	struct drm_crtc *crtc;
+ 	struct drm_crtc_state *crtc_state;
+ 	struct drm_plane *plane;
+@@ -4770,6 +4790,7 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 	int set_count;
+ 	struct dc_validation_set set[MAX_STREAMS] = { { 0 } };
+ 	struct dm_crtc_state *old_acrtc_state, *new_acrtc_state;
++	struct dm_atomic_state *dm_state = to_dm_atomic_state(state);
+ 
+ 	/*
+ 	 * This bool will be set for true for any modeset/reset
+@@ -4784,8 +4805,6 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 		return ret;
+ 	}
+ 
+-	dm_state = to_dm_atomic_state(state);
+-
+ 	/* copy existing configuration */
+ 	set_count = 0;
+ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
+@@ -4830,8 +4849,17 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 
+ 		if (modereset_required(crtc_state)) {
+ 
+-					/* i.e. reset mode */
++			/* i.e. reset mode */
+ 			if (new_acrtc_state->stream) {
++
++				if (!dc_remove_stream_from_ctx(
++						dc,
++						dm_state->context,
++						new_acrtc_state->stream)) {
++					ret = -EINVAL;
++					goto fail;
++				}
++
+ 				set_count = remove_from_val_sets(
+ 						set,
+ 						set_count,
+@@ -4879,8 +4907,19 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 			if (modeset_required(crtc_state, new_stream,
+ 					     old_acrtc_state->stream)) {
+ 
+-				if (new_acrtc_state->stream)
++				if (new_acrtc_state->stream) {
++
++					if (!dc_remove_stream_from_ctx(
++							dc,
++							dm_state->context,
++							new_acrtc_state->stream)) {
++						ret = -EINVAL;
++						goto fail;
++					}
++
++
+ 					dc_stream_release(new_acrtc_state->stream);
++				}
+ 
+ 				new_acrtc_state->stream = new_stream;
+ 
+@@ -4891,6 +4930,14 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 						new_acrtc_state->stream,
+ 						crtc);
+ 
++				if (!dc_add_stream_to_ctx(
++						dc,
++						dm_state->context,
++						new_acrtc_state->stream)) {
++					ret = -EINVAL;
++					goto fail;
++				}
++
+ 				lock_and_validation_needed = true;
+ 			} else {
+ 				/*
+@@ -5007,9 +5054,8 @@ int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 		ret = do_aquire_global_lock(dev, state);
+ 		if (ret)
+ 			goto fail;
+-		WARN_ON(dm_state->context);
+-		dm_state->context = dc_get_validate_context(dc, set, set_count);
+-		if (!dm_state->context) {
++
++		if (!dc_validate_global_state(dc, set, set_count, dm_state->context)) {
+ 			ret = -EINVAL;
+ 			goto fail;
+ 		}
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index b603f1c..5714c9b 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -669,41 +669,6 @@ void dc_destroy(struct dc **dc)
+ 	*dc = NULL;
+ }
+ 
+-static bool is_validation_required(
+-		const struct dc *dc,
+-		const struct dc_validation_set set[],
+-		int set_count)
+-{
+-	const struct validate_context *context = dc->current_context;
+-	int i, j;
+-
+-	if (context->stream_count != set_count)
+-		return true;
+-
+-	for (i = 0; i < set_count; i++) {
+-
+-		if (set[i].plane_count != context->stream_status[i].plane_count)
+-			return true;
+-		if (!dc_is_stream_unchanged(set[i].stream, context->streams[i]))
+-			return true;
+-
+-		for (j = 0; j < set[i].plane_count; j++) {
+-			struct dc_plane_state temp_plane;
+-			memset(&temp_plane, 0, sizeof(temp_plane));
+-
+-			temp_plane = *context->stream_status[i].plane_states[j];
+-			temp_plane.clip_rect = set[i].plane_states[j]->clip_rect;
+-			temp_plane.dst_rect.x = set[i].plane_states[j]->dst_rect.x;
+-			temp_plane.dst_rect.y = set[i].plane_states[j]->dst_rect.y;
+-
+-			if (memcmp(&temp_plane, set[i].plane_states[j], sizeof(temp_plane)) != 0)
+-				return true;
+-		}
+-	}
+-
+-	return false;
+-}
+-
+ static bool validate_streams (
+ 		struct dc *dc,
+ 		const struct dc_validation_set set[],
+@@ -733,52 +698,12 @@ static bool validate_surfaces(
+ 	return true;
+ }
+ 
+-struct validate_context *dc_get_validate_context(
+-		struct dc *dc,
+-		const struct dc_validation_set set[],
+-		uint8_t set_count)
+-{
+-	struct dc *core_dc = dc;
+-	enum dc_status result = DC_ERROR_UNEXPECTED;
+-	struct validate_context *context;
+-
+-
+-	context = dm_alloc(sizeof(struct validate_context));
+-	if (context == NULL)
+-		goto context_alloc_fail;
+-
+-	atomic_inc(&context->ref_count);
+-
+-	if (!is_validation_required(core_dc, set, set_count)) {
+-		dc_resource_validate_ctx_copy_construct(core_dc->current_context, context);
+-		return context;
+-	}
+-
+-	result = core_dc->res_pool->funcs->validate_with_context(
+-			core_dc, set, set_count, context, core_dc->current_context);
+-
+-context_alloc_fail:
+-	if (result != DC_OK) {
+-		dm_logger_write(core_dc->ctx->logger, LOG_WARNING,
+-				"%s:resource validation failed, dc_status:%d\n",
+-				__func__,
+-				result);
+-
+-		dc_release_validate_context(context);
+-		context = NULL;
+-	}
+-
+-	return context;
+-
+-}
+-
+ bool dc_validate_resources(
+ 		struct dc *dc,
+ 		const struct dc_validation_set set[],
+ 		uint8_t set_count)
+ {
+-	struct dc  *core_dc = dc;
+-	enum dc_status result = DC_ERROR_UNEXPECTED;
++	bool result = false;
+ 	struct validate_context *context;
+ 
+ 	if (!validate_streams(dc, set, set_count))
+@@ -793,21 +718,16 @@ bool dc_validate_resources(
+ 
+ 	atomic_inc(&context->ref_count);
+ 
+-	result = core_dc->res_pool->funcs->validate_with_context(
+-				core_dc, set, set_count, context, NULL);
++	dc_resource_validate_ctx_copy_construct_current(dc, context);
+ 
+-context_alloc_fail:
+-	if (result != DC_OK) {
+-		dm_logger_write(core_dc->ctx->logger, LOG_WARNING,
+-				"%s:resource validation failed, dc_status:%d\n",
+-				__func__,
+-				result);
+-	}
++	result = dc_validate_with_context(
++				dc, set, set_count, context);
+ 
++context_alloc_fail:
+ 	dc_release_validate_context(context);
+ 	context = NULL;
+ 
+-	return result == DC_OK;
++	return result;
+ }
+ 
+ bool dc_validate_guaranteed(
+@@ -1093,7 +1013,7 @@ bool dc_commit_streams(
+ 	uint8_t stream_count)
+ {
+ 	struct dc  *core_dc = dc;
+-	enum dc_status result = DC_ERROR_UNEXPECTED;
++	bool result = false;
+ 	struct validate_context *context;
+ 	struct dc_validation_set set[MAX_STREAMS] = { {0, {0} } };
+ 	int i;
+@@ -1135,13 +1055,11 @@ bool dc_commit_streams(
+ 
+ 	atomic_inc(&context->ref_count);
+ 
+-	result = core_dc->res_pool->funcs->validate_with_context(
+-			core_dc, set, stream_count, context, core_dc->current_context);
+-	if (result != DC_OK){
+-		dm_logger_write(core_dc->ctx->logger, LOG_ERROR,
+-					"%s: Context validation failed! dc_status:%d\n",
+-					__func__,
+-					result);
++	dc_resource_validate_ctx_copy_construct_current(dc, context);
++
++	result = dc_validate_with_context(
++			dc, set, stream_count, context);
++	if (!result) {
+ 		BREAK_TO_DEBUGGER();
+ 		goto fail;
+ 	}
+@@ -1152,7 +1070,7 @@ bool dc_commit_streams(
+ 	dc_release_validate_context(context);
+ 
+ context_alloc_fail:
+-	return (result == DC_OK);
++	return result;
+ }
+ 
+ bool dc_post_update_surfaces_to_stream(struct dc *dc)
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index e3cf519..6b4eb4c 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -938,7 +938,7 @@ struct pipe_ctx *resource_get_head_pipe_for_stream(
+ 	int i;
+ 	for (i = 0; i < MAX_PIPES; i++) {
+ 		if (res_ctx->pipe_ctx[i].stream == stream &&
+-				res_ctx->pipe_ctx[i].stream_res.stream_enc) {
++				!res_ctx->pipe_ctx[i].top_pipe) {
+ 			return &res_ctx->pipe_ctx[i];
+ 			break;
+ 		}
+@@ -1217,29 +1217,31 @@ bool resource_validate_attach_surfaces(
+ #define TMDS_MAX_PIXEL_CLOCK_IN_KHZ 165000
+ #define TMDS_MAX_PIXEL_CLOCK_IN_KHZ_UPMOST 297000
+ 
+-static void set_stream_engine_in_use(
++static void update_stream_engine_usage(
+ 		struct resource_context *res_ctx,
+ 		const struct resource_pool *pool,
+-		struct stream_encoder *stream_enc)
++		struct stream_encoder *stream_enc,
++		bool acquired)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < pool->stream_enc_count; i++) {
+ 		if (pool->stream_enc[i] == stream_enc)
+-			res_ctx->is_stream_enc_acquired[i] = true;
++			res_ctx->is_stream_enc_acquired[i] = acquired;
+ 	}
+ }
+ 
+ /* TODO: release audio object */
+-static void set_audio_in_use(
++static void update_audio_usage(
+ 		struct resource_context *res_ctx,
+ 		const struct resource_pool *pool,
+-		struct audio *audio)
++		struct audio *audio,
++		bool acquired)
+ {
+ 	int i;
+ 	for (i = 0; i < pool->audio_count; i++) {
+ 		if (pool->audios[i] == audio)
+-			res_ctx->is_audio_acquired[i] = true;
++			res_ctx->is_audio_acquired[i] = acquired;
+ 	}
+ }
+ 
+@@ -1361,6 +1363,100 @@ bool resource_is_stream_unchanged(
+ 	return false;
+ }
+ 
++bool dc_add_stream_to_ctx(
++		struct dc *dc,
++		struct validate_context *new_ctx,
++		struct dc_stream_state *stream)
++{
++	struct dc_context *dc_ctx = dc->ctx;
++	enum dc_status res;
++
++	if (new_ctx->stream_count >= dc->res_pool->pipe_count) {
++		DC_ERROR("Max streams reached, can add stream %p !\n", stream);
++		return DC_ERROR_UNEXPECTED;
++	}
++
++	new_ctx->streams[new_ctx->stream_count] = stream;
++	dc_stream_retain(stream);
++	new_ctx->stream_count++;
++
++	res = dc->res_pool->funcs->add_stream_to_ctx(dc, new_ctx, stream);
++	if (res != DC_OK)
++		DC_ERROR("Adding stream %p to context failed with err %d!\n", stream, res);
++
++	return res == DC_OK;
++}
++
++bool dc_remove_stream_from_ctx(
++			struct dc *dc,
++			struct validate_context *new_ctx,
++			struct dc_stream_state *stream)
++{
++	int i, j;
++	struct dc_context *dc_ctx = dc->ctx;
++	struct pipe_ctx *del_pipe = NULL;
++
++	/*TODO MPO to remove extra pipe or in surface remove ?*/
++
++	/* Release primary and secondary pipe (if exsist) */
++	for (i = 0; i < MAX_PIPES; i++) {
++		if (new_ctx->res_ctx.pipe_ctx[i].stream == stream) {
++			del_pipe = &new_ctx->res_ctx.pipe_ctx[i];
++
++			if (del_pipe->stream_res.stream_enc)
++				update_stream_engine_usage(
++						&new_ctx->res_ctx,
++						dc->res_pool,
++						del_pipe->stream_res.stream_enc,
++						false);
++
++			if (del_pipe->stream_res.audio)
++				update_audio_usage(
++					&new_ctx->res_ctx,
++					dc->res_pool,
++					del_pipe->stream_res.audio,
++					false);
++
++			memset(del_pipe, 0, sizeof(*del_pipe));
++		}
++	}
++
++	if (!del_pipe) {
++		DC_ERROR("Pipe not found for stream %p !\n", stream);
++		return DC_ERROR_UNEXPECTED;
++	}
++
++	for (i = 0; i < new_ctx->stream_count; i++)
++		if (new_ctx->streams[i] == stream)
++			break;
++
++	if (new_ctx->streams[i] != stream) {
++		DC_ERROR("Context doesn't have stream %p !\n", stream);
++		return DC_ERROR_UNEXPECTED;
++	}
++
++	dc_stream_release(new_ctx->streams[i]);
++	new_ctx->stream_count--;
++
++	/*TODO move into dc_remove_surface_from_ctx	?*/
++	for (j = 0; j < new_ctx->stream_status[i].plane_count; j++)
++		dc_plane_state_release(new_ctx->stream_status[i].plane_states[j]);
++
++	/* Trim back arrays */
++	for (; i < new_ctx->stream_count; i++) {
++		new_ctx->streams[i] = new_ctx->streams[i + 1];
++		new_ctx->stream_status[i] = new_ctx->stream_status[i + 1];
++	}
++
++	new_ctx->streams[new_ctx->stream_count] = NULL;
++	memset(
++			&new_ctx->stream_status[new_ctx->stream_count],
++			0,
++			sizeof(new_ctx->stream_status[0]));
++
++	return DC_OK;
++}
++
+ static void copy_pipe_ctx(
+ 	const struct pipe_ctx *from_pipe_ctx, struct pipe_ctx *to_pipe_ctx)
+ {
+@@ -1440,15 +1536,16 @@ static void calculate_phy_pix_clks(struct dc_stream_state *stream)
+ enum dc_status resource_map_pool_resources(
+ 		const struct dc  *dc,
+ 		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct dc_stream_state *stream)
+ {
+ 	const struct resource_pool *pool = dc->res_pool;
+-	int i, j;
+-
+-	for (i = 0; old_context && i < context->stream_count; i++) {
+-		struct dc_stream_state *stream = context->streams[i];
++	int i;
++	struct dc_context *dc_ctx = dc->ctx;
++	struct pipe_ctx *pipe_ctx = NULL;
++	int pipe_idx = -1;
+ 
+-		if (!resource_is_stream_unchanged(old_context, stream)) {
++	/* TODO Check if this is needed */
++	/*if (!resource_is_stream_unchanged(old_context, stream)) {
+ 			if (stream != NULL && old_context->streams[i] != NULL) {
+ 				stream->bit_depth_params =
+ 						old_context->streams[i]->bit_depth_params;
+@@ -1456,119 +1553,228 @@ enum dc_status resource_map_pool_resources(
+ 				continue;
+ 			}
+ 		}
++	*/
+ 
+-		/* mark resources used for stream that is already active */
+-		for (j = 0; j < pool->pipe_count; j++) {
+-			struct pipe_ctx *pipe_ctx =
+-				&context->res_ctx.pipe_ctx[j];
+-			const struct pipe_ctx *old_pipe_ctx =
+-					&old_context->res_ctx.pipe_ctx[j];
+-
+-			if (!are_stream_backends_same(old_pipe_ctx->stream, stream))
+-				continue;
++	/* acquire new resources */
++	pipe_idx = acquire_first_free_pipe(&context->res_ctx, pool, stream);
+ 
+-			if (old_pipe_ctx->top_pipe)
+-				continue;
++#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
++	if (pipe_idx < 0)
++		acquire_first_split_pipe(&context->res_ctx, pool, stream);
++#endif
++	if (pipe_idx < 0)
++		return DC_NO_CONTROLLER_RESOURCE;
++
++	pipe_ctx = &context->res_ctx.pipe_ctx[pipe_idx];
++
++	pipe_ctx->stream_res.stream_enc =
++		find_first_free_match_stream_enc_for_link(
++			&context->res_ctx, pool, stream);
++
++	if (!pipe_ctx->stream_res.stream_enc)
++		return DC_NO_STREAM_ENG_RESOURCE;
++
++	update_stream_engine_usage(
++		&context->res_ctx, pool,
++		pipe_ctx->stream_res.stream_enc,
++		true);
++
++	/* TODO: Add check if ASIC support and EDID audio */
++	if (!stream->sink->converter_disable_audio &&
++	    dc_is_audio_capable_signal(pipe_ctx->stream->signal) &&
++	    stream->audio_info.mode_count) {
++		pipe_ctx->stream_res.audio = find_first_free_audio(
++		&context->res_ctx, pool);
++
++		/*
++		 * Audio assigned in order first come first get.
++		 * There are asics which has number of audio
++		 * resources less then number of pipes
++		 */
++		if (pipe_ctx->stream_res.audio)
++			update_audio_usage(&context->res_ctx, pool,
++					   pipe_ctx->stream_res.audio, true);
++	}
+ 
+-			pipe_ctx->stream = stream;
+-			copy_pipe_ctx(old_pipe_ctx, pipe_ctx);
++	for (i = 0; i < context->stream_count; i++)
++		if (context->streams[i] == stream) {
++			context->stream_status[i].primary_otg_inst = pipe_ctx->stream_res.tg->inst;
++			return DC_OK;
++		}
+ 
+-			/* Split pipe resource, do not acquire back end */
+-			if (!pipe_ctx->stream_res.stream_enc)
+-				continue;
++	DC_ERROR("Stream %p not found in new ctx!\n", stream);
++	return DC_ERROR_UNEXPECTED;
++}
+ 
+-			set_stream_engine_in_use(
+-				&context->res_ctx, pool,
+-				pipe_ctx->stream_res.stream_enc);
++/* first stream in the context is used to populate the rest */
++void validate_guaranteed_copy_streams(
++		struct validate_context *context,
++		int max_streams)
++{
++	int i;
+ 
+-			/* Switch to dp clock source only if there is
+-			 * no non dp stream that shares the same timing
+-			 * with the dp stream.
+-			 */
+-			if (dc_is_dp_signal(pipe_ctx->stream->signal) &&
+-				!find_pll_sharable_stream(stream, context))
+-				pipe_ctx->clock_source = pool->dp_clock_source;
++	for (i = 1; i < max_streams; i++) {
++		context->streams[i] = context->streams[0];
+ 
+-			resource_reference_clock_source(
+-				&context->res_ctx, pool,
+-				pipe_ctx->clock_source);
++		copy_pipe_ctx(&context->res_ctx.pipe_ctx[0],
++			      &context->res_ctx.pipe_ctx[i]);
++		context->res_ctx.pipe_ctx[i].stream =
++				context->res_ctx.pipe_ctx[0].stream;
+ 
+-			set_audio_in_use(&context->res_ctx, pool,
+-					pipe_ctx->stream_res.audio);
+-		}
++		dc_stream_retain(context->streams[i]);
++		context->stream_count++;
+ 	}
++}
+ 
+-	for (i = 0; i < context->stream_count; i++) {
+-		struct dc_stream_state *stream = context->streams[i];
+-		struct pipe_ctx *pipe_ctx = NULL;
+-		int pipe_idx = -1;
++void dc_resource_validate_ctx_copy_construct_current(
++		const struct dc *dc,
++		struct validate_context *dst_ctx)
++{
++	dc_resource_validate_ctx_copy_construct(dc->current_context, dst_ctx);
++}
+ 
+-		if (old_context && resource_is_stream_unchanged(old_context, stream))
+-			continue;
+-		/* acquire new resources */
+-		pipe_idx = acquire_first_free_pipe(&context->res_ctx, pool, stream);
+-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+-		if (pipe_idx < 0)
+-			acquire_first_split_pipe(&context->res_ctx, pool, stream);
+-#endif
+-		if (pipe_idx < 0)
+-			return DC_NO_CONTROLLER_RESOURCE;
++bool dc_validate_with_context(
++		struct dc *dc,
++		const struct dc_validation_set set[],
++		int set_count,
++		struct validate_context *context)
++{
++	int i, j;
++	enum dc_status res = DC_ERROR_UNEXPECTED;
++	bool found = false;
++	int old_stream_count = context->stream_count;
++	struct dc_stream_state *del_streams[MAX_PIPES] = { 0 };
++	struct dc_stream_state *add_streams[MAX_PIPES] = { 0 };
++	int del_streams_count = 0;
++	int add_streams_count = 0;
+ 
+-		pipe_ctx = &context->res_ctx.pipe_ctx[pipe_idx];
+ 
+-		pipe_ctx->stream_res.stream_enc =
+-			find_first_free_match_stream_enc_for_link(
+-				&context->res_ctx, pool, stream);
++	/* First remove from context all deleted streams */
++	for (i = 0; i < old_stream_count; i++) {
++		struct dc_stream_state *stream = context->streams[i];
++
++		for (j = 0; j < set_count; j++) {
++			if (stream == set[j].stream) {
++				found = true;
++				break;
++			}
++		}
+ 
+-		if (!pipe_ctx->stream_res.stream_enc)
+-			return DC_NO_STREAM_ENG_RESOURCE;
++		if (!found)
++			del_streams[del_streams_count++] = stream;
+ 
+-		set_stream_engine_in_use(
+-			&context->res_ctx, pool,
+-			pipe_ctx->stream_res.stream_enc);
++		found = false;
++	}
+ 
+-		/* TODO: Add check if ASIC support and EDID audio */
+-		if (!stream->sink->converter_disable_audio &&
+-			dc_is_audio_capable_signal(pipe_ctx->stream->signal) &&
+-			stream->audio_info.mode_count) {
+-			pipe_ctx->stream_res.audio = find_first_free_audio(
+-				&context->res_ctx, pool);
++	/* Now add new ones */
++	for (i = 0; i < set_count; i++) {
++		struct dc_stream_state *stream = set[i].stream;
+ 
+-			/*
+-			 * Audio assigned in order first come first get.
+-			 * There are asics which has number of audio
+-			 * resources less then number of pipes
+-			 */
+-			if (pipe_ctx->stream_res.audio)
+-				set_audio_in_use(
+-					&context->res_ctx, pool,
+-					pipe_ctx->stream_res.audio);
++		for (j = 0; j < old_stream_count; j++) {
++			if (stream == context->streams[j]) {
++				found = true;
++				break;
++			}
+ 		}
+ 
+-		context->stream_status[i].primary_otg_inst = pipe_ctx->stream_res.tg->inst;
++		if (!found)
++			add_streams[add_streams_count++] = stream;
++
++		found = false;
+ 	}
+ 
+-	return DC_OK;
++	for (i = 0; i < del_streams_count; i++)
++		if (!dc_remove_stream_from_ctx(dc, context, del_streams[i]))
++			goto fail;
++
++	for (i = 0; i < add_streams_count; i++)
++		if (!dc_add_stream_to_ctx(dc, context, add_streams[i]))
++			goto fail;
++
++	if (!dc_validate_global_state(dc, set, set_count, context))
++		goto fail;
++
++	res = DC_OK;
++
++fail:
++	if (res != DC_OK) {
++		dm_logger_write(dc->ctx->logger, LOG_WARNING,
++				"%s:resource validation failed, dc_status:%d\n",
++				__func__,
++				res);
++}
++	return res == DC_OK;
+ }
+ 
+-/* first stream in the context is used to populate the rest */
+-void validate_guaranteed_copy_streams(
+-		struct validate_context *context,
+-		int max_streams)
++bool dc_validate_global_state(
++		struct dc *dc,
++		const struct dc_validation_set set[],
++		int set_count,
++		struct validate_context *new_ctx)
+ {
+-	int i;
++	enum dc_status result = DC_ERROR_UNEXPECTED;
++	struct dc_context *dc_ctx = dc->ctx;
++	struct validate_context *old_context = dc->current_context;
++	int i, j;
+ 
+-	for (i = 1; i < max_streams; i++) {
+-		context->streams[i] = context->streams[0];
++	if (dc->res_pool->funcs->validate_global &&
++	    dc->res_pool->funcs->validate_global(dc, set, set_count,
++						 old_context, new_ctx) != DC_OK)
++		return false;
+ 
+-		copy_pipe_ctx(&context->res_ctx.pipe_ctx[0],
+-			      &context->res_ctx.pipe_ctx[i]);
+-		context->res_ctx.pipe_ctx[i].stream =
+-				context->res_ctx.pipe_ctx[0].stream;
++	/* TODO without this SWDEV-114774 brakes */
++	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		struct pipe_ctx *pipe_ctx = &new_ctx->res_ctx.pipe_ctx[i];
+ 
+-		dc_stream_retain(context->streams[i]);
+-		context->stream_count++;
++		if (pipe_ctx->top_pipe)
++			memset(pipe_ctx, 0, sizeof(*pipe_ctx));
++	}
++
++	for (i = 0; new_ctx && i < new_ctx->stream_count; i++) {
++		struct dc_stream_state *stream = new_ctx->streams[i];
++
++		for (j = 0; j < dc->res_pool->pipe_count; j++) {
++			struct pipe_ctx *pipe_ctx = &new_ctx->res_ctx.pipe_ctx[j];
++
++			if (pipe_ctx->stream != stream)
++				continue;
++
++			/* Switch to dp clock source only if there is
++			 * no non dp stream that shares the same timing
++			 * with the dp stream.
++			 */
++			if (dc_is_dp_signal(pipe_ctx->stream->signal) &&
++				!find_pll_sharable_stream(stream, new_ctx)) {
++
++				resource_unreference_clock_source(
++						&new_ctx->res_ctx,
++						dc->res_pool,
++						&pipe_ctx->clock_source);
++				pipe_ctx->clock_source = dc->res_pool->dp_clock_source;
++				resource_reference_clock_source(
++						&new_ctx->res_ctx,
++						dc->res_pool,
++						 pipe_ctx->clock_source);
++			}
++		}
++	}
++
++	/*TODO This should be ok */
++	/* Split pipe resource, do not acquire back end */
++
++	if (!resource_validate_attach_surfaces(
++			set, set_count, old_context, new_ctx, dc->res_pool)) {
++		DC_ERROR("Failed to attach surface to stream!\n");
++		return DC_FAIL_ATTACH_SURFACES;
+ 	}
++
++	result = resource_build_scaling_params_for_context(dc, new_ctx);
++
++	if (result == DC_OK)
++		if (!dc->res_pool->funcs->validate_bandwidth(dc, new_ctx))
++			result = DC_FAIL_BANDWIDTH_VALIDATE;
++
++	return result;
+ }
+ 
+ static void patch_gamut_packet_checksum(
+@@ -2318,54 +2524,40 @@ void resource_build_info_frame(struct pipe_ctx *pipe_ctx)
+ enum dc_status resource_map_clock_resources(
+ 		const struct dc  *dc,
+ 		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct dc_stream_state *stream)
+ {
+-	int i, j;
+-	const struct resource_pool *pool = dc->res_pool;
+-
+ 	/* acquire new resources */
+-	for (i = 0; i < context->stream_count; i++) {
+-		struct dc_stream_state *stream = context->streams[i];
+-
+-		if (old_context && resource_is_stream_unchanged(old_context, stream))
+-			continue;
++	const struct resource_pool *pool = dc->res_pool;
++	struct pipe_ctx *pipe_ctx = resource_get_head_pipe_for_stream(
++				&context->res_ctx, stream);
+ 
+-		for (j = 0; j < MAX_PIPES; j++) {
+-			struct pipe_ctx *pipe_ctx =
+-				&context->res_ctx.pipe_ctx[j];
++	if (!pipe_ctx)
++		return DC_ERROR_UNEXPECTED;
+ 
+-			if (context->res_ctx.pipe_ctx[j].stream != stream)
+-				continue;
++	if (dc_is_dp_signal(pipe_ctx->stream->signal)
++		|| pipe_ctx->stream->signal == SIGNAL_TYPE_VIRTUAL)
++		pipe_ctx->clock_source = pool->dp_clock_source;
++	else {
++		pipe_ctx->clock_source = NULL;
+ 
+-			if (dc_is_dp_signal(pipe_ctx->stream->signal)
+-				|| pipe_ctx->stream->signal == SIGNAL_TYPE_VIRTUAL)
+-				pipe_ctx->clock_source = pool->dp_clock_source;
+-			else {
+-				pipe_ctx->clock_source = NULL;
+-
+-				if (!dc->config.disable_disp_pll_sharing)
+-					resource_find_used_clk_src_for_sharing(
+-						&context->res_ctx,
+-						pipe_ctx);
+-
+-				if (pipe_ctx->clock_source == NULL)
+-					pipe_ctx->clock_source =
+-						dc_resource_find_first_free_pll(
+-							&context->res_ctx,
+-							pool);
+-			}
++		if (!dc->config.disable_disp_pll_sharing)
++			resource_find_used_clk_src_for_sharing(
++				&context->res_ctx,
++				pipe_ctx);
+ 
+-			if (pipe_ctx->clock_source == NULL)
+-				return DC_NO_CLOCK_SOURCE_RESOURCE;
++		if (pipe_ctx->clock_source == NULL)
++			pipe_ctx->clock_source =
++				dc_resource_find_first_free_pll(
++					&context->res_ctx,
++					pool);
++	}
+ 
+-			resource_reference_clock_source(
+-				&context->res_ctx, pool,
+-				pipe_ctx->clock_source);
++	if (pipe_ctx->clock_source == NULL)
++		return DC_NO_CLOCK_SOURCE_RESOURCE;
+ 
+-			/* only one cs per stream regardless of mpo */
+-			break;
+-		}
+-	}
++	resource_reference_clock_source(
++		&context->res_ctx, pool,
++		pipe_ctx->clock_source);
+ 
+ 	return DC_OK;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 97c0648..b7b85bc 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -634,6 +634,16 @@ bool dc_stream_get_scanoutpos(const struct dc_stream_state *stream,
+ 				  uint32_t *h_position,
+ 				  uint32_t *v_position);
+ 
++bool dc_remove_stream_from_ctx(
++			struct dc *dc,
++			struct validate_context *new_ctx,
++			struct dc_stream_state *stream);
++
++bool dc_add_stream_to_ctx(
++		struct dc *dc,
++		struct validate_context *new_ctx,
++		struct dc_stream_state *stream);
++
+ /*
+  * Structure to store surface/stream associations for validation
+  */
+@@ -646,16 +656,18 @@ struct dc_validation_set {
+ bool dc_validate_stream(struct dc *dc, struct dc_stream_state *stream);
+ 
+ bool dc_validate_plane(struct dc *dc, const struct dc_plane_state *plane_state);
+-/*
+- * This function takes a set of resources and checks that they are cofunctional.
+- *
+- * After this call:
+- *   No hardware is programmed for call.  Only validation is done.
+- */
+-struct validate_context *dc_get_validate_context(
++
++bool dc_validate_with_context(
+ 		struct dc *dc,
+ 		const struct dc_validation_set set[],
+-		uint8_t set_count);
++		int set_count,
++		struct validate_context *context);
++
++bool dc_validate_global_state(
++		struct dc *dc,
++		const struct dc_validation_set set[],
++		int set_count,
++		struct validate_context *new_ctx);
+ 
+ bool dc_validate_resources(
+ 		struct dc *dc,
+@@ -678,6 +690,10 @@ void dc_resource_validate_ctx_copy_construct(
+ 		const struct validate_context *src_ctx,
+ 		struct validate_context *dst_ctx);
+ 
++void dc_resource_validate_ctx_copy_construct_current(
++		const struct dc *dc,
++		struct validate_context *dst_ctx);
++
+ void dc_resource_validate_ctx_destruct(struct validate_context *context);
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+index b2b0363..c9dad4e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce100/dce100_resource.c
+@@ -654,35 +654,20 @@ static void destruct(struct dce110_resource_pool *pool)
+ static enum dc_status build_mapped_resource(
+ 		const struct dc  *dc,
+ 		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct dc_stream_state *stream)
+ {
+ 	enum dc_status status = DC_OK;
+-	uint8_t i, j;
++	struct pipe_ctx *pipe_ctx = resource_get_head_pipe_for_stream(&context->res_ctx, stream);
+ 
+-	for (i = 0; i < context->stream_count; i++) {
+-		struct dc_stream_state *stream = context->streams[i];
++	if (!pipe_ctx)
++		return DC_ERROR_UNEXPECTED;
+ 
+-		if (old_context && resource_is_stream_unchanged(old_context, stream))
+-			continue;
+-
+-		for (j = 0; j < MAX_PIPES; j++) {
+-			struct pipe_ctx *pipe_ctx =
+-				&context->res_ctx.pipe_ctx[j];
+-
+-			if (context->res_ctx.pipe_ctx[j].stream != stream)
+-				continue;
+-
+-			status = dce110_resource_build_pipe_hw_param(pipe_ctx);
++	status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+-			if (status != DC_OK)
+-				return status;
++	if (status != DC_OK)
++		return status;
+ 
+-			resource_build_info_frame(pipe_ctx);
+-
+-			/* do not need to validate non root pipes */
+-			break;
+-		}
+-	}
++	resource_build_info_frame(pipe_ctx);
+ 
+ 	return DC_OK;
+ }
+@@ -719,48 +704,17 @@ static bool dce100_validate_surface_sets(
+ 	return true;
+ }
+ 
+-enum dc_status dce100_validate_with_context(
++enum dc_status dce100_validate_global(
+ 		struct dc  *dc,
+ 		const struct dc_validation_set set[],
+ 		int set_count,
+-		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct validate_context *old_context,
++		struct validate_context *context)
+ {
+-	struct dc_context *dc_ctx = dc->ctx;
+-	enum dc_status result = DC_ERROR_UNEXPECTED;
+-	int i;
+-
+ 	if (!dce100_validate_surface_sets(set, set_count))
+ 		return DC_FAIL_SURFACE_VALIDATE;
+ 
+-	for (i = 0; i < set_count; i++) {
+-		context->streams[i] = set[i].stream;
+-		dc_stream_retain(context->streams[i]);
+-		context->stream_count++;
+-	}
+-
+-	result = resource_map_pool_resources(dc, context, old_context);
+-
+-	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context, old_context);
+-
+-	if (!resource_validate_attach_surfaces(set, set_count,
+-			old_context, context, dc->res_pool)) {
+-		DC_ERROR("Failed to attach surface to stream!\n");
+-		return DC_FAIL_ATTACH_SURFACES;
+-	}
+-
+-	if (result == DC_OK)
+-		result = build_mapped_resource(dc, context, old_context);
+-
+-	if (result == DC_OK)
+-		result = resource_build_scaling_params_for_context(dc, context);
+-
+-	if (result == DC_OK)
+-		if (!dce100_validate_bandwidth(dc, context))
+-			result = DC_FAIL_BANDWIDTH_VALIDATE;
+-
+-	return result;
++	return DC_OK;
+ }
+ 
+ enum dc_status dce100_validate_guaranteed(
+@@ -774,13 +728,13 @@ enum dc_status dce100_validate_guaranteed(
+ 	dc_stream_retain(context->streams[0]);
+ 	context->stream_count++;
+ 
+-	result = resource_map_pool_resources(dc, context, NULL);
++	result = resource_map_pool_resources(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context, NULL);
++		result = resource_map_clock_resources(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK)
+-		result = build_mapped_resource(dc, context, NULL);
++		result = build_mapped_resource(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+@@ -816,10 +770,10 @@ enum dc_status dce100_validate_plane(const struct dc_plane_state *plane_state)
+ static const struct resource_funcs dce100_res_pool_funcs = {
+ 	.destroy = dce100_destroy_resource_pool,
+ 	.link_enc_create = dce100_link_encoder_create,
+-	.validate_with_context = dce100_validate_with_context,
+ 	.validate_guaranteed = dce100_validate_guaranteed,
+ 	.validate_bandwidth = dce100_validate_bandwidth,
+ 	.validate_plane = dce100_validate_plane,
++	.validate_global = dce100_validate_global
+ };
+ 
+ static bool construct(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+index 2154c2e..d682180 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_resource.c
+@@ -774,41 +774,26 @@ static bool is_surface_pixel_format_supported(struct pipe_ctx *pipe_ctx, unsigne
+ static enum dc_status build_mapped_resource(
+ 		const struct dc *dc,
+ 		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct dc_stream_state *stream)
+ {
+ 	enum dc_status status = DC_OK;
+-	uint8_t i, j;
+-
+-	for (i = 0; i < context->stream_count; i++) {
+-		struct dc_stream_state *stream = context->streams[i];
+-
+-		if (old_context && resource_is_stream_unchanged(old_context, stream))
+-			continue;
++	struct pipe_ctx *pipe_ctx = resource_get_head_pipe_for_stream(&context->res_ctx, stream);
+ 
+-		for (j = 0; j < MAX_PIPES; j++) {
+-			struct pipe_ctx *pipe_ctx =
+-				&context->res_ctx.pipe_ctx[j];
++	if (!pipe_ctx)
++		return DC_ERROR_UNEXPECTED;
+ 
+-			if (context->res_ctx.pipe_ctx[j].stream != stream)
+-				continue;
++	if (!is_surface_pixel_format_supported(pipe_ctx,
++			dc->res_pool->underlay_pipe_index))
++		return DC_SURFACE_PIXEL_FORMAT_UNSUPPORTED;
+ 
+-			if (!is_surface_pixel_format_supported(pipe_ctx,
+-					dc->res_pool->underlay_pipe_index))
+-				return DC_SURFACE_PIXEL_FORMAT_UNSUPPORTED;
++	status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+-			status = dce110_resource_build_pipe_hw_param(pipe_ctx);
++	if (status != DC_OK)
++		return status;
+ 
+-			if (status != DC_OK)
+-				return status;
++	/* TODO: validate audio ASIC caps, encoder */
+ 
+-			/* TODO: validate audio ASIC caps, encoder */
+-
+-			resource_build_info_frame(pipe_ctx);
+-
+-			/* do not need to validate non root pipes */
+-			break;
+-		}
+-	}
++	resource_build_info_frame(pipe_ctx);
+ 
+ 	return DC_OK;
+ }
+@@ -927,48 +912,17 @@ static bool dce110_validate_surface_sets(
+ 	return true;
+ }
+ 
+-static enum dc_status dce110_validate_with_context(
++enum dc_status dce110_validate_global(
+ 		struct dc *dc,
+ 		const struct dc_validation_set set[],
+ 		int set_count,
+-		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct validate_context *old_context,
++		struct validate_context *context)
+ {
+-	struct dc_context *dc_ctx = dc->ctx;
+-	enum dc_status result = DC_ERROR_UNEXPECTED;
+-	int i;
+-
+ 	if (!dce110_validate_surface_sets(set, set_count))
+ 		return DC_FAIL_SURFACE_VALIDATE;
+ 
+-	for (i = 0; i < set_count; i++) {
+-		context->streams[i] = set[i].stream;
+-		dc_stream_retain(context->streams[i]);
+-		context->stream_count++;
+-	}
+-
+-	result = resource_map_pool_resources(dc, context, old_context);
+-
+-	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context, old_context);
+-
+-	if (!resource_validate_attach_surfaces(set, set_count,
+-			old_context, context, dc->res_pool)) {
+-		DC_ERROR("Failed to attach surface to stream!\n");
+-		return DC_FAIL_ATTACH_SURFACES;
+-	}
+-
+-	if (result == DC_OK)
+-		result = build_mapped_resource(dc, context, old_context);
+-
+-	if (result == DC_OK)
+-		result = resource_build_scaling_params_for_context(dc, context);
+-
+-	if (result == DC_OK)
+-		if (!dce110_validate_bandwidth(dc, context))
+-			result = DC_FAIL_BANDWIDTH_VALIDATE;
+-
+-	return result;
++	return DC_OK;
+ }
+ 
+ static enum dc_status dce110_validate_guaranteed(
+@@ -982,13 +936,13 @@ static enum dc_status dce110_validate_guaranteed(
+ 	dc_stream_retain(context->streams[0]);
+ 	context->stream_count++;
+ 
+-	result = resource_map_pool_resources(dc, context, NULL);
++	result = resource_map_pool_resources(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context, NULL);
++		result = resource_map_clock_resources(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK)
+-		result = build_mapped_resource(dc, context, NULL);
++		result = build_mapped_resource(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+@@ -1078,10 +1032,10 @@ static void dce110_destroy_resource_pool(struct resource_pool **pool)
+ static const struct resource_funcs dce110_res_pool_funcs = {
+ 	.destroy = dce110_destroy_resource_pool,
+ 	.link_enc_create = dce110_link_encoder_create,
+-	.validate_with_context = dce110_validate_with_context,
+ 	.validate_guaranteed = dce110_validate_guaranteed,
+ 	.validate_bandwidth = dce110_validate_bandwidth,
+ 	.acquire_idle_pipe_for_layer = dce110_acquire_underlay,
++	.validate_global = dce110_validate_global
+ };
+ 
+ static bool underlay_create(struct dc_context *ctx, struct resource_pool *pool)
+diff --git a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+index 89a8dfa..85a396e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.c
+@@ -725,35 +725,20 @@ static struct clock_source *find_matching_pll(
+ static enum dc_status build_mapped_resource(
+ 		const struct dc *dc,
+ 		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct dc_stream_state *stream)
+ {
+ 	enum dc_status status = DC_OK;
+-	uint8_t i, j;
++	struct pipe_ctx *pipe_ctx = resource_get_head_pipe_for_stream(&context->res_ctx, stream);
+ 
+-	for (i = 0; i < context->stream_count; i++) {
+-		struct dc_stream_state *stream = context->streams[i];
++	if (!pipe_ctx)
++		return DC_ERROR_UNEXPECTED;
+ 
+-		if (old_context && resource_is_stream_unchanged(old_context, stream))
+-			continue;
+-
+-		for (j = 0; j < MAX_PIPES; j++) {
+-			struct pipe_ctx *pipe_ctx =
+-				&context->res_ctx.pipe_ctx[j];
+-
+-			if (context->res_ctx.pipe_ctx[j].stream != stream)
+-				continue;
++	status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+-			status = dce110_resource_build_pipe_hw_param(pipe_ctx);
++	if (status != DC_OK)
++		return status;
+ 
+-			if (status != DC_OK)
+-				return status;
+-
+-			resource_build_info_frame(pipe_ctx);
+-
+-			/* do not need to validate non root pipes */
+-			break;
+-		}
+-	}
++	resource_build_info_frame(pipe_ctx);
+ 
+ 	return DC_OK;
+ }
+@@ -839,45 +824,32 @@ bool dce112_validate_bandwidth(
+ enum dc_status resource_map_phy_clock_resources(
+ 		const struct dc *dc,
+ 		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct dc_stream_state *stream)
+ {
+-	uint8_t i, j;
+ 
+ 	/* acquire new resources */
+-	for (i = 0; i < context->stream_count; i++) {
+-		struct dc_stream_state *stream = context->streams[i];
+-
+-		if (old_context && resource_is_stream_unchanged(old_context, stream))
+-			continue;
+-
+-		for (j = 0; j < MAX_PIPES; j++) {
+-			struct pipe_ctx *pipe_ctx =
+-				&context->res_ctx.pipe_ctx[j];
+-
+-			if (context->res_ctx.pipe_ctx[j].stream != stream)
+-				continue;
++	struct pipe_ctx *pipe_ctx = resource_get_head_pipe_for_stream(
++			&context->res_ctx, stream);
+ 
+-			if (dc_is_dp_signal(pipe_ctx->stream->signal)
+-				|| pipe_ctx->stream->signal == SIGNAL_TYPE_VIRTUAL)
+-				pipe_ctx->clock_source =
+-						dc->res_pool->dp_clock_source;
+-			else
+-				pipe_ctx->clock_source = find_matching_pll(
+-					&context->res_ctx, dc->res_pool,
+-					stream);
++	if (!pipe_ctx)
++		return DC_ERROR_UNEXPECTED;
+ 
+-			if (pipe_ctx->clock_source == NULL)
+-				return DC_NO_CLOCK_SOURCE_RESOURCE;
++	if (dc_is_dp_signal(pipe_ctx->stream->signal)
++		|| pipe_ctx->stream->signal == SIGNAL_TYPE_VIRTUAL)
++		pipe_ctx->clock_source =
++				dc->res_pool->dp_clock_source;
++	else
++		pipe_ctx->clock_source = find_matching_pll(
++			&context->res_ctx, dc->res_pool,
++			stream);
+ 
+-			resource_reference_clock_source(
+-				&context->res_ctx,
+-				dc->res_pool,
+-				pipe_ctx->clock_source);
++	if (pipe_ctx->clock_source == NULL)
++		return DC_NO_CLOCK_SOURCE_RESOURCE;
+ 
+-			/* only one cs per stream regardless of mpo */
+-			break;
+-		}
+-	}
++	resource_reference_clock_source(
++		&context->res_ctx,
++		dc->res_pool,
++		pipe_ctx->clock_source);
+ 
+ 	return DC_OK;
+ }
+@@ -903,46 +875,21 @@ static bool dce112_validate_surface_sets(
+ 	return true;
+ }
+ 
+-enum dc_status dce112_validate_with_context(
++enum dc_status dce112_add_stream_to_ctx(
+ 		struct dc *dc,
+-		const struct dc_validation_set set[],
+-		int set_count,
+-		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct validate_context *new_ctx,
++		struct dc_stream_state *dc_stream)
+ {
+-	struct dc_context *dc_ctx = dc->ctx;
+ 	enum dc_status result = DC_ERROR_UNEXPECTED;
+-	int i;
+ 
+-	if (!dce112_validate_surface_sets(set, set_count))
+-		return DC_FAIL_SURFACE_VALIDATE;
+-
+-	for (i = 0; i < set_count; i++) {
+-		context->streams[i] = set[i].stream;
+-		dc_stream_retain(context->streams[i]);
+-		context->stream_count++;
+-	}
+-
+-	result = resource_map_pool_resources(dc, context, old_context);
++	result = resource_map_pool_resources(dc, new_ctx, dc_stream);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_phy_clock_resources(dc, context, old_context);
+-
+-	if (!resource_validate_attach_surfaces(set, set_count,
+-			old_context, context, dc->res_pool)) {
+-		DC_ERROR("Failed to attach surface to stream!\n");
+-		return DC_FAIL_ATTACH_SURFACES;
+-	}
++		result = resource_map_phy_clock_resources(dc, new_ctx, dc_stream);
+ 
+-	if (result == DC_OK)
+-		result = build_mapped_resource(dc, context, old_context);
+ 
+ 	if (result == DC_OK)
+-		result = resource_build_scaling_params_for_context(dc, context);
+-
+-	if (result == DC_OK)
+-		if (!dce112_validate_bandwidth(dc, context))
+-			result = DC_FAIL_BANDWIDTH_VALIDATE;
++		result = build_mapped_resource(dc, new_ctx, dc_stream);
+ 
+ 	return result;
+ }
+@@ -958,13 +905,13 @@ enum dc_status dce112_validate_guaranteed(
+ 	dc_stream_retain(context->streams[0]);
+ 	context->stream_count++;
+ 
+-	result = resource_map_pool_resources(dc, context, NULL);
++	result = resource_map_pool_resources(dc, context, stream);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_phy_clock_resources(dc, context, NULL);
++		result = resource_map_phy_clock_resources(dc, context, stream);
+ 
+ 	if (result == DC_OK)
+-		result = build_mapped_resource(dc, context, NULL);
++		result = build_mapped_resource(dc, context, stream);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+@@ -979,6 +926,19 @@ enum dc_status dce112_validate_guaranteed(
+ 	return result;
+ }
+ 
++enum dc_status dce112_validate_global(
++		struct dc *dc,
++		const struct dc_validation_set set[],
++		int set_count,
++		struct validate_context *old_context,
++		struct validate_context *context)
++{
++	if (!dce112_validate_surface_sets(set, set_count))
++		return DC_FAIL_SURFACE_VALIDATE;
++
++	return DC_OK;
++}
++
+ static void dce112_destroy_resource_pool(struct resource_pool **pool)
+ {
+ 	struct dce110_resource_pool *dce110_pool = TO_DCE110_RES_POOL(*pool);
+@@ -991,10 +951,11 @@ static void dce112_destroy_resource_pool(struct resource_pool **pool)
+ static const struct resource_funcs dce112_res_pool_funcs = {
+ 	.destroy = dce112_destroy_resource_pool,
+ 	.link_enc_create = dce112_link_encoder_create,
+-	.validate_with_context = dce112_validate_with_context,
+ 	.validate_guaranteed = dce112_validate_guaranteed,
+ 	.validate_bandwidth = dce112_validate_bandwidth,
+-	.validate_plane = dce100_validate_plane
++	.validate_plane = dce100_validate_plane,
++	.add_stream_to_ctx = dce112_add_stream_to_ctx,
++	.validate_global = dce112_validate_global
+ };
+ 
+ static void bw_calcs_data_update_from_pplib(struct dc *dc)
+diff --git a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h
+index 69f8f68..f1834bf 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h
++++ b/drivers/gpu/drm/amd/display/dc/dce112/dce112_resource.h
+@@ -51,6 +51,11 @@ bool dce112_validate_bandwidth(
+ 	struct dc *dc,
+ 	struct validate_context *context);
+ 
++enum dc_status dce112_add_stream_to_ctx(
++		struct dc *dc,
++		struct validate_context *new_ctx,
++		struct dc_stream_state *dc_stream);
++
+ 
+ #endif /* __DC_RESOURCE_DCE112_H__ */
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce120/dce120_resource.c b/drivers/gpu/drm/amd/display/dc/dce120/dce120_resource.c
+index b8fcdff..e5d2d98 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce120/dce120_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce120/dce120_resource.c
+@@ -698,10 +698,10 @@ static void dce120_destroy_resource_pool(struct resource_pool **pool)
+ static const struct resource_funcs dce120_res_pool_funcs = {
+ 	.destroy = dce120_destroy_resource_pool,
+ 	.link_enc_create = dce120_link_encoder_create,
+-	.validate_with_context = dce112_validate_with_context,
+ 	.validate_guaranteed = dce112_validate_guaranteed,
+ 	.validate_bandwidth = dce112_validate_bandwidth,
+-	.validate_plane = dce100_validate_plane
++	.validate_plane = dce100_validate_plane,
++	.add_stream_to_ctx = dce112_add_stream_to_ctx
+ };
+ 
+ static void bw_calcs_data_update_from_pplib(struct dc *dc)
+diff --git a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+index 838bfda..ac3f42a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dce80/dce80_resource.c
+@@ -686,35 +686,20 @@ static void destruct(struct dce110_resource_pool *pool)
+ static enum dc_status build_mapped_resource(
+ 		const struct dc *dc,
+ 		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct dc_stream_state *stream)
+ {
+ 	enum dc_status status = DC_OK;
+-	uint8_t i, j;
++	struct pipe_ctx *pipe_ctx = resource_get_head_pipe_for_stream(&context->res_ctx, stream);
+ 
+-	for (i = 0; i < context->stream_count; i++) {
+-		struct dc_stream_state *stream = context->streams[i];
++	if (!pipe_ctx)
++		return DC_ERROR_UNEXPECTED;
+ 
+-		if (old_context && resource_is_stream_unchanged(old_context, stream))
+-			continue;
+-
+-		for (j = 0; j < MAX_PIPES; j++) {
+-			struct pipe_ctx *pipe_ctx =
+-				&context->res_ctx.pipe_ctx[j];
+-
+-			if (context->res_ctx.pipe_ctx[j].stream != stream)
+-				continue;
+-
+-			status = dce110_resource_build_pipe_hw_param(pipe_ctx);
++	status = dce110_resource_build_pipe_hw_param(pipe_ctx);
+ 
+-			if (status != DC_OK)
+-				return status;
++	if (status != DC_OK)
++		return status;
+ 
+-			resource_build_info_frame(pipe_ctx);
+-
+-			/* do not need to validate non root pipes */
+-			break;
+-		}
+-	}
++	resource_build_info_frame(pipe_ctx);
+ 
+ 	return DC_OK;
+ }
+@@ -751,47 +736,17 @@ static bool dce80_validate_surface_sets(
+ 	return true;
+ }
+ 
+-enum dc_status dce80_validate_with_context(
++enum dc_status dce80_validate_global(
+ 		struct dc *dc,
+ 		const struct dc_validation_set set[],
+ 		int set_count,
+-		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct validate_context *old_context,
++		struct validate_context *context)
+ {
+-	struct dc_context *dc_ctx = dc->ctx;
+-	enum dc_status result = DC_ERROR_UNEXPECTED;
+-	int i;
+-
+ 	if (!dce80_validate_surface_sets(set, set_count))
+ 		return DC_FAIL_SURFACE_VALIDATE;
+ 
+-	for (i = 0; i < set_count; i++) {
+-		context->streams[i] = set[i].stream;
+-		dc_stream_retain(context->streams[i]);
+-		context->stream_count++;
+-	}
+-
+-	result = resource_map_pool_resources(dc, context, old_context);
+-
+-	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context, old_context);
+-
+-	if (!resource_validate_attach_surfaces(set, set_count,
+-			old_context, context, dc->res_pool)) {
+-		DC_ERROR("Failed to attach surface to stream!\n");
+-		return DC_FAIL_ATTACH_SURFACES;
+-	}
+-
+-	if (result == DC_OK)
+-		result = build_mapped_resource(dc, context, old_context);
+-
+-	if (result == DC_OK)
+-		result = resource_build_scaling_params_for_context(dc, context);
+-
+-	if (result == DC_OK)
+-		result = dce80_validate_bandwidth(dc, context);
+-
+-	return result;
++	return DC_OK;
+ }
+ 
+ enum dc_status dce80_validate_guaranteed(
+@@ -805,13 +760,13 @@ enum dc_status dce80_validate_guaranteed(
+ 	dc_stream_retain(context->streams[0]);
+ 	context->stream_count++;
+ 
+-	result = resource_map_pool_resources(dc, context, NULL);
++	result = resource_map_pool_resources(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_clock_resources(dc, context, NULL);
++		result = resource_map_clock_resources(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK)
+-		result = build_mapped_resource(dc, context, NULL);
++		result = build_mapped_resource(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+@@ -837,10 +792,10 @@ static void dce80_destroy_resource_pool(struct resource_pool **pool)
+ static const struct resource_funcs dce80_res_pool_funcs = {
+ 	.destroy = dce80_destroy_resource_pool,
+ 	.link_enc_create = dce80_link_encoder_create,
+-	.validate_with_context = dce80_validate_with_context,
+ 	.validate_guaranteed = dce80_validate_guaranteed,
+ 	.validate_bandwidth = dce80_validate_bandwidth,
+-	.validate_plane = dce100_validate_plane
++	.validate_plane = dce100_validate_plane,
++	.validate_global = dce80_validate_global
+ };
+ 
+ static bool dce80_construct(
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+index 954c234..ee43cbc 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+@@ -48,6 +48,7 @@
+ #include "dce/dce_hwseq.h"
+ #include "../virtual/virtual_stream_encoder.h"
+ #include "dce110/dce110_resource.h"
++#include "dce112/dce112_resource.h"
+ 
+ #include "vega10/soc15ip.h"
+ 
+@@ -840,17 +841,15 @@ static enum dc_status build_pipe_hw_param(struct pipe_ctx *pipe_ctx)
+ static enum dc_status build_mapped_resource(
+ 		const struct dc *dc,
+ 		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct dc_stream_state *stream)
+ {
+ 	enum dc_status status = DC_OK;
+-	uint8_t i, j;
+-
+-	for (i = 0; i < context->stream_count; i++) {
+-		struct dc_stream_state *stream = context->streams[i];
++	struct pipe_ctx *pipe_ctx = resource_get_head_pipe_for_stream(&context->res_ctx, stream);
+ 
+-		if (old_context && resource_is_stream_unchanged(old_context, stream)) {
++	/*TODO Seems unneeded anymore */
++	/*	if (old_context && resource_is_stream_unchanged(old_context, stream)) {
+ 			if (stream != NULL && old_context->streams[i] != NULL) {
+-				/* todo: shouldn't have to copy missing parameter here */
++				 todo: shouldn't have to copy missing parameter here
+ 				resource_build_bit_depth_reduction_params(stream,
+ 						&stream->bit_depth_params);
+ 				stream->clamping.pixel_encoding =
+@@ -863,68 +862,34 @@ static enum dc_status build_mapped_resource(
+ 				continue;
+ 			}
+ 		}
++	*/
+ 
+-		for (j = 0; j < dc->res_pool->pipe_count ; j++) {
+-			struct pipe_ctx *pipe_ctx =
+-				&context->res_ctx.pipe_ctx[j];
++	if (!pipe_ctx)
++		return DC_ERROR_UNEXPECTED;
+ 
+-			if (context->res_ctx.pipe_ctx[j].stream != stream)
+-				continue;
++	status = build_pipe_hw_param(pipe_ctx);
+ 
+-			status = build_pipe_hw_param(pipe_ctx);
+-
+-			if (status != DC_OK)
+-				return status;
+-
+-			/* do not need to validate non root pipes */
+-			break;
+-		}
+-	}
++	if (status != DC_OK)
++		return status;
+ 
+ 	return DC_OK;
+ }
+ 
+-enum dc_status dcn10_validate_with_context(
++enum dc_status dcn10_add_stream_to_ctx(
+ 		struct dc *dc,
+-		const struct dc_validation_set set[],
+-		int set_count,
+-		struct validate_context *context,
+-		struct validate_context *old_context)
++		struct validate_context *new_ctx,
++		struct dc_stream_state *dc_stream)
+ {
+-	enum dc_status result = DC_OK;
+-	int i;
+-
+-	if (set_count == 0)
+-		return result;
+-
+-	for (i = 0; i < set_count; i++) {
+-		context->streams[i] = set[i].stream;
+-		dc_stream_retain(context->streams[i]);
+-		context->stream_count++;
+-	}
+-
+-	result = resource_map_pool_resources(dc, context, old_context);
+-	if (result != DC_OK)
+-		return result;
+-
+-	result = resource_map_phy_clock_resources(dc, context, old_context);
+-	if (result != DC_OK)
+-		return result;
++	enum dc_status result = DC_ERROR_UNEXPECTED;
+ 
+-	result = build_mapped_resource(dc, context, old_context);
+-	if (result != DC_OK)
+-		return result;
++	result = resource_map_pool_resources(dc, new_ctx, dc_stream);
+ 
+-	if (!resource_validate_attach_surfaces(set, set_count,
+-			old_context, context, dc->res_pool))
+-		return DC_FAIL_ATTACH_SURFACES;
++	if (result == DC_OK)
++		result = resource_map_phy_clock_resources(dc, new_ctx, dc_stream);
+ 
+-	result = resource_build_scaling_params_for_context(dc, context);
+-	if (result != DC_OK)
+-		return result;
+ 
+-	if (!dcn_validate_bandwidth(dc, context))
+-		return DC_FAIL_BANDWIDTH_VALIDATE;
++	if (result == DC_OK)
++		result = build_mapped_resource(dc, new_ctx, dc_stream);
+ 
+ 	return result;
+ }
+@@ -940,13 +905,13 @@ enum dc_status dcn10_validate_guaranteed(
+ 	dc_stream_retain(context->streams[0]);
+ 	context->stream_count++;
+ 
+-	result = resource_map_pool_resources(dc, context, NULL);
++	result = resource_map_pool_resources(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK)
+-		result = resource_map_phy_clock_resources(dc, context, NULL);
++		result = resource_map_phy_clock_resources(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK)
+-		result = build_mapped_resource(dc, context, NULL);
++		result = build_mapped_resource(dc, context, dc_stream);
+ 
+ 	if (result == DC_OK) {
+ 		validate_guaranteed_copy_streams(
+@@ -1226,10 +1191,10 @@ static struct dc_cap_funcs cap_funcs = {
+ static struct resource_funcs dcn10_res_pool_funcs = {
+ 	.destroy = dcn10_destroy_resource_pool,
+ 	.link_enc_create = dcn10_link_encoder_create,
+-	.validate_with_context = dcn10_validate_with_context,
+ 	.validate_guaranteed = dcn10_validate_guaranteed,
+ 	.validate_bandwidth = dcn_validate_bandwidth,
+ 	.acquire_idle_pipe_for_layer = dcn10_acquire_idle_pipe_for_layer,
++	.add_stream_to_ctx = dcn10_add_stream_to_ctx
+ };
+ 
+ static bool construct(
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index a3f0039..9a32390 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -87,12 +87,6 @@ struct resource_funcs {
+ 	void (*destroy)(struct resource_pool **pool);
+ 	struct link_encoder *(*link_enc_create)(
+ 			const struct encoder_init_data *init);
+-	enum dc_status (*validate_with_context)(
+-					struct dc *dc,
+-					const struct dc_validation_set set[],
+-					int set_count,
+-					struct validate_context *context,
+-					struct validate_context *old_context);
+ 
+ 	enum dc_status (*validate_guaranteed)(
+ 					struct dc *dc,
+@@ -103,11 +97,24 @@ struct resource_funcs {
+ 					struct dc *dc,
+ 					struct validate_context *context);
+ 
++	enum dc_status (*validate_global)(
++		struct dc *dc,
++		const struct dc_validation_set set[],
++		int set_count,
++		struct validate_context *old_context,
++		struct validate_context *context);
++
+ 	struct pipe_ctx *(*acquire_idle_pipe_for_layer)(
+ 			struct validate_context *context,
+ 			const struct resource_pool *pool,
+ 			struct dc_stream_state *stream);
++
+ 	enum dc_status (*validate_plane)(const struct dc_plane_state *plane_state);
++
++	enum dc_status (*add_stream_to_ctx)(
++			struct dc *dc,
++			struct validate_context *new_ctx,
++			struct dc_stream_state *dc_stream);
+ };
+ 
+ struct audio_support{
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/resource.h b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+index 9085ec7..ebc0f5b 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+@@ -82,7 +82,7 @@ void dc_destroy_resource_pool(struct dc *dc);
+ enum dc_status resource_map_pool_resources(
+ 		const struct dc *dc,
+ 		struct validate_context *context,
+-		struct validate_context *old_context);
++		struct dc_stream_state *stream);
+ 
+ bool resource_build_scaling_params(struct pipe_ctx *pipe_ctx);
+ 
+@@ -150,12 +150,12 @@ void resource_validate_ctx_update_pointer_after_copy(
+ enum dc_status resource_map_clock_resources(
+ 		const struct dc *dc,
+ 		struct validate_context *context,
+-		struct validate_context *old_context);
++		struct dc_stream_state *stream);
+ 
+ enum dc_status resource_map_phy_clock_resources(
+ 		const struct dc *dc,
+ 		struct validate_context *context,
+-		struct validate_context *old_context);
++		struct dc_stream_state *stream);
+ 
+ bool pipe_need_reprogram(
+ 		struct pipe_ctx *pipe_ctx_old,
+-- 
+2.7.4
+

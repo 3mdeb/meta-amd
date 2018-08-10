@@ -1,0 +1,212 @@
+From 65a63c2bceee730dd5b1002dd01c7a2c489481f3 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Sat, 26 Aug 2017 02:00:57 -0400
+Subject: [PATCH 5743/5855] drm/amdkfd: Separate doorbell allocation from PASID
+
+PASID management is moving into KGD. Limiting the PASID range to the
+number of doorbell pages is no longer practical.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c   |  7 -----
+ drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c | 50 +++++++++++++++++++++----------
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h     | 10 +++----
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c  |  6 ++++
+ 4 files changed, 45 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index dc8294f..ca54503 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -168,13 +168,6 @@ static bool device_iommu_pasid_init(struct kfd_dev *kfd)
+ 	pasid_limit = min_t(unsigned int,
+ 			(unsigned int)(1 << kfd->device_info->max_pasid_bits),
+ 			iommu_info.max_pasids);
+-	/*
+-	 * last pasid is used for kernel queues doorbells
+-	 * in the future the last pasid might be used for a kernel thread.
+-	 */
+-	pasid_limit = min_t(unsigned int,
+-				pasid_limit,
+-				kfd->doorbell_process_limit - 1);
+ 
+ 	err = amd_iommu_init_device(kfd->pdev, pasid_limit);
+ 	if (err < 0) {
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c b/drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c
+index acf4d2a..feb76c2 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c
+@@ -24,16 +24,15 @@
+ #include <linux/mman.h>
+ #include <linux/slab.h>
+ #include <linux/io.h>
++#include <linux/idr.h>
+ 
+ /*
+- * This extension supports a kernel level doorbells management for
+- * the kernel queues.
+- * Basically the last doorbells page is devoted to kernel queues
+- * and that's assures that any user process won't get access to the
+- * kernel doorbells page
++ * This extension supports a kernel level doorbells management for the
++ * kernel queues using the first doorbell page reserved for the kernel.
+  */
+ 
+-#define KERNEL_DOORBELL_PASID 1
++static DEFINE_IDA(doorbell_ida);
++static unsigned int max_doorbell_slices;
+ #define KFD_SIZE_OF_DOORBELL_IN_BYTES 4
+ 
+ /*
+@@ -84,13 +83,16 @@ int kfd_doorbell_init(struct kfd_dev *kfd)
+ 			(doorbell_aperture_size - doorbell_start_offset) /
+ 						doorbell_process_allocation();
+ 	else
+-		doorbell_process_limit = 0;
++		return -ENOSPC;
++
++	if (!max_doorbell_slices ||
++	    doorbell_process_limit < max_doorbell_slices)
++		max_doorbell_slices = doorbell_process_limit;
+ 
+ 	kfd->doorbell_base = kfd->shared_resources.doorbell_physical_address +
+ 				doorbell_start_offset;
+ 
+ 	kfd->doorbell_id_offset = doorbell_start_offset / sizeof(u32);
+-	kfd->doorbell_process_limit = doorbell_process_limit - 1;
+ 
+ 	kfd->doorbell_kernel_ptr = ioremap(kfd->doorbell_base,
+ 						doorbell_process_allocation());
+@@ -185,11 +187,10 @@ u32 __iomem *kfd_get_kernel_doorbell(struct kfd_dev *kfd,
+ 		return NULL;
+ 
+ 	/*
+-	 * Calculating the kernel doorbell offset using "faked" kernel
+-	 * pasid that allocated for kernel queues only
++	 * Calculating the kernel doorbell offset using the first
++	 * doorbell page.
+ 	 */
+-	*doorbell_off = KERNEL_DOORBELL_PASID * (doorbell_process_allocation() /
+-							sizeof(u32)) + inx;
++	*doorbell_off = kfd->doorbell_id_offset + inx;
+ 
+ 	pr_debug("Get kernel queue doorbell\n"
+ 			 "     doorbell offset   == 0x%08X\n"
+@@ -228,11 +229,12 @@ unsigned int kfd_queue_id_to_doorbell(struct kfd_dev *kfd,
+ {
+ 	/*
+ 	 * doorbell_id_offset accounts for doorbells taken by KGD.
+-	 * pasid * doorbell_process_allocation/sizeof(u32) adjusts
+-	 * to the process's doorbells
++	 * index * doorbell_process_allocation/sizeof(u32) adjusts to
++	 * the process's doorbells.
+ 	 */
+ 	return kfd->doorbell_id_offset +
+-		process->pasid * (doorbell_process_allocation()/sizeof(u32)) +
++		process->doorbell_index
++		* doorbell_process_allocation() / sizeof(u32) +
+ 		queue_id;
+ }
+ 
+@@ -250,5 +252,21 @@ phys_addr_t kfd_get_process_doorbells(struct kfd_dev *dev,
+ 					struct kfd_process *process)
+ {
+ 	return dev->doorbell_base +
+-		process->pasid * doorbell_process_allocation();
++		process->doorbell_index * doorbell_process_allocation();
++}
++
++int kfd_alloc_process_doorbells(struct kfd_process *process)
++{
++	int r = ida_simple_get(&doorbell_ida, 1, max_doorbell_slices,
++				GFP_KERNEL);
++	if (r > 0)
++		process->doorbell_index = r;
++
++	return r;
++}
++
++void kfd_free_process_doorbells(struct kfd_process *process)
++{
++	if (process->doorbell_index)
++		ida_simple_remove(&doorbell_ida, process->doorbell_index);
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 56807f1..b4c6375 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -157,9 +157,6 @@ struct kfd_dev {
+ 					 * to HW doorbell, GFX reserved some
+ 					 * at the start)
+ 					 */
+-	size_t doorbell_process_limit;	/* Number of processes we have doorbell
+-					 * space for.
+-					 */
+ 	u32 __iomem *doorbell_kernel_ptr; /* This is a pointer for a doorbells
+ 					   * page used by kernel queue
+ 					   */
+@@ -495,6 +492,7 @@ struct kfd_process {
+ 	struct rcu_head	rcu;
+ 
+ 	unsigned int pasid;
++	unsigned int doorbell_index;
+ 
+ 	/*
+ 	 * List of kfd_process_device structures,
+@@ -583,6 +581,10 @@ void write_kernel_doorbell(u32 __iomem *db, u32 value);
+ unsigned int kfd_queue_id_to_doorbell(struct kfd_dev *kfd,
+ 					struct kfd_process *process,
+ 					unsigned int queue_id);
++phys_addr_t kfd_get_process_doorbells(struct kfd_dev *dev,
++					struct kfd_process *process);
++int kfd_alloc_process_doorbells(struct kfd_process *process);
++void kfd_free_process_doorbells(struct kfd_process *process);
+ 
+ /* GTT Sub-Allocator */
+ 
+@@ -694,8 +696,6 @@ int pm_send_unmap_queue(struct packet_manager *pm, enum kfd_queue_type type,
+ void pm_release_ib(struct packet_manager *pm);
+ 
+ uint64_t kfd_get_number_elems(struct kfd_dev *kfd);
+-phys_addr_t kfd_get_process_doorbells(struct kfd_dev *dev,
+-					struct kfd_process *process);
+ 
+ /* Events */
+ extern const struct kfd_event_interrupt_class event_interrupt_class_cik;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index c74cf22..9e65ce3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -183,6 +183,7 @@ static void kfd_process_wq_release(struct work_struct *work)
+ 	kfd_event_free_process(p);
+ 
+ 	kfd_pasid_free(p->pasid);
++	kfd_free_process_doorbells(p);
+ 
+ 	mutex_unlock(&p->mutex);
+ 
+@@ -288,6 +289,9 @@ static struct kfd_process *create_process(const struct task_struct *thread)
+ 	if (process->pasid == 0)
+ 		goto err_alloc_pasid;
+ 
++	if (kfd_alloc_process_doorbells(process) < 0)
++		goto err_alloc_doorbells;
++
+ 	mutex_init(&process->mutex);
+ 
+ 	process->mm = thread->mm;
+@@ -329,6 +333,8 @@ static struct kfd_process *create_process(const struct task_struct *thread)
+ 	mmu_notifier_unregister_no_release(&process->mmu_notifier, process->mm);
+ err_mmu_notifier:
+ 	mutex_destroy(&process->mutex);
++	kfd_free_process_doorbells(process);
++err_alloc_doorbells:
+ 	kfd_pasid_free(process->pasid);
+ err_alloc_pasid:
+ 	kfree(process->queues);
+-- 
+2.7.4
+

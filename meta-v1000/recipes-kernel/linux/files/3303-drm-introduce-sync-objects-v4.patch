@@ -1,0 +1,738 @@
+From 5ce8eae1eac64c3100534a5974fc46b8e0f58252 Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Tue, 4 Apr 2017 13:26:24 +1000
+Subject: [PATCH 3303/5855] drm: introduce sync objects (v4)
+
+Sync objects are new toplevel drm object, that contain a
+pointer to a fence. This fence can be updated via command
+submission ioctls via drivers.
+
+There is also a generic wait obj API modelled on the vulkan
+wait API (with code modelled on some amdgpu code).
+
+These objects can be converted to an opaque fd that can be
+passes between processes.
+
+v2: rename reference/unreference to put/get (Chris)
+fix leaked reference (David Zhou)
+drop mutex in favour of cmpxchg (Chris)
+v3: cleanups from danvet, rebase on drm_fops rename
+check fd_flags is 0 in ioctls.
+v4: export find/free, change replace fence to take a
+syncobj. In order to support lookup first, replace
+later semantics which seem in the end to be cleaner.
+
+Reviewed-by: Sean Paul <seanpaul@chromium.org>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ Documentation/gpu/drm-internals.rst |   3 +
+ Documentation/gpu/drm-mm.rst        |  12 ++
+ drivers/gpu/drm/Makefile            |   3 +-
+ drivers/gpu/drm/drm_fops.c          |   8 +
+ drivers/gpu/drm/drm_internal.h      |  12 ++
+ drivers/gpu/drm/drm_ioctl.c         |  12 ++
+ drivers/gpu/drm/drm_syncobj.c       | 385 ++++++++++++++++++++++++++++++++++++
+ include/drm/drmP.h                  |   6 +
+ include/drm/drm_syncobj.h           |  90 +++++++++
+ include/uapi/drm/drm.h              |  25 +++
+ 10 files changed, 555 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/drm_syncobj.c
+ create mode 100644 include/drm/drm_syncobj.h
+
+diff --git a/Documentation/gpu/drm-internals.rst b/Documentation/gpu/drm-internals.rst
+index 37284bc..bf6c57e 100644
+--- a/Documentation/gpu/drm-internals.rst
++++ b/Documentation/gpu/drm-internals.rst
+@@ -98,6 +98,9 @@ DRIVER_ATOMIC
+     implement appropriate obj->atomic_get_property() vfuncs for any
+     modeset objects with driver specific properties.
+ 
++DRIVER_SYNCOBJ
++    Driver support drm sync objects.
++
+ Major, Minor and Patchlevel
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+diff --git a/Documentation/gpu/drm-mm.rst b/Documentation/gpu/drm-mm.rst
+index bca8085..055dd3b 100644
+--- a/Documentation/gpu/drm-mm.rst
++++ b/Documentation/gpu/drm-mm.rst
+@@ -452,3 +452,15 @@ DRM MM Range Allocator Function References
+ 
+ .. kernel-doc:: include/drm/drm_mm.h
+    :internal:
++
++DRM Sync Objects
++===========================
++
++.. kernel-doc:: drivers/gpu/drm/drm_syncobj.c
++   :doc: Overview
++
++.. kernel-doc:: include/drm/drm_syncobj.h
++   :export:
++
++.. kernel-doc:: drivers/gpu/drm/drm_syncobj.c
++   :export:
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index 25c7204..1201842 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -15,7 +15,8 @@ drm-y       :=	drm_auth.o drm_bufs.o drm_cache.o \
+ 		drm_modeset_lock.o drm_atomic.o drm_bridge.o \
+ 		drm_framebuffer.o drm_connector.o drm_blend.o \
+ 		drm_encoder.o drm_mode_object.o drm_property.o \
+-		drm_plane.o drm_color_mgmt.o
++		drm_plane.o drm_color_mgmt.o \
++		drm_syncobj.o
+ 
+ drm-$(CONFIG_COMPAT) += drm_ioc32.o
+ drm-$(CONFIG_DRM_GEM_CMA_HELPER) += drm_gem_cma_helper.o
+diff --git a/drivers/gpu/drm/drm_fops.c b/drivers/gpu/drm/drm_fops.c
+index f5815e1..e8ae504 100644
+--- a/drivers/gpu/drm/drm_fops.c
++++ b/drivers/gpu/drm/drm_fops.c
+@@ -219,6 +219,9 @@ static int drm_open_helper(struct file *filp, struct drm_minor *minor)
+ 
+ 	if (drm_core_check_feature(dev, DRIVER_GEM))
+ 		drm_gem_open(dev, priv);
++	
++	if (drm_core_check_feature(dev, DRIVER_SYNCOBJ))
++		drm_syncobj_open(priv);
+ 
+ 	if (drm_core_check_feature(dev, DRIVER_PRIME))
+ 		drm_prime_init_file_private(&priv->prime);
+@@ -267,6 +270,8 @@ static int drm_open_helper(struct file *filp, struct drm_minor *minor)
+ out_prime_destroy:
+ 	if (drm_core_check_feature(dev, DRIVER_PRIME))
+ 		drm_prime_destroy_file_private(&priv->prime);
++	if (drm_core_check_feature(dev, DRIVER_SYNCOBJ))
++		drm_syncobj_release(priv);
+ 	if (drm_core_check_feature(dev, DRIVER_GEM))
+ 		drm_gem_release(dev, priv);
+ 	put_pid(priv->pid);
+@@ -401,6 +406,9 @@ int drm_release(struct inode *inode, struct file *filp)
+ 		drm_property_destroy_user_blobs(dev, file_priv);
+ 	}
+ 
++	if (drm_core_check_feature(dev, DRIVER_SYNCOBJ))
++		drm_syncobj_release(file_priv);
++
+ 	if (drm_core_check_feature(dev, DRIVER_GEM))
+ 		drm_gem_release(dev, file_priv);
+ 
+diff --git a/drivers/gpu/drm/drm_internal.h b/drivers/gpu/drm/drm_internal.h
+index e66af28..329312c 100644
+--- a/drivers/gpu/drm/drm_internal.h
++++ b/drivers/gpu/drm/drm_internal.h
+@@ -120,3 +120,15 @@ static inline void drm_debugfs_connector_remove(struct drm_connector *connector)
+ {
+ }
+ #endif
++
++/* drm_syncobj.c */
++void drm_syncobj_open(struct drm_file *file_private);
++void drm_syncobj_release(struct drm_file *file_private);
++int drm_syncobj_create_ioctl(struct drm_device *dev, void *data,
++                            struct drm_file *file_private);
++int drm_syncobj_destroy_ioctl(struct drm_device *dev, void *data,
++                             struct drm_file *file_private);
++int drm_syncobj_handle_to_fd_ioctl(struct drm_device *dev, void *data,
++                                  struct drm_file *file_private);
++int drm_syncobj_fd_to_handle_ioctl(struct drm_device *dev, void *data,
++                                  struct drm_file *file_private);
+diff --git a/drivers/gpu/drm/drm_ioctl.c b/drivers/gpu/drm/drm_ioctl.c
+index 71c3473..859c209 100644
+--- a/drivers/gpu/drm/drm_ioctl.c
++++ b/drivers/gpu/drm/drm_ioctl.c
+@@ -247,6 +247,9 @@ static int drm_getcap(struct drm_device *dev, void *data, struct drm_file *file_
+ 		req->value |= dev->driver->prime_fd_to_handle ? DRM_PRIME_CAP_IMPORT : 0;
+ 		req->value |= dev->driver->prime_handle_to_fd ? DRM_PRIME_CAP_EXPORT : 0;
+ 		break;
++	case DRM_CAP_SYNCOBJ:
++		req->value = drm_core_check_feature(dev, DRIVER_SYNCOBJ);
++		return 0;
+ 	case DRM_CAP_TIMESTAMP_MONOTONIC:
+ 		req->value = drm_timestamp_monotonic;
+ 		break;
+@@ -629,6 +632,15 @@ static const struct drm_ioctl_desc drm_ioctls[] = {
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_ATOMIC, drm_mode_atomic_ioctl, DRM_MASTER|DRM_CONTROL_ALLOW|DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_CREATEPROPBLOB, drm_mode_createblob_ioctl, DRM_CONTROL_ALLOW|DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_DESTROYPROPBLOB, drm_mode_destroyblob_ioctl, DRM_CONTROL_ALLOW|DRM_UNLOCKED),
++
++	DRM_IOCTL_DEF(DRM_IOCTL_SYNCOBJ_CREATE, drm_syncobj_create_ioctl,
++		      DRM_UNLOCKED|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF(DRM_IOCTL_SYNCOBJ_DESTROY, drm_syncobj_destroy_ioctl,
++		      DRM_UNLOCKED|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, drm_syncobj_handle_to_fd_ioctl,
++		      DRM_UNLOCKED|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, drm_syncobj_fd_to_handle_ioctl,
++		      DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ };
+ 
+ #define DRM_CORE_IOCTL_COUNT	ARRAY_SIZE( drm_ioctls )
+diff --git a/drivers/gpu/drm/drm_syncobj.c b/drivers/gpu/drm/drm_syncobj.c
+new file mode 100644
+index 0000000..86f6aa8
+--- /dev/null
++++ b/drivers/gpu/drm/drm_syncobj.c
+@@ -0,0 +1,385 @@
++/*
++ * Copyright 2017 Red Hat
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Authors:
++ *
++ */
++
++/**
++ * DOC: Overview
++ *
++ * DRM synchronisation objects (syncobj) are a persistent objects,
++ * that contain an optional fence. The fence can be updated with a new
++ * fence, or be NULL.
++ *
++ * syncobj's can be export to fd's and back, these fd's are opaque and
++ * have no other use case, except passing the syncobj between processes.
++ *
++ * Their primary use-case is to implement Vulkan fences and semaphores.
++ *
++ * syncobj have a kref reference count, but also have an optional file.
++ * The file is only created once the syncobj is exported.
++ * The file takes a reference on the kref.
++ */
++
++#include <drm/drmP.h>
++#include <linux/file.h>
++#include <linux/fs.h>
++#include <linux/anon_inodes.h>
++
++#include "drm_internal.h"
++#include <drm/drm_syncobj.h>
++
++/**
++ * drm_syncobj_find - lookup and reference a sync object.
++ * @file_private: drm file private pointer
++ * @handle: sync object handle to lookup.
++ *
++ * Returns a reference to the syncobj pointed to by handle or NULL.
++ */
++struct drm_syncobj *drm_syncobj_find(struct drm_file *file_private,
++				     u32 handle)
++{
++	struct drm_syncobj *syncobj;
++
++	spin_lock(&file_private->syncobj_table_lock);
++
++	/* Check if we currently have a reference on the object */
++	syncobj = idr_find(&file_private->syncobj_idr, handle);
++	if (syncobj)
++		drm_syncobj_get(syncobj);
++
++	spin_unlock(&file_private->syncobj_table_lock);
++
++	return syncobj;
++}
++EXPORT_SYMBOL(drm_syncobj_find);
++
++/**
++ * drm_syncobj_replace_fence - replace fence in a sync object.
++ * @file_private: drm file private pointer.
++ * @syncobj: Sync object to replace fence in
++ * @fence: fence to install in sync file.
++ *
++ * This replaces the fence on a sync object.
++ */
++void drm_syncobj_replace_fence(struct drm_file *file_private,
++			       struct drm_syncobj *syncobj,
++			       struct fence *fence)
++{
++	struct fence *old_fence = NULL;
++
++	if (fence)
++		fence_get(fence);
++	old_fence = xchg(&syncobj->fence, fence);
++
++	fence_put(old_fence);
++}
++EXPORT_SYMBOL(drm_syncobj_replace_fence);
++
++int drm_syncobj_fence_get(struct drm_file *file_private,
++			  u32 handle,
++			  struct fence **fence)
++{
++	struct drm_syncobj *syncobj = drm_syncobj_find(file_private, handle);
++	int ret = 0;
++
++	if (!syncobj)
++		return -ENOENT;
++
++	*fence = fence_get(syncobj->fence);
++	if (!*fence) {
++		ret = -EINVAL;
++	}
++	drm_syncobj_put(syncobj);
++	return ret;
++}
++EXPORT_SYMBOL(drm_syncobj_fence_get);
++
++/**
++ * drm_syncobj_free - free a sync object.
++ * @kref: kref to free.
++ *
++ * Only to be called from kref_put in drm_syncobj_put.
++ */
++void drm_syncobj_free(struct kref *kref)
++{
++	struct drm_syncobj *syncobj = container_of(kref,
++						   struct drm_syncobj,
++						   refcount);
++	fence_put(syncobj->fence);
++	kfree(syncobj);
++}
++EXPORT_SYMBOL(drm_syncobj_free);
++
++static int drm_syncobj_create(struct drm_file *file_private,
++			      u32 *handle)
++{
++	int ret;
++	struct drm_syncobj *syncobj;
++
++	syncobj = kzalloc(sizeof(struct drm_syncobj), GFP_KERNEL);
++	if (!syncobj)
++		return -ENOMEM;
++
++	kref_init(&syncobj->refcount);
++
++	idr_preload(GFP_KERNEL);
++	spin_lock(&file_private->syncobj_table_lock);
++	ret = idr_alloc(&file_private->syncobj_idr, syncobj, 1, 0, GFP_NOWAIT);
++	spin_unlock(&file_private->syncobj_table_lock);
++
++	idr_preload_end();
++
++	if (ret < 0) {
++		drm_syncobj_put(syncobj);
++		return ret;
++	}
++
++	*handle = ret;
++	return 0;
++}
++
++static int drm_syncobj_destroy(struct drm_file *file_private,
++			       u32 handle)
++{
++	struct drm_syncobj *syncobj;
++
++	spin_lock(&file_private->syncobj_table_lock);
++	syncobj = idr_find(&file_private->syncobj_idr, handle);
++	if(syncobj){
++		idr_remove(&file_private->syncobj_idr, handle);
++		spin_unlock(&file_private->syncobj_table_lock);
++	}else{
++		spin_unlock(&file_private->syncobj_table_lock);
++		return -EINVAL;
++	} 
++
++	drm_syncobj_put(syncobj);
++	return 0;
++}
++
++static int drm_syncobj_file_release(struct inode *inode, struct file *file)
++{
++	struct drm_syncobj *syncobj = file->private_data;
++
++	drm_syncobj_put(syncobj);
++	return 0;
++}
++
++static const struct file_operations drm_syncobj_file_fops = {
++	.release = drm_syncobj_file_release,
++};
++
++static int drm_syncobj_alloc_file(struct drm_syncobj *syncobj)
++{
++	struct file *file = anon_inode_getfile("syncobj_file",
++					       &drm_syncobj_file_fops,
++					       syncobj, 0);
++	if (IS_ERR(file))
++		return PTR_ERR(file);
++
++	drm_syncobj_get(syncobj);
++	if (cmpxchg(&syncobj->file, NULL, file)) {
++		/* lost the race */
++		fput(file);
++	}
++
++	return 0;
++}
++
++static int drm_syncobj_handle_to_fd(struct drm_file *file_private,
++				    u32 handle, int *p_fd)
++{
++	struct drm_syncobj *syncobj = drm_syncobj_find(file_private, handle);
++	int ret;
++	int fd;
++
++	if (!syncobj)
++		return -EINVAL;
++
++	fd = get_unused_fd_flags(O_CLOEXEC);
++	if (fd < 0) {
++		drm_syncobj_put(syncobj);
++		return fd;
++	}
++
++	if (!syncobj->file) {
++		ret = drm_syncobj_alloc_file(syncobj);
++		if (ret)
++			goto out_put_fd;
++	}
++	fd_install(fd, syncobj->file);
++	drm_syncobj_put(syncobj);
++	*p_fd = fd;
++	return 0;
++out_put_fd:
++	put_unused_fd(fd);
++	drm_syncobj_put(syncobj);
++	return ret;
++}
++
++static struct drm_syncobj *drm_syncobj_fdget(int fd)
++{
++	struct file *file = fget(fd);
++
++	if (!file)
++		return NULL;
++	if (file->f_op != &drm_syncobj_file_fops)
++		goto err;
++
++	return file->private_data;
++err:
++	fput(file);
++	return NULL;
++};
++
++static int drm_syncobj_fd_to_handle(struct drm_file *file_private,
++				    int fd, u32 *handle)
++{
++	struct drm_syncobj *syncobj = drm_syncobj_fdget(fd);
++	int ret;
++
++	if (!syncobj)
++		return -EINVAL;
++
++	/* take a reference to put in the idr */
++	drm_syncobj_get(syncobj);
++
++	idr_preload(GFP_KERNEL);
++	spin_lock(&file_private->syncobj_table_lock);
++	ret = idr_alloc(&file_private->syncobj_idr, syncobj, 1, 0, GFP_NOWAIT);
++	spin_unlock(&file_private->syncobj_table_lock);
++	idr_preload_end();
++
++	if (ret < 0) {
++		fput(syncobj->file);
++		return ret;
++	}
++	*handle = ret;
++	return 0;
++}
++
++/**
++ * drm_syncobj_open - initalizes syncobj file-private structures at devnode open time
++ * @dev: drm_device which is being opened by userspace
++ * @file_private: drm file-private structure to set up
++ *
++ * Called at device open time, sets up the structure for handling refcounting
++ * of sync objects.
++ */
++void
++drm_syncobj_open(struct drm_file *file_private)
++{
++	idr_init(&file_private->syncobj_idr);
++	spin_lock_init(&file_private->syncobj_table_lock);
++}
++
++static int
++drm_syncobj_release_handle(int id, void *ptr, void *data)
++{
++	struct drm_syncobj *syncobj = ptr;
++
++	drm_syncobj_put(syncobj);
++	return 0;
++}
++
++/**
++ * drm_syncobj_release - release file-private sync object resources
++ * @dev: drm_device which is being closed by userspace
++ * @file_private: drm file-private structure to clean up
++ *
++ * Called at close time when the filp is going away.
++ *
++ * Releases any remaining references on objects by this filp.
++ */
++void
++drm_syncobj_release(struct drm_file *file_private)
++{
++	idr_for_each(&file_private->syncobj_idr,
++		     &drm_syncobj_release_handle, file_private);
++	idr_destroy(&file_private->syncobj_idr);
++}
++
++int
++drm_syncobj_create_ioctl(struct drm_device *dev, void *data,
++			 struct drm_file *file_private)
++{
++	struct drm_syncobj_create *args = data;
++
++	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ))
++		return -ENODEV;
++
++	/* no valid flags yet */
++	if (args->flags)
++		return -EINVAL;
++
++	return drm_syncobj_create(file_private,
++				  &args->handle);
++}
++
++int
++drm_syncobj_destroy_ioctl(struct drm_device *dev, void *data,
++			  struct drm_file *file_private)
++{
++	struct drm_syncobj_destroy *args = data;
++
++	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ))
++		return -ENODEV;
++
++	/* make sure padding is empty */
++	if (args->pad)
++		return -EINVAL;
++	return drm_syncobj_destroy(file_private, args->handle);
++}
++
++int
++drm_syncobj_handle_to_fd_ioctl(struct drm_device *dev, void *data,
++				   struct drm_file *file_private)
++{
++	struct drm_syncobj_handle *args = data;
++
++	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ))
++		return -ENODEV;
++
++	if (args->pad || args->flags)
++		return -EINVAL;
++
++	return drm_syncobj_handle_to_fd(file_private, args->handle,
++					&args->fd);
++}
++
++int
++drm_syncobj_fd_to_handle_ioctl(struct drm_device *dev, void *data,
++				   struct drm_file *file_private)
++{
++	struct drm_syncobj_handle *args = data;
++
++	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ))
++		return -ENODEV;
++
++	if (args->pad || args->flags)
++		return -EINVAL;
++
++	return drm_syncobj_fd_to_handle(file_private, args->fd,
++					&args->handle);
++}
+diff --git a/include/drm/drmP.h b/include/drm/drmP.h
+index c77272c..d1b4192 100644
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -163,6 +163,7 @@ void drm_printk(const char *level, unsigned int category,
+ #define DRIVER_RENDER			0x8000
+ #define DRIVER_ATOMIC			0x10000
+ #define DRIVER_KMS_LEGACY_CONTEXT	0x20000
++#define DRIVER_SYNCOBJ                  0x40000
+ 
+ /***********************************************************************/
+ /** \name Macros to make printk easier */
+@@ -406,6 +407,11 @@ struct drm_file {
+ 	/** Lock for synchronization of access to object_idr. */
+ 	spinlock_t table_lock;
+ 
++	/** @syncobj_idr: Mapping of sync object handles to object pointers. */
++	struct idr syncobj_idr;
++	/** @syncobj_table_lock: Protects @syncobj_idr. */
++	spinlock_t syncobj_table_lock;
++
+ 	struct file *filp;
+ 	void *driver_priv;
+ 
+diff --git a/include/drm/drm_syncobj.h b/include/drm/drm_syncobj.h
+new file mode 100644
+index 0000000..e62fb0c
+--- /dev/null
++++ b/include/drm/drm_syncobj.h
+@@ -0,0 +1,90 @@
++/*
++ * Copyright © 2017 Red Hat
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Authors:
++ *
++ */
++#ifndef __DRM_SYNCOBJ_H__
++#define __DRM_SYNCOBJ_H__
++
++#include "linux/fence.h"
++
++/**
++ * struct drm_syncobj - sync object.
++ *
++ * This structure defines a generic sync object which wraps a fence.
++ */
++struct drm_syncobj {
++	/**
++	 * @refcount:
++	 *
++	 * Reference count of this object.
++	 */
++	struct kref refcount;
++	/**
++	 * @fence:
++	 * NULL or a pointer to the fence bound to this object.
++	 */
++	struct fence *fence;
++	/**
++	 * @file:
++	 * a file backing for this syncobj.
++	 */
++	struct file *file;
++};
++
++void drm_syncobj_free(struct kref *kref);
++
++/**
++ * drm_syncobj_get - acquire a syncobj reference
++ * @obj: sync object
++ *
++ * This acquires additional reference to @obj. It is illegal to call this
++ * without already holding a reference. No locks required.
++ */
++static inline void
++drm_syncobj_get(struct drm_syncobj *obj)
++{
++	kref_get(&obj->refcount);
++}
++
++/**
++ * drm_syncobj_put - release a reference to a sync object.
++ * @obj: sync object.
++ */
++static inline void
++drm_syncobj_put(struct drm_syncobj *obj)
++{
++	kref_put(&obj->refcount, drm_syncobj_free);
++}
++
++struct drm_syncobj *drm_syncobj_find(struct drm_file *file_private,
++				     u32 handle);
++void drm_syncobj_replace_fence(struct drm_file *file_private,
++			       struct drm_syncobj *syncobj,
++			       struct fence *fence);
++int drm_syncobj_fence_get(struct drm_file *file_private,
++			  u32 handle,
++			  struct fence **fence);
++void drm_syncobj_free(struct kref *kref);
++
++#endif
+diff --git a/include/uapi/drm/drm.h b/include/uapi/drm/drm.h
+index b2c5284..cfe7359 100644
+--- a/include/uapi/drm/drm.h
++++ b/include/uapi/drm/drm.h
+@@ -634,6 +634,8 @@ struct drm_gem_open {
+ #define  DRM_PRIME_CAP_EXPORT		0x2
+ #define DRM_CAP_TIMESTAMP_MONOTONIC	0x6
+ #define DRM_CAP_ASYNC_PAGE_FLIP		0x7
++#define DRM_CAP_SYNCOBJ                 0x13
++
+ /*
+  * The CURSOR_WIDTH and CURSOR_HEIGHT capabilities return a valid widthxheight
+  * combination for the hardware cursor. The intention is that a hardware
+@@ -696,6 +698,24 @@ struct drm_prime_handle {
+ 	__s32 fd;
+ };
+ 
++struct drm_syncobj_create {
++       __u32 handle;
++       __u32 flags;
++};
++
++struct drm_syncobj_destroy {
++       __u32 handle;
++       __u32 pad;
++};
++
++struct drm_syncobj_handle {
++       __u32 handle;
++       __u32 flags;
++
++       __s32 fd;
++       __u32 pad;
++};
++
+ #if defined(__cplusplus)
+ }
+ #endif
+@@ -814,6 +834,11 @@ extern "C" {
+ #define DRM_IOCTL_MODE_CREATEPROPBLOB	DRM_IOWR(0xBD, struct drm_mode_create_blob)
+ #define DRM_IOCTL_MODE_DESTROYPROPBLOB	DRM_IOWR(0xBE, struct drm_mode_destroy_blob)
+ 
++#define DRM_IOCTL_SYNCOBJ_CREATE       DRM_IOWR(0xBF, struct drm_syncobj_create)
++#define DRM_IOCTL_SYNCOBJ_DESTROY      DRM_IOWR(0xC0, struct drm_syncobj_destroy)
++#define DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD DRM_IOWR(0xC1, struct drm_syncobj_handle)
++#define DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE DRM_IOWR(0xC2, struct drm_syncobj_handle)
++
+ /**
+  * Device specific ioctls should only be in their respective headers
+  * The device specific ioctl range is from 0x40 to 0x9f.
+-- 
+2.7.4
+
