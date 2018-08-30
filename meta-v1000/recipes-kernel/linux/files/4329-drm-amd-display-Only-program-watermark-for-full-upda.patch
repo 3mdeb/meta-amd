@@ -1,0 +1,163 @@
+From 7434715dcbeee0402c66df861b88b21a10e3bcd1 Mon Sep 17 00:00:00 2001
+From: Yongqiang Sun <yongqiang.sun@amd.com>
+Date: Mon, 13 Nov 2017 17:22:17 -0500
+Subject: [PATCH 4329/5855] drm/amd/display: Only program watermark for full
+ update.
+
+For scaling and position change, it isn't necessary to program
+watermark and check P-State as well.
+
+Signed-off-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |  4 +-
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c  |  3 ++
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  | 46 +++++++++-------------
+ 3 files changed, 23 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index fe5aa48..4d3baad 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1141,9 +1141,7 @@ static void commit_planes_for_stream(struct dc *dc,
+ 	if (update_type == UPDATE_TYPE_FULL) {
+ 		dc->hwss.set_bandwidth(dc, context, false);
+ 		context_clock_trace(dc, context);
+-	}
+ 
+-	if (update_type > UPDATE_TYPE_FAST) {
+ 		for (j = 0; j < dc->res_pool->pipe_count; j++) {
+ 			struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[j];
+ 
+@@ -1178,7 +1176,7 @@ static void commit_planes_for_stream(struct dc *dc,
+ 		}
+ 	}
+ 
+-	if (update_type > UPDATE_TYPE_FAST)
++	if (update_type == UPDATE_TYPE_FULL)
+ 		context_timing_trace(dc, &context->res_ctx);
+ 
+ 	/* Perform requested Updates */
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c
+index 999d0ad..7abec52 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c
+@@ -651,6 +651,8 @@ void dpp1_dscl_set_scaler_manual_scale(
+ 	if (memcmp(&dpp->scl_data, scl_data, sizeof(*scl_data)) == 0)
+ 		return;
+ 
++	PERF_TRACE();
++
+ 	dpp->scl_data = *scl_data;
+ 
+ 	/* Recout */
+@@ -704,4 +706,5 @@ void dpp1_dscl_set_scaler_manual_scale(
+ 		SCL_H_NUM_TAPS_C, scl_data->taps.h_taps_c - 1);
+ 
+ 	dpp1_dscl_set_scl_filter(dpp, scl_data, ycbcr);
++	PERF_TRACE();
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 43aa045..949ec8b 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -2114,11 +2114,6 @@ static void program_all_pipe_in_tree(
+ {
+ 	if (pipe_ctx->top_pipe == NULL) {
+ 
+-		if (dc->debug.sanity_checks) {
+-			/* pstate stuck check after watermark update */
+-			dcn10_verify_allow_pstate_change_high(dc);
+-		}
+-
+ 		pipe_ctx->stream_res.tg->dlg_otg_param.vready_offset = pipe_ctx->pipe_dlg_param.vready_offset;
+ 		pipe_ctx->stream_res.tg->dlg_otg_param.vstartup_start = pipe_ctx->pipe_dlg_param.vstartup_start;
+ 		pipe_ctx->stream_res.tg->dlg_otg_param.vupdate_offset = pipe_ctx->pipe_dlg_param.vupdate_offset;
+@@ -2152,11 +2147,6 @@ static void program_all_pipe_in_tree(
+ 			dc->hwss.set_output_transfer_func(pipe_ctx, pipe_ctx->stream);
+ 	}
+ 
+-	if (dc->debug.sanity_checks) {
+-		/* pstate stuck check after each pipe is programmed */
+-		dcn10_verify_allow_pstate_change_high(dc);
+-	}
+-
+ 	if (pipe_ctx->bottom_pipe != NULL && pipe_ctx->bottom_pipe != pipe_ctx)
+ 		program_all_pipe_in_tree(dc, pipe_ctx->bottom_pipe, context);
+ }
+@@ -2241,6 +2231,7 @@ static void dcn10_apply_ctx_for_surface(
+ 	struct timing_generator *tg;
+ 	bool removed_pipe[4] = { false };
+ 	unsigned int ref_clk_mhz = dc->res_pool->ref_clock_inKhz/1000;
++	bool program_water_mark = false;
+ 
+ 	struct pipe_ctx *top_pipe_to_program =
+ 			find_top_pipe_for_stream(dc, context, stream);
+@@ -2250,9 +2241,6 @@ static void dcn10_apply_ctx_for_surface(
+ 
+ 	tg = top_pipe_to_program->stream_res.tg;
+ 
+-	if (dc->debug.sanity_checks)
+-		dcn10_verify_allow_pstate_change_high(dc);
+-
+ 	tg->funcs->lock(tg);
+ 
+ 	if (num_planes == 0) {
+@@ -2319,24 +2307,31 @@ static void dcn10_apply_ctx_for_surface(
+ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+ 		struct pipe_ctx *old_pipe_ctx =
+ 				&dc->current_state->res_ctx.pipe_ctx[i];
++		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
++
++		if (pipe_ctx->stream == stream &&
++				pipe_ctx->plane_state &&
++			pipe_ctx->plane_state->update_flags.bits.full_update)
++			program_water_mark = true;
+ 
+ 		if (removed_pipe[i] && num_planes == 0)
+ 			dcn10_disable_plane(dc, old_pipe_ctx);
+ 	}
+ 
+-	if (dc->debug.sanity_checks) {
+-		/* pstate stuck check after watermark update */
+-		dcn10_verify_allow_pstate_change_high(dc);
+-	}
+-	/* watermark is for all pipes */
+-	hubbub1_program_watermarks(dc->res_pool->hubbub,
+-			&context->bw.dcn.watermarks, ref_clk_mhz);
++	if (program_water_mark) {
++		if (dc->debug.sanity_checks) {
++			/* pstate stuck check after watermark update */
++			dcn10_verify_allow_pstate_change_high(dc);
++		}
++		/* watermark is for all pipes */
++		hubbub1_program_watermarks(dc->res_pool->hubbub,
++				&context->bw.dcn.watermarks, ref_clk_mhz);
+ 
+-	if (dc->debug.sanity_checks) {
+-		/* pstate stuck check after watermark update */
+-		dcn10_verify_allow_pstate_change_high(dc);
++		if (dc->debug.sanity_checks) {
++			/* pstate stuck check after watermark update */
++			dcn10_verify_allow_pstate_change_high(dc);
++		}
+ 	}
+-
+ /*	dm_logger_write(dc->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 			"\n============== Watermark parameters ==============\n"
+ 			"a.urgent_ns: %d \n"
+@@ -2384,9 +2379,6 @@ static void dcn10_apply_ctx_for_surface(
+ 			context->bw.dcn.watermarks.d.pte_meta_urgent_ns
+ 			);
+ */
+-
+-	if (dc->debug.sanity_checks)
+-		dcn10_verify_allow_pstate_change_high(dc);
+ }
+ 
+ static void dcn10_set_bandwidth(
+-- 
+2.7.4
+

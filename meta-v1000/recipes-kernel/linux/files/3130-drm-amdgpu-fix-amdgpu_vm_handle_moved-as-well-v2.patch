@@ -1,0 +1,135 @@
+From 433035eb3d4c9b36b0f860689b646dbf12614899 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 11 Sep 2017 16:54:59 +0200
+Subject: [PATCH 3130/5855] drm/amdgpu: fix amdgpu_vm_handle_moved as well v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+There is no guarantee that the last BO_VA actually needed an update.
+
+Additional to that all command submissions must wait for moved BOs to
+be cleared, not just the first one.
+
+v2: Don't overwrite any newer fence.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+
+Change-Id: Ie4d0dac9ac45c29e14cb610bda7fd84815d68596
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 24 ++++++++++--------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h |  3 +--
+ 3 files changed, 12 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 1b02f5c..86e9853 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -813,7 +813,7 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p)
+ 
+ 	}
+ 
+-	r = amdgpu_vm_handle_moved(adev, vm, &p->job->sync);
++	r = amdgpu_vm_handle_moved(adev, vm);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 33540a1..c43e399 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1760,7 +1760,7 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 	dma_addr_t *pages_addr = NULL;
+ 	struct ttm_mem_reg *mem;
+ 	struct drm_mm_node *nodes;
+-	struct fence *exclusive;
++	struct fence *exclusive, **last_update;
+ 	uint64_t flags;
+ 	uint64_t vram_base_offset = adev->vm_manager.vram_base_offset;
+ 	struct amdgpu_device *bo_adev;
+@@ -1796,6 +1796,11 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 	} else 
+ 		flags = 0x0;
+ 
++	if (clear || (bo && bo->tbo.resv == vm->root.base.bo->tbo.resv))
++		last_update = &vm->last_update;
++	else
++		last_update = &bo_va->last_pt_update;
++
+ 	if (!clear && bo_va->base.moved) {
+ 		bo_va->base.moved = false;	
+ 		list_splice_init(&bo_va->valids, &bo_va->invalids);
+@@ -1807,7 +1812,7 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 	list_for_each_entry(mapping, &bo_va->invalids, list) {
+ 		r = amdgpu_vm_bo_split_mapping(adev, exclusive, pages_addr, vm,
+ 					       mapping, vram_base_offset, flags,
+-					       mem, &bo_va->last_pt_update);
++					       mem, last_update);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -1830,12 +1835,6 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 			trace_amdgpu_vm_bo_mapping(mapping);
+ 	}
+ 
+-	if (bo_va->base.bo &&
+-	    bo_va->base.bo->tbo.resv == vm->root.base.bo->tbo.resv) {
+-		fence_put(vm->last_update);
+-		vm->last_update = fence_get(bo_va->last_pt_update);
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -2033,15 +2032,15 @@ int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
+  * PTs have to be reserved!
+  */
+ int amdgpu_vm_handle_moved(struct amdgpu_device *adev,
+-			   struct amdgpu_vm *vm,
+-			   struct amdgpu_sync *sync)
++			   struct amdgpu_vm *vm)
+ {
+-	struct amdgpu_bo_va *bo_va = NULL;
+ 	bool clear;
+ 	int r = 0;
+ 
+ 	spin_lock(&vm->status_lock);
+ 	while (!list_empty(&vm->moved)) {
++		struct amdgpu_bo_va *bo_va;
++
+ 		bo_va = list_first_entry(&vm->moved,
+ 			struct amdgpu_bo_va, base.vm_status);
+ 		spin_unlock(&vm->status_lock);
+@@ -2057,9 +2056,6 @@ int amdgpu_vm_handle_moved(struct amdgpu_device *adev,
+ 	}
+ 	spin_unlock(&vm->status_lock);
+ 
+-	if (bo_va)
+-		r = amdgpu_sync_fence(adev, sync, bo_va->last_pt_update);
+-
+ 	return r;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 5f0fca8..c71f04c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -256,8 +256,7 @@ int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
+ 			  struct amdgpu_vm *vm,
+ 			  struct fence **fence);
+ int amdgpu_vm_handle_moved(struct amdgpu_device *adev,
+-			   struct amdgpu_vm *vm,
+-			   struct amdgpu_sync *sync);	
++			   struct amdgpu_vm *vm);	
+ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 			struct amdgpu_bo_va *bo_va,
+ 			bool clear);
+-- 
+2.7.4
+

@@ -1,0 +1,181 @@
+From 8f765edc4473641f4287b170b9da7de98086c78c Mon Sep 17 00:00:00 2001
+From: Jay Cornwall <Jay.Cornwall@amd.com>
+Date: Mon, 24 Oct 2016 17:12:50 -0500
+Subject: [PATCH 5530/5855] drm/amdgpu: Load write pointer manually during KFD
+ MQD setup
+
+CP_HQD_PQ_WPTR_POLL* fails intermittently on Tonga due to an RTL bug
+in CP clock gating logic.
+
+Load the write pointer inside the driver after the doorbell logic
+has been enabled. Apply the same shift/mask used by CP microcode to
+populate CP_HQD_PQ_WPTR manually. Unify this code path with MQD setup
+for SDMA queues.
+
+Change-Id: I3f4b8a3b778d00310c85c17f5af740cb3aa2844b
+Signed-off-by: Jay Cornwall <Jay.Cornwall@amd.com>
+---
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c   | 21 ++++++++-------------
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c       |  3 ++-
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h        |  3 ++-
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c    | 19 +++++++++++++------
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c     | 17 ++++++++++++-----
+ 5 files changed, 37 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index e6f6fe4..23ee2b0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -329,9 +329,8 @@ static int create_compute_queue_nocpsch(struct device_queue_manager *dqm,
+ 	if (!q->properties.is_active)
+ 		return 0;
+ 
+-	retval = mqd->load_mqd(mqd, q->mqd, q->pipe,
+-			q->queue, (uint32_t __user *) q->properties.write_ptr,
+-			q->process->mm);
++	retval = mqd->load_mqd(mqd, q->mqd, q->pipe, q->queue, &q->properties,
++			       q->process->mm);
+ 	if (retval != 0) {
+ 		deallocate_hqd(dqm, q);
+ 		mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
+@@ -448,10 +447,8 @@ static int update_queue(struct device_queue_manager *dqm, struct queue *q)
+ 	    (q->properties.type == KFD_QUEUE_TYPE_COMPUTE ||
+ 	     q->properties.type == KFD_QUEUE_TYPE_SDMA)) {
+ 		if (q->properties.is_active)
+-			retval = mqd->load_mqd(mqd, q->mqd, q->pipe,
+-				q->queue,
+-				(uint32_t __user *)q->properties.write_ptr,
+-				q->process->mm);
++			retval = mqd->load_mqd(mqd, q->mqd, q->pipe, q->queue,
++					       &q->properties, q->process->mm);
+ 		else if (prev_active)
+ 			retval = mqd->destroy_mqd(mqd, q->mqd,
+ 				KFD_PREEMPT_TYPE_WAVEFRONT_DRAIN,
+@@ -591,11 +588,9 @@ int process_restore_queues(struct device_queue_manager *dqm,
+ 			if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS &&
+ 			    (q->properties.type == KFD_QUEUE_TYPE_COMPUTE ||
+ 			     q->properties.type == KFD_QUEUE_TYPE_SDMA))
+-				retval = mqd->load_mqd(
+-					mqd, q->mqd, q->pipe, q->queue,
+-					(uint32_t __user *)
+-					q->properties.write_ptr,
+-					q->process->mm);
++				retval = mqd->load_mqd(mqd, q->mqd, q->pipe,
++						       q->queue, &q->properties,
++						       q->process->mm);
+ 			dqm->queue_count++;
+ 		}
+ 	}
+@@ -828,7 +823,7 @@ static int create_sdma_queue_nocpsch(struct device_queue_manager *dqm,
+ 		return retval;
+ 	}
+ 
+-	retval = mqd->load_mqd(mqd, q->mqd, 0, 0, NULL, NULL);
++	retval = mqd->load_mqd(mqd, q->mqd, 0, 0, &q->properties, NULL);
+         if (retval != 0) {
+                 deallocate_sdma_queue(dqm, q->sdma_id);
+                 mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+index f19f2b3..126d848 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+@@ -144,7 +144,8 @@ static bool initialize(struct kernel_queue *kq, struct kfd_dev *dev,
+ 		kq->queue->pipe = KFD_CIK_HIQ_PIPE;
+ 		kq->queue->queue = KFD_CIK_HIQ_QUEUE;
+ 		kq->mqd->load_mqd(kq->mqd, kq->queue->mqd, kq->queue->pipe,
+-					kq->queue->queue, NULL, NULL);
++				  kq->queue->queue, &kq->queue->properties,
++				  NULL);
+ 	} else {
+ 		/* allocate fence for DIQ */
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+index 4be3267..8972bcf 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+@@ -67,7 +67,8 @@ struct mqd_manager {
+ 
+ 	int	(*load_mqd)(struct mqd_manager *mm, void *mqd,
+ 				uint32_t pipe_id, uint32_t queue_id,
+-				uint32_t __user *wptr, struct mm_struct *mms);
++				struct queue_properties *p,
++				struct mm_struct *mms);
+ 
+ 	int	(*update_mqd)(struct mqd_manager *mm, void *mqd,
+ 				struct queue_properties *q);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+index 7528265..11e85d3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -207,18 +207,25 @@ static void uninit_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ }
+ 
+ static int load_mqd(struct mqd_manager *mm, void *mqd, uint32_t pipe_id,
+-		    uint32_t queue_id, uint32_t __user *wptr,
++		    uint32_t queue_id, struct queue_properties *p,
+ 		    struct mm_struct *mms)
+ {
+-	return mm->dev->kfd2kgd->hqd_load
+-		(mm->dev->kgd, mqd, pipe_id, queue_id, wptr);
++	/* AQL write pointer counts in 64B packets, PM4/CP counts in dwords. */
++	uint32_t wptr_shift = (p->format == KFD_QUEUE_FORMAT_AQL ? 4 : 0);
++	uint32_t wptr_mask = (uint32_t)((p->queue_size / sizeof(uint32_t)) - 1);
++
++	return mm->dev->kfd2kgd->hqd_load(mm->dev->kgd, mqd, pipe_id, queue_id,
++					  (uint32_t __user *)p->write_ptr,
++					  wptr_shift, wptr_mask, mms);
+ }
+ 
+ static int load_mqd_sdma(struct mqd_manager *mm, void *mqd,
+-			uint32_t pipe_id, uint32_t queue_id,
+-			uint32_t __user *wptr, struct mm_struct *mms)
++			 uint32_t pipe_id, uint32_t queue_id,
++			 struct queue_properties *p, struct mm_struct *mms)
+ {
+-	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd, wptr, mms);
++	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd,
++					       (uint32_t __user *)p->write_ptr,
++					       mms);
+ }
+ 
+ static int __update_mqd(struct mqd_manager *mm, void *mqd,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+index b0ea0d2..0050821 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -173,10 +173,15 @@ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 
+ static int load_mqd(struct mqd_manager *mm, void *mqd,
+ 			uint32_t pipe_id, uint32_t queue_id,
+-			uint32_t __user *wptr, struct mm_struct *mms)
++			struct queue_properties *p, struct mm_struct *mms)
+ {
+-	return mm->dev->kfd2kgd->hqd_load
+-		(mm->dev->kgd, mqd, pipe_id, queue_id, wptr);
++	/* AQL write pointer counts in 64B packets, PM4/CP counts in dwords. */
++	uint32_t wptr_shift = (p->format == KFD_QUEUE_FORMAT_AQL ? 4 : 0);
++	uint32_t wptr_mask = (uint32_t)((p->queue_size / sizeof(uint32_t)) - 1);
++
++	return mm->dev->kfd2kgd->hqd_load(mm->dev->kgd, mqd, pipe_id, queue_id,
++					  (uint32_t __user *)p->write_ptr,
++					  wptr_shift, wptr_mask, mms);
+ }
+ 
+ static int __update_mqd(struct mqd_manager *mm, void *mqd,
+@@ -371,9 +376,11 @@ static void uninit_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ 
+ static int load_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ 		uint32_t pipe_id, uint32_t queue_id,
+-		uint32_t __user *wptr, struct mm_struct *mms)
++		struct queue_properties *p, struct mm_struct *mms)
+ {
+-	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd, wptr, mms);
++	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd,
++					       (uint32_t __user *)p->write_ptr,
++					       mms);
+ }
+ 
+ static int update_mqd_sdma(struct mqd_manager *mm, void *mqd,
+-- 
+2.7.4
+

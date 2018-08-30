@@ -1,0 +1,82 @@
+From e45ab6a7f21c1684d2ae902b2314c82bc81352b6 Mon Sep 17 00:00:00 2001
+From: Philip Yang <Philip.Yang@amd.com>
+Date: Fri, 20 Oct 2017 14:32:27 -0400
+Subject: [PATCH 3775/5855] drm/amdkfd: fix hang issue if KFD memory failed to
+ restore
+
+In current logic, if restore failed, the restore work is rescheduled,
+and new fence is created for process->eviction_fence, but the new fence
+will attach to BOs created before the next restore, as a result, next
+restore will start evict work because new fence is not signaled while
+ttm_bo_wait on those new BOs. The eviction count can detect and skip
+eviction but it schedules restore work again, this is recursive
+eviction/restore.
+
+The fix is to create new fence only after restore is finished completely.
+
+BUG: SWDEV-134782
+
+Change-Id: Ib2f25f8a50a5eb8247572a105085482dc7326733
+Signed-off-by: Philip Yang <Philip.Yang@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c | 30 +++++++++++++-----------
+ 1 file changed, 16 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index e8cdef8..0d291ad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -2250,7 +2250,7 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info)
+ 	struct amdkfd_vm *peer_vm;
+ 	struct kgd_mem *mem;
+ 	struct bo_vm_reservation_context ctx;
+-	struct amdgpu_amdkfd_fence *old_fence;
++	struct amdgpu_amdkfd_fence *new_fence;
+ 	int ret = 0, i;
+ 	struct list_head duplicate_save;
+ 	struct amdgpu_sync sync_obj;
+@@ -2265,19 +2265,6 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info)
+ 	if (pd_bo_list == NULL)
+ 		return -ENOMEM;
+ 
+-	/* Release old eviction fence and create new one. Use context and mm
+-	 * from the old fence.
+-	 */
+-	old_fence = process_info->eviction_fence;
+-	process_info->eviction_fence =
+-		amdgpu_amdkfd_fence_create(old_fence->base.context,
+-					   old_fence->mm);
+-	fence_put(&old_fence->base);
+-	if (!process_info->eviction_fence) {
+-		pr_err("Failed to create eviction fence\n");
+-		goto evict_fence_fail;
+-	}
+-
+ 	i = 0;
+ 	mutex_lock(&process_info->lock);
+ 	list_for_each_entry(peer_vm, &process_info->vm_list_head,
+@@ -2349,6 +2336,21 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info)
+ 
+ 	amdgpu_sync_wait(ctx.sync, false);
+ 
++	/* Release old eviction fence and create new one, because fence only
++	 * goes from unsignaled to signaled, fence cannot be reused.
++	 * Use context and mm from the old fence.
++	 */
++	new_fence = amdgpu_amdkfd_fence_create(
++				process_info->eviction_fence->base.context,
++				process_info->eviction_fence->mm);
++	if (!new_fence) {
++		pr_err("Failed to create eviction fence\n");
++		ret = -ENOMEM;
++		goto validate_map_fail;
++	}
++	fence_put(&process_info->eviction_fence->base);
++	process_info->eviction_fence = new_fence;
++
+ 	/* Wait for validate to finish and attach new eviction fence */
+ 	list_for_each_entry(mem, &process_info->kfd_bo_list,
+ 		validate_list.head) {
+-- 
+2.7.4
+

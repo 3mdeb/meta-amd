@@ -1,0 +1,171 @@
+From f0680c25ec5e9b91a80cf022d1b6b96567e51a1d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 6 Sep 2017 16:55:16 +0200
+Subject: [PATCH 3106/5855] drm/amdgpu: rework amdgpu_cs_find_mapping
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Use the VM instead of the BO list to find the BO for a virtual address.
+
+This fixes UVD/VCE in physical mode with VM local BOs.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Leo Liu <leo.liu@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+
+Change-Id: I009dc1b89b32962f2fcdc4c9c6a3b93fc85a584c
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c     | 42 +++++++-----------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c     | 17 ++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h     |  2 ++
+ 4 files changed, 30 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index ef86172..d9467f3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -1398,46 +1398,24 @@ int amdgpu_cs_find_mapping(struct amdgpu_cs_parser *parser,
+ 			   uint64_t addr, struct amdgpu_bo **bo,
+ 			   struct amdgpu_bo_va_mapping **map)
+ {
++	struct amdgpu_fpriv *fpriv = parser->filp->driver_priv;
++	struct amdgpu_vm *vm = &fpriv->vm;
+ 	struct amdgpu_bo_va_mapping *mapping;
+-	unsigned i;
+ 	int r;
+ 
+-	if (!parser->bo_list)
+-		return 0;
+-
+ 	addr /= AMDGPU_GPU_PAGE_SIZE;
+ 
+-	for (i = 0; i < parser->bo_list->num_entries; i++) {
+-		struct amdgpu_bo_list_entry *lobj;
+-
+-		lobj = &parser->bo_list->array[i];
+-		if (!lobj->bo_va || amdgpu_ttm_adev(lobj->bo_va->base.bo->tbo.bdev) != parser->adev)
+-			continue;
+-
+-		list_for_each_entry(mapping, &lobj->bo_va->valids, list) {
+-			if (mapping->start > addr ||
+-			    addr > mapping->last)
+-				continue;
+-
+-			*bo = lobj->bo_va->base.bo;
+-			*map = mapping;
+-			goto found;
+-		}
+-
+-		list_for_each_entry(mapping, &lobj->bo_va->invalids, list) {
+-			if (mapping->start > addr ||
+-			    addr > mapping->last)
+-				continue;
++	mapping = amdgpu_vm_bo_lookup_mapping(vm, addr);
++	if (!mapping || !mapping->bo_va || !mapping->bo_va->base.bo)
++		return -EINVAL;
+ 
+-			*bo = lobj->bo_va->base.bo;
+-			*map = mapping;
+-			goto found;
+-		}
+-	}
++	*bo = mapping->bo_va->base.bo;
++	*map = mapping;
+ 
+-	return -EINVAL;
++	/* Double check that the BO is reserved by this CS */
++	if (READ_ONCE((*bo)->tbo.resv->lock.ctx) != &parser->ticket)
++		return -EINVAL;
+ 
+-found:
+ 	r = amdgpu_ttm_bind(&(*bo)->tbo, &(*bo)->tbo.mem);
+ 	if (unlikely(r))
+ 		return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index 2a77285..9e94c23 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -35,6 +35,7 @@
+ 
+ /* bo virtual addresses in a vm */
+ struct amdgpu_bo_va_mapping {
++	struct amdgpu_bo_va		*bo_va;
+ 	struct list_head		list;
+ 	struct rb_node			rb;
+ 	uint64_t			start;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 7841123..781dc2b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -2113,6 +2113,7 @@ static void amdgpu_vm_bo_insert_map(struct amdgpu_device *adev,
+ 	struct amdgpu_vm *vm = bo_va->base.vm;
+ 	struct amdgpu_bo *bo = bo_va->base.bo;
+ 
++	mapping->bo_va = bo_va;
+ 	list_add(&mapping->list, &bo_va->invalids);
+ 	amdgpu_vm_it_insert(mapping, &vm->va);
+ 
+@@ -2290,6 +2291,7 @@ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
+ 
+ 	list_del(&mapping->list);
+ 	amdgpu_vm_it_remove(mapping, &vm->va);
++	mapping->bo_va = NULL;
+ 	trace_amdgpu_vm_bo_unmap(bo_va, mapping);
+ 
+ 	if (valid)
+@@ -2375,6 +2377,7 @@ int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
+ 		if (tmp->last > eaddr)
+ 		    tmp->last = eaddr;
+ 
++		tmp->bo_va = NULL;
+ 		list_add(&tmp->list, &vm->freed);
+ 		trace_amdgpu_vm_bo_unmap(NULL, tmp);
+ 	}
+@@ -2401,6 +2404,19 @@ int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
+ }
+ 
+ /**
++ * amdgpu_vm_bo_lookup_mapping - find mapping by address
++ *
++ * @vm: the requested VM
++ *
++ * Find a mapping by it's address.
++ */
++struct amdgpu_bo_va_mapping *amdgpu_vm_bo_lookup_mapping(struct amdgpu_vm *vm,
++							 uint64_t addr)
++{
++	return amdgpu_vm_it_iter_first(&vm->va, addr, addr);
++}
++
++/**
+  * amdgpu_vm_bo_rmv - remove a bo to a specific vm
+  *
+  * @adev: amdgpu_device pointer
+@@ -2425,6 +2441,7 @@ void amdgpu_vm_bo_rmv(struct amdgpu_device *adev,
+ 	list_for_each_entry_safe(mapping, next, &bo_va->valids, list) {
+ 		list_del(&mapping->list);
+ 		amdgpu_vm_it_remove(mapping, &vm->va);
++		mapping->bo_va = NULL;
+ 		trace_amdgpu_vm_bo_unmap(bo_va, mapping);
+ 		list_add(&mapping->list, &vm->freed);
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 9d1a177..595e457 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -282,6 +282,8 @@ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
+ int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
+ 				struct amdgpu_vm *vm,
+ 				uint64_t saddr, uint64_t size);
++struct amdgpu_bo_va_mapping *amdgpu_vm_bo_lookup_mapping(struct amdgpu_vm *vm,
++							 uint64_t addr);
+ void amdgpu_vm_bo_rmv(struct amdgpu_device *adev,
+ 		      struct amdgpu_bo_va *bo_va);
+ void amdgpu_vm_set_fragment_size(struct amdgpu_device *adev,
+-- 
+2.7.4
+

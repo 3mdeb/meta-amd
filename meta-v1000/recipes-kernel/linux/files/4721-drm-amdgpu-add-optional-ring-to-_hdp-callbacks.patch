@@ -1,0 +1,306 @@
+From 285a1d8e1771cdf88915b01580f409b81630d88d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 19 Jan 2018 14:17:40 +0100
+Subject: [PATCH 4721/5855] drm/amdgpu: add optional ring to *_hdp callbacks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This adds an optional ring to the invalidate_hdp and flush_hdp
+callbacks. If the ring isn't specified or the emit_wreg function not
+available the HDP operation will be done with the CPU otherwise by
+writing on the ring.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h      | 11 ++++++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c   |  4 ++--
+ drivers/gpu/drm/amd/amdgpu/cik.c         | 21 +++++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c    |  2 +-
+ drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c   | 11 +++++++++--
+ drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c   |  9 +++++++--
+ drivers/gpu/drm/amd/amdgpu/si.c          | 21 +++++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/soc15.c       | 13 +++++++++----
+ drivers/gpu/drm/amd/amdgpu/vi.c          | 21 +++++++++++++++------
+ 10 files changed, 81 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index c636e1b..5627d2a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1240,9 +1240,10 @@ struct amdgpu_asic_funcs {
+ 	/* get config memsize register */
+ 	u32 (*get_config_memsize)(struct amdgpu_device *adev);
+ 	/* flush hdp write queue */
+-	void (*flush_hdp)(struct amdgpu_device *adev);
++	void (*flush_hdp)(struct amdgpu_device *adev, struct amdgpu_ring *ring);
+ 	/* invalidate hdp read cache */
+-	void (*invalidate_hdp)(struct amdgpu_device *adev);
++	void (*invalidate_hdp)(struct amdgpu_device *adev,
++			       struct amdgpu_ring *ring);
+ };
+ 
+ /*
+@@ -1424,7 +1425,7 @@ struct amdgpu_nbio_funcs {
+ 	u32 (*get_pcie_data_offset)(struct amdgpu_device *adev);
+ 	u32 (*get_rev_id)(struct amdgpu_device *adev);
+ 	void (*mc_access_enable)(struct amdgpu_device *adev, bool enable);
+-	void (*hdp_flush)(struct amdgpu_device *adev);
++	void (*hdp_flush)(struct amdgpu_device *adev, struct amdgpu_ring *ring);
+ 	u32 (*get_memsize)(struct amdgpu_device *adev);
+ 	void (*sdma_doorbell_range)(struct amdgpu_device *adev, int instance,
+ 				    bool use_doorbell, int doorbell_index);
+@@ -1840,8 +1841,8 @@ amdgpu_get_sdma_instance(struct amdgpu_ring *ring)
+ #define amdgpu_asic_read_bios_from_rom(adev, b, l) (adev)->asic_funcs->read_bios_from_rom((adev), (b), (l))
+ #define amdgpu_asic_read_register(adev, se, sh, offset, v)((adev)->asic_funcs->read_register((adev), (se), (sh), (offset), (v)))
+ #define amdgpu_asic_get_config_memsize(adev) (adev)->asic_funcs->get_config_memsize((adev))
+-#define amdgpu_asic_flush_hdp(adev) (adev)->asic_funcs->flush_hdp((adev))
+-#define amdgpu_asic_invalidate_hdp(adev) (adev)->asic_funcs->invalidate_hdp((adev))
++#define amdgpu_asic_flush_hdp(adev, r) (adev)->asic_funcs->flush_hdp((adev), (r))
++#define amdgpu_asic_invalidate_hdp(adev, r) (adev)->asic_funcs->invalidate_hdp((adev), (r))
+ #define amdgpu_gmc_flush_gpu_tlb(adev, vmid) (adev)->gmc.gmc_funcs->flush_gpu_tlb((adev), (vmid))
+ #define amdgpu_gmc_emit_flush_gpu_tlb(r, vmid, pasid, addr) (r)->adev->gmc.gmc_funcs->emit_flush_gpu_tlb((r), (vmid), (pasid), (addr))
+ #define amdgpu_gmc_set_pte_pde(adev, pt, idx, addr, flags) (adev)->gmc.gmc_funcs->set_pte_pde((adev), (pt), (idx), (addr), (flags))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
+index bbeac3d..fc8ef29 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
+@@ -244,7 +244,7 @@ int amdgpu_gart_unbind(struct amdgpu_device *adev, uint64_t offset,
+ 		}
+ 	}
+ 	mb();
+-	amdgpu_asic_flush_hdp(adev);
++	amdgpu_asic_flush_hdp(adev, NULL);
+ 	amdgpu_gmc_flush_gpu_tlb(adev, 0);
+ 	return 0;
+ }
+@@ -327,7 +327,7 @@ int amdgpu_gart_bind(struct amdgpu_device *adev, uint64_t offset,
+ 		return r;
+ 
+ 	mb();
+-	amdgpu_asic_flush_hdp(adev);
++	amdgpu_asic_flush_hdp(adev, NULL);
+ 	amdgpu_gmc_flush_gpu_tlb(adev, 0);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index f6d16e1..415a436 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -854,7 +854,7 @@ int amdgpu_vm_update_directories(struct amdgpu_device *adev,
+ 	if (vm->use_cpu_for_update) {
+ 		/* Flush HDP */
+ 		mb();
+-		amdgpu_asic_flush_hdp(adev);
++		amdgpu_asic_flush_hdp(adev, NULL);
+ 	} else if (params.ib->length_dw == 0) {
+ 		amdgpu_job_free(job);
+ 	} else {
+@@ -1463,7 +1463,7 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 	if (vm->use_cpu_for_update) {
+ 		/* Flush HDP */
+ 		mb();
+-		amdgpu_asic_flush_hdp(adev);
++		amdgpu_asic_flush_hdp(adev, NULL);
+ 	}
+ 
+ 	spin_lock(&vm->status_lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik.c b/drivers/gpu/drm/amd/amdgpu/cik.c
+index 204ce80..4324184 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik.c
+@@ -1715,16 +1715,25 @@ static void cik_detect_hw_virtualization(struct amdgpu_device *adev)
+ 		adev->virt.caps |= AMDGPU_PASSTHROUGH_MODE;
+ }
+ 
+-static void cik_flush_hdp(struct amdgpu_device *adev)
++static void cik_flush_hdp(struct amdgpu_device *adev, struct amdgpu_ring *ring)
+ {
+-	WREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
+-	RREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL);
++	if (!ring || !ring->funcs->emit_wreg) {
++		WREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
++		RREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL);
++	} else {
++		amdgpu_ring_emit_wreg(ring, mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
++	}
+ }
+ 
+-static void cik_invalidate_hdp(struct amdgpu_device *adev)
++static void cik_invalidate_hdp(struct amdgpu_device *adev,
++			       struct amdgpu_ring *ring)
+ {
+-	WREG32(mmHDP_DEBUG0, 1);
+-	RREG32(mmHDP_DEBUG0);
++	if (!ring || !ring->funcs->emit_wreg) {
++		WREG32(mmHDP_DEBUG0, 1);
++		RREG32(mmHDP_DEBUG0);
++	} else {
++		amdgpu_ring_emit_wreg(ring, mmHDP_DEBUG0, 1);
++	}
+ }
+ 
+ static const struct amdgpu_asic_funcs cik_asic_funcs =
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index f63fc98..9175d7c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -1002,7 +1002,7 @@ static int gmc_v9_0_gart_enable(struct amdgpu_device *adev)
+ 	WREG32_SOC15(HDP, 0, mmHDP_HOST_PATH_CNTL, tmp);
+ 
+         /* After HDP is initialized, flush HDP.*/
+-	adev->nbio_funcs->hdp_flush(adev);
++	adev->nbio_funcs->hdp_flush(adev, NULL);
+ 
+ 	if (amdgpu_vm_fault_stop == AMDGPU_VM_FAULT_STOP_ALWAYS)
+ 		value = false;
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
+index d4da663d..2daeef6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
+@@ -53,9 +53,16 @@ static void nbio_v6_1_mc_access_enable(struct amdgpu_device *adev, bool enable)
+ 		WREG32_SOC15(NBIO, 0, mmBIF_FB_EN, 0);
+ }
+ 
+-static void nbio_v6_1_hdp_flush(struct amdgpu_device *adev)
++static void nbio_v6_1_hdp_flush(struct amdgpu_device *adev,
++				struct amdgpu_ring *ring)
+ {
+-	WREG32_SOC15_NO_KIQ(NBIO, 0, mmBIF_BX_PF0_HDP_MEM_COHERENCY_FLUSH_CNTL, 0);
++	if (!ring || !ring->funcs->emit_wreg)
++		WREG32_SOC15_NO_KIQ(NBIO, 0,
++				    mmBIF_BX_PF0_HDP_MEM_COHERENCY_FLUSH_CNTL,
++				    0);
++	else
++		amdgpu_ring_emit_wreg(ring, SOC15_REG_OFFSET(
++			NBIO, 0, mmBIF_BX_PF0_HDP_MEM_COHERENCY_FLUSH_CNTL), 0);
+ }
+ 
+ static u32 nbio_v6_1_get_memsize(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c b/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
+index 17a9131..cd10c76 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
+@@ -53,9 +53,14 @@ static void nbio_v7_0_mc_access_enable(struct amdgpu_device *adev, bool enable)
+ 		WREG32_SOC15(NBIO, 0, mmBIF_FB_EN, 0);
+ }
+ 
+-static void nbio_v7_0_hdp_flush(struct amdgpu_device *adev)
++static void nbio_v7_0_hdp_flush(struct amdgpu_device *adev,
++				struct amdgpu_ring *ring)
+ {
+-	WREG32_SOC15_NO_KIQ(NBIO, 0, mmHDP_MEM_COHERENCY_FLUSH_CNTL, 0);
++	if (!ring || !ring->funcs->emit_wreg)
++		WREG32_SOC15_NO_KIQ(NBIO, 0, mmHDP_MEM_COHERENCY_FLUSH_CNTL, 0);
++	else
++		amdgpu_ring_emit_wreg(ring, SOC15_REG_OFFSET(
++			NBIO, 0, mmHDP_MEM_COHERENCY_FLUSH_CNTL), 0);
+ }
+ 
+ static u32 nbio_v7_0_get_memsize(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/si.c b/drivers/gpu/drm/amd/amdgpu/si.c
+index f61a431..f20c4b7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/si.c
++++ b/drivers/gpu/drm/amd/amdgpu/si.c
+@@ -1230,16 +1230,25 @@ static void si_detect_hw_virtualization(struct amdgpu_device *adev)
+ 		adev->virt.caps |= AMDGPU_PASSTHROUGH_MODE;
+ }
+ 
+-static void si_flush_hdp(struct amdgpu_device *adev)
++static void si_flush_hdp(struct amdgpu_device *adev, struct amdgpu_ring *ring)
+ {
+-	WREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
+-	RREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL);
++	if (!ring || !ring->funcs->emit_wreg) {
++		WREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
++		RREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL);
++	} else {
++		amdgpu_ring_emit_wreg(ring, mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
++	}
+ }
+ 
+-static void si_invalidate_hdp(struct amdgpu_device *adev)
++static void si_invalidate_hdp(struct amdgpu_device *adev,
++			      struct amdgpu_ring *ring)
+ {
+-	WREG32(mmHDP_DEBUG0, 1);
+-	RREG32(mmHDP_DEBUG0);
++	if (!ring || !ring->funcs->emit_wreg) {
++		WREG32(mmHDP_DEBUG0, 1);
++		RREG32(mmHDP_DEBUG0);
++	} else {
++		amdgpu_ring_emit_wreg(ring, mmHDP_DEBUG0, 1);
++	}
+ }
+ 
+ static const struct amdgpu_asic_funcs si_asic_funcs =
+diff --git a/drivers/gpu/drm/amd/amdgpu/soc15.c b/drivers/gpu/drm/amd/amdgpu/soc15.c
+index 3dd5d24..312d3ea 100644
+--- a/drivers/gpu/drm/amd/amdgpu/soc15.c
++++ b/drivers/gpu/drm/amd/amdgpu/soc15.c
+@@ -583,14 +583,19 @@ static uint32_t soc15_get_rev_id(struct amdgpu_device *adev)
+ 	return adev->nbio_funcs->get_rev_id(adev);
+ }
+ 
+-static void soc15_flush_hdp(struct amdgpu_device *adev)
++static void soc15_flush_hdp(struct amdgpu_device *adev, struct amdgpu_ring *ring)
+ {
+-	adev->nbio_funcs->hdp_flush(adev);
++	adev->nbio_funcs->hdp_flush(adev, ring);
+ }
+ 
+-static void soc15_invalidate_hdp(struct amdgpu_device *adev)
++static void soc15_invalidate_hdp(struct amdgpu_device *adev,
++				 struct amdgpu_ring *ring)
+ {
+-	WREG32_SOC15_NO_KIQ(NBIO, 0, mmHDP_READ_CACHE_INVALIDATE, 1);
++	if (!ring || !ring->funcs->emit_wreg)
++		WREG32_SOC15_NO_KIQ(NBIO, 0, mmHDP_READ_CACHE_INVALIDATE, 1);
++	else
++		amdgpu_ring_emit_wreg(ring, SOC15_REG_OFFSET(
++			HDP, 0, mmHDP_READ_CACHE_INVALIDATE), 1);
+ }
+ 
+ static const struct amdgpu_asic_funcs soc15_asic_funcs =
+diff --git a/drivers/gpu/drm/amd/amdgpu/vi.c b/drivers/gpu/drm/amd/amdgpu/vi.c
+index ce972e2..615692a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vi.c
++++ b/drivers/gpu/drm/amd/amdgpu/vi.c
+@@ -857,16 +857,25 @@ static uint32_t vi_get_rev_id(struct amdgpu_device *adev)
+ 			>> PCIE_EFUSE4__STRAP_BIF_ATI_REV_ID__SHIFT;
+ }
+ 
+-static void vi_flush_hdp(struct amdgpu_device *adev)
++static void vi_flush_hdp(struct amdgpu_device *adev, struct amdgpu_ring *ring)
+ {
+-	WREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
+-	RREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL);
++	if (!ring || !ring->funcs->emit_wreg) {
++		WREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
++		RREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL);
++	} else {
++		amdgpu_ring_emit_wreg(ring, mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
++	}
+ }
+ 
+-static void vi_invalidate_hdp(struct amdgpu_device *adev)
++static void vi_invalidate_hdp(struct amdgpu_device *adev,
++			      struct amdgpu_ring *ring)
+ {
+-	WREG32(mmHDP_DEBUG0, 1);
+-	RREG32(mmHDP_DEBUG0);
++	if (!ring || !ring->funcs->emit_wreg) {
++		WREG32(mmHDP_DEBUG0, 1);
++		RREG32(mmHDP_DEBUG0);
++	} else {
++		amdgpu_ring_emit_wreg(ring, mmHDP_DEBUG0, 1);
++	}
+ }
+ 
+ static const struct amdgpu_asic_funcs vi_asic_funcs =
+-- 
+2.7.4
+

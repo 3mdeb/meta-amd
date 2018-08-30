@@ -1,0 +1,164 @@
+From e9583ddfcb472b6ab8473216e6f4ae4d75f3243c Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Date: Tue, 10 Oct 2017 16:50:17 -0400
+Subject: [PATCH 3673/5855] drm/amdgpu: Move old fence waiting before
+ reservation lock is aquired v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Helps avoiding deadlock during GPU reset.
+Added mutex to amdgpu_ctx to preserve order of fences on a ring.
+
+v2:
+Put waiting logic in a function in a seperate function in amdgpu_ctx.c
+
+Signed-off-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+
+Change-Id: I56f1b6d60eefd53417a7123e017184f45689cbd2
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  | 10 ++++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c | 31 +++++++++++++++++++++++++------
+ 3 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 171ed9c..65c722f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -761,6 +761,7 @@ struct amdgpu_ctx {
+ 	bool 			preamble_presented;
+ 	enum amd_sched_priority init_priority;
+ 	enum amd_sched_priority override_priority;
++	struct mutex            lock;
+ };
+ 
+ struct amdgpu_ctx_mgr {
+@@ -783,9 +784,12 @@ void amdgpu_ctx_priority_override(struct amdgpu_ctx *ctx,
+ int amdgpu_ctx_ioctl(struct drm_device *dev, void *data,
+ 		     struct drm_file *filp);
+ 
++int amdgpu_ctx_wait_prev_fence(struct amdgpu_ctx *ctx, unsigned ring_id);
++
+ void amdgpu_ctx_mgr_init(struct amdgpu_ctx_mgr *mgr);
+ void amdgpu_ctx_mgr_fini(struct amdgpu_ctx_mgr *mgr);
+ 
++
+ /*
+  * file private structure
+  */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 1655ae3..a48dc0d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -90,6 +90,8 @@ static int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
+ 		goto free_chunk;
+ 	}
+ 
++	mutex_lock(&p->ctx->lock);
++
+ 	/* get chunks */
+ 	chunk_array_user = u64_to_user_ptr(cs->in.chunks);
+ 	if (copy_from_user(chunk_array, chunk_array_user,
+@@ -734,8 +736,10 @@ static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser, int error, bo
+ 	
+ 	fence_put(parser->fence);
+ 
+-	if (parser->ctx)
++	if (parser->ctx) {
++		mutex_unlock(&parser->ctx->lock);
+ 		amdgpu_ctx_put(parser->ctx);
++	}
+ 	if (parser->bo_list)
+ 		amdgpu_bo_list_put(parser->bo_list);
+ 
+@@ -892,9 +896,7 @@ static int amdgpu_cs_ib_vm_chunk(struct amdgpu_device *adev,
+ 			r = amdgpu_ring_parse_cs(ring, p, j);
+ 			if (r)
+ 				return r;
+-
+ 		}
+-
+ 		j++;
+ 	}
+ 
+@@ -982,7 +984,7 @@ static int amdgpu_cs_ib_fill(struct amdgpu_device *adev,
+ 	    parser->job->ring->funcs->type == AMDGPU_RING_TYPE_VCE))
+ 		return -EINVAL;
+ 
+-	return 0;
++	return amdgpu_ctx_wait_prev_fence(parser->ctx, parser->job->ring->idx);
+ }
+ 
+ static int amdgpu_cs_process_fence_dep(struct amdgpu_cs_parser *p,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index 282931e..050c7fa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -67,6 +67,8 @@ static int amdgpu_ctx_init(struct amdgpu_device *adev,
+ 	if (!ctx->fences)
+ 		return -ENOMEM;
+ 
++	mutex_init(&ctx->lock);
++
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+ 		ctx->rings[i].sequence = 1;
+ 		ctx->rings[i].fences = &ctx->fences[amdgpu_sched_jobs * i];
+@@ -143,6 +145,8 @@ static void amdgpu_ctx_fini(struct amdgpu_ctx *ctx)
+ 				      &ctx->rings[i].entity);
+ 
+ 	amdgpu_queue_mgr_fini(adev, &ctx->queue_mgr);
++
++	mutex_destroy(&ctx->lock);
+ }
+ 
+ static int amdgpu_ctx_alloc(struct amdgpu_device *adev,
+@@ -317,12 +321,9 @@ uint64_t amdgpu_ctx_add_fence(struct amdgpu_ctx *ctx, struct amdgpu_ring *ring,
+ 
+ 	idx = seq & (amdgpu_sched_jobs - 1);
+ 	other = cring->fences[idx];
+-	if (other) {
+-		signed long r;
+-		r = fence_wait_timeout(other, false, MAX_SCHEDULE_TIMEOUT);
+-		if (r < 0)
+-			DRM_ERROR("Error (%ld) waiting for fence!\n", r);
+-	}
++
++        if (other)
++                BUG_ON(!dma_fence_is_signaled(other));
+ 
+ 	fence_get(fence);
+ 
+@@ -391,6 +392,24 @@ void amdgpu_ctx_priority_override(struct amdgpu_ctx *ctx,
+ 	}
+ }
+ 
++int amdgpu_ctx_wait_prev_fence(struct amdgpu_ctx *ctx, unsigned ring_id)
++{
++	struct amdgpu_ctx_ring *cring = &ctx->rings[ring_id];
++	unsigned idx = cring->sequence & (amdgpu_sched_jobs - 1);
++	struct dma_fence *other = cring->fences[idx];
++
++	if (other) {
++		signed long r;
++		r = kcl_fence_wait_timeout(other, false, MAX_SCHEDULE_TIMEOUT);
++		if (r < 0) {
++			DRM_ERROR("Error (%ld) waiting for fence!\n", r);
++			return r;
++		}
++	}
++
++	return 0;
++}
++
+ void amdgpu_ctx_mgr_init(struct amdgpu_ctx_mgr *mgr)
+ {
+ 	mutex_init(&mgr->lock);
+-- 
+2.7.4
+

@@ -1,0 +1,395 @@
+From 24f3c6e388d875338219033ade44ef266dfda09e Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Tue, 29 Aug 2017 16:08:56 +0800
+Subject: [PATCH 3094/5855] drm/amd/powerplay: add UMD P-state in powerplay.
+
+This feature is for UMD to run benchmark in a
+power state that is as steady as possible. kmd
+need to fix the power state as stable as possible.
+now, kmd support four level:
+profile_standard,peak,min_sclk,min_mclk
+
+move common related code to amd_powerplay.c
+
+Change-Id: I0cd72bac4c98028ab644e68d02c0adee6dd220a6
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+---
+ drivers/gpu/drm/amd/powerplay/amd_powerplay.c      | 47 +++++++++++++++++-
+ drivers/gpu/drm/amd/powerplay/hwmgr/cz_hwmgr.c     | 36 --------------
+ drivers/gpu/drm/amd/powerplay/hwmgr/smu7_hwmgr.c   | 58 ++++------------------
+ drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c | 53 +++-----------------
+ drivers/gpu/drm/amd/powerplay/inc/hwmgr.h          |  4 +-
+ 5 files changed, 66 insertions(+), 132 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+index 604e993..aef9351 100644
+--- a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
++++ b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+@@ -30,7 +30,6 @@
+ #include "pp_instance.h"
+ #include "power_state.h"
+ 
+-
+ static inline int pp_check(struct pp_instance *handle)
+ {
+ 	if (handle == NULL || handle->pp_valid != PP_VALID)
+@@ -287,6 +286,42 @@ static int pp_dpm_fw_loading_complete(void *handle)
+ 	return 0;
+ }
+ 
++static void pp_dpm_en_umd_pstate(struct pp_hwmgr  *hwmgr,
++						enum amd_dpm_forced_level *level)
++{
++	uint32_t profile_mode_mask = AMD_DPM_FORCED_LEVEL_PROFILE_STANDARD |
++					AMD_DPM_FORCED_LEVEL_PROFILE_MIN_SCLK |
++					AMD_DPM_FORCED_LEVEL_PROFILE_MIN_MCLK |
++					AMD_DPM_FORCED_LEVEL_PROFILE_PEAK;
++
++	if (!(hwmgr->dpm_level & profile_mode_mask)) {
++		/* enter umd pstate, save current level, disable gfx cg*/
++		if (*level & profile_mode_mask) {
++			hwmgr->saved_dpm_level = hwmgr->dpm_level;
++			hwmgr->en_umd_pstate = true;
++			cgs_set_clockgating_state(hwmgr->device,
++						AMD_IP_BLOCK_TYPE_GFX,
++						AMD_CG_STATE_UNGATE);
++			cgs_set_powergating_state(hwmgr->device,
++					AMD_IP_BLOCK_TYPE_GFX,
++					AMD_PG_STATE_UNGATE);
++		}
++	} else {
++		/* exit umd pstate, restore level, enable gfx cg*/
++		if (!(*level & profile_mode_mask)) {
++			if (*level == AMD_DPM_FORCED_LEVEL_PROFILE_EXIT)
++				*level = hwmgr->saved_dpm_level;
++			hwmgr->en_umd_pstate = false;
++			cgs_set_clockgating_state(hwmgr->device,
++					AMD_IP_BLOCK_TYPE_GFX,
++					AMD_CG_STATE_GATE);
++			cgs_set_powergating_state(hwmgr->device,
++					AMD_IP_BLOCK_TYPE_GFX,
++					AMD_PG_STATE_GATE);
++		}
++	}
++}
++
+ static int pp_dpm_force_performance_level(void *handle,
+ 					enum amd_dpm_forced_level level)
+ {
+@@ -301,14 +336,22 @@ static int pp_dpm_force_performance_level(void *handle,
+ 
+ 	hwmgr = pp_handle->hwmgr;
+ 
++	if (level == hwmgr->dpm_level)
++		return 0;
++
+ 	if (hwmgr->hwmgr_func->force_dpm_level == NULL) {
+ 		pr_info("%s was not implemented.\n", __func__);
+ 		return 0;
+ 	}
+ 
+ 	mutex_lock(&pp_handle->pp_lock);
++	pp_dpm_en_umd_pstate(hwmgr, &level);
++	hwmgr->request_dpm_level = level;
+ 	hwmgr_handle_task(pp_handle, AMD_PP_TASK_READJUST_POWER_STATE, NULL, NULL);
+-	hwmgr->hwmgr_func->force_dpm_level(hwmgr, level);
++	ret = hwmgr->hwmgr_func->force_dpm_level(hwmgr, level);
++	if (!ret)
++		hwmgr->dpm_level = hwmgr->request_dpm_level;
++
+ 	mutex_unlock(&pp_handle->pp_lock);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/cz_hwmgr.c b/drivers/gpu/drm/amd/powerplay/hwmgr/cz_hwmgr.c
+index b9c61ec..a301003 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/cz_hwmgr.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/cz_hwmgr.c
+@@ -1314,57 +1314,21 @@ static int cz_dpm_force_dpm_level(struct pp_hwmgr *hwmgr,
+ 				enum amd_dpm_forced_level level)
+ {
+ 	int ret = 0;
+-	uint32_t profile_mode_mask = AMD_DPM_FORCED_LEVEL_PROFILE_STANDARD |
+-					AMD_DPM_FORCED_LEVEL_PROFILE_MIN_SCLK |
+-					AMD_DPM_FORCED_LEVEL_PROFILE_PEAK;
+-
+-	if (level == hwmgr->dpm_level)
+-		return ret;
+-
+-	if (!(hwmgr->dpm_level & profile_mode_mask)) {
+-		/* enter profile mode, save current level, disable gfx cg*/
+-		if (level & profile_mode_mask) {
+-			hwmgr->saved_dpm_level = hwmgr->dpm_level;
+-			cgs_set_clockgating_state(hwmgr->device,
+-						AMD_IP_BLOCK_TYPE_GFX,
+-						AMD_CG_STATE_UNGATE);
+-		}
+-	} else {
+-		/* exit profile mode, restore level, enable gfx cg*/
+-		if (!(level & profile_mode_mask)) {
+-			if (level == AMD_DPM_FORCED_LEVEL_PROFILE_EXIT)
+-				level = hwmgr->saved_dpm_level;
+-			cgs_set_clockgating_state(hwmgr->device,
+-					AMD_IP_BLOCK_TYPE_GFX,
+-					AMD_CG_STATE_GATE);
+-		}
+-	}
+ 
+ 	switch (level) {
+ 	case AMD_DPM_FORCED_LEVEL_HIGH:
+ 	case AMD_DPM_FORCED_LEVEL_PROFILE_PEAK:
+ 		ret = cz_phm_force_dpm_highest(hwmgr);
+-		if (ret)
+-			return ret;
+-		hwmgr->dpm_level = level;
+ 		break;
+ 	case AMD_DPM_FORCED_LEVEL_LOW:
+ 	case AMD_DPM_FORCED_LEVEL_PROFILE_MIN_SCLK:
+ 	case AMD_DPM_FORCED_LEVEL_PROFILE_STANDARD:
+ 		ret = cz_phm_force_dpm_lowest(hwmgr);
+-		if (ret)
+-			return ret;
+-		hwmgr->dpm_level = level;
+ 		break;
+ 	case AMD_DPM_FORCED_LEVEL_AUTO:
+ 		ret = cz_phm_unforce_dpm_levels(hwmgr);
+-		if (ret)
+-			return ret;
+-		hwmgr->dpm_level = level;
+ 		break;
+ 	case AMD_DPM_FORCED_LEVEL_MANUAL:
+-		hwmgr->dpm_level = level;
+-		break;
+ 	case AMD_DPM_FORCED_LEVEL_PROFILE_EXIT:
+ 	default:
+ 		break;
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_hwmgr.c b/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_hwmgr.c
+index eb8a3ff..dfe06d9 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_hwmgr.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_hwmgr.c
+@@ -2568,51 +2568,16 @@ static int smu7_force_dpm_level(struct pp_hwmgr *hwmgr,
+ 	uint32_t sclk_mask = 0;
+ 	uint32_t mclk_mask = 0;
+ 	uint32_t pcie_mask = 0;
+-	uint32_t profile_mode_mask = AMD_DPM_FORCED_LEVEL_PROFILE_STANDARD |
+-					AMD_DPM_FORCED_LEVEL_PROFILE_MIN_SCLK |
+-					AMD_DPM_FORCED_LEVEL_PROFILE_MIN_MCLK |
+-					AMD_DPM_FORCED_LEVEL_PROFILE_PEAK;
+-
+-	if (level == hwmgr->dpm_level)
+-		return ret;
+-
+-	if (!(hwmgr->dpm_level & profile_mode_mask)) {
+-		/* enter profile mode, save current level, disable gfx cg*/
+-		if (level & profile_mode_mask) {
+-			hwmgr->saved_dpm_level = hwmgr->dpm_level;
+-			cgs_set_clockgating_state(hwmgr->device,
+-						AMD_IP_BLOCK_TYPE_GFX,
+-						AMD_CG_STATE_UNGATE);
+-		}
+-	} else {
+-		/* exit profile mode, restore level, enable gfx cg*/
+-		if (!(level & profile_mode_mask)) {
+-			if (level == AMD_DPM_FORCED_LEVEL_PROFILE_EXIT)
+-				level = hwmgr->saved_dpm_level;
+-			cgs_set_clockgating_state(hwmgr->device,
+-					AMD_IP_BLOCK_TYPE_GFX,
+-					AMD_CG_STATE_GATE);
+-		}
+-	}
+ 
+ 	switch (level) {
+ 	case AMD_DPM_FORCED_LEVEL_HIGH:
+ 		ret = smu7_force_dpm_highest(hwmgr);
+-		if (ret)
+-			return ret;
+-		hwmgr->dpm_level = level;
+ 		break;
+ 	case AMD_DPM_FORCED_LEVEL_LOW:
+ 		ret = smu7_force_dpm_lowest(hwmgr);
+-		if (ret)
+-			return ret;
+-		hwmgr->dpm_level = level;
+ 		break;
+ 	case AMD_DPM_FORCED_LEVEL_AUTO:
+ 		ret = smu7_unforce_dpm_levels(hwmgr);
+-		if (ret)
+-			return ret;
+-		hwmgr->dpm_level = level;
+ 		break;
+ 	case AMD_DPM_FORCED_LEVEL_PROFILE_STANDARD:
+ 	case AMD_DPM_FORCED_LEVEL_PROFILE_MIN_SCLK:
+@@ -2621,26 +2586,23 @@ static int smu7_force_dpm_level(struct pp_hwmgr *hwmgr,
+ 		ret = smu7_get_profiling_clk(hwmgr, level, &sclk_mask, &mclk_mask, &pcie_mask);
+ 		if (ret)
+ 			return ret;
+-		hwmgr->dpm_level = level;
+ 		smu7_force_clock_level(hwmgr, PP_SCLK, 1<<sclk_mask);
+ 		smu7_force_clock_level(hwmgr, PP_MCLK, 1<<mclk_mask);
+ 		smu7_force_clock_level(hwmgr, PP_PCIE, 1<<pcie_mask);
+-
+ 		break;
+ 	case AMD_DPM_FORCED_LEVEL_MANUAL:
+-		hwmgr->dpm_level = level;
+-		break;
+ 	case AMD_DPM_FORCED_LEVEL_PROFILE_EXIT:
+ 	default:
+ 		break;
+ 	}
+ 
+-	if (level == AMD_DPM_FORCED_LEVEL_PROFILE_PEAK && hwmgr->saved_dpm_level != AMD_DPM_FORCED_LEVEL_PROFILE_PEAK)
+-		smu7_fan_ctrl_set_fan_speed_percent(hwmgr, 100);
+-	else if (level != AMD_DPM_FORCED_LEVEL_PROFILE_PEAK && hwmgr->saved_dpm_level == AMD_DPM_FORCED_LEVEL_PROFILE_PEAK)
+-		smu7_fan_ctrl_reset_fan_speed_to_default(hwmgr);
+-
+-	return 0;
++	if (!ret) {
++		if (level == AMD_DPM_FORCED_LEVEL_PROFILE_PEAK && hwmgr->dpm_level != AMD_DPM_FORCED_LEVEL_PROFILE_PEAK)
++			smu7_fan_ctrl_set_fan_speed_percent(hwmgr, 100);
++		else if (level != AMD_DPM_FORCED_LEVEL_PROFILE_PEAK && hwmgr->dpm_level == AMD_DPM_FORCED_LEVEL_PROFILE_PEAK)
++			smu7_fan_ctrl_reset_fan_speed_to_default(hwmgr);
++	}
++	return ret;
+ }
+ 
+ static int smu7_get_power_state_size(struct pp_hwmgr *hwmgr)
+@@ -4245,9 +4207,9 @@ static int smu7_force_clock_level(struct pp_hwmgr *hwmgr,
+ {
+ 	struct smu7_hwmgr *data = (struct smu7_hwmgr *)(hwmgr->backend);
+ 
+-	if (hwmgr->dpm_level & (AMD_DPM_FORCED_LEVEL_AUTO |
+-				AMD_DPM_FORCED_LEVEL_LOW |
+-				AMD_DPM_FORCED_LEVEL_HIGH))
++	if (hwmgr->request_dpm_level & (AMD_DPM_FORCED_LEVEL_AUTO |
++					AMD_DPM_FORCED_LEVEL_LOW |
++					AMD_DPM_FORCED_LEVEL_HIGH))
+ 		return -EINVAL;
+ 
+ 	switch (type) {
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c b/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c
+index f8f02e7..2e776ed 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c
+@@ -4306,51 +4306,16 @@ static int vega10_dpm_force_dpm_level(struct pp_hwmgr *hwmgr,
+ 	uint32_t sclk_mask = 0;
+ 	uint32_t mclk_mask = 0;
+ 	uint32_t soc_mask = 0;
+-	uint32_t profile_mode_mask = AMD_DPM_FORCED_LEVEL_PROFILE_STANDARD |
+-					AMD_DPM_FORCED_LEVEL_PROFILE_MIN_SCLK |
+-					AMD_DPM_FORCED_LEVEL_PROFILE_MIN_MCLK |
+-					AMD_DPM_FORCED_LEVEL_PROFILE_PEAK;
+-
+-	if (level == hwmgr->dpm_level)
+-		return ret;
+-
+-	if (!(hwmgr->dpm_level & profile_mode_mask)) {
+-		/* enter profile mode, save current level, disable gfx cg*/
+-		if (level & profile_mode_mask) {
+-			hwmgr->saved_dpm_level = hwmgr->dpm_level;
+-			cgs_set_clockgating_state(hwmgr->device,
+-						AMD_IP_BLOCK_TYPE_GFX,
+-						AMD_CG_STATE_UNGATE);
+-		}
+-	} else {
+-		/* exit profile mode, restore level, enable gfx cg*/
+-		if (!(level & profile_mode_mask)) {
+-			if (level == AMD_DPM_FORCED_LEVEL_PROFILE_EXIT)
+-				level = hwmgr->saved_dpm_level;
+-			cgs_set_clockgating_state(hwmgr->device,
+-					AMD_IP_BLOCK_TYPE_GFX,
+-					AMD_CG_STATE_GATE);
+-		}
+-	}
+ 
+ 	switch (level) {
+ 	case AMD_DPM_FORCED_LEVEL_HIGH:
+ 		ret = vega10_force_dpm_highest(hwmgr);
+-		if (ret)
+-			return ret;
+-		hwmgr->dpm_level = level;
+ 		break;
+ 	case AMD_DPM_FORCED_LEVEL_LOW:
+ 		ret = vega10_force_dpm_lowest(hwmgr);
+-		if (ret)
+-			return ret;
+-		hwmgr->dpm_level = level;
+ 		break;
+ 	case AMD_DPM_FORCED_LEVEL_AUTO:
+ 		ret = vega10_unforce_dpm_levels(hwmgr);
+-		if (ret)
+-			return ret;
+-		hwmgr->dpm_level = level;
+ 		break;
+ 	case AMD_DPM_FORCED_LEVEL_PROFILE_STANDARD:
+ 	case AMD_DPM_FORCED_LEVEL_PROFILE_MIN_SCLK:
+@@ -4359,24 +4324,22 @@ static int vega10_dpm_force_dpm_level(struct pp_hwmgr *hwmgr,
+ 		ret = vega10_get_profiling_clk_mask(hwmgr, level, &sclk_mask, &mclk_mask, &soc_mask);
+ 		if (ret)
+ 			return ret;
+-		hwmgr->dpm_level = level;
+ 		vega10_force_clock_level(hwmgr, PP_SCLK, 1<<sclk_mask);
+ 		vega10_force_clock_level(hwmgr, PP_MCLK, 1<<mclk_mask);
+ 		break;
+ 	case AMD_DPM_FORCED_LEVEL_MANUAL:
+-		hwmgr->dpm_level = level;
+-		break;
+ 	case AMD_DPM_FORCED_LEVEL_PROFILE_EXIT:
+ 	default:
+ 		break;
+ 	}
+ 
+-	if (level == AMD_DPM_FORCED_LEVEL_PROFILE_PEAK && hwmgr->saved_dpm_level != AMD_DPM_FORCED_LEVEL_PROFILE_PEAK)
+-		vega10_set_fan_control_mode(hwmgr, AMD_FAN_CTRL_NONE);
+-	else if (level != AMD_DPM_FORCED_LEVEL_PROFILE_PEAK && hwmgr->saved_dpm_level == AMD_DPM_FORCED_LEVEL_PROFILE_PEAK)
+-		vega10_set_fan_control_mode(hwmgr, AMD_FAN_CTRL_AUTO);
+-
+-	return 0;
++	if (!ret) {
++		if (level == AMD_DPM_FORCED_LEVEL_PROFILE_PEAK && hwmgr->dpm_level != AMD_DPM_FORCED_LEVEL_PROFILE_PEAK)
++			vega10_set_fan_control_mode(hwmgr, AMD_FAN_CTRL_NONE);
++		else if (level != AMD_DPM_FORCED_LEVEL_PROFILE_PEAK && hwmgr->dpm_level == AMD_DPM_FORCED_LEVEL_PROFILE_PEAK)
++			vega10_set_fan_control_mode(hwmgr, AMD_FAN_CTRL_AUTO);
++	}
++	return ret;
+ }
+ 
+ static int vega10_get_fan_control_mode(struct pp_hwmgr *hwmgr)
+@@ -4624,7 +4587,7 @@ static int vega10_force_clock_level(struct pp_hwmgr *hwmgr,
+ 	struct vega10_hwmgr *data = (struct vega10_hwmgr *)(hwmgr->backend);
+ 	int i;
+ 
+-	if (hwmgr->dpm_level & (AMD_DPM_FORCED_LEVEL_AUTO |
++	if (hwmgr->request_dpm_level & (AMD_DPM_FORCED_LEVEL_AUTO |
+ 				AMD_DPM_FORCED_LEVEL_LOW |
+ 				AMD_DPM_FORCED_LEVEL_HIGH))
+ 		return -EINVAL;
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+index c649354..3bbe7d5 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+@@ -747,6 +747,7 @@ struct pp_hwmgr {
+ 
+ 	enum amd_dpm_forced_level dpm_level;
+ 	enum amd_dpm_forced_level saved_dpm_level;
++	enum amd_dpm_forced_level request_dpm_level;
+ 	bool block_hw_access;
+ 	struct phm_gfx_arbiter gfx_arbiter;
+ 	struct phm_acp_arbiter acp_arbiter;
+@@ -786,12 +787,13 @@ struct pp_hwmgr {
+ 	struct amd_pp_display_configuration display_config;
+ 	uint32_t feature_mask;
+ 
+-	/* power profile */
++	/* UMD Pstate */
+ 	struct amd_pp_profile gfx_power_profile;
+ 	struct amd_pp_profile compute_power_profile;
+ 	struct amd_pp_profile default_gfx_power_profile;
+ 	struct amd_pp_profile default_compute_power_profile;
+ 	enum amd_pp_profile_type current_power_profile;
++	bool en_umd_pstate;
+ };
+ 
+ extern int hwmgr_early_init(struct pp_instance *handle);
+-- 
+2.7.4
+

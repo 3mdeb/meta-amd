@@ -1,0 +1,138 @@
+From 69b8cd1ee5f0aa044391e771f606785988d50d3f Mon Sep 17 00:00:00 2001
+From: Yong Zhao <yong.zhao@amd.com>
+Date: Wed, 7 Sep 2016 19:43:02 -0400
+Subject: [PATCH 5275/5855] drm/amdkfd: Clean up the function pqm_uninit()
+
+Split process termination part of pqm_uninit() into a separate function
+kfd_process_dequeue_from_all_devices(), which makes the logic clearer.
+
+Change-Id: Ibfe929c48b2d3812bb1e196d3444d22d2565ac0e
+Signed-off-by: Yong Zhao <yong.zhao@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdkfd/kfd_process.c
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h              |  2 +
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c           |  9 +----
+ .../gpu/drm/amd/amdkfd/kfd_process_queue_manager.c | 47 +++++++++++++---------
+ 3 files changed, 31 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index c30d329..360c573 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -820,6 +820,8 @@ struct process_queue_node {
+ 	struct list_head process_queue_list;
+ };
+ 
++void kfd_process_dequeue_from_device(struct kfd_process_device *pdd);
++void kfd_process_dequeue_from_all_devices(struct kfd_process *p);
+ int pqm_init(struct process_queue_manager *pqm, struct kfd_process *p);
+ void pqm_uninit(struct process_queue_manager *pqm);
+ int pqm_create_queue(struct process_queue_manager *pqm,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index cd33ffc..d65dbc5 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -536,24 +536,19 @@ static void kfd_process_notifier_release(struct mmu_notifier *mn,
+ 		mutex_unlock(get_dbgmgr_mutex());
+ 	}
+ 
++	kfd_process_dequeue_from_all_devices(p);
+ 
+ 	/* now we can uninit the pqm: */
+-
+ 	pqm_uninit(&p->pqm);
+ 
+ 	/* Iterate over all process device data structure and check
+-	 * if we should delete debug managers and reset all wavefronts
++	 * if we should delete debug managers
+ 	 */
+ 	list_for_each_entry(pdd, &p->per_device_data, per_device_list) {
+ 		if ((pdd->dev->dbgmgr) &&
+ 				(pdd->dev->dbgmgr->pasid == p->pasid))
+ 			kfd_dbgmgr_destroy(pdd->dev->dbgmgr);
+ 
+-		if (pdd->reset_wavefronts) {
+-			pr_warn("amdkfd: Resetting all wave fronts\n");
+-			dbgdev_wave_reset_wavefronts(pdd->dev, p);
+-			pdd->reset_wavefronts = false;
+-		}
+ 	}
+ 
+ 	/* Indicate to other users that MM is no longer valid */
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+index d2eaa2f..9ef1ad8 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -70,6 +70,33 @@ static int find_available_queue_slot(struct process_queue_manager *pqm,
+ 	return 0;
+ }
+ 
++void kfd_process_dequeue_from_device(struct kfd_process_device *pdd)
++{
++	struct kfd_dev *dev = pdd->dev;
++	struct kfd_process *p = pdd->process;
++	int retval;
++
++	retval = dev->dqm->ops.process_termination(dev->dqm, &pdd->qpd);
++	/* Checking pdd->reset_wavefronts may not be needed, because
++	 * if reset_wavefronts was set to true before, which means unmapping
++	 * failed, process_termination should fail too until we reset
++	 * wavefronts. Now we put the check there to be safe.
++	 */
++	if (retval || pdd->reset_wavefronts) {
++		pr_warn("amdkfd: Resetting wave fronts on dev %p\n", dev);
++		dbgdev_wave_reset_wavefronts(dev, p);
++		pdd->reset_wavefronts = false;
++	}
++}
++
++void kfd_process_dequeue_from_all_devices(struct kfd_process *p)
++{
++	struct kfd_process_device *pdd;
++
++	list_for_each_entry(pdd, &p->per_device_data, per_device_list)
++		kfd_process_dequeue_from_device(pdd);
++}
++
+ int pqm_init(struct process_queue_manager *pqm, struct kfd_process *p)
+ {
+ 	BUG_ON(!pqm);
+@@ -87,33 +114,13 @@ int pqm_init(struct process_queue_manager *pqm, struct kfd_process *p)
+ 
+ void pqm_uninit(struct process_queue_manager *pqm)
+ {
+-	int retval;
+ 	struct process_queue_node *pqn, *next;
+-	struct kfd_process_device *pdd;
+-	struct kfd_dev *dev = NULL;
+ 
+ 	BUG_ON(!pqm);
+ 
+ 	pr_debug("In func %s\n", __func__);
+ 
+ 	list_for_each_entry_safe(pqn, next, &pqm->queues, process_queue_list) {
+-		if (pqn->q)
+-			dev = pqn->q->device;
+-		else if (pqn->kq)
+-			dev = pqn->kq->dev;
+-		else
+-			BUG();
+-
+-		pdd = kfd_get_process_device_data(dev, pqm->process);
+-		if (pdd) {
+-			retval = dev->dqm->ops.process_termination
+-				(dev->dqm, &pdd->qpd);
+-			if (retval != 0)
+-				pdd->reset_wavefronts = true;
+-		}
+-	}
+-
+-	list_for_each_entry_safe(pqn, next, &pqm->queues, process_queue_list) {
+ 		uninit_queue(pqn->q);
+ 		list_del(&pqn->process_queue_list);
+ 		kfree(pqn);
+-- 
+2.7.4
+

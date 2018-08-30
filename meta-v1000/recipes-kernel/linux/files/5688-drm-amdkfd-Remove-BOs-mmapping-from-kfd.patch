@@ -1,0 +1,152 @@
+From 3a7852c8b438276121aa02de8731687140e65b74 Mon Sep 17 00:00:00 2001
+From: oak zeng <oak.zeng@amd.com>
+Date: Thu, 26 Oct 2017 16:36:54 -0400
+Subject: [PATCH 5688/5855] drm/amdkfd: Remove BOs mmapping from kfd
+
+This removed BOs mmapping support from kfd device. Removed
+mmap type and GPU ID from mmap_offset for BOs allocated
+from kfd - only pure offset is returned. Memory allocated
+through kfd is now mmapped through drm render device.
+
+Change-Id: Ia6b38de2dff9ebe843e525d6c8e76b8d14a892e5
+Signed-off-by: oak zeng <oak.zeng@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c | 45 +++++---------------------------
+ drivers/gpu/drm/amd/amdkfd/kfd_ipc.c     |  4 ---
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  3 +--
+ 3 files changed, 8 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 2c69f32..2deb1dd 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -46,7 +46,6 @@
+ static long kfd_ioctl(struct file *, unsigned int, unsigned long);
+ static int kfd_open(struct inode *, struct file *);
+ static int kfd_mmap(struct file *, struct vm_area_struct *);
+-static bool kfd_is_large_bar(struct kfd_dev *dev);
+ 
+ static const char kfd_dev_name[] = "kfd";
+ 
+@@ -1127,25 +1126,6 @@ static int kfd_ioctl_alloc_scratch_memory(struct file *filep,
+ 	return -EFAULT;
+ }
+ 
+-bool kfd_is_large_bar(struct kfd_dev *dev)
+-{
+-	struct kfd_local_mem_info mem_info;
+-
+-	if (debug_largebar) {
+-		pr_debug("Simulate large-bar allocation on non large-bar machine\n");
+-		return true;
+-	}
+-
+-	if (dev->device_info->is_need_iommu_device)
+-		return false;
+-
+-	dev->kfd2kgd->get_local_mem_info(dev->kgd, &mem_info);
+-	if (mem_info.local_mem_size_private == 0 &&
+-			mem_info.local_mem_size_public > 0)
+-		return true;
+-	return false;
+-}
+-
+ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
+ 					struct kfd_process *p, void *data)
+ {
+@@ -1213,15 +1193,7 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
+ 	mutex_unlock(&p->mutex);
+ 
+ 	args->handle = MAKE_HANDLE(args->gpu_id, idr_handle);
+-	if ((args->flags & KFD_IOC_ALLOC_MEM_FLAGS_VRAM) != 0 &&
+-			!kfd_is_large_bar(dev)) {
+-		args->mmap_offset = 0;
+-	} else {
+-		args->mmap_offset = KFD_MMAP_TYPE_MAP_BO;
+-		args->mmap_offset |= KFD_MMAP_GPU_ID(args->gpu_id);
+-		args->mmap_offset <<= PAGE_SHIFT;
+-		args->mmap_offset |= offset;
+-	}
++	args->mmap_offset = offset;
+ 
+ 	return 0;
+ 
+@@ -2204,7 +2176,7 @@ static int kfd_mmap(struct file *filp, struct vm_area_struct *vma)
+ 	struct kfd_process *process;
+ 	struct kfd_dev *kfd;
+ 	unsigned long vm_pgoff;
+-	int retval;
++	unsigned long long mmap_type;
+ 
+ 	process = kfd_get_process(current);
+ 	if (IS_ERR(process))
+@@ -2212,8 +2184,9 @@ static int kfd_mmap(struct file *filp, struct vm_area_struct *vma)
+ 
+ 	vm_pgoff = vma->vm_pgoff;
+ 	vma->vm_pgoff = KFD_MMAP_OFFSET_VALUE_GET(vma->vm_pgoff);
++	mmap_type = vm_pgoff & KFD_MMAP_TYPE_MASK;
+ 
+-	switch (vm_pgoff & KFD_MMAP_TYPE_MASK) {
++	switch (mmap_type) {
+ 	case KFD_MMAP_TYPE_DOORBELL:
+ 		kfd = kfd_device_by_id(KFD_MMAP_GPU_ID_GET(vm_pgoff));
+ 		if (!kfd)
+@@ -2223,16 +2196,12 @@ static int kfd_mmap(struct file *filp, struct vm_area_struct *vma)
+ 	case KFD_MMAP_TYPE_EVENTS:
+ 		return kfd_event_mmap(process, vma);
+ 
+-	case KFD_MMAP_TYPE_MAP_BO:
+-		kfd = kfd_device_by_id(KFD_MMAP_GPU_ID_GET(vm_pgoff));
+-		if (!kfd)
+-			return -EFAULT;
+-		retval = kfd->kfd2kgd->mmap_bo(kfd->kgd, vma);
+-		return retval;
+-
+ 	case KFD_MMAP_TYPE_RESERVED_MEM:
+ 		return kfd_reserved_mem_mmap(process, vma);
+ 
++	default:
++		pr_err("Unsupported kfd mmap type %llx\n", mmap_type);
++		break;
+ 	}
+ 
+ 	return -EFAULT;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c b/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c
+index 58aed52..269cd2a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c
+@@ -118,8 +118,6 @@ static int kfd_import_dmabuf_create_kfd_bo(struct kfd_dev *dev,
+ 	uint64_t size;
+ 	int idr_handle;
+ 	struct kfd_process_device *pdd = NULL;
+-	uint64_t kfd_mmap_flags = KFD_MMAP_TYPE_MAP_BO |
+-				  KFD_MMAP_GPU_ID(gpu_id);
+ 
+ 	if (!handle)
+ 		return -EINVAL;
+@@ -153,8 +151,6 @@ static int kfd_import_dmabuf_create_kfd_bo(struct kfd_dev *dev,
+ 	mutex_unlock(&p->mutex);
+ 
+ 	*handle = MAKE_HANDLE(gpu_id, idr_handle);
+-	if (mmap_offset)
+-		*mmap_offset = (kfd_mmap_flags << PAGE_SHIFT) | *mmap_offset;
+ 
+ 	return 0;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index cf4a688..062b215 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -60,8 +60,7 @@
+ #define KFD_MMAP_TYPE_MASK	(0x3ULL << KFD_MMAP_TYPE_SHIFT)
+ #define KFD_MMAP_TYPE_DOORBELL	(0x3ULL << KFD_MMAP_TYPE_SHIFT)
+ #define KFD_MMAP_TYPE_EVENTS	(0x2ULL << KFD_MMAP_TYPE_SHIFT)
+-#define KFD_MMAP_TYPE_MAP_BO	(0x1ULL << KFD_MMAP_TYPE_SHIFT)
+-#define KFD_MMAP_TYPE_RESERVED_MEM	(0x0ULL << KFD_MMAP_TYPE_SHIFT)
++#define KFD_MMAP_TYPE_RESERVED_MEM	(0x1ULL << KFD_MMAP_TYPE_SHIFT)
+ 
+ #define KFD_MMAP_GPU_ID_SHIFT (46 - PAGE_SHIFT)
+ #define KFD_MMAP_GPU_ID_MASK (((1ULL << KFD_GPU_ID_HASH_WIDTH) - 1) \
+-- 
+2.7.4
+

@@ -1,0 +1,212 @@
+From fa08e7219364408881796979c969c3e220402cdb Mon Sep 17 00:00:00 2001
+From: Andres Rodriguez <andresx7@gmail.com>
+Date: Fri, 15 Sep 2017 20:44:06 -0400
+Subject: [PATCH 3646/5855] drm/amdgpu: introduce
+ AMDGPU_GEM_CREATE_EXPLICIT_SYNC v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Introduce a flag to signal that access to a BO will be synchronized
+through an external mechanism.
+
+Currently all buffers shared between contexts are subject to implicit
+synchronization. However, this is only required for protocols that
+currently don't support an explicit synchronization mechanism (DRI2/3).
+
+This patch introduces the AMDGPU_GEM_CREATE_EXPLICIT_SYNC, so that
+users can specify when it is safe to disable implicit sync.
+
+v2: only disable explicit sync in amdgpu_cs_ioctl
+
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Andres Rodriguez <andresx7@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+
+Change-Id: Ibf688aaa6e947574c3dc1f11047f875daf33ca9c
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c     | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c    | 4 +++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h | 8 ++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c   | 7 +++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h   | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    | 5 +++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c     | 8 ++++----
+ include/uapi/drm/amdgpu_drm.h              | 2 ++
+ 8 files changed, 29 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 0d0b49a..4bbf513 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -704,7 +704,8 @@ static int amdgpu_cs_sync_rings(struct amdgpu_cs_parser *p)
+ 
+ 	list_for_each_entry(e, &p->validated, tv.head) {
+ 		struct reservation_object *resv = e->robj->tbo.resv;
+-		r = amdgpu_sync_resv(p->adev, &p->job->sync, resv, p->filp);
++		r = amdgpu_sync_resv(p->adev, &p->job->sync, resv, p->filp,
++				     amdgpu_bo_explicit_sync(e->robj));
+ 
+ 		if (r)
+ 			return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 69a0433..2708ffd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -255,7 +255,9 @@ int amdgpu_gem_create_ioctl(struct drm_device *dev, void *data,
+ 		      AMDGPU_GEM_CREATE_CPU_GTT_USWC |
+ 		      AMDGPU_GEM_CREATE_VRAM_CLEARED|
+ 		      AMDGPU_GEM_CREATE_NO_EVICT|
+-		      AMDGPU_GEM_CREATE_VM_ALWAYS_VALID))
++                      AMDGPU_GEM_CREATE_VM_ALWAYS_VALID |
++                      AMDGPU_GEM_CREATE_EXPLICIT_SYNC))
++ 
+ 		return -EINVAL;
+ 
+ 	/* reject invalid gem domains */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index bfa97b0..6100200 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -205,6 +205,14 @@ static inline bool amdgpu_bo_gpu_accessible(struct amdgpu_bo *bo)
+ 	}
+ }
+ 
++/**
++ * amdgpu_bo_explicit_sync - return whether the bo is explicitly synced
++ */
++static inline bool amdgpu_bo_explicit_sync(struct amdgpu_bo *bo)
++{
++	return bo->flags & AMDGPU_GEM_CREATE_EXPLICIT_SYNC;
++}
++
+ int amdgpu_bo_create(struct amdgpu_device *adev,
+ 			    unsigned long size, int byte_align,
+ 			    bool kernel, u32 domain, u64 flags,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+index d764043..9897533 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+@@ -177,7 +177,7 @@ int amdgpu_sync_fence(struct amdgpu_device *adev, struct amdgpu_sync *sync,
+  *
+  * @sync: sync object to add fences from reservation object to
+  * @resv: reservation object with embedded fence
+- * @shared: true if we should only sync to the exclusive fence
++ * @explicit_sync: true if we should only sync to the exclusive fence
+  *
+  * Sync to the fence except if it is KFD eviction fence and owner is
+  * AMDGPU_FENCE_OWNER_VM.
+@@ -185,7 +185,7 @@ int amdgpu_sync_fence(struct amdgpu_device *adev, struct amdgpu_sync *sync,
+ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 		     struct amdgpu_sync *sync,
+ 		     struct reservation_object *resv,
+-		     void *owner)
++		     void *owner, bool explicit_sync)
+ {
+ 	struct reservation_object_list *flist;
+ 	struct fence *f;
+@@ -200,6 +200,9 @@ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 	f = reservation_object_get_excl(resv);
+ 	r = amdgpu_sync_fence(adev, sync, f);
+ 
++	if (explicit_sync)
++		return r;
++
+ 	flist = reservation_object_get_list(resv);
+ 	if (!flist || r)
+ 		return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h
+index 69f4c6c..3dd9ddc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.h
+@@ -45,7 +45,8 @@ int amdgpu_sync_fence(struct amdgpu_device *adev, struct amdgpu_sync *sync,
+ int amdgpu_sync_resv(struct amdgpu_device *adev,
+ 		     struct amdgpu_sync *sync,
+ 		     struct reservation_object *resv,
+-		     void *owner);
++                     void *owner,
++                     bool explicit_sync);
+ struct fence *amdgpu_sync_peek_fence(struct amdgpu_sync *sync,
+ 				     struct amdgpu_ring *ring);
+ struct fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index d53f419..37d89d0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1780,7 +1780,8 @@ int amdgpu_copy_buffer(struct amdgpu_ring *ring, uint64_t src_offset,
+ 	job->vm_needs_flush = vm_needs_flush;
+ 	if (resv) {
+ 		r = amdgpu_sync_resv(adev, &job->sync, resv,
+-				     AMDGPU_FENCE_OWNER_UNDEFINED);
++				     AMDGPU_FENCE_OWNER_UNDEFINED,
++				     false);
+ 		if (r) {
+ 			DRM_ERROR("sync failed (%d).\n", r);
+ 			goto error_free;
+@@ -1872,7 +1873,7 @@ int amdgpu_fill_buffer(struct amdgpu_bo *bo,
+ 
+ 	if (resv) {
+ 		r = amdgpu_sync_resv(adev, &job->sync, resv,
+-				     AMDGPU_FENCE_OWNER_UNDEFINED);
++				     AMDGPU_FENCE_OWNER_UNDEFINED, false);
+ 		if (r) {
+ 			DRM_ERROR("sync failed (%d).\n", r);
+ 			goto error_free;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 8d115d9..db48ce0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1038,7 +1038,7 @@ static int amdgpu_vm_wait_pd(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 	int r;
+ 
+ 	amdgpu_sync_create(&sync);
+-	amdgpu_sync_resv(adev, &sync, vm->root.base.bo->tbo.resv, owner);
++	amdgpu_sync_resv(adev, &sync, vm->root.base.bo->tbo.resv, owner, false);
+ 	r = amdgpu_sync_wait(&sync, true);
+ 	amdgpu_sync_free(&sync);
+ 
+@@ -1179,12 +1179,12 @@ static int amdgpu_vm_update_level(struct amdgpu_device *adev,
+ 			amdgpu_ring_pad_ib(ring, params.ib);
+ 			amdgpu_sync_resv(adev, &job->sync,
+ 					 parent->base.bo->tbo.resv,
+-					 AMDGPU_FENCE_OWNER_VM);
++                                         AMDGPU_FENCE_OWNER_VM, false);
+ 
+ 		if (shadow)
+ 			amdgpu_sync_resv(adev, &job->sync,
+ 					 shadow->tbo.resv,
+-					 AMDGPU_FENCE_OWNER_VM);
++                                         AMDGPU_FENCE_OWNER_VM, false);
+ 
+ 		WARN_ON(params.ib->length_dw > ndw);
+ 		r = amdgpu_job_submit(job, ring, &vm->entity,
+@@ -1649,7 +1649,7 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 		goto error_free;
+ 
+ 	r = amdgpu_sync_resv(adev, &job->sync, vm->root.base.bo->tbo.resv,
+-			     owner);
++			     owner, false);
+ 	if (r)
+ 		goto error_free;
+ 
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 63aff31..0774c1d 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -105,6 +105,8 @@ extern "C" {
+ #define AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS	(1 << 5)
+ /* Flag that BO is always valid in this VM */
+ #define AMDGPU_GEM_CREATE_VM_ALWAYS_VALID       (1 << 6)
++/* Flag that BO sharing will be explicitly synchronized */
++#define AMDGPU_GEM_CREATE_EXPLICIT_SYNC                (1 << 7)
+ 
+ /* hybrid specific */
+ /* Flag that the memory should be in SPARSE resource */
+-- 
+2.7.4
+

@@ -1,0 +1,169 @@
+From 910691cb8716218e8ddaeab7e95c3ae95709c914 Mon Sep 17 00:00:00 2001
+From: Andres Rodriguez <andres.rodriguez@amd.com>
+Date: Wed, 17 Aug 2016 17:42:44 -0400
+Subject: [PATCH 5261/5855] drm/amdkfd: use standard kernel kfifo for IH
+
+Replace our implementation of a lockless ring buffer with the standard
+linux kernel kfifo.
+
+We shouldn't maintain our own version of a standard data structure.
+
+Change-Id: I7ee9298a834a577c2fb803f680e2b87fe8213c1a
+Signed-off-by: Andres Rodriguez <andres.rodriguez@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c | 80 +++++++++++-------------------
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h      |  6 +--
+ 2 files changed, 30 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c b/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
+index a8cdbc8..6dac60d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
+@@ -42,25 +42,24 @@
+ 
+ #include <linux/slab.h>
+ #include <linux/device.h>
++#include <linux/kfifo.h>
+ #include "kfd_priv.h"
+ 
+-#define KFD_INTERRUPT_RING_SIZE 1024
++#define KFD_IH_NUM_ENTRIES 1024
+ 
+ static void interrupt_wq(struct work_struct *);
+ 
+ int kfd_interrupt_init(struct kfd_dev *kfd)
+ {
+-	void *interrupt_ring = kmalloc_array(KFD_INTERRUPT_RING_SIZE,
+-					kfd->device_info->ih_ring_entry_size,
+-					GFP_KERNEL);
+-	if (!interrupt_ring)
+-		return -ENOMEM;
+-
+-	kfd->interrupt_ring = interrupt_ring;
+-	kfd->interrupt_ring_size =
+-		KFD_INTERRUPT_RING_SIZE * kfd->device_info->ih_ring_entry_size;
+-	atomic_set(&kfd->interrupt_ring_wptr, 0);
+-	atomic_set(&kfd->interrupt_ring_rptr, 0);
++	int r;
++
++	r = kfifo_alloc(&kfd->ih_fifo,
++			KFD_IH_NUM_ENTRIES * kfd->device_info->ih_ring_entry_size,
++			GFP_KERNEL);
++	if (r) {
++		dev_err(kfd_chardev(), "Failed to allocate IH fifo\n");
++		return r;
++	}
+ 
+ 	spin_lock_init(&kfd->interrupt_lock);
+ 
+@@ -98,66 +97,43 @@ void kfd_interrupt_exit(struct kfd_dev *kfd)
+ 	 */
+ 	flush_scheduled_work();
+ 
+-	kfree(kfd->interrupt_ring);
++	kfifo_free(&kfd->ih_fifo);
+ }
+ 
+ /*
+- * This assumes that it can't be called concurrently with itself
+- * but only with dequeue_ih_ring_entry.
++ * Assumption: single reader/writer. This function is not re-entrant
+  */
+ bool enqueue_ih_ring_entry(struct kfd_dev *kfd,	const void *ih_ring_entry)
+ {
+-	unsigned int rptr = atomic_read(&kfd->interrupt_ring_rptr);
+-	unsigned int wptr = atomic_read(&kfd->interrupt_ring_wptr);
++	int count;
+ 
+-	if ((rptr - wptr) % kfd->interrupt_ring_size ==
+-					kfd->device_info->ih_ring_entry_size) {
+-		/* This is very bad, the system is likely to hang. */
++	count = kfifo_in(&kfd->ih_fifo, ih_ring_entry,
++				kfd->device_info->ih_ring_entry_size);
++	if (count != kfd->device_info->ih_ring_entry_size) {
+ 		dev_err_ratelimited(kfd_chardev(),
+-			"Interrupt ring overflow, dropping interrupt.\n");
++			"Interrupt ring overflow, dropping interrupt %d\n",
++			count);
+ 		return false;
+ 	}
+ 
+-	memcpy(kfd->interrupt_ring + wptr, ih_ring_entry,
+-			kfd->device_info->ih_ring_entry_size);
+-
+-	wptr = (wptr + kfd->device_info->ih_ring_entry_size) %
+-			kfd->interrupt_ring_size;
+-	smp_wmb(); /* Ensure memcpy'd data is visible before wptr update. */
+-	atomic_set(&kfd->interrupt_ring_wptr, wptr);
+-
+ 	return true;
+ }
+ 
+ /*
+- * This assumes that it can't be called concurrently with itself
+- * but only with enqueue_ih_ring_entry.
++ * Assumption: single reader/writer. This function is not re-entrant
+  */
+ static bool dequeue_ih_ring_entry(struct kfd_dev *kfd, void *ih_ring_entry)
+ {
+-	/*
+-	 * Assume that wait queues have an implicit barrier, i.e. anything that
+-	 * happened in the ISR before it queued work is visible.
+-	 */
+-
+-	unsigned int wptr = atomic_read(&kfd->interrupt_ring_wptr);
+-	unsigned int rptr = atomic_read(&kfd->interrupt_ring_rptr);
++	int count;
+ 
+-	if (rptr == wptr)
++	count = kfifo_out(&kfd->ih_fifo, ih_ring_entry,
++				kfd->device_info->ih_ring_entry_size);
++	if (count != kfd->device_info->ih_ring_entry_size) {
++		dev_err_ratelimited(kfd_chardev(),
++				"IH dequeued unexpected number of entries %d\n",
++				count);
+ 		return false;
+-
+-	memcpy(ih_ring_entry, kfd->interrupt_ring + rptr,
+-			kfd->device_info->ih_ring_entry_size);
+-
+-	rptr = (rptr + kfd->device_info->ih_ring_entry_size) %
+-			kfd->interrupt_ring_size;
+-
+-	/*
+-	 * Ensure the rptr write update is not visible until
+-	 * memcpy has finished reading.
+-	 */
+-	smp_mb();
+-	atomic_set(&kfd->interrupt_ring_rptr, rptr);
++	}
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index cb3546e..f8a12ae 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -36,6 +36,7 @@
+ #include <linux/interval_tree.h>
+ #include <linux/seq_file.h>
+ #include <linux/kref.h>
++#include <linux/kfifo.h>
+ #include <kgd_kfd_interface.h>
+ 
+ #include "amd_rdma.h"
+@@ -247,10 +248,7 @@ struct kfd_dev {
+         bool init_complete;
+ 
+         /* Interrupts */
+-        void *interrupt_ring;
+-        size_t interrupt_ring_size;
+-        atomic_t interrupt_ring_rptr;
+-        atomic_t interrupt_ring_wptr;
++	struct kfifo ih_fifo;
+         struct work_struct interrupt_work;
+         spinlock_t interrupt_lock;
+ 
+-- 
+2.7.4
+

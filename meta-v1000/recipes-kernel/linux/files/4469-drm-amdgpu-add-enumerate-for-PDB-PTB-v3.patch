@@ -1,0 +1,229 @@
+From ffc1a7847694070a69be003ddba82d535b4b3cfc Mon Sep 17 00:00:00 2001
+From: Chunming Zhou <david1.zhou@amd.com>
+Date: Wed, 13 Dec 2017 14:22:54 +0800
+Subject: [PATCH 4469/5855] drm/amdgpu: add enumerate for PDB/PTB v3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+v2:
+  remove SUBPTB member
+v3:
+  remove last_level, use AMDGPU_VM_PTB directly instead.
+
+Change-Id: Ic1f39d3bc853e9e4259d3e03a22920eda822eec5
+Signed-off-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 69 ++++++++++++++++++++++++----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h | 11 ++++++
+ 2 files changed, 61 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 423aa51..bded2d6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -152,12 +152,23 @@ struct amdgpu_prt_cb {
+ static unsigned amdgpu_vm_level_shift(struct amdgpu_device *adev,
+ 				      unsigned level)
+ {
+-	if (level != adev->vm_manager.num_level)
+-		return 9 * (adev->vm_manager.num_level - level - 1) +
++	unsigned shift = 0xff;
++
++	switch (level) {
++	case AMDGPU_VM_PDB2:
++	case AMDGPU_VM_PDB1:
++	case AMDGPU_VM_PDB0:
++		shift = 9 * (AMDGPU_VM_PDB0 - level) +
+ 			adev->vm_manager.block_size;
+-	else
+-		/* For the page tables on the leaves */
+-		return 0;
++		break;
++	case AMDGPU_VM_PTB:
++		shift = 0;
++		break;
++	default:
++		dev_err(adev->dev, "the level%d isn't supported.\n", level);
++	}
++
++	return shift;
+ }
+ 
+ /**
+@@ -170,12 +181,13 @@ static unsigned amdgpu_vm_level_shift(struct amdgpu_device *adev,
+ static unsigned amdgpu_vm_num_entries(struct amdgpu_device *adev,
+ 				      unsigned level)
+ {
+-	unsigned shift = amdgpu_vm_level_shift(adev, 0);
++	unsigned shift = amdgpu_vm_level_shift(adev,
++					       adev->vm_manager.root_level);
+ 
+-	if (level == 0)
++	if (level == adev->vm_manager.root_level)
+ 		/* For the root directory */
+ 		return round_up(adev->vm_manager.max_pfn, 1 << shift) >> shift;
+-	else if (level != adev->vm_manager.num_level)
++	else if (level != AMDGPU_VM_PTB)
+ 		/* Everything in between */
+ 		return 512;
+ 	else
+@@ -346,7 +358,7 @@ static int amdgpu_vm_alloc_levels(struct amdgpu_device *adev,
+ 
+ 	if (vm->pte_support_ats) {
+ 		init_value = AMDGPU_PTE_DEFAULT_ATC;
+-		if (level != adev->vm_manager.num_level)
++		if (level != AMDGPU_VM_PTB)
+ 			init_value |= AMDGPU_PDE_PTE;
+ 
+ 	}
+@@ -388,7 +400,7 @@ static int amdgpu_vm_alloc_levels(struct amdgpu_device *adev,
+ 			spin_unlock(&vm->status_lock);
+ 		}
+ 
+-		if (level < adev->vm_manager.num_level) {
++		if (level < AMDGPU_VM_PTB) {
+ 			uint64_t sub_saddr = (pt_idx == from) ? saddr : 0;
+ 			uint64_t sub_eaddr = (pt_idx == to) ? eaddr :
+ 				((1 << shift) - 1);
+@@ -434,7 +446,8 @@ int amdgpu_vm_alloc_pts(struct amdgpu_device *adev,
+ 	saddr /= AMDGPU_GPU_PAGE_SIZE;
+ 	eaddr /= AMDGPU_GPU_PAGE_SIZE;
+ 
+-	return amdgpu_vm_alloc_levels(adev, vm, &vm->root, saddr, eaddr, 0);
++	return amdgpu_vm_alloc_levels(adev, vm, &vm->root, saddr, eaddr,
++				      adev->vm_manager.root_level);
+ }
+ 
+ /**
+@@ -1094,6 +1107,7 @@ static void amdgpu_vm_update_pde(struct amdgpu_pte_update_params *params,
+ 	for (level = 0, pbo = parent->base.bo->parent; pbo; ++level)
+ 		pbo = pbo->parent;
+ 
++	level += params->adev->vm_manager.root_level;
+ 	pt = amdgpu_bo_gpu_offset(bo);
+ 
+ 	flags = AMDGPU_PTE_VALID;
+@@ -1251,7 +1265,8 @@ int amdgpu_vm_update_directories(struct amdgpu_device *adev,
+ 	return 0;
+ 
+ error:
+-	amdgpu_vm_invalidate_level(adev, vm, &vm->root, 0);
++	amdgpu_vm_invalidate_level(adev, vm, &vm->root,
++				   adev->vm_manager.root_level);
+ 	amdgpu_job_free(job);
+ 	return r;
+ }
+@@ -1270,7 +1285,7 @@ void amdgpu_vm_get_entry(struct amdgpu_pte_update_params *p, uint64_t addr,
+ 			 struct amdgpu_vm_pt **entry,
+ 			 struct amdgpu_vm_pt **parent)
+ {
+-	unsigned level = 0;
++	unsigned level = p->adev->vm_manager.root_level;
+ 
+ 	*parent = NULL;
+ 	*entry = &p->vm->root;
+@@ -1282,7 +1297,7 @@ void amdgpu_vm_get_entry(struct amdgpu_pte_update_params *p, uint64_t addr,
+ 		*entry = &(*entry)->entries[idx];
+ 	}
+ 
+-	if (level != p->adev->vm_manager.num_level)
++	if (level != AMDGPU_VM_PTB)
+ 		*entry = NULL;
+ }
+ 
+@@ -1324,7 +1339,7 @@ static void amdgpu_vm_handle_huge_pages(struct amdgpu_pte_update_params *p,
+ 		return;
+ 	entry->huge = !!(flags & AMDGPU_PDE_PTE);
+ 
+-	amdgpu_gart_get_vm_pde(p->adev, p->adev->vm_manager.num_level - 1,
++	amdgpu_gart_get_vm_pde(p->adev, AMDGPU_VM_PDB0,
+ 			       &dst, &flags);
+ 
+ 	if (use_cpu_update) {
+@@ -1641,7 +1656,8 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 
+ error_free:
+ 	amdgpu_job_free(job);
+-	amdgpu_vm_invalidate_level(adev, vm, &vm->root, 0);
++	amdgpu_vm_invalidate_level(adev, vm, &vm->root,
++				   adev->vm_manager.root_level);
+ 	return r;
+ }
+ 
+@@ -2585,7 +2601,19 @@ void amdgpu_vm_adjust_size(struct amdgpu_device *adev, uint32_t vm_size,
+ 		tmp >>= amdgpu_vm_block_size - 9;
+ 	tmp = DIV_ROUND_UP(fls64(tmp) - 1, 9) - 1;
+ 	adev->vm_manager.num_level = min(max_level, (unsigned)tmp);
+-
++	switch (adev->vm_manager.num_level) {
++	case 3:
++		adev->vm_manager.root_level = AMDGPU_VM_PDB2;
++		break;
++	case 2:
++		adev->vm_manager.root_level = AMDGPU_VM_PDB1;
++		break;
++	case 1:
++		adev->vm_manager.root_level = AMDGPU_VM_PDB0;
++		break;
++	default:
++		dev_err(adev->dev, "VMPT only supports 2~4+1 levels\n");
++	}
+ 	/* block size depends on vm size and hw setup*/
+ 	if (amdgpu_vm_block_size != -1)
+ 		adev->vm_manager.block_size =
+@@ -2679,7 +2707,9 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 		flags |= (AMDGPU_GEM_CREATE_NO_CPU_ACCESS |
+ 				AMDGPU_GEM_CREATE_SHADOW);
+ 
+-	r = amdgpu_bo_create(adev, amdgpu_vm_bo_size(adev, 0), align, true,
++	r = amdgpu_bo_create(adev,
++			     amdgpu_vm_bo_size(adev, adev->vm_manager.root_level),
++			     align, true,
+ 			     AMDGPU_GEM_DOMAIN_VRAM,
+ 			     flags,
+ 			     NULL, NULL, init_pde_value, &vm->root.base.bo);
+@@ -2846,7 +2876,8 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+         if (r) {
+                 dev_err(adev->dev, "Leaking page tables because BO reservation failed\n");
+         } else {
+-		amdgpu_vm_free_levels(adev, &vm->root, 0);
++		amdgpu_vm_free_levels(adev, &vm->root,
++				      adev->vm_manager.root_level);
+                 amdgpu_bo_unreserve(root);
+         }
+         amdgpu_bo_unref(&root);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 9121b93..4220609 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -119,6 +119,16 @@ struct amdgpu_bo_list_entry;
+ #define AMDGPU_VM_USE_CPU_FOR_GFX (1 << 0)
+ #define AMDGPU_VM_USE_CPU_FOR_COMPUTE (1 << 1)
+ 
++/* VMPT level enumerate, and the hiberachy is:
++ * PDB2->PDB1->PDB0->PTB
++ */
++enum amdgpu_vm_level {
++	AMDGPU_VM_PDB2,
++	AMDGPU_VM_PDB1,
++	AMDGPU_VM_PDB0,
++	AMDGPU_VM_PTB
++};
++
+ /* base structure for tracking BO usage in a VM */
+ struct amdgpu_vm_bo_base {
+ 	/* constant after initialization */
+@@ -239,6 +249,7 @@ struct amdgpu_vm_manager {
+ 	uint32_t				num_level;
+ 	uint32_t				block_size;
+ 	uint32_t				fragment_size;
++	enum amdgpu_vm_level			root_level;
+ 	/* vram base address for page table entry  */
+ 	u64					vram_base_offset;
+ 	/* vm pte handling */
+-- 
+2.7.4
+

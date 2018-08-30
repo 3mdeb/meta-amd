@@ -1,0 +1,134 @@
+From 840494f538a6939567972f9d704715adb2542996 Mon Sep 17 00:00:00 2001
+From: Hersen Wu <hersenxs.wu@amd.com>
+Date: Mon, 20 Nov 2017 12:45:54 -0500
+Subject: [PATCH 4375/5855] drm/amd/display: USB-C / thunderbolt dock specific
+ workaround
+
+reading dpcd 0x600 cause link loss for a particular USB-C dock with
+thurderbolt.  workaround by avoiding dcpd 0x600 read unless it's
+necessary.
+
+Signed-off-by: Hersen Wu <hersenxs.wu@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c | 85 +++++++++++-------------
+ 1 file changed, 40 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+index 75753b0..708c8c5 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+@@ -1517,7 +1517,7 @@ static bool hpd_rx_irq_check_link_loss_status(
+ 	struct dc_link *link,
+ 	union hpd_irq_data *hpd_irq_dpcd_data)
+ {
+-	uint8_t irq_reg_rx_power_state;
++	uint8_t irq_reg_rx_power_state = 0;
+ 	enum dc_status dpcd_result = DC_ERROR_UNEXPECTED;
+ 	union lane_status lane_status;
+ 	uint32_t lane;
+@@ -1529,60 +1529,55 @@ static bool hpd_rx_irq_check_link_loss_status(
+ 
+ 	if (link->cur_link_settings.lane_count == 0)
+ 		return return_code;
+-	/*1. Check that we can handle interrupt: Not in FS DOS,
+-	 *  Not in "Display Timeout" state, Link is trained.
+-	 */
+ 
+-	dpcd_result = core_link_read_dpcd(link,
+-		DP_SET_POWER,
+-		&irq_reg_rx_power_state,
+-		sizeof(irq_reg_rx_power_state));
++	/*1. Check that Link Status changed, before re-training.*/
+ 
+-	if (dpcd_result != DC_OK) {
+-		irq_reg_rx_power_state = DP_SET_POWER_D0;
+-		dm_logger_write(link->ctx->logger, LOG_HW_HPD_IRQ,
+-			"%s: DPCD read failed to obtain power state.\n",
+-			__func__);
++	/*parse lane status*/
++	for (lane = 0; lane < link->cur_link_settings.lane_count; lane++) {
++		/* check status of lanes 0,1
++		 * changed DpcdAddress_Lane01Status (0x202)
++		 */
++		lane_status.raw = get_nibble_at_index(
++			&hpd_irq_dpcd_data->bytes.lane01_status.raw,
++			lane);
++
++		if (!lane_status.bits.CHANNEL_EQ_DONE_0 ||
++			!lane_status.bits.CR_DONE_0 ||
++			!lane_status.bits.SYMBOL_LOCKED_0) {
++			/* if one of the channel equalization, clock
++			 * recovery or symbol lock is dropped
++			 * consider it as (link has been
++			 * dropped) dp sink status has changed
++			 */
++			sink_status_changed = true;
++			break;
++		}
+ 	}
+ 
+-	if (irq_reg_rx_power_state == DP_SET_POWER_D0) {
++	/* Check interlane align.*/
++	if (sink_status_changed ||
++		!hpd_irq_dpcd_data->bytes.lane_status_updated.bits.INTERLANE_ALIGN_DONE) {
+ 
+-		/*2. Check that Link Status changed, before re-training.*/
+-
+-		/*parse lane status*/
+-		for (lane = 0;
+-			lane < link->cur_link_settings.lane_count;
+-			lane++) {
+-
+-			/* check status of lanes 0,1
+-			 * changed DpcdAddress_Lane01Status (0x202)*/
+-			lane_status.raw = get_nibble_at_index(
+-				&hpd_irq_dpcd_data->bytes.lane01_status.raw,
+-				lane);
+-
+-			if (!lane_status.bits.CHANNEL_EQ_DONE_0 ||
+-				!lane_status.bits.CR_DONE_0 ||
+-				!lane_status.bits.SYMBOL_LOCKED_0) {
+-				/* if one of the channel equalization, clock
+-				 * recovery or symbol lock is dropped
+-				 * consider it as (link has been
+-				 * dropped) dp sink status has changed*/
+-				sink_status_changed = true;
+-				break;
+-			}
++		dm_logger_write(link->ctx->logger, LOG_HW_HPD_IRQ,
++			"%s: Link Status changed.\n", __func__);
+ 
+-		}
++		return_code = true;
+ 
+-		/* Check interlane align.*/
+-		if (sink_status_changed ||
+-			!hpd_irq_dpcd_data->bytes.lane_status_updated.bits.
+-			INTERLANE_ALIGN_DONE) {
++		/*2. Check that we can handle interrupt: Not in FS DOS,
++		 *  Not in "Display Timeout" state, Link is trained.
++		 */
++		dpcd_result = core_link_read_dpcd(link,
++			DP_SET_POWER,
++			&irq_reg_rx_power_state,
++			sizeof(irq_reg_rx_power_state));
+ 
++		if (dpcd_result != DC_OK) {
+ 			dm_logger_write(link->ctx->logger, LOG_HW_HPD_IRQ,
+-				"%s: Link Status changed.\n",
++				"%s: DPCD read failed to obtain power state.\n",
+ 				__func__);
+-
+-			return_code = true;
++		} else {
++			if (irq_reg_rx_power_state != DP_SET_POWER_D0)
++				return_code = false;
+ 		}
+ 	}
+ 
+-- 
+2.7.4
+

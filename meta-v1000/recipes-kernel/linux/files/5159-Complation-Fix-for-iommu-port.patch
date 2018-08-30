@@ -1,0 +1,1282 @@
+From 24f3df17d26364c5552efe1002f46c2669f8efdc Mon Sep 17 00:00:00 2001
+From: Sanjay R Mehta <sanju.mehta@amd.com>
+Date: Mon, 28 May 2018 15:29:35 +0530
+Subject: [PATCH 5159/5855] Complation Fix for iommu port
+
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+---
+ drivers/iommu/Makefile              |   2 -
+ drivers/iommu/amd_iommu.c           |  22 +---
+ drivers/iommu/amd_iommu_init.c      |  22 +++-
+ drivers/iommu/amd_iommu_proto.h     |   0
+ drivers/iommu/amd_iommu_types.h     |   1 +
+ drivers/iommu/amd_iommu_v2.c        |   2 +-
+ drivers/iommu/dmar.c                |  19 +--
+ drivers/iommu/exynos-iommu.c        |   2 -
+ drivers/iommu/intel-iommu.c         |   7 +-
+ drivers/iommu/intel-svm.c           |   2 +-
+ drivers/iommu/intel_irq_remapping.c |  19 +--
+ drivers/iommu/iommu.c               |   2 +-
+ include/linux/dma-iommu.h           |  21 ++-
+ include/linux/intel-iommu.h         |  21 +--
+ include/linux/iommu-common.h        |   1 +
+ include/linux/iommu-helper.h        |   1 +
+ include/linux/iommu.h               | 254 ++++++++++++++++++++++++++----------
+ include/linux/iova.h                | 158 ++++++++++++++++++++++
+ include/linux/mem_encrypt.h         |  53 ++++++++
+ include/linux/of_iommu.h            |   4 +-
+ include/linux/reservation.h         |   1 -
+ 21 files changed, 468 insertions(+), 146 deletions(-)
+ mode change 100644 => 100755 drivers/iommu/Makefile
+ mode change 100644 => 100755 drivers/iommu/amd_iommu.c
+ mode change 100644 => 100755 drivers/iommu/amd_iommu_init.c
+ mode change 100644 => 100755 drivers/iommu/amd_iommu_proto.h
+ mode change 100644 => 100755 drivers/iommu/amd_iommu_v2.c
+ mode change 100644 => 100755 drivers/iommu/dmar.c
+ mode change 100644 => 100755 drivers/iommu/exynos-iommu.c
+ mode change 100644 => 100755 drivers/iommu/intel-iommu.c
+ mode change 100644 => 100755 drivers/iommu/intel-svm.c
+ mode change 100644 => 100755 drivers/iommu/intel_irq_remapping.c
+ mode change 100644 => 100755 drivers/iommu/iommu.c
+ create mode 100644 include/linux/mem_encrypt.h
+
+diff --git a/drivers/iommu/Makefile b/drivers/iommu/Makefile
+old mode 100644
+new mode 100755
+index 1fb6958..195f7b9
+--- a/drivers/iommu/Makefile
++++ b/drivers/iommu/Makefile
+@@ -1,4 +1,3 @@
+-# SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_IOMMU_API) += iommu.o
+ obj-$(CONFIG_IOMMU_API) += iommu-traces.o
+ obj-$(CONFIG_IOMMU_API) += iommu-sysfs.o
+@@ -28,4 +27,3 @@ obj-$(CONFIG_TEGRA_IOMMU_SMMU) += tegra-smmu.o
+ obj-$(CONFIG_EXYNOS_IOMMU) += exynos-iommu.o
+ obj-$(CONFIG_FSL_PAMU) += fsl_pamu.o fsl_pamu_domain.o
+ obj-$(CONFIG_S390_IOMMU) += s390-iommu.o
+-obj-$(CONFIG_QCOM_IOMMU) += qcom_iommu.o
+diff --git a/drivers/iommu/amd_iommu.c b/drivers/iommu/amd_iommu.c
+old mode 100644
+new mode 100755
+index 99a2a57..1ee2252
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@ -490,7 +490,7 @@ static void iommu_uninit_device(struct device *dev)
+ 	iommu_group_remove_device(dev);
+ 
+ 	/* Remove dma-ops */
+-	dev->dma_ops = NULL;
++	dev->archdata.dma_ops = NULL;
+ 
+ 	/*
+ 	 * We keep dev_data around for unplugged devices and reuse it when the
+@@ -2183,7 +2183,7 @@ static int amd_iommu_add_device(struct device *dev)
+ 				dev_name(dev));
+ 
+ 		iommu_ignore_device(dev);
+-		dev->dma_ops = &nommu_dma_ops;
++		dev->archdata.dma_ops = &nommu_dma_ops;
+ 		goto out;
+ 	}
+ 	init_iommu_group(dev);
+@@ -2200,7 +2200,7 @@ static int amd_iommu_add_device(struct device *dev)
+ 	if (domain->type == IOMMU_DOMAIN_IDENTITY)
+ 		dev_data->passthrough = true;
+ 	else
+-		dev->dma_ops = &amd_iommu_dma_ops;
++		dev->archdata.dma_ops = &amd_iommu_dma_ops;
+ 
+ out:
+ 	iommu_completion_wait(iommu);
+@@ -2613,7 +2613,7 @@ static void *alloc_coherent(struct device *dev, size_t size,
+ 			return NULL;
+ 
+ 		page = dma_alloc_from_contiguous(dev, size >> PAGE_SHIFT,
+-						 get_order(size), flag);
++						 get_order(size));
+ 		if (!page)
+ 			return NULL;
+ 	}
+@@ -2670,8 +2670,6 @@ static void free_coherent(struct device *dev, size_t size,
+  */
+ static int amd_iommu_dma_supported(struct device *dev, u64 mask)
+ {
+-	if (!x86_dma_supported(dev, mask))
+-		return 0;
+ 	return check_device(dev);
+ }
+ 
+@@ -4320,20 +4318,14 @@ static struct irq_chip amd_ir_chip = {
+ 
+ int amd_iommu_create_irq_domain(struct amd_iommu *iommu)
+ {
+-	struct fwnode_handle *fn;
++	iommu->ir_domain = irq_domain_add_tree(NULL, &amd_ir_domain_ops, iommu);
+ 
+-	fn = irq_domain_alloc_named_id_fwnode("AMD-IR", iommu->index);
+-	if (!fn)
+-		return -ENOMEM;
+-	iommu->ir_domain = irq_domain_create_tree(fn, &amd_ir_domain_ops, iommu);
+-	irq_domain_free_fwnode(fn);
+ 	if (!iommu->ir_domain)
+ 		return -ENOMEM;
+ 
+ 	iommu->ir_domain->parent = arch_get_ir_parent_domain();
+-	iommu->msi_domain = arch_create_remap_msi_irq_domain(iommu->ir_domain,
+-							     "AMD-IR-MSI",
+-							     iommu->index);
++	iommu->msi_domain = arch_create_msi_irq_domain(iommu->ir_domain);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/iommu/amd_iommu_init.c b/drivers/iommu/amd_iommu_init.c
+old mode 100644
+new mode 100755
+index 6fe2d03..5384a24
+--- a/drivers/iommu/amd_iommu_init.c
++++ b/drivers/iommu/amd_iommu_init.c
+@@ -2408,6 +2408,7 @@ static void __init free_dma_resources(void)
+ static int __init early_amd_iommu_init(void)
+ {
+ 	struct acpi_table_header *ivrs_base;
++	acpi_size ivrs_size;
+ 	acpi_status status;
+ 	int i, remap_cache_sz, ret = 0;
+ 
+@@ -2541,7 +2542,7 @@ static int __init early_amd_iommu_init(void)
+ 
+ out:
+ 	/* Don't leak any ACPI memory */
+-	acpi_put_table(ivrs_base);
++	early_acpi_os_unmap_memory((char __iomem *)ivrs_base, ivrs_size);
+ 	ivrs_base = NULL;
+ 
+ 	return ret;
+@@ -2565,9 +2566,10 @@ static int amd_iommu_enable_interrupts(void)
+ static bool detect_ivrs(void)
+ {
+ 	struct acpi_table_header *ivrs_base;
++	acpi_size ivrs_size;
+ 	acpi_status status;
+ 
+-	status = acpi_get_table("IVRS", 0, &ivrs_base);
++	status = acpi_get_table_with_size("IVRS", 0, &ivrs_base, &ivrs_size);
+ 	if (status == AE_NOT_FOUND)
+ 		return false;
+ 	else if (ACPI_FAILURE(status)) {
+@@ -2576,7 +2578,7 @@ static bool detect_ivrs(void)
+ 		return false;
+ 	}
+ 
+-	acpi_put_table(ivrs_base);
++	early_acpi_os_unmap_memory((char __iomem *)ivrs_base, ivrs_size);
+ 
+ 	/* Make sure ACS will be enabled during PCI probe */
+ 	pci_request_acs();
+@@ -3041,3 +3043,17 @@ int amd_iommu_pc_set_reg(struct amd_iommu *iommu, u8 bank, u8 cntr, u8 fxn, u64
+ 	return iommu_pc_get_set_reg(iommu, bank, cntr, fxn, value, true);
+ }
+ EXPORT_SYMBOL(amd_iommu_pc_set_reg);
++
++int amd_iommu_pc_get_set_reg_val(u16 devid, u8 bank, u8 cntr, u8 fxn,
++                                    u64 *value, bool is_write)
++{
++	struct amd_iommu *iommu = amd_iommu_rlookup_table[devid];
++
++	/* Make sure the IOMMU PC resource is available */
++	if (!amd_iommu_pc_present || iommu == NULL)
++		return -ENODEV;
++
++	return iommu_pc_get_set_reg(iommu, bank, cntr, fxn,
++					value, is_write);
++}
++EXPORT_SYMBOL(amd_iommu_pc_get_set_reg_val);
+diff --git a/drivers/iommu/amd_iommu_proto.h b/drivers/iommu/amd_iommu_proto.h
+old mode 100644
+new mode 100755
+diff --git a/drivers/iommu/amd_iommu_types.h b/drivers/iommu/amd_iommu_types.h
+index f6b24c7..d010f36 100644
+--- a/drivers/iommu/amd_iommu_types.h
++++ b/drivers/iommu/amd_iommu_types.h
+@@ -27,6 +27,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/pci.h>
+ #include <linux/irqreturn.h>
++#include <linux/mem_encrypt.h>
+ 
+ /*
+  * Maximum number of IOMMUs supported
+diff --git a/drivers/iommu/amd_iommu_v2.c b/drivers/iommu/amd_iommu_v2.c
+old mode 100644
+new mode 100755
+index 7d94e1d..22e2819
+--- a/drivers/iommu/amd_iommu_v2.c
++++ b/drivers/iommu/amd_iommu_v2.c
+@@ -22,7 +22,7 @@
+ #include <linux/profile.h>
+ #include <linux/module.h>
+ #include <linux/sched.h>
+-#include <linux/sched/mm.h>
++#include <linux/mm.h>
+ #include <linux/iommu.h>
+ #include <linux/wait.h>
+ #include <linux/pci.h>
+diff --git a/drivers/iommu/dmar.c b/drivers/iommu/dmar.c
+old mode 100644
+new mode 100755
+index 57c920c..322cf33
+--- a/drivers/iommu/dmar.c
++++ b/drivers/iommu/dmar.c
+@@ -68,6 +68,7 @@ DECLARE_RWSEM(dmar_global_lock);
+ LIST_HEAD(dmar_drhd_units);
+ 
+ struct acpi_table_header * __initdata dmar_tbl;
++static acpi_size dmar_tbl_size;
+ static int dmar_dev_scope_status = 1;
+ static unsigned long dmar_seq_ids[BITS_TO_LONGS(DMAR_UNITS_SUPPORTED)];
+ 
+@@ -907,10 +908,8 @@ int __init detect_intel_iommu(void)
+ 		x86_init.iommu.iommu_init = intel_iommu_init;
+ #endif
+ 
+-	if (dmar_tbl) {
+-		acpi_put_table(dmar_tbl);
+-		dmar_tbl = NULL;
+-	}
++	early_acpi_os_unmap_memory((void __iomem *)dmar_tbl, dmar_tbl_size);
++	dmar_tbl = NULL;
+ 	up_write(&dmar_global_lock);
+ 
+ 	return ret ? ret : 1;
+@@ -1808,9 +1807,11 @@ IOMMU_INIT_POST(detect_intel_iommu);
+  * for Directed-IO Architecture Specifiction, Rev 2.2, Section 8.8
+  * "Remapping Hardware Unit Hot Plug".
+  */
+-static guid_t dmar_hp_guid =
+-	GUID_INIT(0xD8C1A3A6, 0xBE9B, 0x4C9B,
+-		  0x91, 0xBF, 0xC3, 0xCB, 0x81, 0xFC, 0x5D, 0xAF);
++
++static u8 dmar_hp_guid[] = {
++	/* 0000 */    0xA6, 0xA3, 0xC1, 0xD8, 0x9B, 0xBE, 0x9B, 0x4C,
++	/* 0008 */    0x91, 0xBF, 0xC3, 0xCB, 0x81, 0xFC, 0x5D, 0xAF
++};
+ 
+ /*
+  * Currently there's only one revision and BIOS will not check the revision id,
+@@ -1823,7 +1824,7 @@ static guid_t dmar_hp_guid =
+ 
+ static inline bool dmar_detect_dsm(acpi_handle handle, int func)
+ {
+-	return acpi_check_dsm(handle, &dmar_hp_guid, DMAR_DSM_REV_ID, 1 << func);
++	return acpi_check_dsm(handle, dmar_hp_guid, DMAR_DSM_REV_ID, 1 << func);
+ }
+ 
+ static int dmar_walk_dsm_resource(acpi_handle handle, int func,
+@@ -1842,7 +1843,7 @@ static int dmar_walk_dsm_resource(acpi_handle handle, int func,
+ 	if (!dmar_detect_dsm(handle, func))
+ 		return 0;
+ 
+-	obj = acpi_evaluate_dsm_typed(handle, &dmar_hp_guid, DMAR_DSM_REV_ID,
++	obj = acpi_evaluate_dsm_typed(handle, dmar_hp_guid, DMAR_DSM_REV_ID,
+ 				      func, NULL, ACPI_TYPE_BUFFER);
+ 	if (!obj)
+ 		return -ENODEV;
+diff --git a/drivers/iommu/exynos-iommu.c b/drivers/iommu/exynos-iommu.c
+old mode 100644
+new mode 100755
+index c18071f..25c2c75
+--- a/drivers/iommu/exynos-iommu.c
++++ b/drivers/iommu/exynos-iommu.c
+@@ -664,8 +664,6 @@ static int __init exynos_sysmmu_probe(struct platform_device *pdev)
+ 
+ 	pm_runtime_enable(dev);
+ 
+-	iommu_register_instance(dev->fwnode, &exynos_iommu_ops);
+-
+ 	return 0;
+ }
+ 
+diff --git a/drivers/iommu/intel-iommu.c b/drivers/iommu/intel-iommu.c
+old mode 100644
+new mode 100755
+index 83f3d48..b8fc710
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@ -3729,7 +3729,7 @@ static void *intel_alloc_coherent(struct device *dev, size_t size,
+ 	if (gfpflags_allow_blocking(flags)) {
+ 		unsigned int count = size >> PAGE_SHIFT;
+ 
+-		page = dma_alloc_from_contiguous(dev, count, order, flags);
++		page = dma_alloc_from_contiguous(dev, count, order);
+ 		if (page && iommu_no_mapping(dev) &&
+ 		    page_to_phys(page) + size > dev->coherent_dma_mask) {
+ 			dma_release_from_contiguous(dev, page, count);
+@@ -3874,9 +3874,6 @@ const struct dma_map_ops intel_dma_ops = {
+ 	.map_page = intel_map_page,
+ 	.unmap_page = intel_unmap_page,
+ 	.mapping_error = intel_mapping_error,
+-#ifdef CONFIG_X86
+-	.dma_supported = x86_dma_supported,
+-#endif
+ };
+ 
+ static inline int iommu_domain_cache_init(void)
+@@ -4820,8 +4817,6 @@ int __init intel_iommu_init(void)
+ 	bus_register_notifier(&pci_bus_type, &device_nb);
+ 	if (si_domain && !hw_pass_through)
+ 		register_memory_notifier(&intel_iommu_memory_nb);
+-	cpuhp_setup_state(CPUHP_IOMMU_INTEL_DEAD, "iommu/intel:dead", NULL,
+-			  intel_iommu_cpu_dead);
+ 	intel_iommu_enabled = 1;
+ 
+ 	return 0;
+diff --git a/drivers/iommu/intel-svm.c b/drivers/iommu/intel-svm.c
+old mode 100644
+new mode 100755
+index f6697e5..32249a7
+--- a/drivers/iommu/intel-svm.c
++++ b/drivers/iommu/intel-svm.c
+@@ -16,7 +16,7 @@
+ #include <linux/intel-iommu.h>
+ #include <linux/mmu_notifier.h>
+ #include <linux/sched.h>
+-#include <linux/sched/mm.h>
++#include <linux/mm.h>
+ #include <linux/slab.h>
+ #include <linux/intel-svm.h>
+ #include <linux/rculist.h>
+diff --git a/drivers/iommu/intel_irq_remapping.c b/drivers/iommu/intel_irq_remapping.c
+old mode 100644
+new mode 100755
+index 25842b5..b6389b3
+--- a/drivers/iommu/intel_irq_remapping.c
++++ b/drivers/iommu/intel_irq_remapping.c
+@@ -501,7 +501,6 @@ static void iommu_enable_irq_remapping(struct intel_iommu *iommu)
+ static int intel_setup_irq_remapping(struct intel_iommu *iommu)
+ {
+ 	struct ir_table *ir_table;
+-	struct fwnode_handle *fn;
+ 	unsigned long *bitmap;
+ 	struct page *pages;
+ 
+@@ -527,24 +526,16 @@ static int intel_setup_irq_remapping(struct intel_iommu *iommu)
+ 		goto out_free_pages;
+ 	}
+ 
+-	fn = irq_domain_alloc_named_id_fwnode("INTEL-IR", iommu->seq_id);
+-	if (!fn)
+-		goto out_free_bitmap;
++	iommu->ir_domain = irq_domain_add_hierarchy(arch_get_ir_parent_domain(),
++						    0, INTR_REMAP_TABLE_ENTRIES,
++						    NULL, &intel_ir_domain_ops,
++						    iommu);
+ 
+-	iommu->ir_domain =
+-		irq_domain_create_hierarchy(arch_get_ir_parent_domain(),
+-					    0, INTR_REMAP_TABLE_ENTRIES,
+-					    fn, &intel_ir_domain_ops,
+-					    iommu);
+-	irq_domain_free_fwnode(fn);
+ 	if (!iommu->ir_domain) {
+ 		pr_err("IR%d: failed to allocate irqdomain\n", iommu->seq_id);
+ 		goto out_free_bitmap;
+ 	}
+-	iommu->ir_msi_domain =
+-		arch_create_remap_msi_irq_domain(iommu->ir_domain,
+-						 "INTEL-IR-MSI",
+-						 iommu->seq_id);
++	iommu->ir_msi_domain = arch_create_msi_irq_domain(iommu->ir_domain);
+ 
+ 	ir_table->base = page_address(pages);
+ 	ir_table->bitmap = bitmap;
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+old mode 100644
+new mode 100755
+index 17cc0ca..3de5c0b
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -251,7 +251,7 @@ iommu_insert_device_resv_regions(struct list_head *dev_resv_regions,
+ int iommu_get_group_resv_regions(struct iommu_group *group,
+ 				 struct list_head *head)
+ {
+-	struct iommu_device *device;
++	struct group_device *device;
+ 	int ret = 0;
+ 
+ 	mutex_lock(&group->mutex);
+diff --git a/include/linux/dma-iommu.h b/include/linux/dma-iommu.h
+index 32c5890..92f2083 100644
+--- a/include/linux/dma-iommu.h
++++ b/include/linux/dma-iommu.h
+@@ -20,6 +20,7 @@
+ #include <asm/errno.h>
+ 
+ #ifdef CONFIG_IOMMU_DMA
++#include <linux/dma-mapping.h>
+ #include <linux/iommu.h>
+ #include <linux/msi.h>
+ 
+@@ -27,6 +28,7 @@ int iommu_dma_init(void);
+ 
+ /* Domain management interface for IOMMU drivers */
+ int iommu_get_dma_cookie(struct iommu_domain *domain);
++int iommu_get_msi_cookie(struct iommu_domain *domain, dma_addr_t base);
+ void iommu_put_dma_cookie(struct iommu_domain *domain);
+ 
+ /* Setup call for arch DMA mapping code */
+@@ -34,7 +36,8 @@ int iommu_dma_init_domain(struct iommu_domain *domain, dma_addr_t base,
+ 		u64 size, struct device *dev);
+ 
+ /* General helpers for DMA-API <-> IOMMU-API interaction */
+-int dma_direction_to_prot(enum dma_data_direction dir, bool coherent);
++int dma_info_to_prot(enum dma_data_direction dir, bool coherent,
++		     unsigned long attrs);
+ 
+ /*
+  * These implement the bulk of the relevant DMA mapping callbacks, but require
+@@ -61,16 +64,21 @@ void iommu_dma_unmap_page(struct device *dev, dma_addr_t handle, size_t size,
+ 		enum dma_data_direction dir, unsigned long attrs);
+ void iommu_dma_unmap_sg(struct device *dev, struct scatterlist *sg, int nents,
+ 		enum dma_data_direction dir, unsigned long attrs);
+-int iommu_dma_supported(struct device *dev, u64 mask);
++dma_addr_t iommu_dma_map_resource(struct device *dev, phys_addr_t phys,
++		size_t size, enum dma_data_direction dir, unsigned long attrs);
++void iommu_dma_unmap_resource(struct device *dev, dma_addr_t handle,
++		size_t size, enum dma_data_direction dir, unsigned long attrs);
+ int iommu_dma_mapping_error(struct device *dev, dma_addr_t dma_addr);
+ 
+ /* The DMA API isn't _quite_ the whole story, though... */
+ void iommu_dma_map_msi_msg(int irq, struct msi_msg *msg);
++void iommu_dma_get_resv_regions(struct device *dev, struct list_head *list);
+ 
+ #else
+ 
+ struct iommu_domain;
+ struct msi_msg;
++struct device;
+ 
+ static inline int iommu_dma_init(void)
+ {
+@@ -82,6 +90,11 @@ static inline int iommu_get_dma_cookie(struct iommu_domain *domain)
+ 	return -ENODEV;
+ }
+ 
++static inline int iommu_get_msi_cookie(struct iommu_domain *domain, dma_addr_t base)
++{
++	return -ENODEV;
++}
++
+ static inline void iommu_put_dma_cookie(struct iommu_domain *domain)
+ {
+ }
+@@ -90,6 +103,10 @@ static inline void iommu_dma_map_msi_msg(int irq, struct msi_msg *msg)
+ {
+ }
+ 
++static inline void iommu_dma_get_resv_regions(struct device *dev, struct list_head *list)
++{
++}
++
+ #endif	/* CONFIG_IOMMU_DMA */
+ #endif	/* __KERNEL__ */
+ #endif	/* __DMA_IOMMU_H */
+diff --git a/include/linux/intel-iommu.h b/include/linux/intel-iommu.h
+index 23e129e..485a5b4 100644
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@ -29,6 +29,9 @@
+ #include <linux/dma_remapping.h>
+ #include <linux/mmu_notifier.h>
+ #include <linux/list.h>
++#include <linux/iommu.h>
++#include <linux/io-64-nonatomic-lo-hi.h>
++
+ #include <asm/cacheflush.h>
+ #include <asm/iommu.h>
+ 
+@@ -71,24 +74,8 @@
+ 
+ #define OFFSET_STRIDE		(9)
+ 
+-#ifdef CONFIG_64BIT
+ #define dmar_readq(a) readq(a)
+ #define dmar_writeq(a,v) writeq(v,a)
+-#else
+-static inline u64 dmar_readq(void __iomem *addr)
+-{
+-	u32 lo, hi;
+-	lo = readl(addr);
+-	hi = readl(addr + 4);
+-	return (((u64) hi) << 32) + lo;
+-}
+-
+-static inline void dmar_writeq(void __iomem *addr, u64 val)
+-{
+-	writel((u32)val, addr);
+-	writel((u32)(val >> 32), addr + 4);
+-}
+-#endif
+ 
+ #define DMAR_VER_MAJOR(v)		(((v) & 0xf0) >> 4)
+ #define DMAR_VER_MINOR(v)		((v) & 0x0f)
+@@ -439,7 +426,7 @@ struct intel_iommu {
+ 	struct irq_domain *ir_domain;
+ 	struct irq_domain *ir_msi_domain;
+ #endif
+-	struct device	*iommu_dev; /* IOMMU-sysfs device */
++	struct iommu_device iommu;  /* IOMMU core code handle */
+ 	int		node;
+ 	u32		flags;      /* Software defined flags */
+ };
+diff --git a/include/linux/iommu-common.h b/include/linux/iommu-common.h
+index 376a27c..802c90c 100644
+--- a/include/linux/iommu-common.h
++++ b/include/linux/iommu-common.h
+@@ -1,3 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
+ #ifndef _LINUX_IOMMU_COMMON_H
+ #define _LINUX_IOMMU_COMMON_H
+ 
+diff --git a/include/linux/iommu-helper.h b/include/linux/iommu-helper.h
+index 86bdeff..cb9a924 100644
+--- a/include/linux/iommu-helper.h
++++ b/include/linux/iommu-helper.h
+@@ -1,3 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
+ #ifndef _LINUX_IOMMU_HELPER_H
+ #define _LINUX_IOMMU_HELPER_H
+ 
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index 436dc21..41b8c57 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -19,18 +19,28 @@
+ #ifndef __LINUX_IOMMU_H
+ #define __LINUX_IOMMU_H
+ 
++#include <linux/scatterlist.h>
++#include <linux/device.h>
++#include <linux/types.h>
+ #include <linux/errno.h>
+ #include <linux/err.h>
+ #include <linux/of.h>
+-#include <linux/types.h>
+-#include <linux/scatterlist.h>
+-#include <trace/events/iommu.h>
+ 
+ #define IOMMU_READ	(1 << 0)
+ #define IOMMU_WRITE	(1 << 1)
+ #define IOMMU_CACHE	(1 << 2) /* DMA cache coherency */
+ #define IOMMU_NOEXEC	(1 << 3)
+ #define IOMMU_MMIO	(1 << 4) /* e.g. things like MSI doorbells */
++/*
++ * Where the bus hardware includes a privilege level as part of its access type
++ * markings, and certain devices are capable of issuing transactions marked as
++ * either 'supervisor' or 'user', the IOMMU_PRIV flag requests that the other
++ * given permission flags only apply to accesses at the higher privilege level,
++ * and that unprivileged transactions should have as little access as possible.
++ * This would usually imply the same permissions as kernel mappings on the CPU,
++ * if the IOMMU page table format is equivalent.
++ */
++#define IOMMU_PRIV	(1 << 5)
+ 
+ struct iommu_ops;
+ struct iommu_group;
+@@ -117,18 +127,32 @@ enum iommu_attr {
+ 	DOMAIN_ATTR_MAX,
+ };
+ 
++/* These are the possible reserved region types */
++enum iommu_resv_type {
++	/* Memory regions which must be mapped 1:1 at all times */
++	IOMMU_RESV_DIRECT,
++	/* Arbitrary "never map this or give it to a device" address ranges */
++	IOMMU_RESV_RESERVED,
++	/* Hardware MSI region (untranslated) */
++	IOMMU_RESV_MSI,
++	/* Software-managed MSI translation window */
++	IOMMU_RESV_SW_MSI,
++};
++
+ /**
+- * struct iommu_dm_region - descriptor for a direct mapped memory region
++ * struct iommu_resv_region - descriptor for a reserved memory region
+  * @list: Linked list pointers
+  * @start: System physical start address of the region
+  * @length: Length of the region in bytes
+  * @prot: IOMMU Protection flags (READ/WRITE/...)
++ * @type: Type of the reserved region
+  */
+-struct iommu_dm_region {
++struct iommu_resv_region {
+ 	struct list_head	list;
+ 	phys_addr_t		start;
+ 	size_t			length;
+ 	int			prot;
++	enum iommu_resv_type	type;
+ };
+ 
+ #ifdef CONFIG_IOMMU_API
+@@ -143,16 +167,20 @@ struct iommu_dm_region {
+  * @map: map a physically contiguous memory region to an iommu domain
+  * @unmap: unmap a physically contiguous memory region from an iommu domain
+  * @map_sg: map a scatter-gather list of physically contiguous memory chunks
+- * to an iommu domain
++ *          to an iommu domain
++ * @flush_tlb_all: Synchronously flush all hardware TLBs for this domain
++ * @tlb_range_add: Add a given iova range to the flush queue for this domain
++ * @tlb_sync: Flush all queued ranges from the hardware TLBs and empty flush
++ *            queue
+  * @iova_to_phys: translate iova to physical address
+  * @add_device: add device to iommu grouping
+  * @remove_device: remove device from iommu grouping
+  * @device_group: find iommu group for a particular device
+  * @domain_get_attr: Query domain attributes
+  * @domain_set_attr: Change domain attributes
+- * @get_dm_regions: Request list of direct mapping requirements for a device
+- * @put_dm_regions: Free list of direct mapping requirements for a device
+- * @apply_dm_region: Temporary helper call-back for iova reserved ranges
++ * @get_resv_regions: Request list of reserved regions for a device
++ * @put_resv_regions: Free list of reserved regions for a device
++ * @apply_resv_region: Temporary helper call-back for iova reserved ranges
+  * @domain_window_enable: Configure and enable a particular window for a domain
+  * @domain_window_disable: Disable a particular window for a domain
+  * @domain_set_windows: Set the number of windows for a domain
+@@ -175,6 +203,10 @@ struct iommu_ops {
+ 		     size_t size);
+ 	size_t (*map_sg)(struct iommu_domain *domain, unsigned long iova,
+ 			 struct scatterlist *sg, unsigned int nents, int prot);
++	void (*flush_iotlb_all)(struct iommu_domain *domain);
++	void (*iotlb_range_add)(struct iommu_domain *domain,
++				unsigned long iova, size_t size);
++	void (*iotlb_sync)(struct iommu_domain *domain);
+ 	phys_addr_t (*iova_to_phys)(struct iommu_domain *domain, dma_addr_t iova);
+ 	int (*add_device)(struct device *dev);
+ 	void (*remove_device)(struct device *dev);
+@@ -184,11 +216,12 @@ struct iommu_ops {
+ 	int (*domain_set_attr)(struct iommu_domain *domain,
+ 			       enum iommu_attr attr, void *data);
+ 
+-	/* Request/Free a list of direct mapping requirements for a device */
+-	void (*get_dm_regions)(struct device *dev, struct list_head *list);
+-	void (*put_dm_regions)(struct device *dev, struct list_head *list);
+-	void (*apply_dm_region)(struct device *dev, struct iommu_domain *domain,
+-				struct iommu_dm_region *region);
++	/* Request/Free a list of reserved regions for a device */
++	void (*get_resv_regions)(struct device *dev, struct list_head *list);
++	void (*put_resv_regions)(struct device *dev, struct list_head *list);
++	void (*apply_resv_region)(struct device *dev,
++				  struct iommu_domain *domain,
++				  struct iommu_resv_region *region);
+ 
+ 	/* Window handling functions */
+ 	int (*domain_window_enable)(struct iommu_domain *domain, u32 wnd_nr,
+@@ -200,10 +233,52 @@ struct iommu_ops {
+ 	u32 (*domain_get_windows)(struct iommu_domain *domain);
+ 
+ 	int (*of_xlate)(struct device *dev, struct of_phandle_args *args);
++	bool (*is_attach_deferred)(struct iommu_domain *domain, struct device *dev);
+ 
+ 	unsigned long pgsize_bitmap;
+ };
+ 
++/**
++ * struct iommu_device - IOMMU core representation of one IOMMU hardware
++ *			 instance
++ * @list: Used by the iommu-core to keep a list of registered iommus
++ * @ops: iommu-ops for talking to this iommu
++ * @dev: struct device for sysfs handling
++ */
++struct iommu_device {
++	struct list_head list;
++	const struct iommu_ops *ops;
++	struct fwnode_handle *fwnode;
++	struct device *dev;
++};
++
++int  iommu_device_register(struct iommu_device *iommu);
++void iommu_device_unregister(struct iommu_device *iommu);
++int  iommu_device_sysfs_add(struct iommu_device *iommu,
++			    struct device *parent,
++			    const struct attribute_group **groups,
++			    const char *fmt, ...) __printf(4, 5);
++void iommu_device_sysfs_remove(struct iommu_device *iommu);
++int  iommu_device_link(struct iommu_device   *iommu, struct device *link);
++void iommu_device_unlink(struct iommu_device *iommu, struct device *link);
++
++static inline void iommu_device_set_ops(struct iommu_device *iommu,
++					const struct iommu_ops *ops)
++{
++	iommu->ops = ops;
++}
++
++static inline void iommu_device_set_fwnode(struct iommu_device *iommu,
++					   struct fwnode_handle *fwnode)
++{
++	iommu->fwnode = fwnode;
++}
++
++static inline struct iommu_device *dev_to_iommu_device(struct device *dev)
++{
++	return (struct iommu_device *)dev_get_drvdata(dev);
++}
++
+ #define IOMMU_GROUP_NOTIFY_ADD_DEVICE		1 /* Device added */
+ #define IOMMU_GROUP_NOTIFY_DEL_DEVICE		2 /* Pre Device removed */
+ #define IOMMU_GROUP_NOTIFY_BIND_DRIVER		3 /* Pre Driver bind */
+@@ -225,7 +300,9 @@ extern struct iommu_domain *iommu_get_domain_for_dev(struct device *dev);
+ extern int iommu_map(struct iommu_domain *domain, unsigned long iova,
+ 		     phys_addr_t paddr, size_t size, int prot);
+ extern size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova,
+-		       size_t size);
++			  size_t size);
++extern size_t iommu_unmap_fast(struct iommu_domain *domain,
++			       unsigned long iova, size_t size);
+ extern size_t default_iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
+ 				struct scatterlist *sg,unsigned int nents,
+ 				int prot);
+@@ -233,9 +310,14 @@ extern phys_addr_t iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t io
+ extern void iommu_set_fault_handler(struct iommu_domain *domain,
+ 			iommu_fault_handler_t handler, void *token);
+ 
+-extern void iommu_get_dm_regions(struct device *dev, struct list_head *list);
+-extern void iommu_put_dm_regions(struct device *dev, struct list_head *list);
++extern void iommu_get_resv_regions(struct device *dev, struct list_head *list);
++extern void iommu_put_resv_regions(struct device *dev, struct list_head *list);
+ extern int iommu_request_dm_for_dev(struct device *dev);
++extern struct iommu_resv_region *
++iommu_alloc_resv_region(phys_addr_t start, size_t length, int prot,
++			enum iommu_resv_type type);
++extern int iommu_get_group_resv_regions(struct iommu_group *group,
++					struct list_head *head);
+ 
+ extern int iommu_attach_group(struct iommu_domain *domain,
+ 			      struct iommu_group *group);
+@@ -253,6 +335,7 @@ extern void iommu_group_remove_device(struct device *dev);
+ extern int iommu_group_for_each_dev(struct iommu_group *group, void *data,
+ 				    int (*fn)(struct device *, void *));
+ extern struct iommu_group *iommu_group_get(struct device *dev);
++extern struct iommu_group *iommu_group_ref_get(struct iommu_group *group);
+ extern void iommu_group_put(struct iommu_group *group);
+ extern int iommu_group_register_notifier(struct iommu_group *group,
+ 					 struct notifier_block *nb);
+@@ -266,57 +349,33 @@ extern int iommu_domain_get_attr(struct iommu_domain *domain, enum iommu_attr,
+ 				 void *data);
+ extern int iommu_domain_set_attr(struct iommu_domain *domain, enum iommu_attr,
+ 				 void *data);
+-struct device *iommu_device_create(struct device *parent, void *drvdata,
+-				   const struct attribute_group **groups,
+-				   const char *fmt, ...) __printf(4, 5);
+-void iommu_device_destroy(struct device *dev);
+-int iommu_device_link(struct device *dev, struct device *link);
+-void iommu_device_unlink(struct device *dev, struct device *link);
+ 
+ /* Window handling function prototypes */
+ extern int iommu_domain_window_enable(struct iommu_domain *domain, u32 wnd_nr,
+ 				      phys_addr_t offset, u64 size,
+ 				      int prot);
+ extern void iommu_domain_window_disable(struct iommu_domain *domain, u32 wnd_nr);
+-/**
+- * report_iommu_fault() - report about an IOMMU fault to the IOMMU framework
+- * @domain: the iommu domain where the fault has happened
+- * @dev: the device where the fault has happened
+- * @iova: the faulting address
+- * @flags: mmu fault flags (e.g. IOMMU_FAULT_READ/IOMMU_FAULT_WRITE/...)
+- *
+- * This function should be called by the low-level IOMMU implementations
+- * whenever IOMMU faults happen, to allow high-level users, that are
+- * interested in such events, to know about them.
+- *
+- * This event may be useful for several possible use cases:
+- * - mere logging of the event
+- * - dynamic TLB/PTE loading
+- * - if restarting of the faulting device is required
+- *
+- * Returns 0 on success and an appropriate error code otherwise (if dynamic
+- * PTE/TLB loading will one day be supported, implementations will be able
+- * to tell whether it succeeded or not according to this return value).
+- *
+- * Specifically, -ENOSYS is returned if a fault handler isn't installed
+- * (though fault handlers can also return -ENOSYS, in case they want to
+- * elicit the default behavior of the IOMMU drivers).
+- */
+-static inline int report_iommu_fault(struct iommu_domain *domain,
+-		struct device *dev, unsigned long iova, int flags)
++
++extern int report_iommu_fault(struct iommu_domain *domain, struct device *dev,
++			      unsigned long iova, int flags);
++
++static inline void iommu_flush_tlb_all(struct iommu_domain *domain)
+ {
+-	int ret = -ENOSYS;
++	if (domain->ops->flush_iotlb_all)
++		domain->ops->flush_iotlb_all(domain);
++}
+ 
+-	/*
+-	 * if upper layers showed interest and installed a fault handler,
+-	 * invoke it.
+-	 */
+-	if (domain->handler)
+-		ret = domain->handler(domain, dev, iova, flags,
+-						domain->handler_token);
++static inline void iommu_tlb_range_add(struct iommu_domain *domain,
++				       unsigned long iova, size_t size)
++{
++	if (domain->ops->iotlb_range_add)
++		domain->ops->iotlb_range_add(domain, iova, size);
++}
+ 
+-	trace_io_page_fault(dev, iova, flags);
+-	return ret;
++static inline void iommu_tlb_sync(struct iommu_domain *domain)
++{
++	if (domain->ops->iotlb_sync)
++		domain->ops->iotlb_sync(domain);
+ }
+ 
+ static inline size_t iommu_map_sg(struct iommu_domain *domain,
+@@ -351,12 +410,14 @@ int iommu_fwspec_init(struct device *dev, struct fwnode_handle *iommu_fwnode,
+ 		      const struct iommu_ops *ops);
+ void iommu_fwspec_free(struct device *dev);
+ int iommu_fwspec_add_ids(struct device *dev, u32 *ids, int num_ids);
++const struct iommu_ops *iommu_ops_from_fwnode(struct fwnode_handle *fwnode);
+ 
+ #else /* CONFIG_IOMMU_API */
+ 
+ struct iommu_ops {};
+ struct iommu_group {};
+ struct iommu_fwspec {};
++struct iommu_device {};
+ 
+ static inline bool iommu_present(struct bus_type *bus)
+ {
+@@ -399,13 +460,19 @@ static inline struct iommu_domain *iommu_get_domain_for_dev(struct device *dev)
+ }
+ 
+ static inline int iommu_map(struct iommu_domain *domain, unsigned long iova,
+-			    phys_addr_t paddr, int gfp_order, int prot)
++			    phys_addr_t paddr, size_t size, int prot)
+ {
+ 	return -ENODEV;
+ }
+ 
+ static inline int iommu_unmap(struct iommu_domain *domain, unsigned long iova,
+-			      int gfp_order)
++			      size_t size)
++{
++	return -ENODEV;
++}
++
++static inline int iommu_unmap_fast(struct iommu_domain *domain, unsigned long iova,
++				   int gfp_order)
+ {
+ 	return -ENODEV;
+ }
+@@ -417,6 +484,19 @@ static inline size_t iommu_map_sg(struct iommu_domain *domain,
+ 	return -ENODEV;
+ }
+ 
++static inline void iommu_flush_tlb_all(struct iommu_domain *domain)
++{
++}
++
++static inline void iommu_tlb_range_add(struct iommu_domain *domain,
++				       unsigned long iova, size_t size)
++{
++}
++
++static inline void iommu_tlb_sync(struct iommu_domain *domain)
++{
++}
++
+ static inline int iommu_domain_window_enable(struct iommu_domain *domain,
+ 					     u32 wnd_nr, phys_addr_t paddr,
+ 					     u64 size, int prot)
+@@ -439,16 +519,22 @@ static inline void iommu_set_fault_handler(struct iommu_domain *domain,
+ {
+ }
+ 
+-static inline void iommu_get_dm_regions(struct device *dev,
++static inline void iommu_get_resv_regions(struct device *dev,
+ 					struct list_head *list)
+ {
+ }
+ 
+-static inline void iommu_put_dm_regions(struct device *dev,
++static inline void iommu_put_resv_regions(struct device *dev,
+ 					struct list_head *list)
+ {
+ }
+ 
++static inline int iommu_get_group_resv_regions(struct iommu_group *group,
++					       struct list_head *head)
++{
++	return -ENODEV;
++}
++
+ static inline int iommu_request_dm_for_dev(struct device *dev)
+ {
+ 	return -ENODEV;
+@@ -542,15 +628,39 @@ static inline int iommu_domain_set_attr(struct iommu_domain *domain,
+ 	return -EINVAL;
+ }
+ 
+-static inline struct device *iommu_device_create(struct device *parent,
+-					void *drvdata,
+-					const struct attribute_group **groups,
+-					const char *fmt, ...)
++static inline int  iommu_device_register(struct iommu_device *iommu)
++{
++	return -ENODEV;
++}
++
++static inline void iommu_device_set_ops(struct iommu_device *iommu,
++					const struct iommu_ops *ops)
+ {
+-	return ERR_PTR(-ENODEV);
+ }
+ 
+-static inline void iommu_device_destroy(struct device *dev)
++static inline void iommu_device_set_fwnode(struct iommu_device *iommu,
++					   struct fwnode_handle *fwnode)
++{
++}
++
++static inline struct iommu_device *dev_to_iommu_device(struct device *dev)
++{
++	return NULL;
++}
++
++static inline void iommu_device_unregister(struct iommu_device *iommu)
++{
++}
++
++static inline int  iommu_device_sysfs_add(struct iommu_device *iommu,
++					  struct device *parent,
++					  const struct attribute_group **groups,
++					  const char *fmt, ...)
++{
++	return -ENODEV;
++}
++
++static inline void iommu_device_sysfs_remove(struct iommu_device *iommu)
+ {
+ }
+ 
+@@ -580,6 +690,12 @@ static inline int iommu_fwspec_add_ids(struct device *dev, u32 *ids,
+ 	return -ENODEV;
+ }
+ 
++static inline
++const struct iommu_ops *iommu_ops_from_fwnode(struct fwnode_handle *fwnode)
++{
++	return NULL;
++}
++
+ #endif /* CONFIG_IOMMU_API */
+ 
+ #endif /* __LINUX_IOMMU_H */
+diff --git a/include/linux/iova.h b/include/linux/iova.h
+index f27bb2c..d179b9b 100644
+--- a/include/linux/iova.h
++++ b/include/linux/iova.h
+@@ -14,6 +14,7 @@
+ #include <linux/types.h>
+ #include <linux/kernel.h>
+ #include <linux/rbtree.h>
++#include <linux/atomic.h>
+ #include <linux/dma-mapping.h>
+ 
+ /* iova structure */
+@@ -36,6 +37,35 @@ struct iova_rcache {
+ 	struct iova_cpu_rcache __percpu *cpu_rcaches;
+ };
+ 
++struct iova_domain;
++
++/* Call-Back from IOVA code into IOMMU drivers */
++typedef void (* iova_flush_cb)(struct iova_domain *domain);
++
++/* Destructor for per-entry data */
++typedef void (* iova_entry_dtor)(unsigned long data);
++
++/* Number of entries per Flush Queue */
++#define IOVA_FQ_SIZE	256
++
++/* Timeout (in ms) after which entries are flushed from the Flush-Queue */
++#define IOVA_FQ_TIMEOUT	10
++
++/* Flush Queue entry for defered flushing */
++struct iova_fq_entry {
++	unsigned long iova_pfn;
++	unsigned long pages;
++	unsigned long data;
++	u64 counter; /* Flush counter when this entrie was added */
++};
++
++/* Per-CPU Flush Queue structure */
++struct iova_fq {
++	struct iova_fq_entry entries[IOVA_FQ_SIZE];
++	unsigned head, tail;
++	spinlock_t lock;
++};
++
+ /* holds all the iova translations for a domain */
+ struct iova_domain {
+ 	spinlock_t	iova_rbtree_lock; /* Lock to protect update of rbtree */
+@@ -45,6 +75,25 @@ struct iova_domain {
+ 	unsigned long	start_pfn;	/* Lower limit for this domain */
+ 	unsigned long	dma_32bit_pfn;
+ 	struct iova_rcache rcaches[IOVA_RANGE_CACHE_MAX_SIZE];	/* IOVA range caches */
++
++	iova_flush_cb	flush_cb;	/* Call-Back function to flush IOMMU
++					   TLBs */
++
++	iova_entry_dtor entry_dtor;	/* IOMMU driver specific destructor for
++					   iova entry */
++
++	struct iova_fq __percpu *fq;	/* Flush Queue */
++
++	atomic64_t	fq_flush_start_cnt;	/* Number of TLB flushes that
++						   have been started */
++
++	atomic64_t	fq_flush_finish_cnt;	/* Number of TLB flushes that
++						   have been finished */
++
++	struct timer_list fq_timer;		/* Timer to regularily empty the
++						   flush-queues */
++	atomic_t fq_timer_on;			/* 1 when timer is active, 0
++						   when not */
+ };
+ 
+ static inline unsigned long iova_size(struct iova *iova)
+@@ -82,6 +131,7 @@ static inline unsigned long iova_pfn(struct iova_domain *iovad, dma_addr_t iova)
+ 	return iova >> iova_shift(iovad);
+ }
+ 
++#if IS_ENABLED(CONFIG_IOMMU_IOVA)
+ int iova_cache_get(void);
+ void iova_cache_put(void);
+ 
+@@ -94,6 +144,9 @@ struct iova *alloc_iova(struct iova_domain *iovad, unsigned long size,
+ 	bool size_aligned);
+ void free_iova_fast(struct iova_domain *iovad, unsigned long pfn,
+ 		    unsigned long size);
++void queue_iova(struct iova_domain *iovad,
++		unsigned long pfn, unsigned long pages,
++		unsigned long data);
+ unsigned long alloc_iova_fast(struct iova_domain *iovad, unsigned long size,
+ 			      unsigned long limit_pfn);
+ struct iova *reserve_iova(struct iova_domain *iovad, unsigned long pfn_lo,
+@@ -101,10 +154,115 @@ struct iova *reserve_iova(struct iova_domain *iovad, unsigned long pfn_lo,
+ void copy_reserved_iova(struct iova_domain *from, struct iova_domain *to);
+ void init_iova_domain(struct iova_domain *iovad, unsigned long granule,
+ 	unsigned long start_pfn, unsigned long pfn_32bit);
++int init_iova_flush_queue(struct iova_domain *iovad,
++			  iova_flush_cb flush_cb, iova_entry_dtor entry_dtor);
+ struct iova *find_iova(struct iova_domain *iovad, unsigned long pfn);
+ void put_iova_domain(struct iova_domain *iovad);
+ struct iova *split_and_remove_iova(struct iova_domain *iovad,
+ 	struct iova *iova, unsigned long pfn_lo, unsigned long pfn_hi);
+ void free_cpu_cached_iovas(unsigned int cpu, struct iova_domain *iovad);
++#else
++static inline int iova_cache_get(void)
++{
++	return -ENOTSUPP;
++}
++
++static inline void iova_cache_put(void)
++{
++}
++
++static inline struct iova *alloc_iova_mem(void)
++{
++	return NULL;
++}
++
++static inline void free_iova_mem(struct iova *iova)
++{
++}
++
++static inline void free_iova(struct iova_domain *iovad, unsigned long pfn)
++{
++}
++
++static inline void __free_iova(struct iova_domain *iovad, struct iova *iova)
++{
++}
++
++static inline struct iova *alloc_iova(struct iova_domain *iovad,
++				      unsigned long size,
++				      unsigned long limit_pfn,
++				      bool size_aligned)
++{
++	return NULL;
++}
++
++static inline void free_iova_fast(struct iova_domain *iovad,
++				  unsigned long pfn,
++				  unsigned long size)
++{
++}
++
++static inline void queue_iova(struct iova_domain *iovad,
++			      unsigned long pfn, unsigned long pages,
++			      unsigned long data)
++{
++}
++
++static inline unsigned long alloc_iova_fast(struct iova_domain *iovad,
++					    unsigned long size,
++					    unsigned long limit_pfn)
++{
++	return 0;
++}
++
++static inline struct iova *reserve_iova(struct iova_domain *iovad,
++					unsigned long pfn_lo,
++					unsigned long pfn_hi)
++{
++	return NULL;
++}
++
++static inline void copy_reserved_iova(struct iova_domain *from,
++				      struct iova_domain *to)
++{
++}
++
++static inline void init_iova_domain(struct iova_domain *iovad,
++				    unsigned long granule,
++				    unsigned long start_pfn,
++				    unsigned long pfn_32bit)
++{
++}
++
++static inline int init_iova_flush_queue(struct iova_domain *iovad,
++					iova_flush_cb flush_cb,
++					iova_entry_dtor entry_dtor)
++{
++	return -ENODEV;
++}
++
++static inline struct iova *find_iova(struct iova_domain *iovad,
++				     unsigned long pfn)
++{
++	return NULL;
++}
++
++static inline void put_iova_domain(struct iova_domain *iovad)
++{
++}
++
++static inline struct iova *split_and_remove_iova(struct iova_domain *iovad,
++						 struct iova *iova,
++						 unsigned long pfn_lo,
++						 unsigned long pfn_hi)
++{
++	return NULL;
++}
++
++static inline void free_cpu_cached_iovas(unsigned int cpu,
++					 struct iova_domain *iovad)
++{
++}
++#endif
+ 
+ #endif
+diff --git a/include/linux/mem_encrypt.h b/include/linux/mem_encrypt.h
+new file mode 100644
+index 0000000..265a9cd
+--- /dev/null
++++ b/include/linux/mem_encrypt.h
+@@ -0,0 +1,53 @@
++/*
++ * AMD Memory Encryption Support
++ *
++ * Copyright (C) 2016 Advanced Micro Devices, Inc.
++ *
++ * Author: Tom Lendacky <thomas.lendacky@amd.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifndef __MEM_ENCRYPT_H__
++#define __MEM_ENCRYPT_H__
++
++#ifndef __ASSEMBLY__
++
++#ifdef CONFIG_ARCH_HAS_MEM_ENCRYPT
++
++#include <asm/mem_encrypt.h>
++
++#else	/* !CONFIG_ARCH_HAS_MEM_ENCRYPT */
++
++#define sme_me_mask	0ULL
++
++#endif	/* CONFIG_ARCH_HAS_MEM_ENCRYPT */
++
++static inline bool sme_active(void)
++{
++	return !!sme_me_mask;
++}
++
++static inline u64 sme_get_me_mask(void)
++{
++	return sme_me_mask;
++}
++
++#ifdef CONFIG_AMD_MEM_ENCRYPT
++/*
++ * The __sme_set() and __sme_clr() macros are useful for adding or removing
++ * the encryption mask from a value (e.g. when dealing with pagetable
++ * entries).
++ */
++#define __sme_set(x)		((x) | sme_me_mask)
++#define __sme_clr(x)		((x) & ~sme_me_mask)
++#else
++#define __sme_set(x)		(x)
++#define __sme_clr(x)		(x)
++#endif
++
++#endif	/* __ASSEMBLY__ */
++
++#endif	/* __MEM_ENCRYPT_H__ */
+diff --git a/include/linux/of_iommu.h b/include/linux/of_iommu.h
+index e80b9c7..cddfaff 100644
+--- a/include/linux/of_iommu.h
++++ b/include/linux/of_iommu.h
+@@ -1,3 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
+ #ifndef __OF_IOMMU_H
+ #define __OF_IOMMU_H
+ 
+@@ -31,9 +32,6 @@ static inline const struct iommu_ops *of_iommu_configure(struct device *dev,
+ 
+ #endif	/* CONFIG_OF_IOMMU */
+ 
+-void of_iommu_set_ops(struct device_node *np, const struct iommu_ops *ops);
+-const struct iommu_ops *of_iommu_get_ops(struct device_node *np);
+-
+ extern struct of_device_id __iommu_of_table;
+ 
+ typedef int (*of_iommu_init_fn)(struct device_node *);
+diff --git a/include/linux/reservation.h b/include/linux/reservation.h
+index d470f9a..58f3a2a 100755
+--- a/include/linux/reservation.h
++++ b/include/linux/reservation.h
+@@ -167,7 +167,6 @@ reservation_object_lock(struct reservation_object *obj,
+ }
+ 
+ /**
+-/**
+  * reservation_object_trylock - trylock the reservation object
+  * @obj: the reservation object
+  *
+-- 
+2.7.4
+

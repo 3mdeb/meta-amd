@@ -1,0 +1,90 @@
+From 649c22d05b634fa34c606f12d56260e57853738d Mon Sep 17 00:00:00 2001
+From: "Leo (Sunpeng) Li" <sunpeng.li@amd.com>
+Date: Wed, 1 Nov 2017 16:49:14 -0400
+Subject: [PATCH 4353/5855] drm/amd/display: Fix warnings on S3 resume
+
+This is a followup to the following revert:
+
+Rex Zhu    Revert "drm/amd/display: Match actual state during S3
+           resume."
+
+Three things needed to be addressed:
+
+1. Potential memory leak on dc_state creation in atomic_check during
+   s3 resume
+2. Warnings are now seen in dmesg during S3 resume
+3. Since dc_state is now created in atomic_check, what the reverted
+   patch was addressing needs to be reevaluated.
+
+This change addresses the above:
+
+1. Since the suspend procedure calls drm_atomic_state_clear, our hook
+   for releasing the dc_state is called. This frees it before
+   atomic_check creates it during resume. The leak does not occur.
+
+2. The dc_crtc/plane_state references kept by the atomic states need to
+   be released before calling atomic_check, which warns if they are
+   non-null. This is because atomic_check is responsible for creating
+   the dc_*_states. This is a special case for S3 resume, since the
+   atomic state duplication that occurs during suspend also copies a
+   reference to the dc_*_states.
+
+3. See 2. comments are also updated to reflect this.
+
+Reviewed-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Signed-off-by: Leo (Sunpeng) Li <sunpeng.li@amd.com>
+Reviewed-by: Harry Wentland <Harry.Wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 28 +++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index e55cd11..2632e06 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -644,6 +644,11 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev )
+ 	struct drm_connector *connector;
+ 	struct drm_crtc *crtc;
+ 	struct drm_crtc_state *new_crtc_state;
++	struct dm_crtc_state *dm_new_crtc_state;
++	struct drm_plane *plane;
++	struct drm_plane_state *new_plane_state;
++	struct dm_plane_state *dm_new_plane_state;
++
+ 	int ret = 0;
+ 	int i;
+ 
+@@ -686,6 +691,29 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev )
+ 	for_each_crtc_in_state(adev->dm.cached_state, crtc, new_crtc_state, i)
+ 		new_crtc_state->active_changed = true;
+ 
++	/*
++	 * atomic_check is expected to create the dc states. We need to release
++	 * them here, since they were duplicated as part of the suspend
++	 * procedure.
++	 */
++	for_each_new_crtc_in_state(adev->dm.cached_state, crtc, new_crtc_state, i) {
++		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
++		if (dm_new_crtc_state->stream) {
++			WARN_ON(kref_read(&dm_new_crtc_state->stream->refcount) > 1);
++			dc_stream_release(dm_new_crtc_state->stream);
++			dm_new_crtc_state->stream = NULL;
++		}
++	}
++
++	for_each_new_plane_in_state(adev->dm.cached_state, plane, new_plane_state, i) {
++		dm_new_plane_state = to_dm_plane_state(new_plane_state);
++		if (dm_new_plane_state->dc_state) {
++			WARN_ON(kref_read(&dm_new_plane_state->dc_state->refcount) > 1);
++			dc_plane_state_release(dm_new_plane_state->dc_state);
++			dm_new_plane_state->dc_state = NULL;
++		}
++	}
++
+ 	ret = drm_atomic_helper_resume(ddev, adev->dm.cached_state);
+ 
+ 	drm_atomic_state_free(adev->dm.cached_state);
+-- 
+2.7.4
+

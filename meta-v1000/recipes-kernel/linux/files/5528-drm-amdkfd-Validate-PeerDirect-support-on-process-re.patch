@@ -1,0 +1,159 @@
+From a7b22ac5b7af908cf8c3651e4c1866577e304115 Mon Sep 17 00:00:00 2001
+From: Serguei Sagalovitch <Serguei.Sagalovitch@amd.com>
+Date: Thu, 27 Oct 2016 10:56:01 -0400
+Subject: [PATCH 5528/5855] drm/amdkfd: Validate PeerDirect support on process
+ registration v2
+
+v2: Call kfd_close_peer_direct() if failed to initialize
+PeerDirect interface to clean-up resources if any
+
+Network stack could be loaded later so PeerDirect interface may be
+not available during amdkfd initialization. Added logic to validate
+PeerDirect API presence when HSA process is created.
+
+Change-Id: Ib39b86a0086e2102baa3f41ba2bbb2f3e9a2017f
+Signed-off-by: Serguei Sagalovitch <Serguei.Sagalovitch@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_module.c     |  3 +--
+ drivers/gpu/drm/amd/amdkfd/kfd_peerdirect.c | 37 ++++++++++++++++++++++++-----
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h       |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c    |  6 +++++
+ 4 files changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_module.c b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+index 0f6a389..dee66c6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_module.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+@@ -137,8 +137,7 @@ static int __init kfd_module_init(void)
+ 
+ 	amdkfd_init_completed = 1;
+ 
+-	if (!kfd_init_peer_direct())
+-		pr_info("PeerDirect support was enabled\n");
++	kfd_init_peer_direct();
+ 
+ 	dev_info(kfd_device, "Initialized module\n");
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_peerdirect.c b/drivers/gpu/drm/amd/amdkfd/kfd_peerdirect.c
+index ffbccb3..0edc652 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_peerdirect.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_peerdirect.c
+@@ -49,6 +49,8 @@
+ #include <linux/slab.h>
+ #include <linux/scatterlist.h>
+ #include <linux/module.h>
++
++#include "kfd_priv.h"
+ #include "amd_rdma.h"
+ 
+ 
+@@ -428,11 +430,21 @@ static struct peer_memory_client amd_mem_client = {
+ 	.release = amd_release,
+ };
+ 
+-
+-int kfd_init_peer_direct(void)
++/** Initialize PeerDirect interface with RDMA Network stack.
++ *
++ *  Because network stack could potentially be loaded later we check
++ *  presence of PeerDirect when HSA process is created. If PeerDirect was
++ *  already initialized we do nothing otherwise try to detect and register.
++ */
++void kfd_init_peer_direct(void)
+ {
+ 	int result;
+ 
++	if (pfn_ib_unregister_peer_memory_client) {
++		pr_debug("PeerDirect support was already initialized\n");
++		return;
++	}
++
+ 	pr_debug("Try to initialize PeerDirect support\n");
+ 
+ 	pfn_ib_register_peer_memory_client =
+@@ -446,7 +458,9 @@ int kfd_init_peer_direct(void)
+ 	if (!pfn_ib_register_peer_memory_client ||
+ 		!pfn_ib_unregister_peer_memory_client) {
+ 		pr_warn("amdkfd: PeerDirect interface was not detected\n");
+-		return -EINVAL;
++		/* Do cleanup */
++		kfd_close_peer_direct();
++		return;
+ 	}
+ 
+ 	result = amdkfd_query_rdma_interface(&rdma_interface);
+@@ -454,7 +468,7 @@ int kfd_init_peer_direct(void)
+ 	if (result < 0) {
+ 		pr_err("amdkfd: Cannot get RDMA Interface (result = %d)\n",
+ 				result);
+-		return result;
++		return;
+ 	}
+ 
+ 	strcpy(amd_mem_client.name,    AMD_PEER_BRIDGE_DRIVER_NAME);
+@@ -465,13 +479,19 @@ int kfd_init_peer_direct(void)
+ 
+ 	if (!ib_reg_handle) {
+ 		pr_err("amdkfd: Cannot register peer memory client\n");
+-		return -EINVAL;
++		/* Do cleanup */
++		kfd_close_peer_direct();
++		return;
+ 	}
+ 
+ 	pr_info("amdkfd: PeerDirect support was initialized successfully\n");
+-	return 0;
++	return;
+ }
+ 
++/**
++ * Close connection with PeerDirect interface with RDMA Network stack.
++ *
++ */
+ void kfd_close_peer_direct(void)
+ {
+ 	if (pfn_ib_unregister_peer_memory_client) {
+@@ -484,5 +504,10 @@ void kfd_close_peer_direct(void)
+ 	if (pfn_ib_register_peer_memory_client)
+ 		symbol_put(ib_register_peer_memory_client);
+ 
++
++	/* Reset pointers to be safe */
++	pfn_ib_unregister_peer_memory_client = NULL;
++	pfn_ib_register_peer_memory_client   = NULL;
++	ib_reg_handle = NULL;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 4608676..8b9ddb0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -966,7 +966,7 @@ int dbgdev_wave_reset_wavefronts(struct kfd_dev *dev, struct kfd_process *p);
+ #define KFD_CWSR_CZ_FW_VER 625
+ 
+ /* PeerDirect support */
+-int kfd_init_peer_direct(void);
++void kfd_init_peer_direct(void);
+ void kfd_close_peer_direct(void);
+ 
+ /* Debugfs */
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index b679ea7..3c068c6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -566,6 +566,12 @@ static struct kfd_process *create_process(const struct task_struct *thread,
+ 
+ 	INIT_WORK(&process->eviction_work.work, kfd_evict_bo_worker);
+ 	INIT_DELAYED_WORK(&process->restore_work, kfd_restore_bo_worker);
++
++	/* If PeerDirect interface was not detected try to detect it again
++	* in case if network driver was loaded later.
++	*/
++	kfd_init_peer_direct();
++
+ 	return process;
+ 
+ err_init_cwsr:
+-- 
+2.7.4
+

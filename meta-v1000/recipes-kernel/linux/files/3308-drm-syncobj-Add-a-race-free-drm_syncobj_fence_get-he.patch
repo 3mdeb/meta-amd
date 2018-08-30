@@ -1,0 +1,104 @@
+From 9a5b96d558e131556f9fab50a66560654d86e5d1 Mon Sep 17 00:00:00 2001
+From: Jason Ekstrand <jason@jlekstrand.net>
+Date: Fri, 25 Aug 2017 10:52:20 -0700
+Subject: [PATCH 3308/5855] drm/syncobj: Add a race-free drm_syncobj_fence_get
+ helper (v2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The atomic exchange operation in drm_syncobj_replace_fence is sufficient
+for the case where it races with itself.  However, if you have a race
+between a replace_fence and dma_fence_get(syncobj->fence), you may end
+up with the entire replace_fence happening between the point in time
+where the one thread gets the syncobj->fence pointer and when it calls
+dma_fence_get() on it.  If this happens, then the reference may be
+dropped before we get a chance to get a new one.  The new helper uses
+dma_fence_get_rcu_safe to get rid of the race.
+
+This is also needed because it allows us to do a bit more than just get
+a reference in drm_syncobj_fence_get should we wish to do so.
+
+v2:
+ - RCU isn't that scary
+ - Call rcu_read_lock/unlock
+ - Don't rename fence to _fence
+ - Make the helper static inline
+
+Signed-off-by: Jason Ekstrand <jason@jlekstrand.net>
+Acked-by: Christian König <christian.koenig@amd.com> (v1)
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/drm_syncobj.c |  2 +-
+ include/drm/drm_syncobj.h     | 12 ++++++++++++
+ include/linux/fence.h         | 17 +++++++++++++++++
+ 3 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/drm_syncobj.c b/drivers/gpu/drm/drm_syncobj.c
+index 16644c0..6040aa3 100644
+--- a/drivers/gpu/drm/drm_syncobj.c
++++ b/drivers/gpu/drm/drm_syncobj.c
+@@ -105,7 +105,7 @@ int drm_syncobj_find_fence(struct drm_file *file_private,
+ 	if (!syncobj)
+ 		return -ENOENT;
+ 
+-	*fence = fence_get(syncobj->fence);
++	*fence = drm_syncobj_fence_get(syncobj);
+ 	if (!*fence) {
+ 		ret = -EINVAL;
+ 	}
+diff --git a/include/drm/drm_syncobj.h b/include/drm/drm_syncobj.h
+index 75eec82..dd629d3 100644
+--- a/include/drm/drm_syncobj.h
++++ b/include/drm/drm_syncobj.h
+@@ -77,6 +77,18 @@ drm_syncobj_put(struct drm_syncobj *obj)
+ 	kref_put(&obj->refcount, drm_syncobj_free);
+ }
+ 
++static inline struct fence *
++drm_syncobj_fence_get(struct drm_syncobj *syncobj)
++{
++	struct fence *fence;
++
++	rcu_read_lock();
++	fence = fence_get_rcu_safe(&syncobj->fence);
++	rcu_read_unlock();
++
++	return fence;
++}
++
+ struct drm_syncobj *drm_syncobj_find(struct drm_file *file_private,
+ 				     u32 handle);
+ void drm_syncobj_replace_fence(struct drm_syncobj *syncobj,
+diff --git a/include/linux/fence.h b/include/linux/fence.h
+index c26a8ef..6629d68 100644
+--- a/include/linux/fence.h
++++ b/include/linux/fence.h
+@@ -354,6 +354,23 @@ static inline signed long fence_wait(struct fence *fence, bool intr)
+ 
+ u64 fence_context_alloc(unsigned num);
+ 
++static inline struct fence *
++fence_get_rcu_safe(struct fence * __rcu *fencep)
++{
++	do {
++		struct fence *fence;
++
++		fence = rcu_dereference(*fencep);
++		if (!fence || !fence_get_rcu(fence))
++			return NULL;
++
++		if (fence == rcu_access_pointer(*fencep))
++			return rcu_pointer_handoff(fence);
++
++		fence_put(fence);
++	} while (1);
++}		
++
+ #define FENCE_TRACE(f, fmt, args...) \
+ 	do {								\
+ 		struct fence *__ff = (f);				\
+-- 
+2.7.4
+

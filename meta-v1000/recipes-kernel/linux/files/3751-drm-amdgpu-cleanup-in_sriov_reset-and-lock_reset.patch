@@ -1,0 +1,194 @@
+From 9ff53c94b93396f94a13a3cb2cc3d0b3bb1731a4 Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Tue, 17 Oct 2017 15:11:12 +0800
+Subject: [PATCH 3751/5855] drm/amdgpu:cleanup in_sriov_reset and lock_reset
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+since now gpu reset is unified with gpu_recover
+for both bare-metal and SR-IOV:
+
+1)rename in_sriov_reset to in_gpu_reset
+2)move lock_reset from adev->virt to adev
+
+Change-Id: I9f4dbab9a4c916fbc156f669824d15ddcd0f2322
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 9 +++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c    | 2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c  | 2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c   | 2 --
+ drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h   | 1 -
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c      | 6 +++---
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c      | 6 +++---
+ 8 files changed, 15 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 5e27073..fe2be7b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1716,7 +1716,8 @@ struct amdgpu_device {
+ 
+ 	/* record last mm index being written through WREG32*/
+ 	unsigned long last_mm_index;
+-        bool         in_sriov_reset;
++	bool                            in_gpu_reset;
++	struct mutex  lock_reset;
+ };
+ 
+ static inline struct amdgpu_device *amdgpu_ttm_adev(struct ttm_bo_device *bdev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 81608df..d5f77e6 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2186,6 +2186,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	mutex_init(&adev->mn_lock);
+ 	mutex_init(&adev->virt.vf_errors.lock);
+ 	hash_init(adev->mn_hash);
++	mutex_init(&adev->lock_reset);
+ 
+ 	amdgpu_check_arguments(adev);
+ 
+@@ -3009,9 +3010,9 @@ int amdgpu_gpu_recover(struct amdgpu_device *adev, struct amdgpu_job *job)
+ 
+ 	dev_info(adev->dev, "GPU reset begin!\n");
+ 
+-	mutex_lock(&adev->virt.lock_reset);
++	mutex_lock(&adev->lock_reset);
+ 	atomic_inc(&adev->gpu_reset_counter);
+-	adev->in_sriov_reset = 1;
++	adev->in_gpu_reset = 1;
+ 
+ 	/* block TTM */
+ 	resched = ttm_bo_lock_delayed_workqueue(&adev->mman.bdev);
+@@ -3121,8 +3122,8 @@ int amdgpu_gpu_recover(struct amdgpu_device *adev, struct amdgpu_job *job)
+ 	}
+ 
+ 	amdgpu_vf_error_trans_all(adev);
+-	adev->in_sriov_reset = 0;
+-	mutex_unlock(&adev->virt.lock_reset);
++	adev->in_gpu_reset = 0;
++	mutex_unlock(&adev->lock_reset);
+ 	return r;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index 2feb1b8..2ff3eb9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -264,7 +264,7 @@ static int psp_hw_start(struct psp_context *psp)
+         struct amdgpu_device *adev = psp->adev;
+ 	int ret;
+ 
+-        if (!amdgpu_sriov_vf(adev) || !adev->in_sriov_reset) {
++	if (!amdgpu_sriov_vf(adev) || !adev->in_gpu_reset) {
+                 ret = psp_bootloader_load_sysdrv(psp);
+                 if (ret)
+                         return ret;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c
+index 3a93675..cade71e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c
+@@ -370,7 +370,7 @@ int amdgpu_ucode_init_bo(struct amdgpu_device *adev)
+ 		return 0;
+ 	}
+ 
+-	if (!amdgpu_sriov_vf(adev) || !adev->in_sriov_reset) {
++	if (!amdgpu_sriov_vf(adev) || !adev->in_gpu_reset) {
+ 		err = amdgpu_bo_create(adev, adev->firmware.fw_size, PAGE_SIZE, true,
+ 					amdgpu_sriov_vf(adev) ? AMDGPU_GEM_DOMAIN_VRAM : AMDGPU_GEM_DOMAIN_GTT,
+ 					AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
+index c908d2a..1e6c03f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
+@@ -115,8 +115,6 @@ void amdgpu_virt_init_setting(struct amdgpu_device *adev)
+ 	adev->enable_virtual_display = true;
+ 	adev->cg_flags = 0;
+ 	adev->pg_flags = 0;
+-
+-	mutex_init(&adev->virt.lock_reset);
+ }
+ 
+ uint32_t amdgpu_virt_kiq_rreg(struct amdgpu_device *adev, uint32_t reg)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
+index 20bdb8f..e3f78f5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
+@@ -239,7 +239,6 @@ struct amdgpu_virt {
+ 	uint64_t			csa_vmid0_addr;
+ 	bool chained_ib_support;
+ 	uint32_t			reg_val_offs;
+-	struct mutex                    lock_reset;
+ 	struct amdgpu_irq_src		ack_irq;
+ 	struct amdgpu_irq_src		rcv_irq;
+ 	struct work_struct		flr_work;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 129344d..f5cefef 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -4814,7 +4814,7 @@ static int gfx_v8_0_kiq_init_queue(struct amdgpu_ring *ring)
+ 
+ 	gfx_v8_0_kiq_setting(ring);
+ 
+-        if (adev->in_sriov_reset) { /* for GPU_RESET case */
++        if (adev->in_gpu_reset) { /* for GPU_RESET case */
+ 		/* reset MQD to a clean status */
+ 		if (adev->gfx.mec.mqd_backup[mqd_idx])
+ 			memcpy(mqd, adev->gfx.mec.mqd_backup[mqd_idx], sizeof(struct vi_mqd_allocation));
+@@ -4851,7 +4851,7 @@ static int gfx_v8_0_kcq_init_queue(struct amdgpu_ring *ring)
+ 	struct vi_mqd *mqd = ring->mqd_ptr;
+ 	int mqd_idx = ring - &adev->gfx.compute_ring[0];
+ 
+-        if (!adev->in_sriov_reset && !adev->gfx.in_suspend) {
++	if (!adev->in_gpu_reset && !adev->gfx.in_suspend) {
+ 		memset((void *)mqd, 0, sizeof(struct vi_mqd_allocation));
+ 		((struct vi_mqd_allocation *)mqd)->dynamic_cu_mask = 0xFFFFFFFF;
+ 		((struct vi_mqd_allocation *)mqd)->dynamic_rb_mask = 0xFFFFFFFF;
+@@ -4863,7 +4863,7 @@ static int gfx_v8_0_kcq_init_queue(struct amdgpu_ring *ring)
+ 
+ 		if (adev->gfx.mec.mqd_backup[mqd_idx])
+ 			memcpy(adev->gfx.mec.mqd_backup[mqd_idx], mqd, sizeof(struct vi_mqd_allocation));
+-        } else if (adev->in_sriov_reset) { /* for GPU_RESET case */
++        } else if (adev->in_gpu_reset) { /* for GPU_RESET case */
+ 		/* reset MQD to a clean status */
+ 		if (adev->gfx.mec.mqd_backup[mqd_idx])
+ 			memcpy(mqd, adev->gfx.mec.mqd_backup[mqd_idx], sizeof(struct vi_mqd_allocation));
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index 73b900f..bed1a64 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -2737,7 +2737,7 @@ static int gfx_v9_0_kiq_init_queue(struct amdgpu_ring *ring)
+ 
+ 	gfx_v9_0_kiq_setting(ring);
+ 
+-        if (adev->in_sriov_reset) { /* for GPU_RESET case */
++        if (adev->in_gpu_reset) { /* for GPU_RESET case */
+ 		/* reset MQD to a clean status */
+ 		if (adev->gfx.mec.mqd_backup[mqd_idx])
+ 			memcpy(mqd, adev->gfx.mec.mqd_backup[mqd_idx], sizeof(struct v9_mqd_allocation));
+@@ -2775,7 +2775,7 @@ static int gfx_v9_0_kcq_init_queue(struct amdgpu_ring *ring)
+ 	struct v9_mqd *mqd = ring->mqd_ptr;
+ 	int mqd_idx = ring - &adev->gfx.compute_ring[0];
+ 
+-        if (!adev->in_sriov_reset && !adev->gfx.in_suspend) {
++        if (!adev->in_gpu_reset && !adev->gfx.in_suspend) {
+ 		memset((void *)mqd, 0, sizeof(struct v9_mqd_allocation));
+ 		((struct v9_mqd_allocation *)mqd)->dynamic_cu_mask = 0xFFFFFFFF;
+ 		((struct v9_mqd_allocation *)mqd)->dynamic_rb_mask = 0xFFFFFFFF;
+@@ -2787,7 +2787,7 @@ static int gfx_v9_0_kcq_init_queue(struct amdgpu_ring *ring)
+ 
+ 		if (adev->gfx.mec.mqd_backup[mqd_idx])
+ 			memcpy(adev->gfx.mec.mqd_backup[mqd_idx], mqd, sizeof(struct v9_mqd_allocation));
+-        } else if (adev->in_sriov_reset) { /* for GPU_RESET case */
++        } else if (adev->in_gpu_reset) { /* for GPU_RESET case */
+ 		/* reset MQD to a clean status */
+ 		if (adev->gfx.mec.mqd_backup[mqd_idx])
+ 			memcpy(mqd, adev->gfx.mec.mqd_backup[mqd_idx], sizeof(struct v9_mqd_allocation));
+-- 
+2.7.4
+

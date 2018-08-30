@@ -1,0 +1,314 @@
+From 7b12a3d9dc7b4f75ed314a9bdd283e0d76a3b8ba Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 29 Nov 2017 13:27:26 +0100
+Subject: [PATCH 4452/5855] drm/amdgpu: allow get_vm_pde to change flags as
+ well
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+And also provide the level for which we need a PDE.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    |  5 +++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 20 +++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c  |  5 +++--
+ drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c  |  6 +++---
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c  |  6 +++---
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c  |  6 +++---
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c  | 10 ++++++----
+ drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c |  5 +++--
+ drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c  | 12 +++++++-----
+ drivers/gpu/drm/amd/amdgpu/vce_v4_0.c  |  5 +++--
+ drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c  | 12 +++++++-----
+ 11 files changed, 54 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index edca29f..e522e1c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -350,7 +350,8 @@ struct amdgpu_gart_funcs {
+ 	uint64_t (*get_vm_pte_flags)(struct amdgpu_device *adev,
+ 				     uint32_t flags);
+ 	/* get the pde for a given mc addr */
+-	u64 (*get_vm_pde)(struct amdgpu_device *adev, u64 addr);
++	void (*get_vm_pde)(struct amdgpu_device *adev, int level,
++			   u64 *dst, u64 *flags);
+ 	uint32_t (*get_invalidate_req)(unsigned int vm_id);
+ };
+ 
+@@ -1903,7 +1904,7 @@ amdgpu_get_sdma_instance(struct amdgpu_ring *ring)
+ #define amdgpu_asic_get_config_memsize(adev) (adev)->asic_funcs->get_config_memsize((adev))
+ #define amdgpu_gart_flush_gpu_tlb(adev, vmid) (adev)->gart.gart_funcs->flush_gpu_tlb((adev), (vmid))
+ #define amdgpu_gart_set_pte_pde(adev, pt, idx, addr, flags) (adev)->gart.gart_funcs->set_pte_pde((adev), (pt), (idx), (addr), (flags))
+-#define amdgpu_gart_get_vm_pde(adev, addr) (adev)->gart.gart_funcs->get_vm_pde((adev), (addr))
++#define amdgpu_gart_get_vm_pde(adev, level, dst, flags) (adev)->gart.gart_funcs->get_vm_pde((adev), (level), (dst), (flags))
+ #define amdgpu_vm_copy_pte(adev, ib, pe, src, count) ((adev)->vm_manager.vm_pte_funcs->copy_pte((ib), (pe), (src), (count)))
+ #define amdgpu_vm_write_pte(adev, ib, pe, value, count, incr) ((adev)->vm_manager.vm_pte_funcs->write_pte((ib), (pe), (value), (count), (incr)))
+ #define amdgpu_vm_set_pte_pde(adev, ib, pe, addr, count, incr, flags) ((adev)->vm_manager.vm_pte_funcs->set_pte_pde((ib), (pe), (addr), (count), (incr), (flags)))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 56937ff..a2d4ec6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1073,9 +1073,10 @@ static void amdgpu_vm_update_pde(struct amdgpu_pte_update_params *params,
+ 				 struct amdgpu_vm_pt *parent,
+ 				 struct amdgpu_vm_pt *entry)
+ {
+-	struct amdgpu_bo *bo = entry->base.bo, *shadow = NULL;
++	struct amdgpu_bo *bo = entry->base.bo, *shadow = NULL, *pbo;
+ 	uint64_t pd_addr, shadow_addr = 0;
+-	uint64_t pde, pt;
++	uint64_t pde, pt, flags;
++	unsigned level;
+ 
+ 	/* Don't update huge pages here */
+ 	if (entry->huge)
+@@ -1090,16 +1091,20 @@ static void amdgpu_vm_update_pde(struct amdgpu_pte_update_params *params,
+ 			shadow_addr = amdgpu_bo_gpu_offset(shadow);
+ 	}
+ 
++	for (level = 0, pbo = parent->base.bo->parent; pbo; ++level)
++		pbo = pbo->parent;
++
+ 	pt = amdgpu_bo_gpu_offset(bo);
+ 
+-	pt = amdgpu_gart_get_vm_pde(params->adev, pt);
++	flags = AMDGPU_PTE_VALID;
++	amdgpu_gart_get_vm_pde(params->adev, level, &pt, &flags);
+ 	if (shadow) {
+ 		pde = shadow_addr + (entry - parent->entries) * 8;
+-		params->func(params, pde, pt, 1, 0, AMDGPU_PTE_VALID);
++		params->func(params, pde, pt, 1, 0, flags);
+ 	}
+ 
+ 	pde = pd_addr + (entry - parent->entries) * 8;
+-	params->func(params, pde, pt, 1, 0, AMDGPU_PTE_VALID);
++	params->func(params, pde, pt, 1, 0, flags);
+ }
+ 
+ /*
+@@ -1309,7 +1314,6 @@ static void amdgpu_vm_handle_huge_pages(struct amdgpu_pte_update_params *p,
+ 	    !(flags & AMDGPU_PTE_VALID)) {
+ 
+ 		dst = amdgpu_bo_gpu_offset(entry->base.bo);
+-		dst = amdgpu_gart_get_vm_pde(p->adev, dst);
+ 		flags = AMDGPU_PTE_VALID;
+ 	} else {
+ 		/* Set the huge page flag to stop scanning at this PDE */
+@@ -1318,9 +1322,11 @@ static void amdgpu_vm_handle_huge_pages(struct amdgpu_pte_update_params *p,
+ 
+ 	if (!entry->huge && !(flags & AMDGPU_PDE_PTE))
+ 		return;
+-
+ 	entry->huge = !!(flags & AMDGPU_PDE_PTE);
+ 
++	amdgpu_gart_get_vm_pde(p->adev, p->adev->vm_manager.num_level - 1,
++			       &dst, &flags);
++
+ 	if (use_cpu_update) {
+ 		/* In case a huge page is replaced with a system
+ 		 * memory mapping, p->pages_addr != NULL and
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index afc6716..b5d2f93 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -3683,10 +3683,11 @@ static void gfx_v9_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	int usepfp = (ring->funcs->type == AMDGPU_RING_TYPE_GFX);
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
++	uint64_t flags = AMDGPU_PTE_VALID;
+ 	unsigned eng = ring->vm_inv_eng;
+ 
+-	pd_addr = amdgpu_gart_get_vm_pde(ring->adev, pd_addr);
+-	pd_addr |= AMDGPU_PTE_VALID;
++	amdgpu_gart_get_vm_pde(ring->adev, -1, &pd_addr, &flags);
++	pd_addr |= flags;
+ 
+ 	gfx_v9_0_write_data_to_reg(ring, usepfp, true,
+ 				   hub->ctx0_ptb_addr_lo32 + (2 * vm_id),
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+index c3dd110..c94bcdd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+@@ -390,10 +390,10 @@ static uint64_t gmc_v6_0_get_vm_pte_flags(struct amdgpu_device *adev,
+ 	return pte_flag;
+ }
+ 
+-static uint64_t gmc_v6_0_get_vm_pde(struct amdgpu_device *adev, uint64_t addr)
++static void gmc_v6_0_get_vm_pde(struct amdgpu_device *adev, int level,
++				uint64_t *addr, uint64_t *flags)
+ {
+-	BUG_ON(addr & 0xFFFFFF0000000FFFULL);
+-	return addr;
++	BUG_ON(*addr & 0xFFFFFF0000000FFFULL);
+ }
+ 
+ static void gmc_v6_0_set_fault_enable_default(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index 0a17d63..1dc912f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -476,10 +476,10 @@ static uint64_t gmc_v7_0_get_vm_pte_flags(struct amdgpu_device *adev,
+ 	return pte_flag;
+ }
+ 
+-static uint64_t gmc_v7_0_get_vm_pde(struct amdgpu_device *adev, uint64_t addr)
++static void gmc_v7_0_get_vm_pde(struct amdgpu_device *adev, int level,
++				uint64_t *addr, uint64_t *flags)
+ {
+-	BUG_ON(addr & 0xFFFFFF0000000FFFULL);
+-	return addr;
++	BUG_ON(*addr & 0xFFFFFF0000000FFFULL);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index fd3dbc1..7b43abd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -677,10 +677,10 @@ static uint64_t gmc_v8_0_get_vm_pte_flags(struct amdgpu_device *adev,
+ 	return pte_flag;
+ }
+ 
+-static uint64_t gmc_v8_0_get_vm_pde(struct amdgpu_device *adev, uint64_t addr)
++static void gmc_v8_0_get_vm_pde(struct amdgpu_device *adev, int level,
++				uint64_t *addr, uint64_t *flags)
+ {
+-	BUG_ON(addr & 0xFFFFFF0000000FFFULL);
+-	return addr;
++	BUG_ON(*addr & 0xFFFFFF0000000FFFULL);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 379efb9..a2943c9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -474,11 +474,13 @@ static uint64_t gmc_v9_0_get_vm_pte_flags(struct amdgpu_device *adev,
+ 	return pte_flag;
+ }
+ 
+-static u64 gmc_v9_0_get_vm_pde(struct amdgpu_device *adev, u64 addr)
++static void gmc_v9_0_get_vm_pde(struct amdgpu_device *adev, int level,
++				uint64_t *addr, uint64_t *flags)
+ {
+-	addr = adev->vm_manager.vram_base_offset + addr - adev->mc.vram_start;
+-	BUG_ON(addr & 0xFFFF00000000003FULL);
+-	return addr;
++	if (!(*flags & AMDGPU_PDE_PTE))
++		*addr = adev->vm_manager.vram_base_offset + *addr -
++			adev->mc.vram_start;
++	BUG_ON(*addr & 0xFFFF00000000003FULL);
+ }
+ 
+ static const struct amdgpu_gart_funcs gmc_v9_0_gart_funcs = {
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+index d760f53..4765bfb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+@@ -1146,10 +1146,11 @@ static void sdma_v4_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
++	uint64_t flags = AMDGPU_PTE_VALID;
+ 	unsigned eng = ring->vm_inv_eng;
+ 
+-	pd_addr = amdgpu_gart_get_vm_pde(ring->adev, pd_addr);
+-	pd_addr |= AMDGPU_PTE_VALID;
++	amdgpu_gart_get_vm_pde(ring->adev, -1, &pd_addr, &flags);
++	pd_addr |= flags;
+ 
+ 	amdgpu_ring_write(ring, SDMA_PKT_HEADER_OP(SDMA_OP_SRBM_WRITE) |
+ 			  SDMA_PKT_SRBM_WRITE_HEADER_BYTE_EN(0xf));
+diff --git a/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c b/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c
+index f933be0..8d4ff6a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c
+@@ -1295,11 +1295,12 @@ static void uvd_v7_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
+-	uint32_t data0, data1, mask;
++	uint64_t flags = AMDGPU_PTE_VALID;
+ 	unsigned eng = ring->vm_inv_eng;
++	uint32_t data0, data1, mask;
+ 
+-	pd_addr = amdgpu_gart_get_vm_pde(ring->adev, pd_addr);
+-	pd_addr |= AMDGPU_PTE_VALID;
++	amdgpu_gart_get_vm_pde(ring->adev, -1, &pd_addr, &flags);
++	pd_addr |= flags;
+ 
+ 	data0 = (hub->ctx0_ptb_addr_hi32 + vm_id * 2) << 2;
+ 	data1 = upper_32_bits(pd_addr);
+@@ -1346,10 +1347,11 @@ static void uvd_v7_0_enc_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
++	uint64_t flags = AMDGPU_PTE_VALID;
+ 	unsigned eng = ring->vm_inv_eng;
+ 
+-	pd_addr = amdgpu_gart_get_vm_pde(ring->adev, pd_addr);
+-	pd_addr |= AMDGPU_PTE_VALID;
++	amdgpu_gart_get_vm_pde(ring->adev, -1, &pd_addr, &flags);
++	pd_addr |= flags;
+ 
+ 	amdgpu_ring_write(ring, HEVC_ENC_CMD_REG_WRITE);
+ 	amdgpu_ring_write(ring,	(hub->ctx0_ptb_addr_hi32 + vm_id * 2) << 2);
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
+index 880721fa..3727820 100755
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v4_0.c
+@@ -969,10 +969,11 @@ static void vce_v4_0_emit_vm_flush(struct amdgpu_ring *ring,
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
++	uint64_t flags = AMDGPU_PTE_VALID;
+ 	unsigned eng = ring->vm_inv_eng;
+ 
+-	pd_addr = amdgpu_gart_get_vm_pde(ring->adev, pd_addr);
+-	pd_addr |= AMDGPU_PTE_VALID;
++	amdgpu_gart_get_vm_pde(ring->adev, -1, &pd_addr, &flags);
++	pd_addr |= flags;
+ 
+ 	amdgpu_ring_write(ring, VCE_CMD_REG_WRITE);
+ 	amdgpu_ring_write(ring,	(hub->ctx0_ptb_addr_hi32 + vm_id * 2) << 2);
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
+index bc1adef..2c2b4cc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
+@@ -892,11 +892,12 @@ static void vcn_v1_0_dec_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
+-	uint32_t data0, data1, mask;
++	uint64_t flags = AMDGPU_PTE_VALID;
+ 	unsigned eng = ring->vm_inv_eng;
++	uint32_t data0, data1, mask;
+ 
+-	pd_addr = amdgpu_gart_get_vm_pde(ring->adev, pd_addr);
+-	pd_addr |= AMDGPU_PTE_VALID;
++	amdgpu_gart_get_vm_pde(ring->adev, -1, &pd_addr, &flags);
++	pd_addr |= flags;
+ 
+ 	data0 = (hub->ctx0_ptb_addr_hi32 + vm_id * 2) << 2;
+ 	data1 = upper_32_bits(pd_addr);
+@@ -1024,10 +1025,11 @@ static void vcn_v1_0_enc_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ {
+ 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
+ 	uint32_t req = ring->adev->gart.gart_funcs->get_invalidate_req(vm_id);
++	uint64_t flags = AMDGPU_PTE_VALID;
+ 	unsigned eng = ring->vm_inv_eng;
+ 
+-	pd_addr = amdgpu_gart_get_vm_pde(ring->adev, pd_addr);
+-	pd_addr |= AMDGPU_PTE_VALID;
++	amdgpu_gart_get_vm_pde(ring->adev, -1, &pd_addr, &flags);
++	pd_addr |= flags;
+ 
+ 	amdgpu_ring_write(ring, VCN_ENC_CMD_REG_WRITE);
+ 	amdgpu_ring_write(ring,
+-- 
+2.7.4
+

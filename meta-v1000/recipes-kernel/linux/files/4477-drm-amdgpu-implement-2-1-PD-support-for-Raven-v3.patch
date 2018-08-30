@@ -1,0 +1,259 @@
+From 3307629dc45d592e05c2104d1caa558a471995eb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 5 Dec 2017 15:23:26 +0100
+Subject: [PATCH 4477/5855] drm/amdgpu: implement 2+1 PD support for Raven v3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead of falling back to 2 level and very limited address space use
+2+1 PD support and 128TB + 512GB of virtual address space.
+
+v2: cleanup defines, rebase on top of level enum
+v3: fix inverted check in hardware setup
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-and-Tested-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu.h
+
+Change-Id: Ib754b7fe1b0d7b75c8e493a9c2b1e212bb23892c
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h      |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h   |  6 ++++
+ drivers/gpu/drm/amd/amdgpu/gfxhub_v1_0.c | 42 ++++++++++++++++++---------
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c    | 26 ++++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/mmhub_v1_0.c  | 49 ++++++++++++++++++++------------
+ 5 files changed, 89 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index e381a30..25d3da9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -557,6 +557,7 @@ struct amdgpu_mc {
+ 	u64					private_aperture_end;
+ 	/* protects concurrent invalidation */
+ 	spinlock_t		invalidate_lock;
++	bool			translate_further;
+ 
+ 	struct kfd_vm_fault_info *vm_fault_info;
+ 	atomic_t		vm_fault_info_updated;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 4220609..e92476a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -69,6 +69,12 @@ struct amdgpu_bo_list_entry;
+ /* PDE is handled as PTE for VEGA10 */
+ #define AMDGPU_PDE_PTE		(1ULL << 54)
+ 
++/* PTE is handled as PDE for VEGA10 (Translate Further) */
++#define AMDGPU_PTE_TF		(1ULL << 56)
++
++/* PDE Block Fragment Size for VEGA10 */
++#define AMDGPU_PDE_BFS(a)	((uint64_t)a << 59)
++
+ /* VEGA10 only */
+ #define AMDGPU_PTE_MTYPE(a)    ((uint64_t)a << 57)
+ #define AMDGPU_PTE_MTYPE_MASK	AMDGPU_PTE_MTYPE(3ULL)
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_0.c b/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_0.c
+index 1387095..aa3664e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_0.c
+@@ -145,8 +145,15 @@ static void gfxhub_v1_0_init_cache_regs(struct amdgpu_device *adev)
+ 	field = adev->vm_manager.fragment_size;
+ 
+ 	tmp = mmVM_L2_CNTL3_DEFAULT;
+-	tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3, BANK_SELECT, field);
+-	tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3, L2_CACHE_BIGK_FRAGMENT_SIZE, 6);
++	if (adev->mc.translate_further) {
++		tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3, BANK_SELECT, 12);
++		tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3,
++				    L2_CACHE_BIGK_FRAGMENT_SIZE, 9);
++	} else {
++		tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3, BANK_SELECT, 9);
++		tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3,
++				    L2_CACHE_BIGK_FRAGMENT_SIZE, 6);
++	}
+ 	WREG32_SOC15(GC, 0, mmVM_L2_CNTL3, tmp);
+ 
+ 	tmp = mmVM_L2_CNTL4_DEFAULT;
+@@ -184,31 +191,40 @@ static void gfxhub_v1_0_disable_identity_aperture(struct amdgpu_device *adev)
+ 
+ static void gfxhub_v1_0_setup_vmid_config(struct amdgpu_device *adev)
+ {
+-	int i;
++	unsigned num_level, block_size;
+ 	uint32_t tmp;
++	int i;
++
++	num_level = adev->vm_manager.num_level;
++	block_size = adev->vm_manager.block_size;
++	if (adev->mc.translate_further)
++		num_level -= 1;
++	else
++		block_size -= 9;
+ 
+ 	for (i = 0; i <= 14; i++) {
+ 		tmp = RREG32_SOC15_OFFSET(GC, 0, mmVM_CONTEXT1_CNTL, i);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL, ENABLE_CONTEXT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL, PAGE_TABLE_DEPTH,
+-				    adev->vm_manager.num_level);
++				    num_level);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				RANGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    RANGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT,
++				    1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				PDE0_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    PDE0_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				VALID_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    VALID_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				READ_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    READ_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				WRITE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    WRITE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				PAGE_TABLE_BLOCK_SIZE,
+-				adev->vm_manager.block_size - 9);
++				    PAGE_TABLE_BLOCK_SIZE,
++				    block_size);
+ 		/* Send no-retry XNACK on fault to suppress VM fault storm. */
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+ 				    RETRY_PERMISSION_OR_INVALID_PAGE_FAULT, 0);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 58e74f8..4ffb681 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -476,6 +476,21 @@ static void gmc_v9_0_get_vm_pde(struct amdgpu_device *adev, int level,
+ 		*addr = adev->vm_manager.vram_base_offset + *addr -
+ 			adev->mc.vram_start;
+ 	BUG_ON(*addr & 0xFFFF00000000003FULL);
++
++	if (!adev->mc.translate_further)
++		return;
++
++	if (level == AMDGPU_VM_PDB1) {
++		/* Set the block fragment size */
++		if (!(*flags & AMDGPU_PDE_PTE))
++			*flags |= AMDGPU_PDE_BFS(0x9);
++
++	} else if (level == AMDGPU_VM_PDB0) {
++		if (*flags & AMDGPU_PDE_PTE)
++			*flags &= ~AMDGPU_PDE_PTE;
++		else
++			*flags |= AMDGPU_PTE_TF;
++	}
+ }
+ 
+ static const struct amdgpu_gart_funcs gmc_v9_0_gart_funcs = {
+@@ -768,11 +783,14 @@ static int gmc_v9_0_sw_init(void *handle)
+ 	switch (adev->asic_type) {
+ 	case CHIP_RAVEN:
+ 		adev->mc.vram_type = AMDGPU_VRAM_TYPE_UNKNOWN;
+-		if (adev->rev_id == 0x0 || adev->rev_id == 0x1)
++		if (adev->rev_id == 0x0 || adev->rev_id == 0x1) {
+ 			amdgpu_vm_adjust_size(adev, 256 * 1024, 9, 3, 48);
+-		else
+-			/* vm_size is 64GB for legacy 2-level page support */
+-			amdgpu_vm_adjust_size(adev, 64, 9, 1, 48);
++		} else {
++			/* vm_size is 128TB + 512GB for legacy 3-level page support */
++			amdgpu_vm_adjust_size(adev, 128 * 1024 + 512, 9, 2, 48);
++			adev->mc.translate_further =
++				adev->vm_manager.num_level > 1;
++		}
+ 		break;
+ 	case CHIP_VEGA10:
+ 		/* XXX Don't know how to get VRAM type yet. */
+diff --git a/drivers/gpu/drm/amd/amdgpu/mmhub_v1_0.c b/drivers/gpu/drm/amd/amdgpu/mmhub_v1_0.c
+index c678b61..d2900bf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mmhub_v1_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/mmhub_v1_0.c
+@@ -155,10 +155,15 @@ static void mmhub_v1_0_init_cache_regs(struct amdgpu_device *adev)
+ 	WREG32_SOC15(MMHUB, 0, mmVM_L2_CNTL2, tmp);
+ 
+ 	field = adev->vm_manager.fragment_size;
+-	tmp = mmVM_L2_CNTL3_DEFAULT;
+-	tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3, BANK_SELECT, field);
+-	tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3, L2_CACHE_BIGK_FRAGMENT_SIZE, 6);
+-	WREG32_SOC15(MMHUB, 0, mmVM_L2_CNTL3, tmp);
++	if (adev->mc.translate_further) {
++		tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3, BANK_SELECT, 12);
++		tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3,
++				    L2_CACHE_BIGK_FRAGMENT_SIZE, 9);
++	} else {
++		tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3, BANK_SELECT, 9);
++		tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3,
++				    L2_CACHE_BIGK_FRAGMENT_SIZE, 6);
++	}
+ 
+ 	tmp = mmVM_L2_CNTL4_DEFAULT;
+ 	tmp = REG_SET_FIELD(tmp, VM_L2_CNTL4, VMC_TAP_PDE_REQUEST_PHYSICAL, 0);
+@@ -196,32 +201,40 @@ static void mmhub_v1_0_disable_identity_aperture(struct amdgpu_device *adev)
+ 
+ static void mmhub_v1_0_setup_vmid_config(struct amdgpu_device *adev)
+ {
+-	int i;
++	unsigned num_level, block_size;
+ 	uint32_t tmp;
++	int i;
++
++	num_level = adev->vm_manager.num_level;
++	block_size = adev->vm_manager.block_size;
++	if (adev->mc.translate_further)
++		num_level -= 1;
++	else
++		block_size -= 9;
+ 
+ 	for (i = 0; i <= 14; i++) {
+ 		tmp = RREG32_SOC15_OFFSET(MMHUB, 0, mmVM_CONTEXT1_CNTL, i);
++		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL, ENABLE_CONTEXT, 1);
++		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL, PAGE_TABLE_DEPTH,
++				    num_level);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				ENABLE_CONTEXT, 1);
+-		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				PAGE_TABLE_DEPTH, adev->vm_manager.num_level);
+-		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				RANGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    RANGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT,
++				    1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				PDE0_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    PDE0_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				VALID_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    VALID_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				READ_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    READ_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				WRITE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    WRITE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
++				    EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+-				PAGE_TABLE_BLOCK_SIZE,
+-				adev->vm_manager.block_size - 9);
++				    PAGE_TABLE_BLOCK_SIZE,
++				    block_size);
+ 		/* Send no-retry XNACK on fault to suppress VM fault storm. */
+ 		tmp = REG_SET_FIELD(tmp, VM_CONTEXT1_CNTL,
+ 				    RETRY_PERMISSION_OR_INVALID_PAGE_FAULT, 0);
+-- 
+2.7.4
+

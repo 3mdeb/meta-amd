@@ -1,0 +1,312 @@
+From f8bd168265881419af9dd407d0ec005b8ff9512d Mon Sep 17 00:00:00 2001
+From: christian koenig <christian.koenig@amd.com>
+Date: Thu, 14 Jan 2016 16:46:57 +0100
+Subject: [PATCH 3/4] st/mesa: Revert patches solves perf issues with mesa
+ 12.0.3
+
+This patch reverts below patches to solve performance issue observed with
+upgrade to mesa 12.0.3
+
+patch1: This patch needs to be applied
+Revert "st/vdpau: use linear layout for output surfaces"
+
+patch2:
+Subject: st/mesa: directly compute level=0 texture size in st_finalize_texture
+
+patch3:
+Subject: st/mesa: Replace GLvoid with void
+
+patch4:
+Subject: st/mesa: fix reference counting bug in st_vdpau
+
+Signed-off-by: Tamil Velan <Tamil-Velan.Jayakumar@amd.com>
+---
+ src/gallium/state_trackers/vdpau/output.c |   2 +-
+ src/mesa/state_tracker/st_texture.h       |   6 +
+ src/mesa/state_tracker/st_vdpau.c         | 194 +++++++++---------------------
+ 3 files changed, 62 insertions(+), 140 deletions(-)
+
+diff --git a/src/gallium/state_trackers/vdpau/output.c b/src/gallium/state_trackers/vdpau/output.c
+index c644cc8..5175da4 100644
+--- a/src/gallium/state_trackers/vdpau/output.c
++++ b/src/gallium/state_trackers/vdpau/output.c
+@@ -82,7 +82,7 @@ vlVdpOutputSurfaceCreate(VdpDevice device,
+    res_tmpl.depth0 = 1;
+    res_tmpl.array_size = 1;
+    res_tmpl.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET |
+-                   PIPE_BIND_LINEAR | PIPE_BIND_SHARED;
++		   PIPE_BIND_SHARED;
+    res_tmpl.usage = PIPE_USAGE_DEFAULT;
+ 
+    pipe_mutex_lock(dev->mutex);
+diff --git a/src/mesa/state_tracker/st_texture.h b/src/mesa/state_tracker/st_texture.h
+index ae9e2b4..d8cd7c7 100644
+--- a/src/mesa/state_tracker/st_texture.h
++++ b/src/mesa/state_tracker/st_texture.h
+@@ -79,6 +79,12 @@ struct st_texture_object
+     */
+    GLuint lastLevel;
+ 
++   /** The size of the level=0 mipmap image.
++    * Note that the number of 1D array layers will be in height0 and the
++    * number of 2D array layers will be in depth0, as in GL.
++    */
++   GLuint width0, height0, depth0;
++
+    /* On validation any active images held in main memory or in other
+     * textures will be copied to this texture and the old storage freed.
+     */
+diff --git a/src/mesa/state_tracker/st_vdpau.c b/src/mesa/state_tracker/st_vdpau.c
+index 4f599dd..807eebd 100644
+--- a/src/mesa/state_tracker/st_vdpau.c
++++ b/src/mesa/state_tracker/st_vdpau.c
+@@ -39,6 +39,8 @@
+ #include "pipe/p_state.h"
+ #include "pipe/p_video_codec.h"
+ 
++#include "state_tracker/vdpau_interop.h"
++
+ #include "util/u_inlines.h"
+ 
+ #include "st_vdpau.h"
+@@ -49,140 +51,15 @@
+ 
+ #ifdef HAVE_ST_VDPAU
+ 
+-#include "state_tracker/vdpau_interop.h"
+-#include "state_tracker/vdpau_dmabuf.h"
+-#include "state_tracker/vdpau_funcs.h"
+-#include "state_tracker/drm_driver.h"
+-
+-static struct pipe_resource *
+-st_vdpau_video_surface_gallium(struct gl_context *ctx, const void *vdpSurface,
+-                               GLuint index)
+-{
+-   int (*getProcAddr)(uint32_t device, uint32_t id, void **ptr);
+-   uint32_t device = (uintptr_t)ctx->vdpDevice;
+-   struct pipe_sampler_view *sv;
+-   VdpVideoSurfaceGallium *f;
+-
+-   struct pipe_video_buffer *buffer;
+-   struct pipe_sampler_view **samplers;
+-   struct pipe_resource *res = NULL;
+-
+-   getProcAddr = (void *)ctx->vdpGetProcAddress;
+-   if (getProcAddr(device, VDP_FUNC_ID_VIDEO_SURFACE_GALLIUM, (void**)&f))
+-      return NULL;
+-
+-   buffer = f((uintptr_t)vdpSurface);
+-   if (!buffer)
+-      return NULL;
+-
+-   samplers = buffer->get_sampler_view_planes(buffer);
+-   if (!samplers)
+-      return NULL;
+-
+-   sv = samplers[index >> 1];
+-   if (!sv)
+-      return NULL;
+-
+-   pipe_resource_reference(&res, sv->texture);
+-   return res;
+-}
+-
+-static struct pipe_resource *
+-st_vdpau_output_surface_gallium(struct gl_context *ctx, const void *vdpSurface)
+-{
+-   int (*getProcAddr)(uint32_t device, uint32_t id, void **ptr);
+-   uint32_t device = (uintptr_t)ctx->vdpDevice;
+-   struct pipe_resource *res = NULL;
+-   VdpOutputSurfaceGallium *f;
+-
+-   getProcAddr = (void *)ctx->vdpGetProcAddress;
+-   if (getProcAddr(device, VDP_FUNC_ID_OUTPUT_SURFACE_GALLIUM, (void**)&f))
+-      return NULL;
+-
+-   pipe_resource_reference(&res, f((uintptr_t)vdpSurface));
+-   return res;
+-}
+-
+-static struct pipe_resource *
+-st_vdpau_resource_from_description(struct gl_context *ctx,
+-                                   const struct VdpSurfaceDMABufDesc *desc)
+-{
+-   struct st_context *st = st_context(ctx);
+-   struct pipe_resource templ, *res;
+-   struct winsys_handle whandle;
+-
+-   if (desc->handle == -1)
+-      return NULL;
+-
+-   memset(&templ, 0, sizeof(templ));
+-   templ.target = PIPE_TEXTURE_2D;
+-   templ.last_level = 0;
+-   templ.depth0 = 1;
+-   templ.array_size = 1;
+-   templ.width0 = desc->width;
+-   templ.height0 = desc->height;
+-   templ.format = VdpFormatRGBAToPipe(desc->format);
+-   templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
+-   templ.usage = PIPE_USAGE_DEFAULT;
+-
+-   memset(&whandle, 0, sizeof(whandle));
+-   whandle.type = DRM_API_HANDLE_TYPE_FD;
+-   whandle.handle = desc->handle;
+-   whandle.offset = desc->offset;
+-   whandle.stride = desc->stride;
+-
+-   res = st->pipe->screen->resource_from_handle(st->pipe->screen, &templ, &whandle,
+-						PIPE_HANDLE_USAGE_READ_WRITE);
+-   close(desc->handle);
+-
+-   return res;
+-}
+-
+-static struct pipe_resource *
+-st_vdpau_output_surface_dma_buf(struct gl_context *ctx, const void *vdpSurface)
+-{
+-   int (*getProcAddr)(uint32_t device, uint32_t id, void **ptr);
+-   uint32_t device = (uintptr_t)ctx->vdpDevice;
+-
+-   struct VdpSurfaceDMABufDesc desc;
+-   VdpOutputSurfaceDMABuf *f;
+-
+-   getProcAddr = (void *)ctx->vdpGetProcAddress;
+-   if (getProcAddr(device, VDP_FUNC_ID_OUTPUT_SURFACE_DMA_BUF, (void**)&f))
+-      return NULL;
+-
+-   if (f((uintptr_t)vdpSurface, &desc) != VDP_STATUS_OK)
+-      return NULL;
+-
+-   return st_vdpau_resource_from_description(ctx, &desc);
+-}
+-
+-static struct pipe_resource *
+-st_vdpau_video_surface_dma_buf(struct gl_context *ctx, const void *vdpSurface,
+-                               GLuint index)
+-{
+-   int (*getProcAddr)(uint32_t device, uint32_t id, void **ptr);
+-   uint32_t device = (uintptr_t)ctx->vdpDevice;
+-
+-   struct VdpSurfaceDMABufDesc desc;
+-   VdpVideoSurfaceDMABuf *f;
+-
+-   getProcAddr = (void *)ctx->vdpGetProcAddress;
+-   if (getProcAddr(device, VDP_FUNC_ID_VIDEO_SURFACE_DMA_BUF, (void**)&f))
+-      return NULL;
+-
+-   if (f((uintptr_t)vdpSurface, index, &desc) != VDP_STATUS_OK)
+-      return NULL;
+-
+-   return st_vdpau_resource_from_description(ctx, &desc);
+-}
+-
+ static void
+ st_vdpau_map_surface(struct gl_context *ctx, GLenum target, GLenum access,
+                      GLboolean output, struct gl_texture_object *texObj,
+                      struct gl_texture_image *texImage,
+-                     const void *vdpSurface, GLuint index)
++                     const GLvoid *vdpSurface, GLuint index)
+ {
++   int (*getProcAddr)(uint32_t device, uint32_t id, void **ptr);
++   uint32_t device = (uintptr_t)ctx->vdpDevice;
++
+    struct st_context *st = st_context(ctx);
+    struct st_texture_object *stObj = st_texture_object(texObj);
+    struct st_texture_image *stImage = st_texture_image(texImage);
+@@ -191,17 +68,53 @@ st_vdpau_map_surface(struct gl_context *ctx, GLenum target, GLenum access,
+    struct pipe_sampler_view templ, **sampler_view;
+    mesa_format texFormat;
+ 
++   getProcAddr = (void *)ctx->vdpGetProcAddress;
+    if (output) {
+-      res = st_vdpau_output_surface_dma_buf(ctx, vdpSurface);
++      VdpOutputSurfaceGallium *f;
+ 
+-      if (!res)
+-         res = st_vdpau_output_surface_gallium(ctx, vdpSurface);
++      if (getProcAddr(device, VDP_FUNC_ID_OUTPUT_SURFACE_GALLIUM, (void**)&f)) {
++         _mesa_error(ctx, GL_INVALID_OPERATION, "VDPAUMapSurfacesNV");
++         return;
++      }
+ 
+-   } else {
+-      res = st_vdpau_video_surface_dma_buf(ctx, vdpSurface, index);
++      res = f((uintptr_t)vdpSurface);
++
++      if (!res) {
++         _mesa_error(ctx, GL_INVALID_OPERATION, "VDPAUMapSurfacesNV");
++         return;
++      }
+ 
+-      if (!res)
+-         res = st_vdpau_video_surface_gallium(ctx, vdpSurface, index);
++   } else {
++      struct pipe_sampler_view *sv;
++      VdpVideoSurfaceGallium *f;
++
++      struct pipe_video_buffer *buffer;
++      struct pipe_sampler_view **samplers;
++
++      if (getProcAddr(device, VDP_FUNC_ID_VIDEO_SURFACE_GALLIUM, (void**)&f)) {
++         _mesa_error(ctx, GL_INVALID_OPERATION, "VDPAUMapSurfacesNV");
++         return;
++      }
++
++      buffer = f((uintptr_t)vdpSurface);
++      if (!buffer) {
++         _mesa_error(ctx, GL_INVALID_OPERATION, "VDPAUMapSurfacesNV");
++         return;
++      }
++
++      samplers = buffer->get_sampler_view_planes(buffer);
++      if (!samplers) {
++         _mesa_error(ctx, GL_INVALID_OPERATION, "VDPAUMapSurfacesNV");
++         return;
++      }
++
++      sv = samplers[index >> 1];
++      if (!sv) {
++         _mesa_error(ctx, GL_INVALID_OPERATION, "VDPAUMapSurfacesNV");
++         return;
++      }
++
++      res = sv->texture;
+    }
+ 
+    if (!res) {
+@@ -212,7 +125,6 @@ st_vdpau_map_surface(struct gl_context *ctx, GLenum target, GLenum access,
+    /* do we have different screen objects ? */
+    if (res->screen != st->pipe->screen) {
+       _mesa_error(ctx, GL_INVALID_OPERATION, "VDPAUMapSurfacesNV");
+-      pipe_resource_reference(&res, NULL);
+       return;
+    }
+ 
+@@ -243,17 +155,21 @@ st_vdpau_map_surface(struct gl_context *ctx, GLenum target, GLenum access,
+    sampler_view = st_texture_get_sampler_view(st, stObj);
+    *sampler_view = st->pipe->create_sampler_view(st->pipe, res, &templ);
+ 
++   stObj->width0 = res->width0;
++   stObj->height0 = res->height0;
++   stObj->depth0 = 1;
++
++
+    stObj->surface_format = res->format;
+ 
+    _mesa_dirty_texobj(ctx, texObj);
+-   pipe_resource_reference(&res, NULL);
+ }
+ 
+ static void
+ st_vdpau_unmap_surface(struct gl_context *ctx, GLenum target, GLenum access,
+                        GLboolean output, struct gl_texture_object *texObj,
+                        struct gl_texture_image *texImage,
+-                       const void *vdpSurface, GLuint index)
++                       const GLvoid *vdpSurface, GLuint index)
+ {
+    struct st_context *st = st_context(ctx);
+    struct st_texture_object *stObj = st_texture_object(texObj);
+-- 
+2.7.4
+

@@ -1,0 +1,144 @@
+From 0ee14fdc160cf05fcd67c3a34e9397cc8f092bad Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Tue, 14 Nov 2017 16:41:20 -0500
+Subject: [PATCH 5803/5855] drm/amdkfd: Add support for user-mode trap handlers
+
+A second-level user mode trap handler can be installed. The CWSR trap
+handler jumps to the secondary trap handler conditionally for any
+conditions not handled by it. This can be used e.g. for debugging or
+catching math exceptions.
+
+When CWSR is disabled, the user mode trap handler is installed as
+first level trap handler.
+
+Signed-off-by: Shaoyun.liu <shaoyun.liu@amd.com>
+Signed-off-by: Jay Cornwall <Jay.Cornwall@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c           | 37 +++++++++++++++++++++-
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 22 +++++++++++++
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.h  |  5 +++
+ 3 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 9770f12..7f010e0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -432,6 +432,38 @@ static int kfd_ioctl_set_memory_policy(struct file *filep,
+ 	return err;
+ }
+ 
++static int kfd_ioctl_set_trap_handler(struct file *filep,
++					struct kfd_process *p, void *data)
++{
++	struct kfd_ioctl_set_trap_handler_args *args = data;
++	struct kfd_dev *dev;
++	int err = 0;
++	struct kfd_process_device *pdd;
++
++	dev = kfd_device_by_id(args->gpu_id);
++	if (dev == NULL)
++		return -EINVAL;
++
++	mutex_lock(&p->mutex);
++
++	pdd = kfd_bind_process_to_device(dev, p);
++	if (IS_ERR(pdd)) {
++		err = -ESRCH;
++		goto out;
++	}
++
++	if (dev->dqm->ops.set_trap_handler(dev->dqm,
++					&pdd->qpd,
++					args->tba_addr,
++					args->tma_addr))
++		err = -EINVAL;
++
++out:
++	mutex_unlock(&p->mutex);
++
++	return err;
++}
++
+ static int kfd_ioctl_dbg_register(struct file *filep,
+ 				struct kfd_process *p, void *data)
+ {
+@@ -985,7 +1017,10 @@ static const struct amdkfd_ioctl_desc amdkfd_ioctls[] = {
+ 			kfd_ioctl_set_scratch_backing_va, 0),
+ 
+ 	AMDKFD_IOCTL_DEF(AMDKFD_IOC_GET_TILE_CONFIG,
+-			kfd_ioctl_get_tile_config, 0)
++			kfd_ioctl_get_tile_config, 0),
++
++	AMDKFD_IOCTL_DEF(AMDKFD_IOC_SET_TRAP_HANDLER,
++			kfd_ioctl_set_trap_handler, 0),
+ };
+ 
+ #define AMDKFD_CORE_IOCTL_COUNT	ARRAY_SIZE(amdkfd_ioctls)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 77d7700..62bbcc8 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -1118,6 +1118,26 @@ static bool set_cache_memory_policy(struct device_queue_manager *dqm,
+ 	return retval;
+ }
+ 
++static int set_trap_handler(struct device_queue_manager *dqm,
++				struct qcm_process_device *qpd,
++				uint64_t tba_addr,
++				uint64_t tma_addr)
++{
++	uint64_t *tma;
++
++	if (dqm->dev->cwsr_enabled) {
++		/* Jump from CWSR trap handler to user trap */
++		tma = (uint64_t *)(qpd->cwsr_kaddr + KFD_CWSR_TMA_OFFSET);
++		tma[0] = tba_addr;
++		tma[1] = tma_addr;
++	} else {
++		qpd->tba_addr = tba_addr;
++		qpd->tma_addr = tma_addr;
++	}
++
++	return 0;
++}
++
+ static int process_termination_nocpsch(struct device_queue_manager *dqm,
+ 		struct qcm_process_device *qpd)
+ {
+@@ -1249,6 +1269,7 @@ struct device_queue_manager *device_queue_manager_init(struct kfd_dev *dev)
+ 		dqm->ops.create_kernel_queue = create_kernel_queue_cpsch;
+ 		dqm->ops.destroy_kernel_queue = destroy_kernel_queue_cpsch;
+ 		dqm->ops.set_cache_memory_policy = set_cache_memory_policy;
++		dqm->ops.set_trap_handler = set_trap_handler;
+ 		dqm->ops.process_termination = process_termination_cpsch;
+ 		break;
+ 	case KFD_SCHED_POLICY_NO_HWS:
+@@ -1264,6 +1285,7 @@ struct device_queue_manager *device_queue_manager_init(struct kfd_dev *dev)
+ 		dqm->ops.initialize = initialize_nocpsch;
+ 		dqm->ops.uninitialize = uninitialize;
+ 		dqm->ops.set_cache_memory_policy = set_cache_memory_policy;
++		dqm->ops.set_trap_handler = set_trap_handler;
+ 		dqm->ops.process_termination = process_termination_nocpsch;
+ 		break;
+ 	default:
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+index bfaac00..41e3f6a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+@@ -123,6 +123,11 @@ struct device_queue_manager_ops {
+ 					   void __user *alternate_aperture_base,
+ 					   uint64_t alternate_aperture_size);
+ 
++	int	(*set_trap_handler)(struct device_queue_manager *dqm,
++				    struct qcm_process_device *qpd,
++				    uint64_t tba_addr,
++				    uint64_t tma_addr);
++
+ 	int (*process_termination)(struct device_queue_manager *dqm,
+ 			struct qcm_process_device *qpd);
+ };
+-- 
+2.7.4
+

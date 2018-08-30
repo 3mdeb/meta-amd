@@ -1,0 +1,155 @@
+From ce86d5edaf8a8e4110da350fd299add9b1b59253 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 12 Jan 2018 17:08:22 +0100
+Subject: [PATCH 4696/5855] drm/amdgpu: implement gmc_v7_0_emit_flush_gpu_tlb
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Unify tlb flushing for gmc v7.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Chunming Zhou <david1.zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/cik.h      |  2 ++
+ drivers/gpu/drm/amd/amdgpu/cik_sdma.c | 15 ++-------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c | 25 +++----------------------
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c | 19 +++++++++++++++++++
+ 4 files changed, 26 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik.h b/drivers/gpu/drm/amd/amdgpu/cik.h
+index c4989f5..201d878 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik.h
++++ b/drivers/gpu/drm/amd/amdgpu/cik.h
+@@ -24,6 +24,8 @@
+ #ifndef __CIK_H__
+ #define __CIK_H__
+ 
++#define CIK_FLUSH_GPU_TLB_NUM_WREG	2
++
+ void cik_srbm_select(struct amdgpu_device *adev,
+ 		     u32 me, u32 pipe, u32 queue, u32 vmid);
+ int cik_set_ip_blocks(struct amdgpu_device *adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+index 5bf1afb..912da49 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_sdma.c
+@@ -886,18 +886,7 @@ static void cik_sdma_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ 	u32 extra_bits = (SDMA_POLL_REG_MEM_EXTRA_OP(0) |
+ 			  SDMA_POLL_REG_MEM_EXTRA_FUNC(0)); /* always */
+ 
+-	amdgpu_ring_write(ring, SDMA_PACKET(SDMA_OPCODE_SRBM_WRITE, 0, 0xf000));
+-	if (vmid < 8) {
+-		amdgpu_ring_write(ring, (mmVM_CONTEXT0_PAGE_TABLE_BASE_ADDR + vmid));
+-	} else {
+-		amdgpu_ring_write(ring, (mmVM_CONTEXT8_PAGE_TABLE_BASE_ADDR + vmid - 8));
+-	}
+-	amdgpu_ring_write(ring, pd_addr >> 12);
+-
+-	/* flush TLB */
+-	amdgpu_ring_write(ring, SDMA_PACKET(SDMA_OPCODE_SRBM_WRITE, 0, 0xf000));
+-	amdgpu_ring_write(ring, mmVM_INVALIDATE_REQUEST);
+-	amdgpu_ring_write(ring, 1 << vmid);
++	amdgpu_gmc_emit_flush_gpu_tlb(ring, vmid, pasid, pd_addr);
+ 
+ 	amdgpu_ring_write(ring, SDMA_PACKET(SDMA_OPCODE_POLL_REG_MEM, 0, extra_bits));
+ 	amdgpu_ring_write(ring, mmVM_INVALIDATE_REQUEST << 2);
+@@ -1290,7 +1279,7 @@ static const struct amdgpu_ring_funcs cik_sdma_ring_funcs = {
+ 		6 + /* cik_sdma_ring_emit_hdp_flush */
+ 		3 + /* cik_sdma_ring_emit_hdp_invalidate */
+ 		6 + /* cik_sdma_ring_emit_pipeline_sync */
+-		12 + /* cik_sdma_ring_emit_vm_flush */
++		CIK_FLUSH_GPU_TLB_NUM_WREG * 3 + 6 + /* cik_sdma_ring_emit_vm_flush */
+ 		9 + 9 + 9, /* cik_sdma_ring_emit_fence x3 for user fence, vm fence */
+ 	.emit_ib_size = 7 + 4, /* cik_sdma_ring_emit_ib */
+ 	.emit_ib = cik_sdma_ring_emit_ib,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 176967d..e899de4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -3244,26 +3244,7 @@ static void gfx_v7_0_ring_emit_vm_flush(struct amdgpu_ring *ring,
+ {
+ 	int usepfp = (ring->funcs->type == AMDGPU_RING_TYPE_GFX);
+ 
+-	amdgpu_ring_write(ring, PACKET3(PACKET3_WRITE_DATA, 3));
+-	amdgpu_ring_write(ring, (WRITE_DATA_ENGINE_SEL(usepfp) |
+-				 WRITE_DATA_DST_SEL(0)));
+-	if (vmid < 8) {
+-		amdgpu_ring_write(ring,
+-				  (mmVM_CONTEXT0_PAGE_TABLE_BASE_ADDR + vmid));
+-	} else {
+-		amdgpu_ring_write(ring,
+-				  (mmVM_CONTEXT8_PAGE_TABLE_BASE_ADDR + vmid - 8));
+-	}
+-	amdgpu_ring_write(ring, 0);
+-	amdgpu_ring_write(ring, pd_addr >> 12);
+-
+-	/* bits 0-15 are the VM contexts0-15 */
+-	amdgpu_ring_write(ring, PACKET3(PACKET3_WRITE_DATA, 3));
+-	amdgpu_ring_write(ring, (WRITE_DATA_ENGINE_SEL(0) |
+-				 WRITE_DATA_DST_SEL(0)));
+-	amdgpu_ring_write(ring, mmVM_INVALIDATE_REQUEST);
+-	amdgpu_ring_write(ring, 0);
+-	amdgpu_ring_write(ring, 1 << vmid);
++	amdgpu_gmc_emit_flush_gpu_tlb(ring, vmid, pasid, pd_addr);
+ 
+ 	/* wait for the invalidate to complete */
+ 	amdgpu_ring_write(ring, PACKET3(PACKET3_WAIT_REG_MEM, 5));
+@@ -5132,7 +5113,7 @@ static const struct amdgpu_ring_funcs gfx_v7_0_ring_funcs_gfx = {
+ 		5 + /* gfx_v7_0_ring_emit_hdp_invalidate */
+ 		12 + 12 + 12 + /* gfx_v7_0_ring_emit_fence_gfx x3 for user fence, vm fence */
+ 		7 + 4 + /* gfx_v7_0_ring_emit_pipeline_sync */
+-		17 + 6 + /* gfx_v7_0_ring_emit_vm_flush */
++		CIK_FLUSH_GPU_TLB_NUM_WREG * 5 + 7 + 6 + /* gfx_v7_0_ring_emit_vm_flush */
+ 		3 + 4, /* gfx_v7_ring_emit_cntxcntl including vgt flush*/
+ 	.emit_ib_size = 4, /* gfx_v7_0_ring_emit_ib_gfx */
+ 	.emit_ib = gfx_v7_0_ring_emit_ib_gfx,
+@@ -5163,7 +5144,7 @@ static const struct amdgpu_ring_funcs gfx_v7_0_ring_funcs_compute = {
+ 		7 + /* gfx_v7_0_ring_emit_hdp_flush */
+ 		5 + /* gfx_v7_0_ring_emit_hdp_invalidate */
+ 		7 + /* gfx_v7_0_ring_emit_pipeline_sync */
+-		17 + /* gfx_v7_0_ring_emit_vm_flush */
++		CIK_FLUSH_GPU_TLB_NUM_WREG * 5 + 7 + /* gfx_v7_0_ring_emit_vm_flush */
+ 		7 + 7 + 7, /* gfx_v7_0_ring_emit_fence_compute x3 for user fence, vm fence */
+ 	.emit_ib_size =	4, /* gfx_v7_0_ring_emit_ib_compute */
+ 	.emit_ib = gfx_v7_0_ring_emit_ib_compute,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index 5d39bc0..238391f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -430,6 +430,24 @@ static void gmc_v7_0_flush_gpu_tlb(struct amdgpu_device *adev, uint32_t vmid)
+ 	WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);
+ }
+ 
++static uint64_t gmc_v7_0_emit_flush_gpu_tlb(struct amdgpu_ring *ring,
++					    unsigned vmid, unsigned pasid,
++					    uint64_t pd_addr)
++{
++	uint32_t reg;
++
++	if (vmid < 8)
++		reg = mmVM_CONTEXT0_PAGE_TABLE_BASE_ADDR + vmid;
++	else
++		reg = mmVM_CONTEXT8_PAGE_TABLE_BASE_ADDR + vmid - 8;
++	amdgpu_ring_emit_wreg(ring, reg, pd_addr >> 12);
++
++	/* bits 0-15 are the VM contexts0-15 */
++	amdgpu_ring_emit_wreg(ring, mmVM_INVALIDATE_REQUEST, 1 << vmid);
++
++	return pd_addr;
++}
++
+ /**
+  * gmc_v7_0_set_pte_pde - update the page tables using MMIO
+  *
+@@ -1331,6 +1349,7 @@ static const struct amd_ip_funcs gmc_v7_0_ip_funcs = {
+ 
+ static const struct amdgpu_gmc_funcs gmc_v7_0_gmc_funcs = {
+ 	.flush_gpu_tlb = gmc_v7_0_flush_gpu_tlb,
++	.emit_flush_gpu_tlb = gmc_v7_0_emit_flush_gpu_tlb,
+ 	.set_pte_pde = gmc_v7_0_set_pte_pde,
+ 	.set_prt = gmc_v7_0_set_prt,
+ 	.get_vm_pte_flags = gmc_v7_0_get_vm_pte_flags,
+-- 
+2.7.4
+

@@ -1,0 +1,86 @@
+From 5a7f36639938bc22a4f7e2a1387b687074e301f9 Mon Sep 17 00:00:00 2001
+From: Joerg Roedel <jroedel@suse.de>
+Date: Fri, 2 Jun 2017 15:44:57 +0200
+Subject: [PATCH 5007/5855] iommu/amd: Add locking to per-domain flush-queue
+
+With locking we can safely access the flush-queues of other
+cpus.
+
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/amd_iommu.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/iommu/amd_iommu.c b/drivers/iommu/amd_iommu.c
+index 9fafc30..9a06acc 100644
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@ -146,6 +146,7 @@ struct flush_queue_entry {
+ struct flush_queue {
+ 	struct flush_queue_entry *entries;
+ 	unsigned head, tail;
++	spinlock_t lock;
+ };
+ 
+ /*
+@@ -1801,6 +1802,8 @@ static int dma_ops_domain_alloc_flush_queue(struct dma_ops_domain *dom)
+ 			dma_ops_domain_free_flush_queue(dom);
+ 			return -ENOMEM;
+ 		}
++
++		spin_lock_init(&queue->lock);
+ 	}
+ 
+ 	return 0;
+@@ -1808,6 +1811,8 @@ static int dma_ops_domain_alloc_flush_queue(struct dma_ops_domain *dom)
+ 
+ static inline bool queue_ring_full(struct flush_queue *queue)
+ {
++	assert_spin_locked(&queue->lock);
++
+ 	return (((queue->tail + 1) % FLUSH_QUEUE_SIZE) == queue->head);
+ }
+ 
+@@ -1819,6 +1824,8 @@ static void queue_release(struct dma_ops_domain *dom,
+ {
+ 	unsigned i;
+ 
++	assert_spin_locked(&queue->lock);
++
+ 	queue_ring_for_each(i, queue)
+ 		free_iova_fast(&dom->iovad,
+ 			       queue->entries[i].iova_pfn,
+@@ -1831,6 +1838,7 @@ static inline unsigned queue_ring_add(struct flush_queue *queue)
+ {
+ 	unsigned idx = queue->tail;
+ 
++	assert_spin_locked(&queue->lock);
+ 	queue->tail = (idx + 1) % FLUSH_QUEUE_SIZE;
+ 
+ 	return idx;
+@@ -1840,12 +1848,14 @@ static void queue_add(struct dma_ops_domain *dom,
+ 		      unsigned long address, unsigned long pages)
+ {
+ 	struct flush_queue *queue;
++	unsigned long flags;
+ 	int idx;
+ 
+ 	pages     = __roundup_pow_of_two(pages);
+ 	address >>= PAGE_SHIFT;
+ 
+ 	queue = get_cpu_ptr(dom->flush_queue);
++	spin_lock_irqsave(&queue->lock, flags);
+ 
+ 	if (queue_ring_full(queue)) {
+ 		domain_flush_tlb(&dom->domain);
+@@ -1858,6 +1868,7 @@ static void queue_add(struct dma_ops_domain *dom,
+ 	queue->entries[idx].iova_pfn = address;
+ 	queue->entries[idx].pages    = pages;
+ 
++	spin_unlock_irqrestore(&queue->lock, flags);
+ 	put_cpu_ptr(dom->flush_queue);
+ }
+ 
+-- 
+2.7.4
+

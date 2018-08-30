@@ -1,0 +1,151 @@
+From 3d031cd96bdc09c292365d952178233fd7873653 Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Wed, 26 Apr 2017 04:09:02 +0100
+Subject: [PATCH 3304/5855] drm/syncobj: add sync_file interaction. (v1.2)
+
+This interface allows importing the fence from a sync_file into
+an existing drm sync object, or exporting the fence attached to
+an existing drm sync object into a new sync file object.
+
+This should only be used to interact with sync files where necessary.
+
+v1.1: fence put fixes (Chris), drop fence from ioctl names (Chris)
+fixup for new fence replace API.
+
+Reviewed-by: Sean Paul <seanpaul@chromium.org>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/drm_syncobj.c | 75 +++++++++++++++++++++++++++++++++++++++++--
+ include/uapi/drm/drm.h        |  3 ++
+ 2 files changed, 76 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_syncobj.c b/drivers/gpu/drm/drm_syncobj.c
+index 86f6aa8..d1298c1 100644
+--- a/drivers/gpu/drm/drm_syncobj.c
++++ b/drivers/gpu/drm/drm_syncobj.c
+@@ -45,6 +45,7 @@
+ #include <linux/file.h>
+ #include <linux/fs.h>
+ #include <linux/anon_inodes.h>
++#include <linux/sync_file.h>
+ 
+ #include "drm_internal.h"
+ #include <drm/drm_syncobj.h>
+@@ -279,6 +280,59 @@ static int drm_syncobj_fd_to_handle(struct drm_file *file_private,
+ 	return 0;
+ }
+ 
++int drm_syncobj_import_sync_file_fence(struct drm_file *file_private,
++				       int fd, int handle)
++{
++	struct fence *fence = sync_file_get_fence(fd);
++	struct drm_syncobj *syncobj;
++
++	if (!fence)
++		return -EINVAL;
++
++	syncobj = drm_syncobj_find(file_private, handle);
++	if (!syncobj) {
++		fence_put(fence);
++		return -ENOENT;
++	}
++
++	drm_syncobj_replace_fence(file_private, syncobj, fence);
++	fence_put(fence);
++	drm_syncobj_put(syncobj);
++	return 0;
++}
++
++int drm_syncobj_export_sync_file(struct drm_file *file_private,
++				 int handle, int *p_fd)
++{
++	int ret;
++	struct fence *fence;
++	struct sync_file *sync_file;
++	int fd = get_unused_fd_flags(O_CLOEXEC);
++
++	if (fd < 0)
++		return fd;
++
++	ret = drm_syncobj_fence_get(file_private, handle, &fence);
++	if (ret)
++		goto err_put_fd;
++
++	sync_file = sync_file_create(fence);
++
++	fence_put(fence);
++
++	if (!sync_file) {
++		ret = -EINVAL;
++		goto err_put_fd;
++	}
++
++	fd_install(fd, sync_file->file);
++
++	*p_fd = fd;
++	return 0;
++err_put_fd:
++	put_unused_fd(fd);
++	return ret;
++}
+ /**
+  * drm_syncobj_open - initalizes syncobj file-private structures at devnode open time
+  * @dev: drm_device which is being opened by userspace
+@@ -361,9 +415,17 @@ drm_syncobj_handle_to_fd_ioctl(struct drm_device *dev, void *data,
+ 	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ))
+ 		return -ENODEV;
+ 
+-	if (args->pad || args->flags)
++	if (args->pad)
+ 		return -EINVAL;
+ 
++	if (args->flags != 0 &&
++	    args->flags != DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE)
++		return -EINVAL;
++
++	if (args->flags & DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE)
++		return drm_syncobj_export_sync_file(file_private, args->handle,
++						    &args->fd);
++
+ 	return drm_syncobj_handle_to_fd(file_private, args->handle,
+ 					&args->fd);
+ }
+@@ -377,9 +439,18 @@ drm_syncobj_fd_to_handle_ioctl(struct drm_device *dev, void *data,
+ 	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ))
+ 		return -ENODEV;
+ 
+-	if (args->pad || args->flags)
++	if (args->pad)
++		return -EINVAL;
++
++	if (args->flags != 0 &&
++	    args->flags != DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE)
+ 		return -EINVAL;
+ 
++	if (args->flags & DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE)
++		return drm_syncobj_import_sync_file_fence(file_private,
++							  args->fd,
++							  args->handle);
++
+ 	return drm_syncobj_fd_to_handle(file_private, args->fd,
+ 					&args->handle);
+ }
+diff --git a/include/uapi/drm/drm.h b/include/uapi/drm/drm.h
+index cfe7359..102fe89 100644
+--- a/include/uapi/drm/drm.h
++++ b/include/uapi/drm/drm.h
+@@ -708,6 +708,9 @@ struct drm_syncobj_destroy {
+        __u32 pad;
+ };
+ 
++#define DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE (1 << 0)
++#define DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE (1 << 0)
++
+ struct drm_syncobj_handle {
+        __u32 handle;
+        __u32 flags;
+-- 
+2.7.4
+

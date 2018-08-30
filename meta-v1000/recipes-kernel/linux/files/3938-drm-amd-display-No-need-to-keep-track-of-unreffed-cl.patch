@@ -1,0 +1,184 @@
+From e4fe210721e634dde3c6e647d315d26a7a5982a1 Mon Sep 17 00:00:00 2001
+From: Harry Wentland <harry.wentland@amd.com>
+Date: Tue, 5 Sep 2017 15:50:48 -0400
+Subject: [PATCH 3938/5855] drm/amd/display: No need to keep track of unreffed
+ clk sources
+
+This simplifies clock source reprogramming a bit.
+
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c  | 18 ++--------------
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    | 21 +++++-------------
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  | 25 +++++++---------------
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h    |  2 --
+ drivers/gpu/drm/amd/display/dc/inc/resource.h      |  2 +-
+ 5 files changed, 16 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 6d658de..0c3d4e9 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -261,13 +261,12 @@ bool resource_construct(
+ }
+ 
+ 
+-bool resource_unreference_clock_source(
++void resource_unreference_clock_source(
+ 		struct resource_context *res_ctx,
+ 		const struct resource_pool *pool,
+ 		struct clock_source *clock_source)
+ {
+ 	int i;
+-	bool need_reset = false;
+ 
+ 	for (i = 0; i < pool->clk_src_count; i++) {
+ 		if (pool->clock_sources[i] != clock_source)
+@@ -275,24 +274,11 @@ bool resource_unreference_clock_source(
+ 
+ 		res_ctx->clock_source_ref_count[i]--;
+ 
+-		if (res_ctx->clock_source_ref_count[i] == 0) {
+-			res_ctx->clock_source_changed[i] = true;
+-			need_reset = true;
+-		}
+-
+ 		break;
+ 	}
+ 
+-	if (pool->dp_clock_source == clock_source) {
++	if (pool->dp_clock_source == clock_source)
+ 		res_ctx->dp_clock_source_ref_count--;
+-
+-		if (res_ctx->dp_clock_source_ref_count == 0) {
+-			res_ctx->dp_clock_source_changed = true;
+-			need_reset = true;
+-		}
+-	}
+-
+-	return need_reset;
+ }
+ 
+ void resource_reference_clock_source(
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index b38965d..323cf60 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -1635,6 +1635,8 @@ static void dce110_reset_hw_ctx_wrap(
+ 
+ 		if (!pipe_ctx->stream ||
+ 				pipe_need_reprogram(pipe_ctx_old, pipe_ctx)) {
++			struct clock_source *old_clk = pipe_ctx_old->clock_source;
++
+ 			core_link_disable_stream(pipe_ctx_old);
+ 			pipe_ctx_old->stream_res.tg->funcs->set_blank(pipe_ctx_old->stream_res.tg, true);
+ 			if (!hwss_wait_for_blank_complete(pipe_ctx_old->stream_res.tg)) {
+@@ -1645,27 +1647,14 @@ static void dce110_reset_hw_ctx_wrap(
+ 			pipe_ctx_old->plane_res.mi->funcs->free_mem_input(
+ 					pipe_ctx_old->plane_res.mi, dc->current_state->stream_count);
+ 
++			if (old_clk)
++				old_clk->funcs->cs_power_down(old_clk);
++
+ 			dc->hwss.power_down_front_end(dc, pipe_ctx_old->pipe_idx);
+ 
+ 			pipe_ctx_old->stream = NULL;
+ 		}
+ 	}
+-
+-	/* power down changed clock sources */
+-	for (i = 0; i < dc->res_pool->clk_src_count; i++)
+-		if (context->res_ctx.clock_source_changed[i]) {
+-			struct clock_source *clk = dc->res_pool->clock_sources[i];
+-
+-			clk->funcs->cs_power_down(clk);
+-			context->res_ctx.clock_source_changed[i] = false;
+-		}
+-
+-	if (context->res_ctx.dp_clock_source_changed) {
+-		struct clock_source *clk = dc->res_pool->dp_clock_source;
+-
+-		clk->funcs->cs_power_down(clk);
+-		context->res_ctx.clock_source_changed[i] = false;
+-	}
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index b40287c..a3d41a1 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -1335,22 +1335,6 @@ static void reset_hw_ctx_wrap(
+ 			plane_atomic_power_down(dc, i);
+ 	}
+ 
+-	/* power down changed clock sources */
+-	for (i = 0; i < dc->res_pool->clk_src_count; i++)
+-		if (context->res_ctx.clock_source_changed[i]) {
+-			struct clock_source *clk = dc->res_pool->clock_sources[i];
+-
+-			clk->funcs->cs_power_down(clk);
+-			context->res_ctx.clock_source_changed[i] = false;
+-		}
+-
+-	if (context->res_ctx.dp_clock_source_changed) {
+-		struct clock_source *clk = dc->res_pool->dp_clock_source;
+-
+-		clk->funcs->cs_power_down(clk);
+-		context->res_ctx.dp_clock_source_changed = false;
+-	}
+-
+ 	/* Reset Back End*/
+ 	for (i = dc->res_pool->pipe_count - 1; i >= 0 ; i--) {
+ 		struct pipe_ctx *pipe_ctx_old =
+@@ -1361,9 +1345,16 @@ static void reset_hw_ctx_wrap(
+ 			continue;
+ 
+ 		if (!pipe_ctx->stream ||
+-				pipe_need_reprogram(pipe_ctx_old, pipe_ctx))
++				pipe_need_reprogram(pipe_ctx_old, pipe_ctx)) {
++			struct clock_source *old_clk = pipe_ctx_old->clock_source;
++
+ 			reset_back_end_for_pipe(dc, pipe_ctx_old, dc->current_state);
++
++			if (old_clk)
++				old_clk->funcs->cs_power_down(old_clk);
++		}
+ 	}
++
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index 4dad5a1..f295b61 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -213,9 +213,7 @@ struct resource_context {
+ 	bool is_stream_enc_acquired[MAX_PIPES * 2];
+ 	bool is_audio_acquired[MAX_PIPES];
+ 	uint8_t clock_source_ref_count[MAX_CLOCK_SOURCES];
+-	bool clock_source_changed[MAX_CLOCK_SOURCES];
+ 	uint8_t dp_clock_source_ref_count;
+-	bool dp_clock_source_changed;
+ };
+ 
+ struct dce_bw_output {
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/resource.h b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+index cf1797c..614bb69 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+@@ -92,7 +92,7 @@ enum dc_status resource_build_scaling_params_for_context(
+ 
+ void resource_build_info_frame(struct pipe_ctx *pipe_ctx);
+ 
+-bool resource_unreference_clock_source(
++void resource_unreference_clock_source(
+ 		struct resource_context *res_ctx,
+ 		const struct resource_pool *pool,
+ 		struct clock_source *clock_source);
+-- 
+2.7.4
+

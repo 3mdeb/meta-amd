@@ -1,0 +1,127 @@
+From ffa4f468b510b9649f4aa5853faf68b5d8d94de4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 15 Aug 2017 17:08:12 +0200
+Subject: [PATCH 3046/5855] drm/amdgpu: add bo_va cleared flag again v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We changed this to use an extra list a while back, but for the next
+series I need a separate flag again.
+
+v2: reorder to avoid unlocked list access
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h |  3 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c     | 36 ++++++++++++------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h     |  3 ---
+ 3 files changed, 17 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index ce94f05..777009e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -55,6 +55,9 @@ struct amdgpu_bo_va {
+ 	/* mappings for this bo_va */
+ 	struct list_head		invalids;
+ 	struct list_head		valids;
++
++	/* If the mappings are cleared or filled */
++	bool				cleared;
+ };
+ 
+ struct amdgpu_bo {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index fc43c25..5280c5c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1818,11 +1818,9 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 	if (!clear && bo_va->base.moved) {
+ 		bo_va->base.moved = false;	
+ 		list_splice_init(&bo_va->valids, &bo_va->invalids);
+-	} else {
+-		spin_lock(&vm->status_lock);
+-		if (!list_empty(&bo_va->base.vm_status))
+-			list_splice_init(&bo_va->valids, &bo_va->invalids);
+-		spin_unlock(&vm->status_lock);
++
++	} else if (bo_va->cleared != clear) {
++		list_splice_init(&bo_va->valids, &bo_va->invalids);
+ 	}
+ 	
+ 	list_for_each_entry(mapping, &bo_va->invalids, list) {
+@@ -1833,25 +1831,22 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 			return r;
+ 	}
+ 
+-	if (trace_amdgpu_vm_bo_mapping_enabled()) {
+-		list_for_each_entry(mapping, &bo_va->valids, list)
+-			trace_amdgpu_vm_bo_mapping(mapping);
+-
+-		list_for_each_entry(mapping, &bo_va->invalids, list)
+-			trace_amdgpu_vm_bo_mapping(mapping);
++	if (vm->use_cpu_for_update) {
++		/* Flush HDP */
++		mb();
++		amdgpu_gart_flush_gpu_tlb(adev, 0);
+ 	}
+ 
+ 	spin_lock(&vm->status_lock);
+-	list_splice_init(&bo_va->invalids, &bo_va->valids);
+ 	list_del_init(&bo_va->base.vm_status);
+-	if (clear)
+-		list_add(&bo_va->base.vm_status, &vm->cleared);
+ 	spin_unlock(&vm->status_lock);
+ 
+-	if (vm->use_cpu_for_update) {
+-		/* Flush HDP */
+-		mb();
+-		amdgpu_gart_flush_gpu_tlb(adev, 0);
++	list_splice_init(&bo_va->invalids, &bo_va->valids);
++	bo_va->cleared = clear;
++
++	if (trace_amdgpu_vm_bo_mapping_enabled()) {
++		list_for_each_entry(mapping, &bo_va->valids, list)
++			trace_amdgpu_vm_bo_mapping(mapping);
+ 	}
+ 
+ 	return 0;
+@@ -2453,9 +2448,7 @@ void amdgpu_vm_bo_invalidate(struct amdgpu_device *adev,
+ 	list_for_each_entry(bo_base, &bo->va, bo_list) {
+ 		bo_base->moved = true;
+ 		spin_lock(&bo_base->vm->status_lock);
+-		if (list_empty(&bo_base->vm_status))
+-			list_add(&bo_base->vm_status,
+-				 &bo_base->vm->moved);
++		list_move(&bo_base->vm_status, &bo_base->vm->moved);
+ 		spin_unlock(&bo_base->vm->status_lock);
+ 	}
+ }
+@@ -2542,7 +2535,6 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 		vm->reserved_vmid[i] = NULL;
+ 	spin_lock_init(&vm->status_lock);
+ 	INIT_LIST_HEAD(&vm->moved);
+-	INIT_LIST_HEAD(&vm->cleared);
+ 	INIT_LIST_HEAD(&vm->freed);
+ 
+ 	/* create scheduler entity for page table updates */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 9c36a1d..53a4ead 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -129,9 +129,6 @@ struct amdgpu_vm {
+ 	/* BOs moved, but not yet updated in the PT */
+ 	struct list_head	moved;
+ 
+-	/* BOs cleared in the PT because of a move */
+-	struct list_head	cleared;
+-
+ 	/* BO mappings freed, but not yet updated in the PT */
+ 	struct list_head	freed;
+ 
+-- 
+2.7.4
+

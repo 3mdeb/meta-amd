@@ -1,0 +1,79 @@
+From 757d223aac070399f1ff3d4490ef7a1decfe9ccf Mon Sep 17 00:00:00 2001
+From: Joerg Roedel <jroedel@suse.de>
+Date: Thu, 10 Aug 2017 16:31:17 +0200
+Subject: [PATCH 5105/5855] iommu/iova: Add locking to Flush-Queues
+
+The lock is taken from the same CPU most of the time. But
+having it allows to flush the queue also from another CPU if
+necessary.
+
+This will be used by a timer to regularily flush any pending
+IOVAs from the Flush-Queues.
+
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/iova.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/iommu/iova.c b/drivers/iommu/iova.c
+index 47b144e..749d395 100644
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@ -91,6 +91,8 @@ int init_iova_flush_queue(struct iova_domain *iovad,
+ 		fq = per_cpu_ptr(iovad->fq, cpu);
+ 		fq->head = 0;
+ 		fq->tail = 0;
++
++		spin_lock_init(&fq->lock);
+ 	}
+ 
+ 	return 0;
+@@ -471,6 +473,7 @@ EXPORT_SYMBOL_GPL(free_iova_fast);
+ 
+ static inline bool fq_full(struct iova_fq *fq)
+ {
++	assert_spin_locked(&fq->lock);
+ 	return (((fq->tail + 1) % IOVA_FQ_SIZE) == fq->head);
+ }
+ 
+@@ -478,6 +481,8 @@ static inline unsigned fq_ring_add(struct iova_fq *fq)
+ {
+ 	unsigned idx = fq->tail;
+ 
++	assert_spin_locked(&fq->lock);
++
+ 	fq->tail = (idx + 1) % IOVA_FQ_SIZE;
+ 
+ 	return idx;
+@@ -488,6 +493,8 @@ static void fq_ring_free(struct iova_domain *iovad, struct iova_fq *fq)
+ 	u64 counter = atomic64_read(&iovad->fq_flush_finish_cnt);
+ 	unsigned idx;
+ 
++	assert_spin_locked(&fq->lock);
++
+ 	fq_ring_for_each(idx, fq) {
+ 
+ 		if (fq->entries[idx].counter >= counter)
+@@ -537,8 +544,11 @@ void queue_iova(struct iova_domain *iovad,
+ 		unsigned long data)
+ {
+ 	struct iova_fq *fq = get_cpu_ptr(iovad->fq);
++	unsigned long flags;
+ 	unsigned idx;
+ 
++	spin_lock_irqsave(&fq->lock, flags);
++
+ 	/*
+ 	 * First remove all entries from the flush queue that have already been
+ 	 * flushed out on another CPU. This makes the fq_full() check below less
+@@ -558,6 +568,7 @@ void queue_iova(struct iova_domain *iovad,
+ 	fq->entries[idx].data     = data;
+ 	fq->entries[idx].counter  = atomic64_read(&iovad->fq_flush_start_cnt);
+ 
++	spin_unlock_irqrestore(&fq->lock, flags);
+ 	put_cpu_ptr(iovad->fq);
+ }
+ EXPORT_SYMBOL_GPL(queue_iova);
+-- 
+2.7.4
+

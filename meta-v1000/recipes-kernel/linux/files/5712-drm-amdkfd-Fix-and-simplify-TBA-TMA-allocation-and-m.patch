@@ -1,0 +1,112 @@
+From c80e0b48915170904aae44ed98e3828b3b532d4f Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Wed, 8 Nov 2017 19:16:52 -0500
+Subject: [PATCH 5712/5855] drm/amdkfd: Fix and simplify TBA+TMA allocation and
+ mapping
+
+Use __get_free_pages without __GFP_HIGHMEM to get a kernel-virtual
+address directly without having to kmap it, one page at a time.
+
+Use __GFP_ZERO to ensure that the TBA+TMA are zero-initialized.
+
+Map all pages in a single call to remap_pfn_range, since they are
+physically contiguous.
+
+Change-Id: Ia53246a87d01869f605cdfba24ed7601cff4d523
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  5 ++---
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c | 30 ++++++++++--------------------
+ 2 files changed, 12 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 385025c..2f15ef0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -579,12 +579,11 @@ struct qcm_process_device {
+ 	uint32_t num_oac;
+ 	uint32_t sh_hidden_private_base;
+ 
+-	/*cwsr memory*/
++	/* CWSR memory */
++	void *cwsr_kaddr;
+ 	uint64_t cwsr_base;
+ 	uint64_t tba_addr;
+ 	uint64_t tma_addr;
+-	void *cwsr_kaddr;
+-	struct page *cwsr_pages;
+ 
+ 	/* IB memory */
+ 	uint64_t ib_base; /* ib_base+ib_size must be below cwsr_base */
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 70799c6..17c2ecd 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -34,7 +34,7 @@
+ #include <linux/notifier.h>
+ #include <linux/compat.h>
+ #include <linux/mman.h>
+-#include <linux/highmem.h>
++#include <asm/page.h>
+ #include "kfd_ipc.h"
+ 
+ struct mm_struct;
+@@ -376,11 +376,9 @@ static void kfd_process_destroy_pdds(struct kfd_process *p)
+ 		}
+ 		list_del(&pdd->per_device_list);
+ 
+-		if (pdd->qpd.cwsr_pages) {
+-			kunmap(pdd->qpd.cwsr_pages);
+-			__free_pages(pdd->qpd.cwsr_pages,
++		if (pdd->qpd.cwsr_kaddr && !pdd->qpd.cwsr_base)
++			free_pages((unsigned long)pdd->qpd.cwsr_kaddr,
+ 				get_order(KFD_CWSR_TBA_TMA_SIZE));
+-		}
+ 
+ 		kfree(pdd->qpd.doorbell_bitmap);
+ 		idr_destroy(&pdd->alloc_idr);
+@@ -1119,8 +1117,6 @@ struct kfd_process *kfd_lookup_process_by_mm(const struct mm_struct *mm)
+ int kfd_reserved_mem_mmap(struct kfd_process *process,
+ 		struct vm_area_struct *vma)
+ {
+-	unsigned long pfn, i;
+-	int ret = 0;
+ 	struct kfd_dev *dev = kfd_device_by_id(vma->vm_pgoff);
+ 	struct kfd_process_device *temp, *pdd = NULL;
+ 	struct qcm_process_device *qpd = NULL;
+@@ -1146,25 +1142,19 @@ int kfd_reserved_mem_mmap(struct kfd_process *process,
+ 	if (!qpd)
+ 		return -EINVAL;
+ 
+-	qpd->cwsr_pages = alloc_pages(GFP_KERNEL | __GFP_HIGHMEM,
+-				get_order(KFD_CWSR_TBA_TMA_SIZE));
+-	if (!qpd->cwsr_pages) {
++	qpd->cwsr_kaddr = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
++					get_order(KFD_CWSR_TBA_TMA_SIZE));
++	if (!qpd->cwsr_kaddr) {
+ 		pr_err("amdkfd: error alloc CWSR isa memory per process.\n");
+ 		return -ENOMEM;
+ 	}
+-	qpd->cwsr_kaddr = kmap(qpd->cwsr_pages);
+ 
+ 	vma->vm_flags |= VM_IO | VM_DONTCOPY | VM_DONTEXPAND
+ 		| VM_NORESERVE | VM_DONTDUMP | VM_PFNMAP;
+-	for (i = 0; i < ((vma->vm_end - vma->vm_start) >> PAGE_SHIFT); ++i) {
+-		pfn = page_to_pfn(&qpd->cwsr_pages[i]);
+-		/* mapping the page to user process */
+-		ret = remap_pfn_range(vma, vma->vm_start + (i << PAGE_SHIFT),
+-				pfn, PAGE_SIZE, vma->vm_page_prot);
+-		if (ret)
+-			break;
+-	}
+-	return ret;
++	/* Mapping pages to user process */
++	return remap_pfn_range(vma, vma->vm_start,
++			       PFN_DOWN(__pa(qpd->cwsr_kaddr)),
++			       KFD_CWSR_TBA_TMA_SIZE, vma->vm_page_prot);
+ }
+ 
+ #if defined(CONFIG_DEBUG_FS)
+-- 
+2.7.4
+
