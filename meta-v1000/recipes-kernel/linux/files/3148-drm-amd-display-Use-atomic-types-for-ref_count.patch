@@ -1,0 +1,364 @@
+From 95868d7adf8c638b08e0d4986cd7f8be9afb5d37 Mon Sep 17 00:00:00 2001
+From: Jerry Zuo <Jerry.Zuo@amd.com>
+Date: Mon, 31 Jul 2017 17:10:44 -0400
+Subject: [PATCH 3148/5855] drm/amd/display: Use atomic types for ref_count
+
+Current ref_count inc/dec is not guarded by locks which leads to
+a raced condition where two threads try to access the variable
+at the same time. In this case, both might act on the same cached
+value and inc/dec from the same value, rather than inc/dec by 2.
+
+Signed-off-by: Jerry Zuo <Jerry.Zuo@amd.com>
+Reviewed-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c          | 24 +++++++--------
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c |  2 +-
+ drivers/gpu/drm/amd/display/dc/core/dc_sink.c     | 12 ++++----
+ drivers/gpu/drm/amd/display/dc/core/dc_stream.c   | 14 ++++-----
+ drivers/gpu/drm/amd/display/dc/core/dc_surface.c  | 36 +++++++++++------------
+ drivers/gpu/drm/amd/display/dc/dc.h               |  8 ++---
+ drivers/gpu/drm/amd/display/dc/dc_hw_types.h      |  2 +-
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h   |  2 +-
+ 8 files changed, 49 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index c2c379a..e1f71ff 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -454,7 +454,7 @@ static bool construct(struct core_dc *dc,
+ 		goto val_ctx_fail;
+ 	}
+ 
+-	dc->current_context->ref_count++;
++	atomic_inc(&dc->current_context->ref_count);
+ 
+ 	dc_ctx->cgs_device = init_params->cgs_device;
+ 	dc_ctx->driver_context = init_params->driver;
+@@ -704,7 +704,7 @@ struct validate_context *dc_get_validate_context(
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+ 
+-	++context->ref_count;
++	atomic_inc(&context->ref_count);
+ 
+ 	if (!is_validation_required(core_dc, set, set_count)) {
+ 		dc_resource_validate_ctx_copy_construct(core_dc->current_context, context);
+@@ -748,7 +748,7 @@ bool dc_validate_resources(
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+ 
+-	++context->ref_count;
++	atomic_inc(&context->ref_count);
+ 
+ 	result = core_dc->res_pool->funcs->validate_with_context(
+ 				core_dc, set, set_count, context, NULL);
+@@ -782,7 +782,7 @@ bool dc_validate_guaranteed(
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+ 
+-	++context->ref_count;
++	atomic_inc(&context->ref_count);
+ 
+ 	result = core_dc->res_pool->funcs->validate_guaranteed(
+ 					core_dc, stream, context);
+@@ -1090,7 +1090,7 @@ bool dc_commit_streams(
+ 	if (context == NULL)
+ 		goto context_alloc_fail;
+ 
+-	++context->ref_count;
++	atomic_inc(&context->ref_count);
+ 
+ 	result = core_dc->res_pool->funcs->validate_with_context(
+ 			core_dc, set, stream_count, context, core_dc->current_context);
+@@ -1203,16 +1203,16 @@ bool dc_commit_planes_to_stream(
+ 
+ void dc_retain_validate_context(struct validate_context *context)
+ {
+-	ASSERT(context->ref_count > 0);
+-	++context->ref_count;
++	ASSERT(atomic_read(&context->ref_count) > 0);
++	atomic_inc(&context->ref_count);
+ }
+ 
+ void dc_release_validate_context(struct validate_context *context)
+ {
+-	ASSERT(context->ref_count > 0);
+-	--context->ref_count;
++	ASSERT(atomic_read(&context->ref_count) > 0);
++	atomic_dec(&context->ref_count);
+ 
+-	if (context->ref_count == 0) {
++	if (atomic_read(&context->ref_count) == 0) {
+ 		dc_resource_validate_ctx_destruct(context);
+ 		dm_free(context);
+ 	}
+@@ -1485,7 +1485,7 @@ void dc_update_planes_and_stream(struct dc *dc,
+ 		if (context == NULL)
+ 				goto context_alloc_fail;
+ 
+-		++context->ref_count;
++		atomic_inc(&context->ref_count);
+ 
+ 		dc_resource_validate_ctx_copy_construct(
+ 				core_dc->current_context, context);
+@@ -1801,7 +1801,7 @@ void dc_set_power_state(
+ 	enum dc_video_power_state video_power_state)
+ {
+ 	struct core_dc *core_dc = DC_TO_CORE(dc);
+-	int ref_count;
++	atomic_t ref_count;
+ 
+ 	core_dc->previous_power_state = core_dc->current_power_state;
+ 	core_dc->current_power_state = video_power_state;
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index f010039..6687baa 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -2238,7 +2238,7 @@ void dc_resource_validate_ctx_copy_construct(
+ 		struct validate_context *dst_ctx)
+ {
+ 	int i, j;
+-	int ref_count = dst_ctx->ref_count;
++	atomic_t ref_count = dst_ctx->ref_count;
+ 
+ 	*dst_ctx = *src_ctx;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_sink.c b/drivers/gpu/drm/amd/display/dc/core/dc_sink.c
+index a83f124..7717350 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_sink.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_sink.c
+@@ -63,16 +63,16 @@ static bool construct(struct dc_sink *sink, const struct dc_sink_init_data *init
+ 
+ void dc_sink_retain(struct dc_sink *sink)
+ {
+-	ASSERT(sink->ref_count > 0);
+-	++sink->ref_count;
++	ASSERT(atomic_read(&sink->ref_count) > 0);
++	atomic_inc(&sink->ref_count);
+ }
+ 
+ void dc_sink_release(struct dc_sink *sink)
+ {
+-	ASSERT(sink->ref_count > 0);
+-	--sink->ref_count;
++	ASSERT(atomic_read(&sink->ref_count) > 0);
++	atomic_dec(&sink->ref_count);
+ 
+-	if (sink->ref_count == 0) {
++	if (atomic_read(&sink->ref_count) == 0) {
+ 		destruct(sink);
+ 		dm_free(sink);
+ 	}
+@@ -88,7 +88,7 @@ struct dc_sink *dc_sink_create(const struct dc_sink_init_data *init_params)
+ 	if (false == construct(sink, init_params))
+ 		goto construct_fail;
+ 
+-	++sink->ref_count;
++	atomic_inc(&sink->ref_count);
+ 
+ 	return sink;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+index 2de37fe..47e407d 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+@@ -96,19 +96,17 @@ static void destruct(struct dc_stream_state *stream)
+ 
+ void dc_stream_retain(struct dc_stream_state *stream)
+ {
+-
+-	ASSERT(stream->ref_count > 0);
+-	stream->ref_count++;
++	ASSERT(atomic_read(&stream->ref_count) > 0);
++	atomic_inc(&stream->ref_count);
+ }
+ 
+ void dc_stream_release(struct dc_stream_state *stream)
+ {
+-
+ 	if (stream != NULL) {
+-		ASSERT(stream->ref_count > 0);
+-		stream->ref_count--;
++		ASSERT(atomic_read(&stream->ref_count) > 0);
++		atomic_dec(&stream->ref_count);
+ 
+-		if (stream->ref_count == 0) {
++		if (atomic_read(&stream->ref_count) == 0) {
+ 			destruct(stream);
+ 			dm_free(stream);
+ 		}
+@@ -131,7 +129,7 @@ struct dc_stream_state *dc_create_stream_for_sink(
+ 	if (false == construct(stream, sink))
+ 			goto construct_fail;
+ 
+-	stream->ref_count++;
++	atomic_inc(&stream->ref_count);
+ 
+ 	return stream;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_surface.c b/drivers/gpu/drm/amd/display/dc/core/dc_surface.c
+index 3bcca2d..da19c7f 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_surface.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_surface.c
+@@ -76,7 +76,7 @@ struct dc_plane_state *dc_create_plane_state(const struct dc *dc)
+ 	if (false == construct(core_dc->ctx, plane_state))
+ 		goto construct_fail;
+ 
+-	++plane_state->ref_count;
++	atomic_inc(&plane_state->ref_count);
+ 
+ 	return plane_state;
+ 
+@@ -122,16 +122,16 @@ const struct dc_plane_status *dc_plane_get_status(
+ 
+ void dc_plane_state_retain(struct dc_plane_state *plane_state)
+ {
+-	ASSERT(plane_state->ref_count > 0);
+-	++plane_state->ref_count;
++	ASSERT(atomic_read(&plane_state->ref_count) > 0);
++	atomic_inc(&plane_state->ref_count);
+ }
+ 
+ void dc_plane_state_release(struct dc_plane_state *plane_state)
+ {
+-	ASSERT(plane_state->ref_count > 0);
+-	--plane_state->ref_count;
++	ASSERT(atomic_read(&plane_state->ref_count) > 0);
++	atomic_dec(&plane_state->ref_count);
+ 
+-	if (plane_state->ref_count == 0) {
++	if (atomic_read(&plane_state->ref_count) == 0) {
+ 		destruct(plane_state);
+ 		dm_free(plane_state);
+ 	}
+@@ -139,16 +139,16 @@ void dc_plane_state_release(struct dc_plane_state *plane_state)
+ 
+ void dc_gamma_retain(struct dc_gamma *gamma)
+ {
+-	ASSERT(gamma->ref_count > 0);
+-	++gamma->ref_count;
++	ASSERT(atomic_read(&gamma->ref_count) > 0);
++	atomic_inc(&gamma->ref_count);
+ }
+ 
+ void dc_gamma_release(struct dc_gamma **gamma)
+ {
+-	ASSERT((*gamma)->ref_count > 0);
+-	--(*gamma)->ref_count;
++	ASSERT(atomic_read(&(*gamma)->ref_count) > 0);
++	atomic_dec(&(*gamma)->ref_count);
+ 
+-	if ((*gamma)->ref_count == 0)
++	if (atomic_read(&(*gamma)->ref_count) == 0)
+ 		dm_free((*gamma));
+ 
+ 	*gamma = NULL;
+@@ -161,7 +161,7 @@ struct dc_gamma *dc_create_gamma()
+ 	if (gamma == NULL)
+ 		goto alloc_fail;
+ 
+-	++gamma->ref_count;
++	atomic_inc(&gamma->ref_count);
+ 
+ 	return gamma;
+ 
+@@ -171,16 +171,16 @@ struct dc_gamma *dc_create_gamma()
+ 
+ void dc_transfer_func_retain(struct dc_transfer_func *tf)
+ {
+-	ASSERT(tf->ref_count > 0);
+-	++tf->ref_count;
++	ASSERT(atomic_read(&tf->ref_count) > 0);
++	atomic_inc(&tf->ref_count);
+ }
+ 
+ void dc_transfer_func_release(struct dc_transfer_func *tf)
+ {
+-	ASSERT(tf->ref_count > 0);
+-	--tf->ref_count;
++	ASSERT(atomic_read(&tf->ref_count) > 0);
++	atomic_dec(&tf->ref_count);
+ 
+-	if (tf->ref_count == 0)
++	if (atomic_read(&tf->ref_count) == 0)
+ 		dm_free(tf);
+ }
+ 
+@@ -191,7 +191,7 @@ struct dc_transfer_func *dc_create_transfer_func()
+ 	if (tf == NULL)
+ 		goto alloc_fail;
+ 
+-	++tf->ref_count;
++	atomic_inc(&tf->ref_count);
+ 
+ 	return tf;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index cd79a1b..913060a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -295,7 +295,7 @@ struct dc_transfer_func {
+ 	enum dc_transfer_func_type type;
+ 	enum dc_transfer_func_predefined tf;
+ 	struct dc_context *ctx;
+-	int ref_count;
++	atomic_t ref_count;
+ };
+ 
+ /*
+@@ -342,7 +342,7 @@ struct dc_plane_state {
+ 
+ 	/* private to dc_surface.c */
+ 	enum dc_irq_source irq_source;
+-	int ref_count;
++	atomic_t ref_count;
+ };
+ 
+ struct dc_plane_info {
+@@ -530,7 +530,7 @@ struct dc_stream_state {
+ 	struct dc_stream_status status;
+ 
+ 	/* from stream struct */
+-	int ref_count;
++	atomic_t ref_count;
+ };
+ 
+ struct dc_stream_update {
+@@ -914,7 +914,7 @@ struct dc_sink {
+ 	struct dc_context *ctx;
+ 
+ 	/* private to dc_sink.c */
+-	int ref_count;
++	atomic_t ref_count;
+ };
+ 
+ void dc_sink_retain(struct dc_sink *sink);
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+index 8d15046..94f83cd 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+@@ -433,7 +433,7 @@ struct dc_gamma {
+ 	struct dc_context *ctx;
+ 
+ 	/* private to dc_surface.c */
+-	int ref_count;
++	atomic_t ref_count;
+ };
+ 
+ /* Used by both ipp amd opp functions*/
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index b300562..5190901 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -260,7 +260,7 @@ struct validate_context {
+ 	struct dcn_bw_internal_vars dcn_bw_vars;
+ #endif
+ 
+-	int ref_count;
++	atomic_t ref_count;
+ };
+ 
+ #endif /* _CORE_TYPES_H_ */
+-- 
+2.7.4
+

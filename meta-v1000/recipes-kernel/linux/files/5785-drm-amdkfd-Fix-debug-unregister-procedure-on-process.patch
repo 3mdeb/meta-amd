@@ -1,0 +1,106 @@
+From 7de38dc4f9b7412483976d5bacbeb204fe11a267 Mon Sep 17 00:00:00 2001
+From: Yair Shachar <yair.shachar@amd.com>
+Date: Wed, 1 Nov 2017 19:21:29 -0400
+Subject: [PATCH 5785/5855] drm/amdkfd: Fix debug unregister procedure on
+ process termination
+
+Take the dbgmgr lock and unregister before destroying the debug manager.
+Do this before destroying the queues.
+
+v2: Correct locking order in kfd_ioctl_dbg_register to ake sure the
+process mutex and dbgmgr mutex are always taken in the same order.
+
+Signed-off-by: Yair Shachar <yair.shachar@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c |  4 ++--
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c | 37 +++++++++++++++++++++++---------
+ 2 files changed, 29 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index fce64a8..2406697 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -450,8 +450,8 @@ static int kfd_ioctl_dbg_register(struct file *filep,
+ 		return -EINVAL;
+ 	}
+ 
+-	mutex_lock(kfd_get_dbgmgr_mutex());
+ 	mutex_lock(&p->mutex);
++	mutex_lock(kfd_get_dbgmgr_mutex());
+ 
+ 	/*
+ 	 * make sure that we have pdd, if this the first queue created for
+@@ -479,8 +479,8 @@ static int kfd_ioctl_dbg_register(struct file *filep,
+ 	}
+ 
+ out:
+-	mutex_unlock(&p->mutex);
+ 	mutex_unlock(kfd_get_dbgmgr_mutex());
++	mutex_unlock(&p->mutex);
+ 
+ 	return status;
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index b81ad816..db08f8f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -224,17 +224,26 @@ static void kfd_process_notifier_release(struct mmu_notifier *mn,
+ 
+ 	mutex_lock(&p->mutex);
+ 
++	/* Iterate over all process device data structures and if the
++	 * pdd is in debug mode, we should first force unregistration,
++	 * then we will be able to destroy the queues
++	 */
++	list_for_each_entry(pdd, &p->per_device_data, per_device_list) {
++		struct kfd_dev *dev = pdd->dev;
++
++		mutex_lock(kfd_get_dbgmgr_mutex());
++		if (dev && dev->dbgmgr && dev->dbgmgr->pasid == p->pasid) {
++			if (!kfd_dbgmgr_unregister(dev->dbgmgr, p)) {
++				kfd_dbgmgr_destroy(dev->dbgmgr);
++				dev->dbgmgr = NULL;
++			}
++		}
++		mutex_unlock(kfd_get_dbgmgr_mutex());
++	}
++
+ 	kfd_process_dequeue_from_all_devices(p);
+ 	pqm_uninit(&p->pqm);
+ 
+-	/* Iterate over all process device data structure and check
+-	 * if we should delete debug managers
+-	 */
+-	list_for_each_entry(pdd, &p->per_device_data, per_device_list)
+-		if ((pdd->dev->dbgmgr) &&
+-				(pdd->dev->dbgmgr->pasid == p->pasid))
+-			kfd_dbgmgr_destroy(pdd->dev->dbgmgr);
+-
+ 	mutex_unlock(&p->mutex);
+ 
+ 	/*
+@@ -463,8 +472,16 @@ void kfd_process_iommu_unbind_callback(struct kfd_dev *dev, unsigned int pasid)
+ 
+ 	pr_debug("Unbinding process %d from IOMMU\n", pasid);
+ 
+-	if ((dev->dbgmgr) && (dev->dbgmgr->pasid == p->pasid))
+-		kfd_dbgmgr_destroy(dev->dbgmgr);
++	mutex_lock(kfd_get_dbgmgr_mutex());
++
++	if (dev->dbgmgr && dev->dbgmgr->pasid == p->pasid) {
++		if (!kfd_dbgmgr_unregister(dev->dbgmgr, p)) {
++			kfd_dbgmgr_destroy(dev->dbgmgr);
++			dev->dbgmgr = NULL;
++		}
++	}
++
++	mutex_unlock(kfd_get_dbgmgr_mutex());
+ 
+ 	pdd = kfd_get_process_device_data(dev, p);
+ 	if (pdd)
+-- 
+2.7.4
+

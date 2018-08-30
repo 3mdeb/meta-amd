@@ -1,0 +1,157 @@
+From 5d3927f25bc5a118e6283d1f5c0d7337860f5294 Mon Sep 17 00:00:00 2001
+From: Harry Wentland <harry.wentland@amd.com>
+Date: Mon, 28 Aug 2017 18:43:45 -0400
+Subject: [PATCH 3933/5855] drm/amd/display: Don't reset clock source at unref
+
+Powering down the clock source during unref is unsafe as we might want
+to unref during atomic_check
+
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c  | 25 ++++++++++++++--------
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    | 16 +++++++++-----
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  |  9 +++++---
+ drivers/gpu/drm/amd/display/dc/inc/resource.h      |  4 ++--
+ 4 files changed, 35 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index ee711ec..683ea53 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -261,31 +261,34 @@ bool resource_construct(
+ }
+ 
+ 
+-void resource_unreference_clock_source(
++bool resource_unreference_clock_source(
+ 		struct resource_context *res_ctx,
+ 		const struct resource_pool *pool,
+-		struct clock_source **clock_source)
++		struct clock_source *clock_source)
+ {
+ 	int i;
++	bool need_reset = false;
++
+ 	for (i = 0; i < pool->clk_src_count; i++) {
+-		if (pool->clock_sources[i] != *clock_source)
++		if (pool->clock_sources[i] != clock_source)
+ 			continue;
+ 
+ 		res_ctx->clock_source_ref_count[i]--;
+ 
+ 		if (res_ctx->clock_source_ref_count[i] == 0)
+-			(*clock_source)->funcs->cs_power_down(*clock_source);
++			need_reset = true;
+ 
+ 		break;
+ 	}
+ 
+-	if (pool->dp_clock_source == *clock_source) {
++	if (pool->dp_clock_source == clock_source) {
+ 		res_ctx->dp_clock_source_ref_count--;
+ 
+ 		if (res_ctx->dp_clock_source_ref_count == 0)
+-			(*clock_source)->funcs->cs_power_down(*clock_source);
++			need_reset = true;
+ 	}
+-	*clock_source = NULL;
++
++	return need_reset;
+ }
+ 
+ void resource_reference_clock_source(
+@@ -1756,10 +1759,14 @@ bool dc_validate_global_state(
+ 			if (dc_is_dp_signal(pipe_ctx->stream->signal) &&
+ 				!find_pll_sharable_stream(stream, new_ctx)) {
+ 
+-				resource_unreference_clock_source(
++				if (resource_unreference_clock_source(
+ 						&new_ctx->res_ctx,
+ 						dc->res_pool,
+-						&pipe_ctx->clock_source);
++						pipe_ctx->clock_source)) {
++					pipe_ctx->clock_source->funcs->cs_power_down(pipe_ctx->clock_source);
++					pipe_ctx->clock_source = NULL;
++				}
++
+ 				pipe_ctx->clock_source = dc->res_pool->dp_clock_source;
+ 				resource_reference_clock_source(
+ 						&new_ctx->res_ctx,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index ab739cc..84836d8 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -1357,9 +1357,12 @@ static void switch_dp_clock_sources(
+ 
+ 			if (clk_src &&
+ 				clk_src != pipe_ctx->clock_source) {
+-				resource_unreference_clock_source(
+-					res_ctx, dc->res_pool,
+-					&pipe_ctx->clock_source);
++				if (resource_unreference_clock_source(res_ctx,
++				    dc->res_pool, pipe_ctx->clock_source)) {
++					pipe_ctx->clock_source->funcs->cs_power_down(pipe_ctx->clock_source);
++					pipe_ctx->clock_source = NULL;
++				}
++
+ 				pipe_ctx->clock_source = clk_src;
+ 				resource_reference_clock_source(
+ 						res_ctx, dc->res_pool, clk_src);
+@@ -1675,9 +1678,12 @@ static void dce110_reset_hw_ctx_wrap(
+ 			pipe_ctx_old->stream_res.tg->funcs->disable_crtc(pipe_ctx_old->stream_res.tg);
+ 			pipe_ctx_old->plane_res.mi->funcs->free_mem_input(
+ 					pipe_ctx_old->plane_res.mi, dc->current_state->stream_count);
+-			resource_unreference_clock_source(
++			if (resource_unreference_clock_source(
+ 					&dc->current_state->res_ctx, dc->res_pool,
+-					&pipe_ctx_old->clock_source);
++					pipe_ctx_old->clock_source)) {
++				pipe_ctx_old->clock_source->funcs->cs_power_down(pipe_ctx_old->clock_source);
++				pipe_ctx_old->clock_source = NULL;
++			}
+ 
+ 			dc->hwss.power_down_front_end(dc, pipe_ctx_old->pipe_idx);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 22a40e5..cceaebe 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -1115,9 +1115,12 @@ static void reset_back_end_for_pipe(
+ 	}
+ 
+ 	if (!IS_FPGA_MAXIMUS_DC(dc->ctx->dce_environment))
+-		resource_unreference_clock_source(
+-			&context->res_ctx, dc->res_pool,
+-			&pipe_ctx->clock_source);
++		if (resource_unreference_clock_source(&context->res_ctx,
++		    dc->res_pool, pipe_ctx->clock_source)) {
++			pipe_ctx->clock_source->funcs->cs_power_down(pipe_ctx->clock_source);
++			pipe_ctx->clock_source = NULL;
++		}
++
+ 
+ 	for (i = 0; i < dc->res_pool->pipe_count; i++)
+ 		if (&dc->current_state->res_ctx.pipe_ctx[i] == pipe_ctx)
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/resource.h b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+index 41437da..cf1797c 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+@@ -92,10 +92,10 @@ enum dc_status resource_build_scaling_params_for_context(
+ 
+ void resource_build_info_frame(struct pipe_ctx *pipe_ctx);
+ 
+-void resource_unreference_clock_source(
++bool resource_unreference_clock_source(
+ 		struct resource_context *res_ctx,
+ 		const struct resource_pool *pool,
+-		struct clock_source **clock_source);
++		struct clock_source *clock_source);
+ 
+ void resource_reference_clock_source(
+ 		struct resource_context *res_ctx,
+-- 
+2.7.4
+

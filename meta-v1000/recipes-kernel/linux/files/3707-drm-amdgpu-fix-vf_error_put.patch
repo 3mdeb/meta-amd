@@ -1,0 +1,100 @@
+From db5d3f906b540af46235366a6d8118bf87cd4f0e Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Mon, 16 Oct 2017 19:50:44 +0800
+Subject: [PATCH 3707/5855] drm/amdgpu:fix vf_error_put
+
+1,it should not work on non-SR-IOV case
+2,the NO_VBIOS error is incorrect, should
+handle it under detect_sriov_bios.
+3,wrap the whole detect_sriov_bios with sriov check
+
+Change-Id: Icf34f88a0642e4b04c857a07b72df3bb772075d6
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c   | 21 +++++++++++----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.c |  7 ++++++-
+ 2 files changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 6f41e62..5c00ef9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2058,12 +2058,17 @@ static int amdgpu_resume(struct amdgpu_device *adev)
+ 
+ static void amdgpu_device_detect_sriov_bios(struct amdgpu_device *adev)
+ {
+-	if (adev->is_atom_fw) {
+-		if (amdgpu_atomfirmware_gpu_supports_virtualization(adev))
+-			adev->virt.caps |= AMDGPU_SRIOV_CAPS_SRIOV_VBIOS;
+-	} else {
+-		if (amdgpu_atombios_has_gpu_virtualization_table(adev))
+-			adev->virt.caps |= AMDGPU_SRIOV_CAPS_SRIOV_VBIOS;
++	if (amdgpu_sriov_vf(adev)) {
++		if (adev->is_atom_fw) {
++			if (amdgpu_atomfirmware_gpu_supports_virtualization(adev))
++				adev->virt.caps |= AMDGPU_SRIOV_CAPS_SRIOV_VBIOS;
++		} else {
++			if (amdgpu_atombios_has_gpu_virtualization_table(adev))
++				adev->virt.caps |= AMDGPU_SRIOV_CAPS_SRIOV_VBIOS;
++		}
++
++		if (!(adev->virt.caps & AMDGPU_SRIOV_CAPS_SRIOV_VBIOS))
++			amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_NO_VBIOS, 0, 0);
+ 	}
+ }
+ 
+@@ -2275,7 +2280,6 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	if (amdgpu_need_post(adev)) {
+ 		if (!adev->bios) {
+ 			dev_err(adev->dev, "no vBIOS found\n");
+-			amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_NO_VBIOS, 0, 0);
+ 			r = -EINVAL;
+ 			goto failed;
+ 		}
+@@ -2283,7 +2287,6 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 		r = amdgpu_atom_asic_init(adev->mode_info.atom_context);
+ 		if (r) {
+ 			dev_err(adev->dev, "gpu post error!\n");
+-			amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_GPU_POST_ERROR, 0, 0);
+ 			goto failed;
+ 		}
+ 	} else {
+@@ -3109,7 +3112,6 @@ int amdgpu_gpu_reset(struct amdgpu_device *adev)
+ 		}
+ 	} else {
+ 		dev_err(adev->dev, "asic resume failed (%d).\n", r);
+-		amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_ASIC_RESUME_FAIL, 0, r);
+ 		for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+ 			if (adev->rings[i] && adev->rings[i]->sched.thread) {
+ 				kthread_unpark(adev->rings[i]->sched.thread);
+@@ -3127,7 +3129,6 @@ int amdgpu_gpu_reset(struct amdgpu_device *adev)
+ 	if (r) {
+ 		/* bad news, how to tell it to userspace ? */
+ 		dev_info(adev->dev, "GPU reset failed\n");
+-		amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_GPU_RESET_FAIL, 0, r);
+ 	}
+ 	else {
+ 		dev_info(adev->dev, "GPU reset successed!\n");
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.c
+index 746b813..7f70979 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.c
+@@ -31,7 +31,12 @@ void amdgpu_vf_error_put(struct amdgpu_device *adev,
+ 			 uint64_t error_data)
+ {
+ 	int index;
+-	uint16_t error_code = AMDGIM_ERROR_CODE(AMDGIM_ERROR_CATEGORY_VF, sub_error_code);
++	uint16_t error_code;
++
++	if (!amdgpu_sriov_vf(adev))
++		return;
++
++	error_code = AMDGIM_ERROR_CODE(AMDGIM_ERROR_CATEGORY_VF, sub_error_code);
+ 
+ 	mutex_lock(&adev->virt.vf_errors.lock);
+ 	index = adev->virt.vf_errors.write_count % AMDGPU_VF_ERROR_ENTRY_SIZE;
+-- 
+2.7.4
+

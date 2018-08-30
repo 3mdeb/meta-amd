@@ -1,0 +1,169 @@
+From 53fd71904cea88684a434eea49e652ecf2a8a208 Mon Sep 17 00:00:00 2001
+From: Yong Zhao <Yong.Zhao@amd.com>
+Date: Fri, 28 Jul 2017 18:15:46 -0400
+Subject: [PATCH 5413/5855] drm/amdkfd: Fix a bug that vmid is released before
+ resetting wavefronts
+
+When no HWS is used, vmid is always released after the last queue is
+destroyed rather than when the process terminates. With the current code,
+when a process terminates with all queues destroyed and somehow we need
+to reset wavefronts, dbgdev_wave_reset_wavefronts() will fail because
+no vmid is bound to this process any more.
+
+With this commit, we will reset the wavefronts, if needed, just before
+releasing the vmid. As part of the change, the wavefronts reset handling
+is moved to DQM from PQM, resulting in clearer logic.
+
+Change-Id: Ib72b7dc1d910045130928a8e20729b884a55b335
+Signed-off-by: Yong Zhao <Yong.Zhao@amd.com>
+
+ Conflicts[4.12]:
+	drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+---
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 24 +++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h              | 11 +++++-----
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c           |  1 -
+ .../gpu/drm/amd/amdkfd/kfd_process_queue_manager.c | 15 --------------
+ 4 files changed, 29 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 7b33bf1..5246c97 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -421,12 +421,26 @@ static int destroy_queue_nocpsch_locked(struct device_queue_manager *dqm,
+ 				KFD_PREEMPT_TYPE_WAVEFRONT_RESET,
+ 				KFD_HIQ_TIMEOUT,
+ 				q->pipe, q->queue);
++	if (retval == -ETIME)
++		qpd->reset_wavefronts = true;
+ 
+ 	mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
+ 
+ 	list_del(&q->list);
+-	if (list_empty(&qpd->queues_list))
++	if (list_empty(&qpd->queues_list)) {
++		if (qpd->reset_wavefronts) {
++			pr_warn("Resetting wave fronts (nocpsch) on dev %p\n",
++					dqm->dev);
++			/* dbgdev_wave_reset_wavefronts has to be called before
++			 * deallocate_vmid(), i.e. when vmid is still in use.
++			 */
++			dbgdev_wave_reset_wavefronts(dqm->dev,
++					qpd->pqm->process);
++			qpd->reset_wavefronts = false;
++		}
++
+ 		deallocate_vmid(dqm, qpd, q);
++	}
+ 	if (q->properties.is_active)
+ 		dqm->queue_count--;
+ 
+@@ -1311,6 +1325,8 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
+ 		dqm->queue_count--;
+ 
+ 	retval = execute_queues_cpsch(dqm, false, false);
++	if (retval == -ETIME)
++		qpd->reset_wavefronts = true;
+ 
+ 	mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
+ 
+@@ -1537,6 +1553,12 @@ static int process_termination_cpsch(struct device_queue_manager *dqm,
+ 
+ 	retval = execute_queues_cpsch(dqm, true, true);
+ 
++	if (retval || qpd->reset_wavefronts) {
++		pr_warn("Resetting wave fronts (cpsch) on dev %p\n", dqm->dev);
++		dbgdev_wave_reset_wavefronts(dqm->dev, qpd->pqm->process);
++		qpd->reset_wavefronts = false;
++	}
++
+ 	/* lastly, free mqd resources */
+ 	list_for_each_entry_safe(q, next, &qpd->queues_list, list) {
+ 		mqd = dqm->ops.get_mqd_manager(dqm,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 71f4182..1e57b4c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -544,6 +544,12 @@ struct qcm_process_device {
+ 	unsigned int vmid;
+ 	bool is_debug;
+ 	unsigned int evicted; /* eviction counter, 0=active */
++
++	/* This flag tells if we should reset all wavefronts on
++	 * process termination
++	 */
++	bool reset_wavefronts;
++
+ 	/*
+ 	 * All the memory management data should be here too
+ 	 */
+@@ -645,11 +651,6 @@ struct kfd_process_device {
+ 	/* GPUVM allocations storage */
+ 	struct idr alloc_idr;
+ 
+-	/* This flag tells if we should reset all
+-	 * wavefronts on process termination
+-	 */
+-	bool reset_wavefronts;
+-
+ 	/* Flag used to tell the pdd has dequeued from the dqm.
+ 	 * This is used to prevent dev->dqm->ops.process_termination() from
+ 	 * being called twice when it is already called in IOMMU callback
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 39d9e6d..baf1f75 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -705,7 +705,6 @@ struct kfd_process_device *kfd_create_process_device_data(struct kfd_dev *dev,
+ 	pdd->qpd.dqm = dev->dqm;
+ 	pdd->qpd.pqm = &p->pqm;
+ 	pdd->qpd.evicted = 0;
+-	pdd->reset_wavefronts = false;
+ 	pdd->process = p;
+ 	pdd->bound = PDD_UNBOUND;
+ 	pdd->already_dequeued = false;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+index bc9188b..0b89bee 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -66,7 +66,6 @@ static int find_available_queue_slot(struct process_queue_manager *pqm,
+ void kfd_process_dequeue_from_device(struct kfd_process_device *pdd)
+ {
+ 	struct kfd_dev *dev = pdd->dev;
+-	struct kfd_process *p = pdd->process;
+ 	int retval;
+ 
+ 	if (pdd->already_dequeued)
+@@ -74,16 +73,6 @@ void kfd_process_dequeue_from_device(struct kfd_process_device *pdd)
+ 
+ 	retval = dev->dqm->ops.process_termination(dev->dqm, &pdd->qpd);
+ 	pdd->already_dequeued = true;
+-	/* Checking pdd->reset_wavefronts may not be needed, because
+-	 * if reset_wavefronts was set to true before, which means unmapping
+-	 * failed, process_termination should fail too until we reset
+-	 * wavefronts. Now we put the check there to be safe.
+-	 */
+-	if (retval || pdd->reset_wavefronts) {
+-		pr_warn("Resetting wave fronts on dev %p\n", dev);
+-		dbgdev_wave_reset_wavefronts(dev, p);
+-		pdd->reset_wavefronts = false;
+-	}
+ }
+ 
+ void kfd_process_dequeue_from_all_devices(struct kfd_process *p)
+@@ -337,10 +326,6 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
+ 		kfree(pqn->q->properties.cu_mask);
+ 		pqn->q->properties.cu_mask = NULL;
+ 		retval = dqm->ops.destroy_queue(dqm, &pdd->qpd, pqn->q);
+-		if (retval != 0) {
+-			if (retval == -ETIME)
+-				pdd->reset_wavefronts = true;
+-		}
+ 		uninit_queue(pqn->q);
+ 	}
+ 
+-- 
+2.7.4
+

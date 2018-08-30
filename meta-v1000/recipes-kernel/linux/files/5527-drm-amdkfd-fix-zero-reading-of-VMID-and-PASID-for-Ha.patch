@@ -1,0 +1,140 @@
+From 6322b41d716cd0a38630e41f39b4e37aa7eb4517 Mon Sep 17 00:00:00 2001
+From: Lan Xiao <Lan.Xiao@amd.com>
+Date: Thu, 13 Oct 2016 16:03:33 -0400
+Subject: [PATCH 5527/5855] drm/amdkfd: fix zero reading of VMID and PASID for
+ Hawaii
+
+Upon VM Fault, the VMID and PASID written by HW are zeros in
+Hawaii. Instead of reading from ih_ring_entry, read directly
+from the registers. This workaround fix the soft hang issues
+caused by mishandled VM Fault in Hawaii.
+
+Fix BUG: SWDEV-100220
+
+Change-Id: I1c89263e4bccde037d24f71f3efef7903d83d2f0
+Signed-off-by: Lan Xiao <Lan.Xiao@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c | 24 +++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c          |  9 +++++++--
+ drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c       |  7 +++++--
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h            |  7 +++++--
+ 4 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c b/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c
+index 3f49f8e..c60a71a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c
++++ b/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c
+@@ -37,12 +37,34 @@ static bool is_cpc_vm_fault(struct kfd_dev *dev,
+ 		return true;
+ 	return false;
+ }
++
+ static bool cik_event_interrupt_isr(struct kfd_dev *dev,
+-					const uint32_t *ih_ring_entry)
++					const uint32_t *ih_ring_entry,
++					uint32_t *patched_ihre,
++					bool *patched_flag)
+ {
+ 	const struct cik_ih_ring_entry *ihre =
+ 			(const struct cik_ih_ring_entry *)ih_ring_entry;
++	const struct kfd2kgd_calls *f2g = dev->kfd2kgd;
++	struct cik_ih_ring_entry *tmp_ihre =
++			(struct cik_ih_ring_entry *) patched_ihre;
++
++	/* This workaround is due to HW/FW limitation on Hawaii that
++	 * VMID and PASID are not written into ih_ring_entry
++	 */
++	if ((ihre->source_id == CIK_INTSRC_GFX_PAGE_INV_FAULT ||
++		ihre->source_id == CIK_INTSRC_GFX_MEM_PROT_FAULT) &&
++		dev->device_info->asic_family == CHIP_HAWAII) {
++		*patched_flag = true;
++		*tmp_ihre = *ihre;
+ 
++		tmp_ihre->vmid = f2g->read_vmid_from_vmfault_reg(dev->kgd);
++		tmp_ihre->pasid = f2g->get_atc_vmid_pasid_mapping_pasid(
++						 dev->kgd, tmp_ihre->vmid);
++		return (tmp_ihre->pasid != 0) &&
++			tmp_ihre->vmid >= dev->vm_info.first_vmid_kfd &&
++			tmp_ihre->vmid <= dev->vm_info.last_vmid_kfd;
++	}
+ 	/* Do not process in ISR, just request it to be forwarded to WQ. */
+ 	return (ihre->pasid != 0) &&
+ 		(ihre->source_id == CIK_INTSRC_CP_END_OF_PIPE ||
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 10941fa..a68c342 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -658,6 +658,10 @@ static int kfd_resume(struct kfd_dev *kfd)
+ /* This is called directly from KGD at ISR. */
+ void kgd2kfd_interrupt(struct kfd_dev *kfd, const void *ih_ring_entry)
+ {
++        uint32_t patched_ihre[DIV_ROUND_UP(
++                                kfd->device_info->ih_ring_entry_size,
++                                sizeof(uint32_t))];
++        bool is_patched = false;
+ 
+ 	if (!kfd->init_complete)
+ 		return;
+@@ -665,9 +669,10 @@ void kgd2kfd_interrupt(struct kfd_dev *kfd, const void *ih_ring_entry)
+ 	spin_lock(&kfd->interrupt_lock);
+ 
+         if (kfd->interrupts_active
+-            && interrupt_is_wanted(kfd, ih_ring_entry)
+-            && enqueue_ih_ring_entry(kfd, ih_ring_entry))
++            && interrupt_is_wanted(kfd, ih_ring_entry, patched_ihre, &is_patched)
++            && enqueue_ih_ring_entry(kfd, is_patched ? patched_ihre : ih_ring_entry))
+ 		queue_work(kfd->ih_wq, &kfd->interrupt_work);
++
+ 	spin_unlock(&kfd->interrupt_lock);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c b/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
+index 4d1639f..d737df0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
+@@ -148,12 +148,15 @@ static void interrupt_wq(struct work_struct *work)
+ 		dev->device_info->event_interrupt_class->interrupt_wq(dev, ih_ring_entry);
+ }
+ 
+-bool interrupt_is_wanted(struct kfd_dev *dev, const uint32_t *ih_ring_entry)
++bool interrupt_is_wanted(struct kfd_dev *dev,
++			const uint32_t *ih_ring_entry,
++			uint32_t *patched_ihre, bool *flag)
+ {
+ 	/* integer and bitwise OR so there is no boolean short-circuiting */
+ 	unsigned wanted = 0;
+ 
+-	wanted |= dev->device_info->event_interrupt_class->interrupt_isr(dev, ih_ring_entry);
++	wanted |= dev->device_info->event_interrupt_class->interrupt_isr(dev,
++					 ih_ring_entry, patched_ihre, flag);
+ 
+ 	return wanted != 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 91c9d0d..4608676 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -175,7 +175,8 @@ enum asic_family_type {
+ 			   (chip) == CHIP_HAWAII)
+ 
+ struct kfd_event_interrupt_class {
+-	bool (*interrupt_isr)(struct kfd_dev *dev, const uint32_t *ih_ring_entry);
++	bool (*interrupt_isr)(struct kfd_dev *dev, const uint32_t *ih_ring_entry,
++				uint32_t *patched_ihre, bool *patched_flag);
+ 	void (*interrupt_wq)(struct kfd_dev *dev, const uint32_t *ih_ring_entry);
+ };
+ 
+@@ -805,7 +806,9 @@ int kfd_interrupt_init(struct kfd_dev *dev);
+ void kfd_interrupt_exit(struct kfd_dev *dev);
+ void kgd2kfd_interrupt(struct kfd_dev *kfd, const void *ih_ring_entry);
+ bool enqueue_ih_ring_entry(struct kfd_dev *kfd,	const void *ih_ring_entry);
+-bool interrupt_is_wanted(struct kfd_dev *dev, const uint32_t *ih_ring_entry);
++bool interrupt_is_wanted(struct kfd_dev *dev,
++				const uint32_t *ih_ring_entry,
++				uint32_t *patched_ihre, bool *flag);
+ 
+ /* Power Management */
+ void kgd2kfd_suspend(struct kfd_dev *kfd);
+-- 
+2.7.4
+

@@ -1,0 +1,154 @@
+From 01063994a271e9dfcaf866aa7bcb734461e645c8 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Thu, 30 Jun 2016 00:10:44 -0400
+Subject: [PATCH 5243/5855] drm/amd: Update kgd_kfd interface for resuming SDMA
+ queues
+
+Add wptr and mm parameters to hqd_sdma_load and pass these parameters
+from device_queue_manager through the mqd_manager. Remove the unused
+page_table_base parameter from hqd_load while working on the interface.
+
+SDMA doesn't support polling while the engine believes it's idle. The
+driver must update the wptr. The new parameters will be used for looking
+up the updated value from the specified mm when SDMA queues are resumed
+after being disabled.
+
+Change-Id: Iff5e36596246b95ef36f579c620601c7122e3813
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c | 10 +++++-----
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c         |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h          |  3 +--
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c      | 10 +++++-----
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c       |  8 ++++----
+ 5 files changed, 16 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 03f4a53..7393ba4 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -303,7 +303,7 @@ static int create_compute_queue_nocpsch(struct device_queue_manager *dqm,
+ 
+ 	retval = mqd->load_mqd(mqd, q->mqd, q->pipe,
+ 			q->queue, (uint32_t __user *) q->properties.write_ptr,
+-			qpd->page_table_base);
++			q->process->mm);
+ 	if (retval != 0) {
+ 		deallocate_hqd(dqm, q);
+ 		mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
+@@ -422,7 +422,8 @@ static int update_queue(struct device_queue_manager *dqm, struct queue *q)
+ 		if (q->properties.is_active)
+ 			retval = mqd->load_mqd(mqd, q->mqd, q->pipe,
+ 				q->queue,
+-				(uint32_t __user *)q->properties.write_ptr, 0);
++				(uint32_t __user *)q->properties.write_ptr,
++				q->process->mm);
+ 		else if (prev_active)
+ 			retval = mqd->destroy_mqd(mqd, q->mqd,
+ 				KFD_PREEMPT_TYPE_WAVEFRONT_DRAIN,
+@@ -550,7 +551,7 @@ int process_restore_queues(struct device_queue_manager *dqm,
+ 								q->pipe,
+ 								q->queue,
+ 				(uint32_t __user *)q->properties.write_ptr,
+-								0);
++								q->process->mm);
+ 			dqm->queue_count++;
+ 		}
+ 	}
+@@ -777,8 +778,7 @@ static int create_sdma_queue_nocpsch(struct device_queue_manager *dqm,
+ 		return retval;
+ 	}
+ 
+-	retval = mqd->load_mqd(mqd, q->mqd, 0,
+-				0, NULL, 0);
++	retval = mqd->load_mqd(mqd, q->mqd, 0, 0, NULL, NULL);
+ 	if (retval != 0) {
+ 		deallocate_sdma_queue(dqm, q->sdma_id);
+ 		mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+index fc4d8b2..90a26fa 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+@@ -143,7 +143,7 @@ static bool initialize(struct kernel_queue *kq, struct kfd_dev *dev,
+ 		kq->queue->pipe = KFD_CIK_HIQ_PIPE;
+ 		kq->queue->queue = KFD_CIK_HIQ_QUEUE;
+ 		kq->mqd->load_mqd(kq->mqd, kq->queue->mqd, kq->queue->pipe,
+-					kq->queue->queue, NULL, 0);
++					kq->queue->queue, NULL, NULL);
+ 	} else {
+ 		/* allocate fence for DIQ */
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+index 574684f..4be3267 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+@@ -67,8 +67,7 @@ struct mqd_manager {
+ 
+ 	int	(*load_mqd)(struct mqd_manager *mm, void *mqd,
+ 				uint32_t pipe_id, uint32_t queue_id,
+-				uint32_t __user *wptr,
+-				uint32_t page_table_base);
++				uint32_t __user *wptr, struct mm_struct *mms);
+ 
+ 	int	(*update_mqd)(struct mqd_manager *mm, void *mqd,
+ 				struct queue_properties *q);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+index e565bee..1badce1 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -208,18 +208,18 @@ static void uninit_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ }
+ 
+ static int load_mqd(struct mqd_manager *mm, void *mqd, uint32_t pipe_id,
+-			uint32_t queue_id, uint32_t __user *wptr,
+-			uint32_t page_table_base)
++		    uint32_t queue_id, uint32_t __user *wptr,
++		    struct mm_struct *mms)
+ {
+ 	return mm->dev->kfd2kgd->hqd_load
+-		(mm->dev->kgd, mqd, pipe_id, queue_id, wptr, page_table_base);
++		(mm->dev->kgd, mqd, pipe_id, queue_id, wptr);
+ }
+ 
+ static int load_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ 			uint32_t pipe_id, uint32_t queue_id,
+-			uint32_t __user *wptr, uint32_t page_table_base)
++			uint32_t __user *wptr, struct mm_struct *mms)
+ {
+-	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd);
++	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd, wptr, mms);
+ }
+ 
+ static int __update_mqd(struct mqd_manager *mm, void *mqd,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+index 25c1269..d78964c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -171,10 +171,10 @@ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 
+ static int load_mqd(struct mqd_manager *mm, void *mqd,
+ 			uint32_t pipe_id, uint32_t queue_id,
+-			uint32_t __user *wptr, uint32_t page_table_base)
++			uint32_t __user *wptr, struct mm_struct *mms)
+ {
+ 	return mm->dev->kfd2kgd->hqd_load
+-		(mm->dev->kgd, mqd, pipe_id, queue_id, wptr, page_table_base);
++		(mm->dev->kgd, mqd, pipe_id, queue_id, wptr);
+ }
+ 
+ static int __update_mqd(struct mqd_manager *mm, void *mqd,
+@@ -362,9 +362,9 @@ static void uninit_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ 
+ static int load_mqd_sdma(struct mqd_manager *mm, void *mqd,
+ 		uint32_t pipe_id, uint32_t queue_id,
+-		uint32_t __user *wptr, uint32_t page_table_base)
++		uint32_t __user *wptr, struct mm_struct *mms)
+ {
+-	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd);
++	return mm->dev->kfd2kgd->hqd_sdma_load(mm->dev->kgd, mqd, wptr, mms);
+ }
+ 
+ static int update_mqd_sdma(struct mqd_manager *mm, void *mqd,
+-- 
+2.7.4
+

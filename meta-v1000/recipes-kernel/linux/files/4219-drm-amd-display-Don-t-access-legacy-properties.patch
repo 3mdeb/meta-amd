@@ -1,0 +1,183 @@
+From 1e811d032c35bd2b6327d29576a87b043c357cad Mon Sep 17 00:00:00 2001
+From: Harry Wentland <harry.wentland@amd.com>
+Date: Tue, 17 Oct 2017 12:02:01 -0400
+Subject: [PATCH 4219/5855] drm/amd/display: Don't access legacy properties
+
+We're an atomic driver and shouldn't access legacy properties. Doing so
+will only scare users with stack traces.
+
+Instead save the prop in the state and access it directly. Much simpler.
+
+Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Reviewed-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 69 +++++++++++------------
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |  1 +
+ 2 files changed, 33 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index c7621f3..b0f8d1f 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2472,21 +2472,6 @@ amdgpu_dm_connector_detect(struct drm_connector *connector, bool force)
+ 			connector_status_disconnected);
+ }
+ 
+-/* Compare user free sync property with immunable property free sync capable
+- * and if display is not free sync capable sets free sync property to 0
+- */
+-static int amdgpu_freesync_update_property_atomic(struct drm_connector *connector)
+-{
+-	struct drm_device *dev = connector->dev;
+-	struct amdgpu_device *adev = dev->dev_private;
+-
+-	return drm_object_property_set_value(&connector->base,
+-					     adev->mode_info.freesync_property,
+-					     0);
+-
+-
+-}
+-
+ int amdgpu_dm_connector_atomic_set_property(
+ 	struct drm_connector *connector,
+ 	struct drm_connector_state *connector_state,
+@@ -2541,8 +2526,8 @@ int amdgpu_dm_connector_atomic_set_property(
+ 		dm_new_state->user_enable.enable_for_video = val;
+ 		ret = 0;
+ 	} else if (property == adev->mode_info.freesync_capable_property) {
+-		ret = -EINVAL;
+-		return ret;
++		dm_new_state->freesync_capable = val;
++		ret = 0;
+ 	}
+ 
+ 	return ret;
+@@ -2559,7 +2544,6 @@ int amdgpu_dm_connector_atomic_get_property(
+ 	struct dm_connector_state *dm_state =
+ 		to_dm_connector_state(state);
+ 	int ret = -EINVAL;
+-	int i;
+ 
+ 	if (property == dev->mode_config.scaling_mode_property) {
+ 		switch (dm_state->scaling) {
+@@ -2587,14 +2571,12 @@ int amdgpu_dm_connector_atomic_get_property(
+ 	} else if (property == adev->mode_info.underscan_property) {
+ 		*val = dm_state->underscan_enable;
+ 		ret = 0;
+-	} else if ((property == adev->mode_info.freesync_property) ||
+-		   (property == adev->mode_info.freesync_capable_property)) {
+-		for (i = 0; i < connector->base.properties->count; i++) {
+-			if (connector->base.properties->properties[i] == property) {
+-				*val = connector->base.properties->values[i];
+-				ret = 0;
+-			}
+-		}
++	} else if (property == adev->mode_info.freesync_property) {
++		*val = dm_state->user_enable.enable_for_gaming;
++		ret = 0;
++	} else if (property == adev->mode_info.freesync_capable_property) {
++		*val = dm_state->freesync_capable;
++		ret = 0;
+ 	}
+ 	return ret;
+ }
+@@ -4902,17 +4884,24 @@ void amdgpu_dm_add_sink_to_freesync_module(
+ 		struct edid *edid)
+ {
+ 	int i;
+-	uint64_t val_capable;
+ 	bool edid_check_required;
+ 	struct detailed_timing *timing;
+ 	struct detailed_non_pixel *data;
+ 	struct detailed_data_monitor_range *range;
+ 	struct amdgpu_dm_connector *amdgpu_dm_connector =
+ 			to_amdgpu_dm_connector(connector);
++	struct dm_connector_state *dm_con_state;
+ 
+ 	struct drm_device *dev = connector->dev;
+ 	struct amdgpu_device *adev = dev->dev_private;
+ 
++	if (!connector->state) {
++		DRM_ERROR("%s - Connector has no state", __func__);
++		return;
++	}
++
++	dm_con_state = to_dm_connector_state(connector->state);
++
+ 	edid_check_required = false;
+ 	if (!amdgpu_dm_connector->dc_sink) {
+ 		DRM_ERROR("dc_sink NULL, could not add free_sync module.\n");
+@@ -4931,7 +4920,7 @@ void amdgpu_dm_add_sink_to_freesync_module(
+ 						amdgpu_dm_connector);
+ 		}
+ 	}
+-	val_capable = 0;
++	dm_con_state->freesync_capable = false;
+ 	if (edid_check_required == true && (edid->version > 1 ||
+ 	   (edid->version == 1 && edid->revision > 1))) {
+ 		for (i = 0; i < 4; i++) {
+@@ -4967,14 +4956,13 @@ void amdgpu_dm_add_sink_to_freesync_module(
+ 					amdgpu_dm_connector->min_vfreq * 1000000;
+ 			amdgpu_dm_connector->caps.max_refresh_in_micro_hz =
+ 					amdgpu_dm_connector->max_vfreq * 1000000;
+-				val_capable = 1;
++			dm_con_state->freesync_capable = true;
+ 		}
+ 	}
+-	drm_object_property_set_value(&connector->base,
+-				      adev->mode_info.freesync_capable_property,
+-				      val_capable);
+-	amdgpu_freesync_update_property_atomic(connector);
+ 
++	dm_con_state->user_enable.enable_for_gaming = dm_con_state->freesync_capable;
++	dm_con_state->user_enable.enable_for_static = dm_con_state->freesync_capable;
++	dm_con_state->user_enable.enable_for_video = dm_con_state->freesync_capable;
+ }
+ 
+ void amdgpu_dm_remove_sink_from_freesync_module(
+@@ -4991,15 +4979,22 @@ void amdgpu_dm_remove_sink_from_freesync_module(
+ 		return;
+ 	}
+ 
++	if (!connector->state) {
++		DRM_ERROR("%s - Connector has no state", __func__);
++		return;
++	}
++
++	dm_con_state = to_dm_connector_state(connector->state);
++
+ 	amdgpu_dm_connector->min_vfreq = 0;
+ 	amdgpu_dm_connector->max_vfreq = 0;
+ 	amdgpu_dm_connector->pixel_clock_mhz = 0;
+ 
+ 	memset(&amdgpu_dm_connector->caps, 0, sizeof(amdgpu_dm_connector->caps));
+ 
+-	drm_object_property_set_value(&connector->base,
+-				      adev->mode_info.freesync_capable_property,
+-				      0);
+-	amdgpu_freesync_update_property_atomic(connector);
++	dm_con_state->freesync_capable = false;
+ 
++	dm_con_state->user_enable.enable_for_gaming = false;
++	dm_con_state->user_enable.enable_for_static = false;
++	dm_con_state->user_enable.enable_for_video = false;
+ }
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index 4f04205b..cbba5a4 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -234,6 +234,7 @@ struct dm_connector_state {
+ 	uint8_t underscan_hborder;
+ 	bool underscan_enable;
+ 	struct mod_freesync_user_enable user_enable;
++	bool freesync_capable;
+ };
+ 
+ #define to_dm_connector_state(x)\
+-- 
+2.7.4
+

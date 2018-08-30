@@ -1,0 +1,358 @@
+From 754f4ef973f6d4cee1dbcc1332955b08c0c1c04e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 7 Aug 2017 17:46:49 +0200
+Subject: [PATCH 2990/5855] drm/amdgpu: move vram usage tracking into the vram
+ manager v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Looks like a better place for this.
+
+v2: use atomic64_t members instead
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h          |  2 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c       |  5 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c      |  9 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c   | 62 ------------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h      |  3 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c | 72 ++++++++++++++++++++++++++--
+ 6 files changed, 79 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 8d48b37..0e04931 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1547,8 +1547,6 @@ struct amdgpu_device {
+ 	struct amdgpu_mman		mman;
+ 	struct amdgpu_vram_scratch	vram_scratch;
+ 	struct amdgpu_wb		wb;
+-	atomic64_t			vram_usage;
+-	atomic64_t			vram_vis_usage;
+ 	atomic64_t			num_bytes_moved;
+ 	atomic64_t			num_evictions;
+ 	atomic64_t                      num_vram_cpu_page_faults;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 11b8af1..66acc1d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -243,7 +243,7 @@ static void amdgpu_cs_get_threshold_for_moves(struct amdgpu_device *adev,
+ 	}
+ 
+ 	total_vram = adev->mc.real_vram_size - adev->vram_pin_size;
+-	used_vram = atomic64_read(&adev->vram_usage);
++	used_vram = amdgpu_vram_mgr_usage(&adev->mman.bdev.man[TTM_PL_VRAM]);
+ 	free_vram = used_vram >= total_vram ? 0 : total_vram - used_vram;
+ 
+ 	spin_lock(&adev->mm_stats.lock);
+@@ -289,7 +289,8 @@ static void amdgpu_cs_get_threshold_for_moves(struct amdgpu_device *adev,
+ 	/* Do the same for visible VRAM if half of it is free */
+ 	if (adev->mc.visible_vram_size < adev->mc.real_vram_size) {
+ 		u64 total_vis_vram = adev->mc.visible_vram_size;
+-		u64 used_vis_vram = atomic64_read(&adev->vram_vis_usage);
++		u64 used_vis_vram =
++			amdgpu_vram_mgr_vis_usage(&adev->mman.bdev.man[TTM_PL_VRAM]);
+ 
+ 		if (used_vis_vram < total_vis_vram) {
+ 			u64 free_vis_vram = total_vis_vram - used_vis_vram;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index da731e4..4547952 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -472,10 +472,10 @@ static int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file
+ 		ui64 = atomic64_read(&adev->num_vram_cpu_page_faults);
+ 		return copy_to_user(out, &ui64, min(size, 8u)) ? -EFAULT : 0;
+ 	case AMDGPU_INFO_VRAM_USAGE:
+-		ui64 = atomic64_read(&adev->vram_usage);
++		ui64 = amdgpu_vram_mgr_usage(&adev->mman.bdev.man[TTM_PL_VRAM]);
+ 		return copy_to_user(out, &ui64, min(size, 8u)) ? -EFAULT : 0;
+ 	case AMDGPU_INFO_VIS_VRAM_USAGE:
+-		ui64 = atomic64_read(&adev->vram_vis_usage);
++		ui64 = amdgpu_vram_mgr_vis_usage(&adev->mman.bdev.man[TTM_PL_VRAM]);
+ 		return copy_to_user(out, &ui64, min(size, 8u)) ? -EFAULT : 0;
+ 	case AMDGPU_INFO_GTT_USAGE:
+ 		ui64 = amdgpu_gtt_mgr_usage(&adev->mman.bdev.man[TTM_PL_TT]);
+@@ -514,7 +514,8 @@ static int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file
+ 		mem.vram.total_heap_size = adev->mc.real_vram_size;
+ 		mem.vram.usable_heap_size =
+ 			adev->mc.real_vram_size - adev->vram_pin_size;
+-		mem.vram.heap_usage = atomic64_read(&adev->vram_usage);
++		mem.vram.heap_usage =
++			amdgpu_vram_mgr_usage(&adev->mman.bdev.man[TTM_PL_VRAM]);
+ 		mem.vram.max_allocation = mem.vram.usable_heap_size * 3 / 4;
+ 
+ 		mem.cpu_accessible_vram.total_heap_size =
+@@ -523,7 +524,7 @@ static int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file
+ 			adev->mc.visible_vram_size -
+ 			(adev->vram_pin_size - adev->invisible_pin_size);
+ 		mem.cpu_accessible_vram.heap_usage =
+-			atomic64_read(&adev->vram_vis_usage);
++			amdgpu_vram_mgr_vis_usage(&adev->mman.bdev.man[TTM_PL_VRAM]);
+ 		mem.cpu_accessible_vram.max_allocation =
+ 			mem.cpu_accessible_vram.usable_heap_size * 3 / 4;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 429469f..2f723a3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -38,64 +38,6 @@
+ #include "amdgpu_trace.h"
+ #include "amdgpu_amdkfd.h"
+ 
+-
+-static u64 amdgpu_get_vis_part_size(struct amdgpu_device *adev,
+-						struct ttm_mem_reg *mem)
+-{
+-	if (mem->start << PAGE_SHIFT >= adev->mc.visible_vram_size)
+-		return 0;
+-
+-	return ((mem->start << PAGE_SHIFT) + mem->size) >
+-		adev->mc.visible_vram_size ?
+-		adev->mc.visible_vram_size - (mem->start << PAGE_SHIFT) :
+-		mem->size;
+-}
+-
+-static void amdgpu_update_memory_usage(struct amdgpu_device *adev,
+-		       struct ttm_mem_reg *old_mem,
+-		       struct ttm_mem_reg *new_mem)
+-{
+-	u64 vis_size;
+-	if (!adev)
+-		return;
+-
+-	if (new_mem) {
+-		switch (new_mem->mem_type) {
+-		case TTM_PL_TT:
+-			break;
+-		case TTM_PL_VRAM:
+-			atomic64_add(new_mem->size, &adev->vram_usage);
+-			vis_size = amdgpu_get_vis_part_size(adev, new_mem);
+-			atomic64_add(vis_size, &adev->vram_vis_usage);
+-			break;
+-		case AMDGPU_PL_DGMA:
+-			atomic64_add(new_mem->size, &adev->direct_gma.vram_usage);
+-			break;
+-		case AMDGPU_PL_DGMA_IMPORT:
+-			atomic64_add(new_mem->size, &adev->direct_gma.gart_usage);
+-			break;
+-		}
+-	}
+-
+-	if (old_mem) {
+-		switch (old_mem->mem_type) {
+-		case TTM_PL_TT:
+-			break;
+-		case TTM_PL_VRAM:
+-			atomic64_sub(old_mem->size, &adev->vram_usage);
+-			vis_size = amdgpu_get_vis_part_size(adev, old_mem);
+-			atomic64_sub(vis_size, &adev->vram_vis_usage);
+-			break;
+-		case AMDGPU_PL_DGMA:
+-			atomic64_sub(old_mem->size, &adev->direct_gma.vram_usage);
+-			break;
+-		case AMDGPU_PL_DGMA_IMPORT:
+-			atomic64_add(old_mem->size, &adev->direct_gma.gart_usage);
+-			break;
+-		}
+-	}
+-}
+-
+ static void amdgpu_ttm_bo_destroy(struct ttm_buffer_object *tbo)
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(tbo->bdev);
+@@ -110,8 +52,6 @@ static void amdgpu_ttm_bo_destroy(struct ttm_buffer_object *tbo)
+ 		amdgpu_amdkfd_unreserve_system_memory_limit(bo);
+ 	amdgpu_bo_kunmap(bo);
+ 
+-	amdgpu_update_memory_usage(adev, &bo->tbo.mem, NULL);
+-
+ 	amdgpu_bo_unref(&bo->parent);
+ 	if (!list_empty(&bo->shadow_list)) {
+ 		mutex_lock(&adev->shadow_list_lock);
+@@ -1038,8 +978,6 @@ void amdgpu_bo_move_notify(struct ttm_buffer_object *bo,
+ 		return;
+ 
+ 	/* move_notify is called before move happens */
+-	amdgpu_update_memory_usage(adev, &bo->mem, new_mem);
+-
+ 	trace_amdgpu_ttm_bo_move(abo, new_mem->mem_type, old_mem->mem_type);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 367af36..79c8c38 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -72,6 +72,9 @@ int amdgpu_gtt_mgr_alloc(struct ttm_mem_type_manager *man,
+ 			 struct ttm_mem_reg *mem);
+ uint64_t amdgpu_gtt_mgr_usage(struct ttm_mem_type_manager *man);
+ 
++uint64_t amdgpu_vram_mgr_usage(struct ttm_mem_type_manager *man);
++uint64_t amdgpu_vram_mgr_vis_usage(struct ttm_mem_type_manager *man);
++
+ int amdgpu_copy_buffer(struct amdgpu_ring *ring, uint64_t src_offset,
+ 		       uint64_t dst_offset, uint32_t byte_count,
+ 		       struct reservation_object *resv,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
+index 6d00801..842381c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
+@@ -28,6 +28,8 @@
+ struct amdgpu_vram_mgr {
+ 	struct drm_mm mm;
+ 	spinlock_t lock;
++	atomic64_t usage;
++	atomic64_t vis_usage;
+ };
+ 
+ /**
+@@ -79,6 +81,27 @@ static int amdgpu_vram_mgr_fini(struct ttm_mem_type_manager *man)
+ }
+ 
+ /**
++ * amdgpu_vram_mgr_vis_size - Calculate visible node size
++ *
++ * @adev: amdgpu device structure
++ * @node: MM node structure
++ *
++ * Calculate how many bytes of the MM node are inside visible VRAM
++ */
++static u64 amdgpu_vram_mgr_vis_size(struct amdgpu_device *adev,
++				    struct drm_mm_node *node)
++{
++	uint64_t start = node->start << PAGE_SHIFT;
++	uint64_t end = (node->size + node->start) << PAGE_SHIFT;
++
++	if (start >= adev->mc.visible_vram_size)
++		return 0;
++
++	return (end > adev->mc.visible_vram_size ?
++		adev->mc.visible_vram_size : end) - start;
++}
++
++/**
+  * amdgpu_vram_mgr_new - allocate new ranges
+  *
+  * @man: TTM memory type manager
+@@ -93,12 +116,14 @@ static int amdgpu_vram_mgr_new(struct ttm_mem_type_manager *man,
+ 			       const struct ttm_place *place,
+ 			       struct ttm_mem_reg *mem)
+ {
++	struct amdgpu_device *adev = amdgpu_ttm_adev(man->bdev);
+ 	struct amdgpu_vram_mgr *mgr = man->priv;
+ 	struct drm_mm *mm = &mgr->mm;
+ 	struct drm_mm_node *nodes;
+ 	enum drm_mm_search_flags sflags = DRM_MM_SEARCH_DEFAULT;
+ 	enum drm_mm_allocator_flags aflags = DRM_MM_CREATE_DEFAULT;
+ 	unsigned long lpfn, num_nodes, pages_per_node, pages_left;
++	uint64_t usage = 0, vis_usage = 0;
+ 	unsigned i;
+ 	int r;
+ 
+@@ -146,6 +171,9 @@ static int amdgpu_vram_mgr_new(struct ttm_mem_type_manager *man,
+ 		if (unlikely(r))
+ 			goto error;
+ 
++		usage += nodes[i].size << PAGE_SHIFT;
++		vis_usage += amdgpu_vram_mgr_vis_size(adev, &nodes[i]);
++
+ 		/* Calculate a virtual BO start address to easily check if
+ 		 * everything is CPU accessible.
+ 		 */
+@@ -159,6 +187,9 @@ static int amdgpu_vram_mgr_new(struct ttm_mem_type_manager *man,
+ 	}
+ 	spin_unlock(&mgr->lock);
+ 
++	atomic64_add(usage, &mgr->usage);
++	atomic64_add(vis_usage, &mgr->vis_usage);
++
+ 	mem->mm_node = nodes;
+ 
+ 	return 0;
+@@ -185,8 +216,10 @@ static int amdgpu_vram_mgr_new(struct ttm_mem_type_manager *man,
+ static void amdgpu_vram_mgr_del(struct ttm_mem_type_manager *man,
+ 				struct ttm_mem_reg *mem)
+ {
++	struct amdgpu_device *adev = amdgpu_ttm_adev(man->bdev);
+ 	struct amdgpu_vram_mgr *mgr = man->priv;
+ 	struct drm_mm_node *nodes = mem->mm_node;
++	uint64_t usage = 0, vis_usage = 0;
+ 	unsigned pages = mem->num_pages;
+ 
+ 	if (!mem->mm_node)
+@@ -196,15 +229,48 @@ static void amdgpu_vram_mgr_del(struct ttm_mem_type_manager *man,
+ 	while (pages) {
+ 		pages -= nodes->size;
+ 		drm_mm_remove_node(nodes);
++		usage += nodes->size << PAGE_SHIFT;
++		vis_usage += amdgpu_vram_mgr_vis_size(adev, nodes);
+ 		++nodes;
+ 	}
+ 	spin_unlock(&mgr->lock);
+ 
++	atomic64_sub(usage, &mgr->usage);
++	atomic64_sub(vis_usage, &mgr->vis_usage);
++
+ 	kfree(mem->mm_node);
+ 	mem->mm_node = NULL;
+ }
+ 
+ /**
++ * amdgpu_vram_mgr_usage - how many bytes are used in this domain
++ *
++ * @man: TTM memory type manager
++ *
++ * Returns how many bytes are used in this domain.
++ */
++uint64_t amdgpu_vram_mgr_usage(struct ttm_mem_type_manager *man)
++{
++	struct amdgpu_vram_mgr *mgr = man->priv;
++
++	return atomic64_read(&mgr->usage);
++}
++
++/**
++ * amdgpu_vram_mgr_vis_usage - how many bytes are used in the visible part
++ *
++ * @man: TTM memory type manager
++ *
++ * Returns how many bytes are used in the visible part of VRAM
++ */
++uint64_t amdgpu_vram_mgr_vis_usage(struct ttm_mem_type_manager *man)
++{
++	struct amdgpu_vram_mgr *mgr = man->priv;
++
++	return atomic64_read(&mgr->vis_usage);
++}
++
++/**
+  * amdgpu_vram_mgr_debug - dump VRAM table
+  *
+  * @man: TTM memory type manager
+@@ -215,7 +281,6 @@ static void amdgpu_vram_mgr_del(struct ttm_mem_type_manager *man,
+ static void amdgpu_vram_mgr_debug(struct ttm_mem_type_manager *man,
+ 				  const char *prefix)
+ {
+-	struct amdgpu_device *adev = amdgpu_ttm_adev(man->bdev);
+ 	struct amdgpu_vram_mgr *mgr = man->priv;
+ 
+ 	spin_lock(&mgr->lock);
+@@ -223,9 +288,8 @@ static void amdgpu_vram_mgr_debug(struct ttm_mem_type_manager *man,
+ 	spin_unlock(&mgr->lock);
+ 
+ 	DRM_DEBUG("man size:%llu pages, ram usage:%lluMB, vis usage:%lluMB\n",
+-		 adev->mman.bdev.man[TTM_PL_VRAM].size,
+-		 (u64)atomic64_read(&adev->vram_usage) >> 20,
+-		 (u64)atomic64_read(&adev->vram_vis_usage) >> 20);
++		   man->size, amdgpu_vram_mgr_usage(man) >> 20,
++		   amdgpu_vram_mgr_vis_usage(man) >> 20);
+ }
+ 
+ const struct ttm_mem_type_manager_func amdgpu_vram_mgr_func = {
+-- 
+2.7.4
+

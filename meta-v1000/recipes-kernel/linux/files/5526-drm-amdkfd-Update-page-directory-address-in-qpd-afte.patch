@@ -1,0 +1,313 @@
+From 6f547c3c8bd3e5b6876330f84ed3e61f9902632a Mon Sep 17 00:00:00 2001
+From: Yong Zhao <yong.zhao@amd.com>
+Date: Wed, 5 Oct 2016 14:48:03 -0400
+Subject: [PATCH 5526/5855] drm/amdkfd: Update page directory address in qpd
+ after restoring BOs
+
+When restoring BOs, page_table_base may be different from before, so we
+should update it in qpd after restoring BOs.
+
+Moreover, page_table_base won't change during mapping BOs, and it is
+used for queue management, rather than buffer management. So we should
+not change page_table_base in qpd when mapping BOs.
+
+Lastly, flushing TLB should be done only when unmapping or evicting
+BOs, and it is not needed when mapping BOs. However, as there are some
+bugs in PTE handling for mapping and unmapping, we choose to keep the
+flushing as a workaround.
+
+Change-Id: I996b95b617b1542eab6e0b921a509a59ddfcc708
+Signed-off-by: Yong Zhao <yong.zhao@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c           | 45 ++++++------
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 79 +++++++++-------------
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.h  |  2 -
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h              |  1 +
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c           | 10 +--
+ 5 files changed, 63 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 91870bc..c0479c9 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1399,25 +1399,16 @@ int kfd_map_memory_to_gpu(void *mem, struct kfd_process_device *pdd)
+ 	int err;
+ 	struct kfd_dev *dev = pdd->dev;
+ 
+-	BUG_ON(!dev);
+-	BUG_ON(!pdd);
+-
+ 	err = dev->kfd2kgd->map_memory_to_gpu(
+ 		dev->kgd, (struct kgd_mem *) mem, pdd->vm);
+ 
+-	if (err != 0)
+-		return err;
+-
++	/* Theoretically we don't need this flush. However, as there are
++	 * some bugs in our PTE handling for mapping and unmapping, we
++	 * need this flush to pass all the tests.
++	 */
+ 	kfd_flush_tlb(dev, pdd->process->pasid);
+ 
+-	err = dev->dqm->ops.set_page_directory_base(dev->dqm, &pdd->qpd);
+-	if (err != 0) {
+-		dev->kfd2kgd->unmap_memory_to_gpu(dev->kgd,
+-				(struct kgd_mem *) mem, pdd->vm);
+-		return err;
+-	}
+-
+-	return 0;
++	return err;
+ }
+ 
+ static int kfd_ioctl_map_memory_to_gpu(struct file *filep,
+@@ -1526,6 +1517,22 @@ static int kfd_ioctl_map_memory_to_gpu_wrapper(struct file *filep,
+ 	return kfd_ioctl_map_memory_to_gpu(filep, p, &new_args);
+ }
+ 
++int kfd_unmap_memory_from_gpu(void *mem, struct kfd_process_device *pdd)
++{
++	int err;
++	struct kfd_dev *dev = pdd->dev;
++
++	err = dev->kfd2kgd->unmap_memory_to_gpu(
++		dev->kgd, (struct kgd_mem *) mem, pdd->vm);
++
++	if (err != 0)
++		return err;
++
++	kfd_flush_tlb(dev, pdd->process->pasid);
++
++	return 0;
++}
++
+ static int kfd_ioctl_unmap_memory_from_gpu(struct file *filep,
+ 					struct kfd_process *p, void *data)
+ {
+@@ -1594,15 +1601,11 @@ static int kfd_ioctl_unmap_memory_from_gpu(struct file *filep,
+ 				err = -EFAULT;
+ 				goto get_mem_obj_from_handle_failed;
+ 			}
+-			peer->kfd2kgd->unmap_memory_to_gpu(peer->kgd,
+-					mem, peer_pdd->vm);
+-			kfd_flush_tlb(peer, p->pasid);
++			kfd_unmap_memory_from_gpu(mem, peer_pdd);
+ 		}
+ 		kfree(devices_arr);
+-	} else {
+-		dev->kfd2kgd->unmap_memory_to_gpu(dev->kgd, mem, pdd->vm);
+-		kfd_flush_tlb(dev, p->pasid);
+-	}
++	} else
++		kfd_unmap_memory_from_gpu(mem, pdd);
+ 
+ 	return 0;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index c19848b..e6f6fe4 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -131,11 +131,15 @@ static int allocate_vmid(struct device_queue_manager *dqm,
+ 	set_pasid_vmid_mapping(dqm, q->process->pasid, q->properties.vmid);
+ 	program_sh_mem_settings(dqm, qpd);
+ 
++	/* qpd->page_table_base is set earlier when register_process()
++	 * is called, i.e. when the first queue is created.
++	 */
+ 	dqm->dev->kfd2kgd->set_vm_context_page_table_base(dqm->dev->kgd,
+-			allocated_vmid,
++			qpd->vmid,
+ 			qpd->page_table_base);
+ 	/*invalidate the VM context after pasid and vmid mapping is set up*/
+ 	kfd_flush_tlb(dqm->dev, qpd->pqm->process->pasid);
++
+ 	return 0;
+ }
+ 
+@@ -542,9 +546,15 @@ int process_restore_queues(struct device_queue_manager *dqm,
+ 	struct queue *q, *next;
+ 	struct mqd_manager *mqd;
+ 	int retval = 0;
++	struct kfd_process_device *pdd;
++	uint32_t pd_base;
+ 
+ 	BUG_ON(!dqm || !qpd);
+ 
++	pdd = qpd_to_pdd(qpd);
++	/* Retrieve PD base */
++	pd_base = dqm->dev->kfd2kgd->get_process_page_dir(pdd->vm);
++
+ 	mutex_lock(&dqm->lock);
+ 	if (qpd->evicted == 0) /* already restored, do nothing */
+ 		goto out_unlock;
+@@ -554,6 +564,19 @@ int process_restore_queues(struct device_queue_manager *dqm,
+ 		goto out_unlock;
+ 	}
+ 
++	/* Update PD Base in QPD */
++	qpd->page_table_base = pd_base;
++	pr_debug("Updated PD address to 0x%08x in %s\n", pd_base, __func__);
++
++	if (dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS) {
++		dqm->dev->kfd2kgd->set_vm_context_page_table_base(
++				dqm->dev->kgd,
++				qpd->vmid,
++				qpd->page_table_base);
++
++		kfd_flush_tlb(dqm->dev, pdd->process->pasid);
++	}
++
+ 	/* activate all active queues on the qpd */
+ 	list_for_each_entry_safe(q, next, &qpd->queues_list, list) {
+ 		mqd = dqm->ops.get_mqd_manager(dqm,
+@@ -591,9 +614,10 @@ int process_restore_queues(struct device_queue_manager *dqm,
+ static int register_process(struct device_queue_manager *dqm,
+ 					struct qcm_process_device *qpd)
+ {
+-	struct kfd_process_device *pdd;
+ 	struct device_process_node *n;
+ 	int retval;
++	struct kfd_process_device *pdd;
++	uint32_t pd_base;
+ 
+ 	BUG_ON(!dqm || !qpd);
+ 
+@@ -605,13 +629,16 @@ static int register_process(struct device_queue_manager *dqm,
+ 
+ 	n->qpd = qpd;
+ 
++	pdd = qpd_to_pdd(qpd);
++	/* Retrieve PD base */
++	pd_base = dqm->dev->kfd2kgd->get_process_page_dir(pdd->vm);
++
+ 	mutex_lock(&dqm->lock);
+ 	list_add(&n->list, &dqm->queues);
+ 
+-	pdd = qpd_to_pdd(qpd);
+-	qpd->page_table_base =
+-		dqm->dev->kfd2kgd->get_process_page_dir(pdd->vm);
+-	pr_debug("Retrieved PD address == 0x%08u\n", qpd->page_table_base);
++	/* Update PD Base in QPD */
++	qpd->page_table_base = pd_base;
++	pr_debug("Updated PD address to 0x%08x in %s\n", pd_base, __func__);
+ 
+ 	retval = dqm->asic_ops.update_qpd(dqm, qpd);
+ 
+@@ -1350,44 +1377,6 @@ static int set_trap_handler(struct device_queue_manager *dqm,
+ 	return 0;
+ }
+ 
+-
+-static int set_page_directory_base(struct device_queue_manager *dqm,
+-					struct qcm_process_device *qpd)
+-{
+-	struct kfd_process_device *pdd;
+-	uint32_t pd_base;
+-	int retval = 0;
+-
+-	BUG_ON(!dqm || !qpd);
+-
+-	mutex_lock(&dqm->lock);
+-
+-	pdd = qpd_to_pdd(qpd);
+-
+-	/* Retrieve PD base */
+-	pd_base = dqm->dev->kfd2kgd->get_process_page_dir(pdd->vm);
+-
+-	/* If it has not changed, just get out */
+-	if (qpd->page_table_base == pd_base)
+-		goto out;
+-
+-	/* Update PD Base in QPD */
+-	qpd->page_table_base = pd_base;
+-	pr_debug("Updated PD address == 0x%08u\n", pd_base);
+-
+-	/*
+-	 * Preempt queues, destroy runlist and create new runlist. Queues
+-	 * will have the update PD base address
+-	 */
+-	if (dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS)
+-		retval = execute_queues_cpsch(dqm, false);
+-
+-out:
+-	mutex_unlock(&dqm->lock);
+-
+-	return retval;
+-}
+-
+ static int process_termination_nocpsch(struct device_queue_manager *dqm,
+ 		struct qcm_process_device *qpd)
+ {
+@@ -1523,7 +1512,6 @@ struct device_queue_manager *device_queue_manager_init(struct kfd_dev *dev)
+ 		dqm->ops.destroy_kernel_queue = destroy_kernel_queue_cpsch;
+ 		dqm->ops.set_cache_memory_policy = set_cache_memory_policy;
+ 		dqm->ops.set_trap_handler = set_trap_handler;
+-		dqm->ops.set_page_directory_base = set_page_directory_base;
+ 		dqm->ops.process_termination = process_termination_cpsch;
+ 		break;
+ 	case KFD_SCHED_POLICY_NO_HWS:
+@@ -1540,7 +1528,6 @@ struct device_queue_manager *device_queue_manager_init(struct kfd_dev *dev)
+ 		dqm->ops.uninitialize = uninitialize_nocpsch;
+ 		dqm->ops.set_cache_memory_policy = set_cache_memory_policy;
+ 		dqm->ops.set_trap_handler = set_trap_handler;
+-		dqm->ops.set_page_directory_base = set_page_directory_base;
+ 		dqm->ops.process_termination = process_termination_nocpsch;
+ 		break;
+ 	default:
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+index d978b91..f5f5dd9 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+@@ -134,8 +134,6 @@ struct device_queue_manager_ops {
+ 				    uint64_t tba_addr,
+ 				    uint64_t tma_addr);
+ 
+-	int	(*set_page_directory_base)(struct device_queue_manager *dqm,
+-					struct qcm_process_device *qpd);
+ 	int (*process_termination)(struct device_queue_manager *dqm,
+ 			struct qcm_process_device *qpd);
+ };
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 884199d..91c9d0d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -749,6 +749,7 @@ struct kfd_process *kfd_lookup_process_by_pid(struct pid *pid);
+ 
+ /* kfd dgpu memory */
+ int kfd_map_memory_to_gpu(void *mem, struct kfd_process_device *pdd);
++int kfd_unmap_memory_from_gpu(void *mem, struct kfd_process_device *pdd);
+ 
+ /* Process device data iterator */
+ struct kfd_process_device *kfd_get_first_process_device_data(struct kfd_process *p);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 5894142..b679ea7 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -75,11 +75,11 @@ void kfd_process_destroy_wq(void)
+ 	}
+ }
+ 
+-static void kfd_process_free_gpuvm(struct kfd_dev *kdev, struct kgd_mem *mem,
+-				void *vm)
++static void kfd_process_free_gpuvm(struct kgd_mem *mem,
++			struct kfd_process_device *pdd)
+ {
+-	kdev->kfd2kgd->unmap_memory_to_gpu(kdev->kgd, mem, vm);
+-	kdev->kfd2kgd->free_memory_of_gpu(kdev->kgd, mem, vm);
++	kfd_unmap_memory_from_gpu(mem, pdd);
++	pdd->dev->kfd2kgd->free_memory_of_gpu(pdd->dev->kgd, mem, pdd->vm);
+ }
+ 
+ /* kfd_process_alloc_gpuvm - Allocate GPU VM for the KFD process
+@@ -127,7 +127,7 @@ static int kfd_process_alloc_gpuvm(struct kfd_process *p,
+ 	return err;
+ 
+ free_gpuvm:
+-	kfd_process_free_gpuvm(kdev, (struct kgd_mem *)mem, pdd->vm);
++	kfd_process_free_gpuvm(mem, pdd);
+ 	return err;
+ 
+ err_map_mem:
+-- 
+2.7.4
+

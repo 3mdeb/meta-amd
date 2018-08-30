@@ -1,0 +1,194 @@
+From 33ace29d9c09ad270adf431efa2e8f1440687b35 Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Wed, 10 Jan 2018 18:42:36 +0800
+Subject: [PATCH 4662/5855] drm/amdgpu: add custom power policy support in
+ sysfs
+
+when cat pp_power_profile_mode on Vega10
+NUM        MODE_NAME BUSY_SET_POINT FPS USE_RLC_BUSY MIN_ACTIVE_LEVEL
+  0 3D_FULL_SCREEN :             70  60          1              3
+  1   POWER_SAVING :             90  60          0              0
+  2          VIDEO*:             70  60          0              0
+  3             VR :             70  90          0              0
+  4       COMPUTER :             30  60          0              6
+  5         CUSTOM :              0   0          0              0
+
+the result show all the profile mode we can support and custom mode.
+user can echo the num(0-4) to pp_power_profile_mode to select the profile
+mode or can echo "5 value value value value" to enter CUSTOM mode.
+the four parameter is set_point/FPS/USER_RLC_BUSY/MIN_ACTIVE_LEVEL.
+
+Change-Id: I54d634ddf2e27473e1da3f02f15a3ccf43e54745
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_dpm.h        |  8 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c         | 81 +++++++++++++++++++++++++-
+ drivers/gpu/drm/amd/include/kgd_pp_interface.h | 12 +++-
+ 3 files changed, 99 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_dpm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_dpm.h
+index 8a8d09dd..986f1d5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dpm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dpm.h
+@@ -366,6 +366,14 @@ enum amdgpu_pcie_gen {
+ 			(adev)->powerplay.pp_handle, virtual_addr_low, \
+ 			virtual_addr_hi, mc_addr_low, mc_addr_hi, size)
+ 
++#define amdgpu_dpm_get_power_profile_mode(adev, buf) \
++		((adev)->powerplay.pp_funcs->get_power_profile_mode(\
++			(adev)->powerplay.pp_handle, buf))
++
++#define amdgpu_dpm_set_power_profile_mode(adev, parameter, size) \
++		((adev)->powerplay.pp_funcs->set_power_profile_mode(\
++			(adev)->powerplay.pp_handle, parameter, size))
++
+ struct amdgpu_dpm {
+ 	struct amdgpu_ps        *ps;
+ 	/* number of valid power states */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
+index 741ec02..cdf3ce0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
+@@ -582,6 +582,73 @@ static ssize_t amdgpu_set_pp_mclk_od(struct device *dev,
+ 	return count;
+ }
+ 
++static ssize_t amdgpu_get_pp_power_profile_mode(struct device *dev,
++		struct device_attribute *attr,
++		char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++
++	if (adev->powerplay.pp_funcs->get_power_profile_mode)
++		return amdgpu_dpm_get_power_profile_mode(adev, buf);
++
++	return snprintf(buf, PAGE_SIZE, "\n");
++}
++
++
++static ssize_t amdgpu_set_pp_power_profile_mode(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf,
++		size_t count)
++{
++	int ret = 0xff;
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = ddev->dev_private;
++	uint32_t parameter_size = 0;
++	long parameter[64];
++	char *sub_str, buf_cpy[128];
++	char *tmp_str;
++	uint32_t i = 0;
++	char tmp[2];
++	long int profile_mode = 0;
++	const char delimiter[3] = {' ', '\n', '\0'};
++
++	tmp[0] = *(buf);
++	tmp[1] = '\0';
++	ret = kstrtol(tmp, 0, &profile_mode);
++	if (ret)
++		goto fail;
++
++	if (profile_mode == PP_SMC_POWER_PROFILE_CUSTOM) {
++		if (count < 2 || count > 127)
++			return -EINVAL;
++		while (isspace(*++buf))
++			i++;
++		memcpy(buf_cpy, buf, count-i);
++		tmp_str = buf_cpy;
++		while (tmp_str[0]) {
++			sub_str = strsep(&tmp_str, delimiter);
++			ret = kstrtol(sub_str, 0, &parameter[parameter_size]);
++			if (ret) {
++				count = -EINVAL;
++				goto fail;
++			}
++			pr_info("value is %ld \n", parameter[parameter_size]);
++			parameter_size++;
++			while (isspace(*tmp_str))
++				tmp_str++;
++		}
++	}
++	parameter[parameter_size] = profile_mode;
++	if (adev->powerplay.pp_funcs->set_power_profile_mode)
++		ret = amdgpu_dpm_set_power_profile_mode(adev, parameter, parameter_size);
++
++	if (!ret)
++		return count;
++fail:
++	return -EINVAL;
++}
++
+ static ssize_t amdgpu_get_pp_power_profile(struct device *dev,
+ 		char *buf, struct amd_pp_profile *query)
+ {
+@@ -770,7 +837,9 @@ static DEVICE_ATTR(pp_gfx_power_profile, S_IRUGO | S_IWUSR,
+ static DEVICE_ATTR(pp_compute_power_profile, S_IRUGO | S_IWUSR,
+ 		amdgpu_get_pp_compute_power_profile,
+ 		amdgpu_set_pp_compute_power_profile);
+-
++static DEVICE_ATTR(pp_power_profile_mode, S_IRUGO | S_IWUSR,
++		amdgpu_get_pp_power_profile_mode,
++		amdgpu_set_pp_power_profile_mode);
+ static ssize_t amdgpu_hwmon_show_temp(struct device *dev,
+ 				      struct device_attribute *attr,
+ 				      char *buf)
+@@ -1402,6 +1471,14 @@ int amdgpu_pm_sysfs_init(struct amdgpu_device *adev)
+ 		return ret;
+ 	}
+ 
++	ret = device_create_file(adev->dev,
++			&dev_attr_pp_power_profile_mode);
++	if (ret) {
++		DRM_ERROR("failed to create device file	"
++				"pp_power_profile_mode\n");
++		return ret;
++	}
++
+ 	ret = amdgpu_debugfs_pm_init(adev);
+ 	if (ret) {
+ 		DRM_ERROR("Failed to register debugfs file for dpm!\n");
+@@ -1437,6 +1514,8 @@ void amdgpu_pm_sysfs_fini(struct amdgpu_device *adev)
+ 			&dev_attr_pp_gfx_power_profile);
+ 	device_remove_file(adev->dev,
+ 			&dev_attr_pp_compute_power_profile);
++	device_remove_file(adev->dev,
++			&dev_attr_pp_power_profile_mode);
+ }
+ 
+ void amdgpu_pm_compute_clocks(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/include/kgd_pp_interface.h b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+index 0f89d2a8..1746180 100644
+--- a/drivers/gpu/drm/amd/include/kgd_pp_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+@@ -140,7 +140,15 @@ struct amd_pp_init {
+ 	uint32_t feature_mask;
+ };
+ 
+-
++enum PP_SMC_POWER_PROFILE {
++	PP_SMC_POWER_PROFILE_FULLSCREEN3D = 0x0,
++	PP_SMC_POWER_PROFILE_POWERSAVING  = 0x1,
++	PP_SMC_POWER_PROFILE_VIDEO        = 0x2,
++	PP_SMC_POWER_PROFILE_VR           = 0x3,
++	PP_SMC_POWER_PROFILE_COMPUTE      = 0x4,
++	PP_SMC_POWER_PROFILE_CUSTOM       = 0x5,
++	PP_SMC_POWER_PROFILE_AUTO         = 0x6,
++};
+ 
+ enum {
+ 	PP_GROUP_UNKNOWN = 0,
+@@ -289,6 +297,8 @@ struct amd_pm_funcs {
+ 				struct pp_display_clock_request *clock);
+ 	int (*get_display_mode_validation_clocks)(void *handle,
+ 		struct amd_pp_simple_clock_info *clocks);
++	int (*get_power_profile_mode)(void *handle, char *buf);
++	int (*set_power_profile_mode)(void *handle, long *input, uint32_t size);
+ };
+ 
+ #endif
+-- 
+2.7.4
+

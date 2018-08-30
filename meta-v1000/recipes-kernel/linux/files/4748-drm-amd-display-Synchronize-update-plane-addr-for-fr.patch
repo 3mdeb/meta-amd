@@ -1,0 +1,97 @@
+From 90b3ce42ddacbe7e26f0cbbc3aaf775b8175208f Mon Sep 17 00:00:00 2001
+From: SivapiriyanKumarasamy <sivapiriyan.kumarasamy@amd.com>
+Date: Thu, 4 Jan 2018 14:29:58 -0500
+Subject: [PATCH 4748/5855] drm/amd/display: Synchronize update plane addr for
+ freesync
+
+Lock top_pipe when doing update plane addr for split pipe freesync case
+
+Signed-off-by: SivapiriyanKumarasamy <sivapiriyan.kumarasamy@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c | 47 +++++++++++++++++++++-----------
+ 1 file changed, 31 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 0b71264..b8412645 100755
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1280,6 +1280,7 @@ static void commit_planes_for_stream(struct dc *dc,
+ 		struct dc_state *context)
+ {
+ 	int i, j;
++	struct pipe_ctx *top_pipe_to_program = NULL;
+ 
+ 	if (update_type == UPDATE_TYPE_FULL) {
+ 		dc->hwss.set_bandwidth(dc, context, false);
+@@ -1299,13 +1300,17 @@ static void commit_planes_for_stream(struct dc *dc,
+ 	for (j = 0; j < dc->res_pool->pipe_count; j++) {
+ 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[j];
+ 
+-		if (update_type == UPDATE_TYPE_FAST || !pipe_ctx->plane_state)
+-			continue;
+-
+ 		if (!pipe_ctx->top_pipe &&
+-		    pipe_ctx->stream &&
+-		    pipe_ctx->stream == stream) {
+-			struct dc_stream_status *stream_status =
++			pipe_ctx->stream &&
++			pipe_ctx->stream == stream) {
++			struct dc_stream_status *stream_status = NULL;
++
++			top_pipe_to_program = pipe_ctx;
++
++			if (update_type == UPDATE_TYPE_FAST || !pipe_ctx->plane_state)
++				continue;
++
++			stream_status =
+ 					stream_get_status(context, pipe_ctx->stream);
+ 
+ 			dc->hwss.apply_ctx_for_surface(
+@@ -1316,22 +1321,32 @@ static void commit_planes_for_stream(struct dc *dc,
+ 	if (update_type == UPDATE_TYPE_FULL)
+ 		context_timing_trace(dc, &context->res_ctx);
+ 
+-	/* Perform requested Updates */
+-	for (i = 0; i < surface_count; i++) {
+-		struct dc_plane_state *plane_state = srf_updates[i].surface;
++	/* Lock the top pipe while updating plane addrs, since freesync requires
++	 *  plane addr update event triggers to be synchronized.
++	 *  top_pipe_to_program is expected to never be NULL
++	 */
++	if (update_type == UPDATE_TYPE_FAST) {
++		dc->hwss.pipe_control_lock(dc, top_pipe_to_program, true);
+ 
+-		for (j = 0; j < dc->res_pool->pipe_count; j++) {
+-			struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[j];
++		/* Perform requested Updates */
++		for (i = 0; i < surface_count; i++) {
++			struct dc_plane_state *plane_state = srf_updates[i].surface;
+ 
+-			if (pipe_ctx->stream != stream)
+-				continue;
++			for (j = 0; j < dc->res_pool->pipe_count; j++) {
++				struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[j];
+ 
+-			if (pipe_ctx->plane_state != plane_state)
+-				continue;
++				if (pipe_ctx->stream != stream)
++					continue;
++
++				if (pipe_ctx->plane_state != plane_state)
++					continue;
+ 
+-			if (update_type == UPDATE_TYPE_FAST && srf_updates[i].flip_addr)
++				if (srf_updates[i].flip_addr)
+ 					dc->hwss.update_plane_addr(dc, pipe_ctx);
++			}
+ 		}
++
++		dc->hwss.pipe_control_lock(dc, top_pipe_to_program, false);
+ 	}
+ 
+ 	if (stream && stream_update && update_type > UPDATE_TYPE_FAST)
+-- 
+2.7.4
+

@@ -1,0 +1,163 @@
+From 68c13234eb30fc71ee4b00cbda4e953e15c40998 Mon Sep 17 00:00:00 2001
+From: Yongqiang Sun <yongqiang.sun@amd.com>
+Date: Thu, 28 Sep 2017 17:18:27 -0400
+Subject: [PATCH 4089/5855] drm/amd/display: Fixed extend to second screen mode
+ hang
+
+	1. Fixed acquire free split pipe bug.
+	2. Change return value for dc_add_stream_to_ctx
+	   from bool to enum.
+	4. Remove redundant apply_ctx_for_surface calling
+	5. Unlock pipe after back end programming.
+
+Signed-off-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  5 +--
+ drivers/gpu/drm/amd/display/dc/core/dc.c          | 48 ++++++++++++-----------
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c |  9 ++---
+ drivers/gpu/drm/amd/display/dc/dc.h               |  2 +-
+ 4 files changed, 32 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 8e02268..108c75e 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -4618,11 +4618,10 @@ static int dm_update_crtcs_state(
+ 
+ 				DRM_DEBUG_DRIVER("Enabling DRM crtc: %d\n",
+ 							crtc->base.id);
+-
+-				if (!dc_add_stream_to_ctx(
++				if (dc_add_stream_to_ctx(
+ 						dc,
+ 						dm_state->context,
+-						new_acrtc_state->stream)) {
++						new_acrtc_state->stream) != DC_OK) {
+ 					ret = -EINVAL;
+ 					goto fail;
+ 				}
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index e37a6b8..0737941 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -766,34 +766,27 @@ static bool dc_commit_state_no_check(struct dc *dc, struct dc_state *context)
+ 	for (i = 0; i < context->stream_count; i++) {
+ 		const struct dc_sink *sink = context->streams[i]->sink;
+ 
+-		for (j = 0; j < context->stream_status[i].plane_count; j++) {
+-			dc->hwss.apply_ctx_for_surface(
+-					dc, context->streams[i],
+-					context->stream_status[i].plane_count,
+-					context);
++		dc->hwss.apply_ctx_for_surface(
++				dc, context->streams[i],
++				context->stream_status[i].plane_count,
++				context);
+ 
+-			/*
+-			 * enable stereo
+-			 * TODO rework dc_enable_stereo call to work with validation sets?
+-			 */
+-			for (k = 0; k < MAX_PIPES; k++) {
+-				pipe = &context->res_ctx.pipe_ctx[k];
+-
+-				for (l = 0 ; pipe && l < context->stream_count; l++)  {
+-					if (context->streams[l] &&
+-					    context->streams[l] == pipe->stream &&
+-					    dc->hwss.setup_stereo)
+-						dc->hwss.setup_stereo(pipe, dc);
+-				}
++		/*
++		 * enable stereo
++		 * TODO rework dc_enable_stereo call to work with validation sets?
++		 */
++		for (k = 0; k < MAX_PIPES; k++) {
++			pipe = &context->res_ctx.pipe_ctx[k];
++
++			for (l = 0 ; pipe && l < context->stream_count; l++)  {
++				if (context->streams[l] &&
++					context->streams[l] == pipe->stream &&
++					dc->hwss.setup_stereo)
++					dc->hwss.setup_stereo(pipe, dc);
+ 			}
+ 		}
+ 
+-		for (j = 0; j < MAX_PIPES; j++) {
+-			pipe = &context->res_ctx.pipe_ctx[j];
+ 
+-			if (!pipe->top_pipe && pipe->stream == context->streams[i])
+-				dc->hwss.pipe_control_lock(dc, pipe, false);
+-		}
+ 
+ 		CONN_MSG_MODE(sink->link, "{%dx%d, %dx%d@%dKhz}",
+ 				context->streams[i]->timing.h_addressable,
+@@ -815,6 +808,15 @@ static bool dc_commit_state_no_check(struct dc *dc, struct dc_state *context)
+ 
+ 	dc_enable_stereo(dc, context, dc_streams, context->stream_count);
+ 
++	for (i = 0; i < context->stream_count; i++) {
++		for (j = 0; j < MAX_PIPES; j++) {
++			pipe = &context->res_ctx.pipe_ctx[j];
++
++			if (!pipe->top_pipe && pipe->stream == context->streams[i])
++				dc->hwss.pipe_control_lock(dc, pipe, false);
++		}
++	}
++
+ 	dc_release_state(dc->current_state);
+ 
+ 	dc->current_state = context;
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index c31dccd..c60f530 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -1446,7 +1446,7 @@ bool resource_is_stream_unchanged(
+ 	return false;
+ }
+ 
+-bool dc_add_stream_to_ctx(
++enum dc_status dc_add_stream_to_ctx(
+ 		struct dc *dc,
+ 		struct dc_state *new_ctx,
+ 		struct dc_stream_state *stream)
+@@ -1467,7 +1467,7 @@ bool dc_add_stream_to_ctx(
+ 	if (res != DC_OK)
+ 		DC_ERROR("Adding stream %p to context failed with err %d!\n", stream, res);
+ 
+-	return res == DC_OK;
++	return res;
+ }
+ 
+ bool dc_remove_stream_from_ctx(
+@@ -1640,10 +1640,9 @@ enum dc_status resource_map_pool_resources(
+ 	/* acquire new resources */
+ 	pipe_idx = acquire_first_free_pipe(&context->res_ctx, pool, stream);
+ 
+-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+ 	if (pipe_idx < 0)
+-		acquire_first_split_pipe(&context->res_ctx, pool, stream);
+-#endif
++		pipe_idx = acquire_first_split_pipe(&context->res_ctx, pool, stream);
++
+ 	if (pipe_idx < 0)
+ 		return DC_NO_CONTROLLER_RESOURCE;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index b29d729..e60ce77 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -682,7 +682,7 @@ bool dc_stream_get_scanoutpos(const struct dc_stream_state *stream,
+ 				  uint32_t *h_position,
+ 				  uint32_t *v_position);
+ 
+-bool dc_add_stream_to_ctx(
++enum dc_status dc_add_stream_to_ctx(
+ 			struct dc *dc,
+ 		struct dc_state *new_ctx,
+ 		struct dc_stream_state *stream);
+-- 
+2.7.4
+

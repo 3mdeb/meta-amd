@@ -1,0 +1,129 @@
+From a3a6e02d546c72b7cafb52887488a547f84bab4f Mon Sep 17 00:00:00 2001
+From: Samuel Li <Samuel.Li@amd.com>
+Date: Fri, 8 Dec 2017 16:18:59 -0500
+Subject: [PATCH 4635/5855] drm/amdgpu: Move to gtt before cpu accesses dma
+ buf.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+To improve cpu read performance. This is implemented for APUs currently.
+
+v2: Adapt to change https://lists.freedesktop.org/archives/amd-gfx/2017-October/015174.html
+v3: Adapt to change "forward begin_cpu_access callback to drivers"
+v4: Instead of v3, reuse drm_gem dmabuf_ops here. Also some minor fixes as suggested.
+
+Signed-off-by: Samuel Li <Samuel.Li@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+Conflicts:
+      drivers/gpu/drm/amd/amdgpu/amdgpu.h
+      drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+
+Change-Id: Id6bb0710995b868f90ac0ad06683b73ec38b69f3
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c | 67 +++++++++++++++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+ mode change 100644 => 100755 drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+old mode 100644
+new mode 100755
+index fb73822..c0cc3c0
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+@@ -26,6 +26,7 @@
+ #include <drm/drmP.h>
+ 
+ #include "amdgpu.h"
++#include "amdgpu_display.h"
+ #include <drm/amdgpu_drm.h>
+ #include <linux/dma-buf.h>
+ 
+@@ -182,6 +183,50 @@ struct reservation_object *amdgpu_gem_prime_res_obj(struct drm_gem_object *obj)
+ 	return bo->tbo.resv;
+ }
+ 
++static int amdgpu_gem_begin_cpu_access(struct dma_buf *dma_buf,
++				       enum dma_data_direction direction)
++{
++	struct amdgpu_bo *bo = gem_to_amdgpu_bo(dma_buf->priv);
++	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
++	struct ttm_operation_ctx ctx = { true, false };
++	u32 domain = amdgpu_display_framebuffer_domains(adev);
++	int ret;
++	bool reads = (direction == DMA_BIDIRECTIONAL ||
++		      direction == DMA_FROM_DEVICE);
++
++	if (!reads || !(domain & AMDGPU_GEM_DOMAIN_GTT))
++		return 0;
++
++	/* move to gtt */
++	ret = amdgpu_bo_reserve(bo, false);
++	if (unlikely(ret != 0))
++		return ret;
++
++	if (!bo->pin_count && (bo->allowed_domains & AMDGPU_GEM_DOMAIN_GTT)) {
++		amdgpu_ttm_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_GTT);
++		ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
++	}
++
++	amdgpu_bo_unreserve(bo);
++	return ret;
++}
++
++static const struct dma_buf_ops amdgpu_dmabuf_ops = {
++	.attach = drm_gem_map_attach,
++	.detach = drm_gem_map_detach,
++	.map_dma_buf = drm_gem_map_dma_buf,
++	.unmap_dma_buf = drm_gem_unmap_dma_buf,
++	.release = drm_gem_dmabuf_release,
++	.begin_cpu_access = amdgpu_gem_begin_cpu_access,
++	.map = drm_gem_dmabuf_kmap,
++	.map_atomic = drm_gem_dmabuf_kmap_atomic,
++	.unmap = drm_gem_dmabuf_kunmap,
++	.unmap_atomic = drm_gem_dmabuf_kunmap_atomic,
++	.mmap = drm_gem_dmabuf_mmap,
++	.vmap = drm_gem_dmabuf_vmap,
++	.vunmap = drm_gem_dmabuf_vunmap,
++};
++
+ struct dma_buf *amdgpu_gem_prime_export(struct drm_device *dev,
+ 					struct drm_gem_object *gobj,
+ 					int flags)
+@@ -196,6 +241,8 @@ struct dma_buf *amdgpu_gem_prime_export(struct drm_device *dev,
+ 	buf = drm_gem_prime_export(dev, gobj, flags);
+ 	if (!IS_ERR(buf))
+ 		buf->file->f_mapping = dev->anon_inode->i_mapping;
++	buf->ops = &amdgpu_dmabuf_ops;
++
+ 	return buf;
+ }
+ 
+@@ -238,3 +285,23 @@ amdgpu_gem_prime_foreign_bo(struct amdgpu_device *adev, struct amdgpu_bo *bo)
+ 
+ 	return &gobj->base;
+ }
++
++struct drm_gem_object *amdgpu_gem_prime_import(struct drm_device *dev,
++					    struct dma_buf *dma_buf)
++{
++	struct drm_gem_object *obj;
++
++	if (dma_buf->ops == &amdgpu_dmabuf_ops) {
++		obj = dma_buf->priv;
++		if (obj->dev == dev) {
++			/*
++			 * Importing dmabuf exported from out own gem increases
++			 * refcount on gem itself instead of f_count of dmabuf.
++			 */
++			drm_gem_object_get(obj);
++			return obj;
++		}
++	}
++
++	return drm_gem_prime_import(dev, dma_buf);
++}
+-- 
+2.7.4
+

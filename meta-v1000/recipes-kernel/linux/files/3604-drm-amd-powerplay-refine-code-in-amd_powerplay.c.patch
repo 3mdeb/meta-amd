@@ -1,0 +1,208 @@
+From 4a056e6f2b67944ebdff1949e7b3366007129747 Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Fri, 29 Sep 2017 13:57:54 +0800
+Subject: [PATCH 3604/5855] drm/amd/powerplay: refine code in amd_powerplay.c
+
+1. use flag PP_DPM_DISABLED within powerplay
+   notify amdgpu dpm state by cgs interface.
+2. delete redundant virtualization check in
+   powerplay
+
+Change-Id: I2f613aeec922946fee18ef26a10ef57a845c10ae
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c     | 12 ------
+ drivers/gpu/drm/amd/powerplay/amd_powerplay.c     | 52 ++++++++++-------------
+ drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h |  2 -
+ 3 files changed, 22 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
+index 1649b1e..3b42f40 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_powerplay.c
+@@ -98,10 +98,6 @@ static int amdgpu_pp_early_init(void *handle)
+ 					amd_pp->cgs_device ? amd_pp->cgs_device :
+ 					amd_pp->pp_handle);
+ 
+-	if (ret == PP_DPM_DISABLED) {
+-		adev->pm.dpm_enabled = false;
+-		return 0;
+-	}
+ 	return ret;
+ }
+ 
+@@ -154,14 +150,6 @@ static int amdgpu_pp_hw_init(void *handle)
+ 		ret = adev->powerplay.ip_funcs->hw_init(
+ 					adev->powerplay.pp_handle);
+ 
+-	if (ret == PP_DPM_DISABLED) {
+-		adev->pm.dpm_enabled = false;
+-		return 0;
+-	}
+-
+-	if ((amdgpu_dpm != 0) && !amdgpu_sriov_vf(adev))
+-		adev->pm.dpm_enabled = true;
+-
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+index 3ffbe2a..507e0df 100644
+--- a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
++++ b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+@@ -30,6 +30,8 @@
+ #include "pp_instance.h"
+ #include "power_state.h"
+ 
++#define PP_DPM_DISABLED 0xCCCC
++
+ static int pp_dpm_dispatch_tasks(void *handle, enum amd_pp_task task_id,
+ 		void *input, void *output);
+ 
+@@ -99,10 +101,6 @@ static int pp_early_init(void *handle)
+ 	if (ret)
+ 		return -EINVAL;
+ 
+-	if ((pp_handle->pm_en == 0)
+-		|| cgs_is_virtualization_enabled(pp_handle->device))
+-		return PP_DPM_DISABLED;
+-
+ 	return 0;
+ }
+ 
+@@ -114,7 +112,7 @@ static int pp_sw_init(void *handle)
+ 
+ 	ret = pp_check(pp_handle);
+ 
+-	if (ret == 0 || ret == PP_DPM_DISABLED) {
++	if (ret >= 0) {
+ 		hwmgr = pp_handle->hwmgr;
+ 
+ 		if (hwmgr->smumgr_funcs->smu_init == NULL)
+@@ -134,7 +132,7 @@ static int pp_sw_fini(void *handle)
+ 	struct pp_instance *pp_handle = (struct pp_instance *)handle;
+ 
+ 	ret = pp_check(pp_handle);
+-	if (ret == 0 || ret == PP_DPM_DISABLED) {
++	if (ret >= 0) {
+ 		hwmgr = pp_handle->hwmgr;
+ 
+ 		if (hwmgr->smumgr_funcs->smu_fini == NULL)
+@@ -153,7 +151,7 @@ static int pp_hw_init(void *handle)
+ 
+ 	ret = pp_check(pp_handle);
+ 
+-	if (ret == 0 || ret == PP_DPM_DISABLED) {
++	if (ret >= 0) {
+ 		hwmgr = pp_handle->hwmgr;
+ 
+ 		if (hwmgr->smumgr_funcs->start_smu == NULL)
+@@ -165,16 +163,18 @@ static int pp_hw_init(void *handle)
+ 			return -EINVAL;;
+ 		}
+ 		if (ret == PP_DPM_DISABLED)
+-			return PP_DPM_DISABLED;
++			goto exit;
+ 	}
+ 
+ 	ret = hwmgr_hw_init(pp_handle);
+ 	if (ret)
+-		goto err;
++		goto exit;
+ 	return 0;
+-err:
++exit:
+ 	pp_handle->pm_en = 0;
+-	return PP_DPM_DISABLED;
++	cgs_notify_dpm_enabled(hwmgr->device, false);
++	return 0;
++
+ }
+ 
+ static int pp_hw_fini(void *handle)
+@@ -275,39 +275,34 @@ static int pp_suspend(void *handle)
+ 	int ret = 0;
+ 
+ 	ret = pp_check(pp_handle);
+-
+-	if (ret == PP_DPM_DISABLED)
+-		return 0;
+-	else if (ret != 0)
+-		return ret;
+-
+-	return hwmgr_hw_suspend(pp_handle);
++	if (ret == 0)
++		hwmgr_hw_suspend(pp_handle);
++	return 0;
+ }
+ 
+ static int pp_resume(void *handle)
+ {
+ 	struct pp_hwmgr  *hwmgr;
+-	int ret, ret1;
++	int ret;
+ 	struct pp_instance *pp_handle = (struct pp_instance *)handle;
+ 
+-	ret1 = pp_check(pp_handle);
++	ret = pp_check(pp_handle);
+ 
+-	if (ret1 != 0 && ret1 != PP_DPM_DISABLED)
+-		return ret1;
++	if (ret < 0)
++		return ret;
+ 
+ 	hwmgr = pp_handle->hwmgr;
+ 
+ 	if (hwmgr->smumgr_funcs->start_smu == NULL)
+ 		return -EINVAL;
+ 
+-	ret = hwmgr->smumgr_funcs->start_smu(pp_handle->hwmgr);
+-	if (ret) {
++	if (hwmgr->smumgr_funcs->start_smu(pp_handle->hwmgr)) {
+ 		pr_err("smc start failed\n");
+ 		hwmgr->smumgr_funcs->smu_fini(pp_handle->hwmgr);
+-		return ret;
++		return -EINVAL;
+ 	}
+ 
+-	if (ret1 == PP_DPM_DISABLED)
++	if (ret == PP_DPM_DISABLED)
+ 		return 0;
+ 
+ 	return hwmgr_hw_resume(pp_handle);
+@@ -1190,9 +1185,6 @@ int amd_powerplay_reset(void *handle)
+ 	struct pp_instance *instance = (struct pp_instance *)handle;
+ 	int ret;
+ 
+-	if (cgs_is_virtualization_enabled(instance->hwmgr->device))
+-		return PP_DPM_DISABLED;
+-
+ 	ret = pp_check(instance);
+ 	if (ret != 0)
+ 		return ret;
+@@ -1203,7 +1195,7 @@ int amd_powerplay_reset(void *handle)
+ 
+ 	ret = hwmgr_hw_init(instance);
+ 	if (ret)
+-		return PP_DPM_DISABLED;
++		return ret;
+ 
+ 	return hwmgr_handle_task(instance, AMD_PP_TASK_COMPLETE_INIT, NULL, NULL);
+ }
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+index 916b6c4..e52adc8 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+@@ -33,8 +33,6 @@
+ extern const struct amd_ip_funcs pp_ip_funcs;
+ extern const struct amd_pm_funcs pp_dpm_funcs;
+ 
+-#define PP_DPM_DISABLED 0xCCCC
+-
+ enum amd_pp_sensors {
+ 	AMDGPU_PP_SENSOR_GFX_SCLK = 0,
+ 	AMDGPU_PP_SENSOR_VDDNB,
+-- 
+2.7.4
+

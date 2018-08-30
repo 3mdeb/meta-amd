@@ -1,0 +1,166 @@
+From c1c684a6d0d9ef8e30585b8166a7795bb0df821a Mon Sep 17 00:00:00 2001
+From: Hersen Wu <hersenxs.wu@amd.com>
+Date: Mon, 11 Sep 2017 16:42:14 -0400
+Subject: [PATCH 3926/5855] drm/amd/display: USB-C to HDMI dongle not light
+
+RV1 support only USB-C active DP-2-HDMI dongle. HPD short pulse is
+generated only for DP signal.
+
+When processing HPD short pulse, it must be DP active dongle. No need
+for I2C-Over-AUX detection.
+
+v2: Add description
+
+Signed-off-by: Hersen Wu <hersenxs.wu@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  9 ++++---
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c     | 32 +++++++++++++++--------
+ drivers/gpu/drm/amd/display/dc/dc.h               |  8 +++++-
+ 3 files changed, 33 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index fc26b5a..544f523 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -639,7 +639,7 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev )
+ 			continue;
+ 
+ 		mutex_lock(&aconnector->hpd_lock);
+-		dc_link_detect(aconnector->dc_link, false);
++		dc_link_detect(aconnector->dc_link, DETECT_REASON_HPD);
+ 
+ 		if (aconnector->fake_enable && aconnector->dc_link->local_sink)
+ 			aconnector->fake_enable = false;
+@@ -878,7 +878,7 @@ static void handle_hpd_irq(void *param)
+ 	if (aconnector->fake_enable)
+ 		aconnector->fake_enable = false;
+ 
+-	if (dc_link_detect(aconnector->dc_link, false)) {
++	if (dc_link_detect(aconnector->dc_link, DETECT_REASON_HPD)) {
+ 		amdgpu_dm_update_connector_after_detect(aconnector);
+ 
+ 
+@@ -988,7 +988,7 @@ static void handle_hpd_rx_irq(void *param)
+ 	if (dc_link_handle_hpd_rx_irq(aconnector->dc_link, NULL) &&
+ 			!is_mst_root_connector) {
+ 		/* Downstream Port status changed. */
+-		if (dc_link_detect(aconnector->dc_link, false)) {
++		if (dc_link_detect(aconnector->dc_link, DETECT_REASON_HPDRX)) {
+ 			amdgpu_dm_update_connector_after_detect(aconnector);
+ 
+ 
+@@ -1376,7 +1376,8 @@ int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
+ 			goto fail_free_encoder;
+ 		}
+ 
+-		if (dc_link_detect(dc_get_link_at_index(dm->dc, i), true))
++		if (dc_link_detect(dc_get_link_at_index(dm->dc, i),
++				DETECT_REASON_BOOT))
+ 			amdgpu_dm_update_connector_after_detect(aconnector);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index cea8daf..845ec42 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -355,7 +355,9 @@ static bool is_dp_sink_present(struct dc_link *link)
+  * @brief
+  * Detect output sink type
+  */
+-static enum signal_type link_detect_sink(struct dc_link *link)
++static enum signal_type link_detect_sink(
++	struct dc_link *link,
++	enum dc_detect_reason reason)
+ {
+ 	enum signal_type result = get_basic_signal_type(
+ 		link->link_enc->id, link->link_id);
+@@ -388,12 +390,17 @@ static enum signal_type link_detect_sink(struct dc_link *link)
+ 	}
+ 	break;
+ 	case CONNECTOR_ID_DISPLAY_PORT: {
+-
+-		/* Check whether DP signal detected: if not -
+-		 * we assume signal is DVI; it could be corrected
+-		 * to HDMI after dongle detection */
+-		if (!is_dp_sink_present(link))
+-			result = SIGNAL_TYPE_DVI_SINGLE_LINK;
++		/* DP HPD short pulse. Passive DP dongle will not
++		 * have short pulse
++		 */
++		if (reason != DETECT_REASON_HPDRX) {
++			/* Check whether DP signal detected: if not -
++			 * we assume signal is DVI; it could be corrected
++			 * to HDMI after dongle detection
++			 */
++			if (!is_dp_sink_present(link))
++				result = SIGNAL_TYPE_DVI_SINGLE_LINK;
++		}
+ 	}
+ 	break;
+ 	default:
+@@ -460,9 +467,10 @@ static void detect_dp(
+ 	struct display_sink_capability *sink_caps,
+ 	bool *converter_disable_audio,
+ 	struct audio_support *audio_support,
+-	bool boot)
++	enum dc_detect_reason reason)
+ {
+-	sink_caps->signal = link_detect_sink(link);
++	bool boot = false;
++	sink_caps->signal = link_detect_sink(link, reason);
+ 	sink_caps->transaction_type =
+ 		get_ddc_transaction_type(sink_caps->signal);
+ 
+@@ -513,6 +521,8 @@ static void detect_dp(
+ 			 * Need check ->sink usages in case ->sink = NULL
+ 			 * TODO: s3 resume check
+ 			 */
++			if (reason == DETECT_REASON_BOOT)
++				boot = true;
+ 
+ 			if (dm_helpers_dp_mst_start_top_mgr(
+ 				link->ctx,
+@@ -531,7 +541,7 @@ static void detect_dp(
+ 	}
+ }
+ 
+-bool dc_link_detect(struct dc_link *link, bool boot)
++bool dc_link_detect(struct dc_link *link, enum dc_detect_reason reason)
+ {
+ 	struct dc_sink_init_data sink_init_data = { 0 };
+ 	struct display_sink_capability sink_caps = { 0 };
+@@ -596,7 +606,7 @@ bool dc_link_detect(struct dc_link *link, bool boot)
+ 				link,
+ 				&sink_caps,
+ 				&converter_disable_audio,
+-				aud_support, boot);
++				aud_support, reason);
+ 
+ 			/* Active dongle downstream unplug */
+ 			if (link->type == dc_connection_active_dongle
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index deef757..95dccaf 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -937,7 +937,13 @@ bool dc_link_setup_psr(struct dc_link *dc_link,
+  * true otherwise. True meaning further action is required (status update
+  * and OS notification).
+  */
+-bool dc_link_detect(struct dc_link *dc_link, bool boot);
++enum dc_detect_reason {
++	DETECT_REASON_BOOT,
++	DETECT_REASON_HPD,
++	DETECT_REASON_HPDRX,
++};
++
++bool dc_link_detect(struct dc_link *dc_link, enum dc_detect_reason reason);
+ 
+ /* Notify DC about DP RX Interrupt (aka Short Pulse Interrupt).
+  * Return:
+-- 
+2.7.4
+

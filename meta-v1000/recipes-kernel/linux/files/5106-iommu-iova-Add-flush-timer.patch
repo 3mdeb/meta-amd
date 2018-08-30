@@ -1,0 +1,89 @@
+From 3e90a643cf236096e828b627424bf18fd05e1d99 Mon Sep 17 00:00:00 2001
+From: Joerg Roedel <jroedel@suse.de>
+Date: Thu, 10 Aug 2017 16:58:18 +0200
+Subject: [PATCH 5106/5855] iommu/iova: Add flush timer
+
+Add a timer to flush entries from the Flush-Queues every
+10ms. This makes sure that no stale TLB entries remain for
+too long after an IOVA has been unmapped.
+
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/iova.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/drivers/iommu/iova.c b/drivers/iommu/iova.c
+index 749d395..33edfa7 100644
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@ -33,6 +33,7 @@ static unsigned long iova_rcache_get(struct iova_domain *iovad,
+ static void init_iova_rcaches(struct iova_domain *iovad);
+ static void free_iova_rcaches(struct iova_domain *iovad);
+ static void fq_destroy_all_entries(struct iova_domain *iovad);
++static void fq_flush_timeout(unsigned long data);
+ 
+ void
+ init_iova_domain(struct iova_domain *iovad, unsigned long granule,
+@@ -62,7 +63,11 @@ static void free_iova_flush_queue(struct iova_domain *iovad)
+ 	if (!iovad->fq)
+ 		return;
+ 
++	if (timer_pending(&iovad->fq_timer))
++		del_timer(&iovad->fq_timer);
++
+ 	fq_destroy_all_entries(iovad);
++
+ 	free_percpu(iovad->fq);
+ 
+ 	iovad->fq         = NULL;
+@@ -95,6 +100,9 @@ int init_iova_flush_queue(struct iova_domain *iovad,
+ 		spin_lock_init(&fq->lock);
+ 	}
+ 
++	setup_timer(&iovad->fq_timer, fq_flush_timeout, (unsigned long)iovad);
++	atomic_set(&iovad->fq_timer_on, 0);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(init_iova_flush_queue);
+@@ -539,6 +547,25 @@ static void fq_destroy_all_entries(struct iova_domain *iovad)
+ 	}
+ }
+ 
++static void fq_flush_timeout(unsigned long data)
++{
++	struct iova_domain *iovad = (struct iova_domain *)data;
++	int cpu;
++
++	atomic_set(&iovad->fq_timer_on, 0);
++	iova_domain_flush(iovad);
++
++	for_each_possible_cpu(cpu) {
++		unsigned long flags;
++		struct iova_fq *fq;
++
++		fq = per_cpu_ptr(iovad->fq, cpu);
++		spin_lock_irqsave(&fq->lock, flags);
++		fq_ring_free(iovad, fq);
++		spin_unlock_irqrestore(&fq->lock, flags);
++	}
++}
++
+ void queue_iova(struct iova_domain *iovad,
+ 		unsigned long pfn, unsigned long pages,
+ 		unsigned long data)
+@@ -569,6 +596,11 @@ void queue_iova(struct iova_domain *iovad,
+ 	fq->entries[idx].counter  = atomic64_read(&iovad->fq_flush_start_cnt);
+ 
+ 	spin_unlock_irqrestore(&fq->lock, flags);
++
++	if (atomic_cmpxchg(&iovad->fq_timer_on, 0, 1) == 0)
++		mod_timer(&iovad->fq_timer,
++			  jiffies + msecs_to_jiffies(IOVA_FQ_TIMEOUT));
++
+ 	put_cpu_ptr(iovad->fq);
+ }
+ EXPORT_SYMBOL_GPL(queue_iova);
+-- 
+2.7.4
+

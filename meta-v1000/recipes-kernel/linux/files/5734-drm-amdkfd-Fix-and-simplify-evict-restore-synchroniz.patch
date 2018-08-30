@@ -1,0 +1,192 @@
+From 141db639683fbd6d0824a66f30578520b07f7d0f Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Tue, 16 Jan 2018 17:37:43 -0500
+Subject: [PATCH 5734/5855] drm/amdkfd: Fix and simplify evict/restore
+ synchronization
+
+Use the fence sequence number to check whether an eviction has already
+been scheduled for a given eviction fence. Using the pointer is not
+reliable because a new fence can have the same address as a previous
+fence.
+
+Remove the quiesce_fence that is no longer needed.
+
+In the eviction worker, flush restore_work unconditionally.
+delayed_work_pending return false if the worker is already running.
+
+Change-Id: Id769e456221f47f3d8b308505d475eacaeecaf7c
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+
+Conflicts:
+      drivers/gpu/drm/amd/amdkfd/kfd_process.c
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c  | 60 +++++++++++---------------------
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  8 ++---
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c |  7 ++--
+ 3 files changed, 26 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 796946c..14b58f4 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -946,21 +946,10 @@ int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
+ 	if (!p)
+ 		return -ENODEV;
+ 
+-	if (delayed_work_pending(&p->eviction_work.dwork)) {
+-		/* It is possible has TTM has lined up couple of BOs of the same
+-		 * process to be evicted. Check if the fence is same which
+-		 * indicates that previous work item scheduled is not completed
+-		 */
+-		if (p->eviction_work.quiesce_fence == fence)
+-			goto out;
+-		else {
+-			WARN(1, "Starting new evict with previous evict is not completed\n");
+-			if (cancel_delayed_work_sync(&p->eviction_work.dwork))
+-				dma_fence_put(p->eviction_work.quiesce_fence);
+-		}
+-	}
++	if (fence->seqno == p->last_eviction_seqno)
++		goto out;
+ 
+-	p->eviction_work.quiesce_fence = dma_fence_get(fence);
++	p->last_eviction_seqno = fence->seqno;
+ 
+ 	/* Avoid KFD process starvation. Wait for at least
+ 	 * PROCESS_ACTIVE_TIME_MS before evicting the process again
+@@ -974,7 +963,7 @@ int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
+ 	/* During process initialization eviction_work.dwork is initialized
+ 	 * to kfd_evict_bo_worker
+ 	 */
+-	schedule_delayed_work(&p->eviction_work.dwork, delay_jiffies);
++	schedule_delayed_work(&p->eviction_work, delay_jiffies);
+ out:
+ 	kfd_unref_process(p);
+ 	return 0;
+@@ -984,48 +973,39 @@ void kfd_evict_bo_worker(struct work_struct *work)
+ {
+ 	int ret;
+ 	struct kfd_process *p;
+-	struct kfd_eviction_work *eviction_work;
+ 	struct delayed_work *dwork;
+ 
+ 	dwork = to_delayed_work(work);
+-	eviction_work = container_of(dwork, struct kfd_eviction_work,
+-				     dwork);
+ 
+ 	/* Process termination destroys this worker thread. So during the
+ 	 * lifetime of this thread, kfd_process p will be valid
+ 	 */
+-	p = container_of(eviction_work, struct kfd_process, eviction_work);
+-
+-	/* Narrow window of overlap between restore and evict work item is
+-	 * possible. Once amdgpu_amdkfd_gpuvm_restore_process_bos unreserves
+-	 * KFD BOs, it is possible to evicted again. But restore has few more
+-	 * steps of finish. So lets wait for the restore work to complete
++	p = container_of(dwork, struct kfd_process, eviction_work);
++	WARN_ONCE(p->last_eviction_seqno != p->ef->seqno,
++		  "Eviction fence mismatch\n");
++
++	/* Narrow window of overlap between restore and evict work
++	 * item is possible. Once
++	 * amdgpu_amdkfd_gpuvm_restore_process_bos unreserves KFD BOs,
++	 * it is possible to evicted again. But restore has few more
++	 * steps of finish. So lets wait for any previous restore work
++	 * to complete
+ 	 */
+-	if (delayed_work_pending(&p->restore_work))
+-		flush_delayed_work(&p->restore_work);
++	flush_delayed_work(&p->restore_work);
+ 
+ 	pr_info("Started evicting process of pasid %d\n", p->pasid);
+ 	ret = quiesce_process_mm(p);
+ 	if (!ret) {
+-		dma_fence_signal(eviction_work->quiesce_fence);
+-		WARN_ONCE(eviction_work->quiesce_fence != p->ef,
+-			 "Eviction fence mismatch\n");
++		dma_fence_signal(p->ef);
+ 		dma_fence_put(p->ef);
+-		/* TODO: quiesce_fence is same as kfd_process->ef. But
+-		 * quiesce_fence is also used to avoid starting multiple
+-		 * eviction work items. This might not be necessary and
+-		 * one of the variables could be removed
+-		 */
+ 		p->ef = NULL;
+ 		schedule_delayed_work(&p->restore_work,
+ 				msecs_to_jiffies(PROCESS_RESTORE_TIME_MS));
+-	} else
+-		pr_err("Failed to quiesce user queues. Cannot evict BOs\n");
+-
+-	dma_fence_put(eviction_work->quiesce_fence);
+-
+-	pr_info("Finished evicting process of pasid %d\n", p->pasid);
+ 
++		pr_info("Finished evicting process of pasid %d\n", p->pasid);
++	} else
++		pr_err("Failed to quiesce user queues. Cannot evict pasid %d\n",
++		       p->pasid);
+ }
+ 
+ static int kfd_gtt_sa_init(struct kfd_dev *kfd, unsigned int buf_size,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index d3e246e..54bffc2 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -595,10 +595,6 @@ struct qcm_process_device {
+ };
+ 
+ /* KFD Memory Eviction */
+-struct kfd_eviction_work {
+-	struct delayed_work dwork;
+-	struct dma_fence *quiesce_fence;
+-};
+ 
+ /* Approx. wait time before attempting to restore evicted BOs */
+ #define PROCESS_RESTORE_TIME_MS 100
+@@ -743,8 +739,10 @@ struct kfd_process {
+ 	struct dma_fence *ef;
+ 
+ 	/* Work items for evicting and restoring BOs */
+-	struct kfd_eviction_work eviction_work;
++	struct delayed_work eviction_work;
+ 	struct delayed_work restore_work;
++	/* seqno of the last scheduled eviction */
++	unsigned int last_eviction_seqno;
+ 	/* Approx. the last timestamp (in jiffies) when the process was
+ 	 * restored after an eviction
+ 	 */
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 3d663d3..64042f1 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -458,7 +458,7 @@ static void kfd_process_notifier_release(struct mmu_notifier *mn,
+ 	mutex_unlock(&kfd_processes_mutex);
+ 	synchronize_srcu(&kfd_processes_srcu);
+ 
+-	cancel_delayed_work_sync(&p->eviction_work.dwork);
++	cancel_delayed_work_sync(&p->eviction_work);
+ 	cancel_delayed_work_sync(&p->restore_work);
+ 
+ 	mutex_lock(&p->mutex);
+@@ -607,7 +607,7 @@ static struct kfd_process *create_process(const struct task_struct *thread,
+ 	if (err != 0)
+ 		goto err_init_apertures;
+ 
+-	INIT_DELAYED_WORK(&process->eviction_work.dwork, kfd_evict_bo_worker);
++	INIT_DELAYED_WORK(&process->eviction_work, kfd_evict_bo_worker);
+ 	INIT_DELAYED_WORK(&process->restore_work, kfd_restore_bo_worker);
+ 	process->last_restore_timestamp = get_jiffies_64();
+ 
+@@ -1051,8 +1051,7 @@ void kfd_suspend_all_processes(void)
+ #else
+ 	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
+ #endif
+-		if (cancel_delayed_work_sync(&p->eviction_work.dwork))
+-			dma_fence_put(p->eviction_work.quiesce_fence);
++		cancel_delayed_work_sync(&p->eviction_work);
+ 		cancel_delayed_work_sync(&p->restore_work);
+ 
+ 		if (quiesce_process_mm(p))
+-- 
+2.7.4
+

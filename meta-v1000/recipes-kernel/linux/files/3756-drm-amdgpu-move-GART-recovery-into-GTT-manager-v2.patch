@@ -1,0 +1,330 @@
+From 62ec90883eef0bc2e3c58d25ef631f92ccdf71f8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 16 Oct 2017 16:50:32 +0200
+Subject: [PATCH 3756/5855] drm/amdgpu: move GART recovery into GTT manager v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The GTT manager handles the GART address space anyway, so it is
+completely pointless to keep the same information around twice.
+
+v2: rebased
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
+
+Change-Id: I7e2b77eee6b795de6f05d6aafd877a9f20615ffe
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h         |  3 --
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c  |  8 ++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c | 49 ++++++++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c     | 51 +++++++++--------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h     |  3 +-
+ 5 files changed, 57 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index fe2be7b..6fe9019 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1700,9 +1700,6 @@ struct amdgpu_device {
+ 	/* link all shadow bo */
+ 	struct list_head                shadow_list;
+ 	struct mutex                    shadow_list_lock;
+-	/* link all gtt */
+-	spinlock_t			gtt_list_lock;
+-	struct list_head                gtt_list;
+ 	/* keep an lru list of rings by HW IP */
+ 	struct list_head		ring_lru_list;
+ 	spinlock_t			ring_lru_list_lock;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index d5f77e6..ca7b5ab 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2204,9 +2204,6 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	INIT_LIST_HEAD(&adev->shadow_list);
+ 	mutex_init(&adev->shadow_list_lock);
+ 
+-	INIT_LIST_HEAD(&adev->gtt_list);
+-	spin_lock_init(&adev->gtt_list_lock);
+-
+ 	INIT_LIST_HEAD(&adev->ring_lru_list);
+ 	spin_lock_init(&adev->ring_lru_list_lock);
+ 
+@@ -2896,7 +2893,8 @@ static int amdgpu_reset(struct amdgpu_device *adev, uint64_t* reset_flags)
+ 				atomic_inc(&adev->vram_lost_counter);
+ 			}
+ 
+-			r = amdgpu_ttm_recover_gart(adev);
++			r = amdgpu_gtt_mgr_recover(
++				&adev->mman.bdev.man[TTM_PL_TT]);
+ 			if (r)
+ 				goto out;
+ 
+@@ -2958,7 +2956,7 @@ static int amdgpu_reset_sriov(struct amdgpu_device *adev, uint64_t *reset_flags,
+ 		goto error;
+ 
+ 	/* we need recover gart prior to run SMC/CP/SDMA resume */
+-	amdgpu_ttm_recover_gart(adev);
++	amdgpu_gtt_mgr_recover(&adev->mman.bdev.man[TTM_PL_TT]);
+ 
+ 	/* now we are okay to resume SMC/CP/SDMA */
+ 	r = amdgpu_sriov_reinit_late(adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
+index 4456bc4..e35f849 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
+@@ -31,6 +31,11 @@ struct amdgpu_gtt_mgr {
+ 	atomic64_t available;
+ };
+ 
++struct amdgpu_gtt_node {
++	struct drm_mm_node node;
++	struct ttm_buffer_object *tbo;
++};
++
+ /**
+  * amdgpu_gtt_mgr_init - init GTT manager and DRM MM
+  *
+@@ -93,9 +98,9 @@ static int amdgpu_gtt_mgr_fini(struct ttm_mem_type_manager *man)
+  */
+ bool amdgpu_gtt_mgr_has_gart_addr(struct ttm_mem_reg *mem)
+ {
+-	struct drm_mm_node *node = mem->mm_node;
++	struct amdgpu_gtt_node *node = mem->mm_node;
+ 
+-	return (node->start != AMDGPU_BO_INVALID_OFFSET);
++	return (node->node.start != AMDGPU_BO_INVALID_OFFSET);
+ }
+ 
+ /**
+@@ -115,7 +120,7 @@ static int amdgpu_gtt_mgr_alloc(struct ttm_mem_type_manager *man,
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(man->bdev);
+ 	struct amdgpu_gtt_mgr *mgr = man->priv;
+-	struct drm_mm_node *node = mem->mm_node;
++	struct amdgpu_gtt_node *node = mem->mm_node;
+ 	enum drm_mm_search_flags sflags = DRM_MM_SEARCH_BEST;
+ 	enum drm_mm_allocator_flags aflags = DRM_MM_CREATE_DEFAULT;
+ 	unsigned long fpfn, lpfn;
+@@ -140,13 +145,13 @@ static int amdgpu_gtt_mgr_alloc(struct ttm_mem_type_manager *man,
+ 	}
+ 
+ 	spin_lock(&mgr->lock);
+-	r = drm_mm_insert_node_in_range_generic(&mgr->mm, node, mem->num_pages,
++	r = drm_mm_insert_node_in_range_generic(&mgr->mm, &node->node, mem->num_pages,
+ 						mem->page_alignment, 0,
+ 						fpfn, lpfn, sflags, aflags);
+ 	spin_unlock(&mgr->lock);
+ 
+ 	if (!r) 
+-		mem->start = node->start;
++		mem->start = node->node.start;
+ 
+ 	return r;
+ }
+@@ -167,7 +172,7 @@ static int amdgpu_gtt_mgr_new(struct ttm_mem_type_manager *man,
+ 			      struct ttm_mem_reg *mem)
+ {
+ 	struct amdgpu_gtt_mgr *mgr = man->priv;
+-	struct drm_mm_node *node;
++	struct amdgpu_gtt_node *node;
+ 	int r;
+ 
+ 	spin_lock(&mgr->lock);
+@@ -185,8 +190,9 @@ static int amdgpu_gtt_mgr_new(struct ttm_mem_type_manager *man,
+ 		goto err_out;
+ 	}
+ 
+-	node->start = AMDGPU_BO_INVALID_OFFSET;
+-	node->size = mem->num_pages;
++	node->node.start = AMDGPU_BO_INVALID_OFFSET;
++	node->node.size = mem->num_pages;
++	node->tbo = tbo;
+ 	mem->mm_node = node;
+ 
+ 	if (place->fpfn || place->lpfn || place->flags & TTM_PL_FLAG_TOPDOWN) {
+@@ -198,7 +204,7 @@ static int amdgpu_gtt_mgr_new(struct ttm_mem_type_manager *man,
+ 			goto err_out;
+ 		}
+ 	} else {
+-		mem->start = node->start;
++		mem->start = node->node.start;
+ 	}
+ 
+ 	return 0;
+@@ -222,14 +228,14 @@ static void amdgpu_gtt_mgr_del(struct ttm_mem_type_manager *man,
+ 			       struct ttm_mem_reg *mem)
+ {
+ 	struct amdgpu_gtt_mgr *mgr = man->priv;
+-	struct drm_mm_node *node = mem->mm_node;
++	struct amdgpu_gtt_node *node = mem->mm_node;
+ 
+ 	if (!node)
+ 		return;
+ 
+ 	spin_lock(&mgr->lock);
+-	if (node->start != AMDGPU_BO_INVALID_OFFSET)
+-		drm_mm_remove_node(node);
++	if (node->node.start != AMDGPU_BO_INVALID_OFFSET)
++		drm_mm_remove_node(&nomdgpu_gtt_mgr_newde->node);
+ 	spin_unlock(&mgr->lock);
+ 	atomic64_add(mem->num_pages, &mgr->available);
+ 
+@@ -252,6 +258,25 @@ uint64_t amdgpu_gtt_mgr_usage(struct ttm_mem_type_manager *man)
+ 	return (result > 0 ? result : 0) * PAGE_SIZE;
+ }
+ 
++int amdgpu_gtt_mgr_recover(struct ttm_mem_type_manager *man)
++{
++	struct amdgpu_gtt_mgr *mgr = man->priv;
++	struct amdgpu_gtt_node *node;
++	struct drm_mm_node *mm_node;
++	int r = 0;
++
++	spin_lock(&mgr->lock);
++	drm_mm_for_each_node(mm_node, &mgr->mm) {
++		node = container_of(mm_node, struct amdgpu_gtt_node, node);
++		r = amdgpu_ttm_recover_gart(node->tbo);
++		if (r)
++			break;
++	}
++	spin_unlock(&mgr->lock);
++
++	return r;
++}
++
+ /**
+  * amdgpu_gtt_mgr_debug - dump VRAM table
+  *
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 2ef5427..08ac47d 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -752,7 +752,6 @@ struct amdgpu_ttm_tt {
+ 	struct list_head        guptasks;
+ 	atomic_t		mmu_invalidations;
+ 	uint32_t		last_set_pages;
+-	struct list_head        list;
+ };
+ 
+ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages)
+@@ -937,21 +936,14 @@ static int amdgpu_ttm_backend_bind(struct ttm_tt *ttm,
+ 		return 0;
+ 	}
+ 
+-	spin_lock(&gtt->adev->gtt_list_lock);
+ 	flags = amdgpu_ttm_tt_pte_flags(gtt->adev, ttm, bo_mem);
+ 	gtt->offset = (u64)bo_mem->start << PAGE_SHIFT;
+ 	r = amdgpu_gart_bind(gtt->adev, gtt->offset, ttm->num_pages,
+ 		ttm->pages, gtt->ttm.dma_address, flags);
+ 
+-	if (r) {
++	if (r)
+ 		DRM_ERROR("failed to bind %lu pages at 0x%08llX\n",
+ 			  ttm->num_pages, gtt->offset);
+-		goto error_gart_bind;
+-	}
+-
+-	list_add_tail(&gtt->list, &gtt->adev->gtt_list);
+-error_gart_bind:
+-	spin_unlock(&gtt->adev->gtt_list_lock);
+ 	return r;
+ }
+ 
+@@ -993,29 +985,23 @@ int amdgpu_ttm_bind(struct ttm_buffer_object *bo)
+ 	return r;
+ }
+ 
+-int amdgpu_ttm_recover_gart(struct amdgpu_device *adev)
++int amdgpu_ttm_recover_gart(struct ttm_buffer_object *tbo)
+ {
+-	struct amdgpu_ttm_tt *gtt, *tmp;
+-	struct ttm_mem_reg bo_mem;
++	struct amdgpu_device *adev = amdgpu_ttm_adev(tbo->bdev);
++	struct amdgpu_ttm_tt *gtt = (void *)tbo->ttm;
+ 	uint64_t flags;
+ 	int r;
+ 
+-	bo_mem.mem_type = TTM_PL_TT;
+-	spin_lock(&adev->gtt_list_lock);
+-	list_for_each_entry_safe(gtt, tmp, &adev->gtt_list, list) {
+-		flags = amdgpu_ttm_tt_pte_flags(gtt->adev, &gtt->ttm.ttm, &bo_mem);
+-		r = amdgpu_gart_bind(adev, gtt->offset, gtt->ttm.ttm.num_pages,
+-				     gtt->ttm.ttm.pages, gtt->ttm.dma_address,
+-				     flags);
+-		if (r) {
+-			spin_unlock(&adev->gtt_list_lock);
+-			DRM_ERROR("failed to bind %lu pages at 0x%08llX\n",
+-				  gtt->ttm.ttm.num_pages, gtt->offset);
+-			return r;
+-		}
+-	}
+-	spin_unlock(&adev->gtt_list_lock);
+-	return 0;
++	if (!gtt)
++		return 0;
++
++	flags = amdgpu_ttm_tt_pte_flags(adev, &gtt->ttm.ttm, &tbo->mem);
++	r = amdgpu_gart_bind(adev, gtt->offset, gtt->ttm.ttm.num_pages,
++			     gtt->ttm.ttm.pages, gtt->ttm.dma_address, flags);
++	if (r)
++		DRM_ERROR("failed to bind %lu pages at 0x%08llX\n",
++			  gtt->ttm.ttm.num_pages, gtt->offset);
++	return r;
+ }
+ 
+ static int amdgpu_ttm_backend_unbind(struct ttm_tt *ttm)
+@@ -1030,16 +1016,10 @@ static int amdgpu_ttm_backend_unbind(struct ttm_tt *ttm)
+ 		return 0;
+ 
+ 	/* unbind shouldn't be done for GDS/GWS/OA in ttm_bo_clean_mm */
+-	spin_lock(&gtt->adev->gtt_list_lock);
+ 	r = amdgpu_gart_unbind(gtt->adev, gtt->offset, ttm->num_pages);
+-	if (r) {
++	if (r)
+ 		DRM_ERROR("failed to unbind %lu pages at 0x%08llX\n",
+ 			  gtt->ttm.ttm.num_pages, gtt->offset);
+-		goto error_unbind;
+-	}
+-	list_del_init(&gtt->list);
+-error_unbind:
+-	spin_unlock(&gtt->adev->gtt_list_lock);
+ 	return r;
+ }
+ 
+@@ -1076,7 +1056,6 @@ static struct ttm_tt *amdgpu_ttm_tt_create(struct ttm_bo_device *bdev,
+ 		kfree(gtt);
+ 		return NULL;
+ 	}
+-	INIT_LIST_HEAD(&gtt->list);
+ 	return &gtt->ttm.ttm;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 7fc842c..454ff29 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -73,6 +73,7 @@ extern const struct ttm_mem_type_manager_func amdgpu_vram_mgr_func;
+ 
+ bool amdgpu_gtt_mgr_has_gart_addr(struct ttm_mem_reg *mem);
+ uint64_t amdgpu_gtt_mgr_usage(struct ttm_mem_type_manager *man);
++int amdgpu_gtt_mgr_recover(struct ttm_mem_type_manager *man);
+ 
+ uint64_t amdgpu_vram_mgr_usage(struct ttm_mem_type_manager *man);
+ uint64_t amdgpu_vram_mgr_vis_usage(struct ttm_mem_type_manager *man);
+@@ -97,7 +98,7 @@ int amdgpu_mmap(struct file *filp, struct vm_area_struct *vma);
+ int amdgpu_bo_mmap(struct file *filp, struct vm_area_struct *vma,
+ 		   struct ttm_bo_device *bdev);
+ int amdgpu_ttm_bind(struct ttm_buffer_object *bo);
+-int amdgpu_ttm_recover_gart(struct amdgpu_device *adev);
++int amdgpu_ttm_recover_gart(struct ttm_buffer_object *tbo);
+ 
+ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages);
+ void amdgpu_ttm_tt_set_user_pages(struct ttm_tt *ttm, struct page **pages);
+-- 
+2.7.4
+

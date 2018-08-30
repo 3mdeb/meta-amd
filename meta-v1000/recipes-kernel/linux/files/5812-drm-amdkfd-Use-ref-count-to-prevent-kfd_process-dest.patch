@@ -1,0 +1,178 @@
+From ba23148bb4fcc6639b802dcc3acab5087856d343 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Mon, 27 Nov 2017 18:29:52 -0500
+Subject: [PATCH 5812/5855] drm/amdkfd: Use ref count to prevent kfd_process
+ destruction
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Use a reference counter instead of a lock to prevent process
+destruction while functions running out of process context are using
+the kfd_process structure. In many cases these functions don't need
+the structure to be locked. In the few cases that really do need the
+process lock, take it explicitly.
+
+This helps simplify lock dependencies between the process lock and
+other locks, particularly amdgpu and mm_struct locks. This will be
+important when amdgpu calls back to amdkfd for memory evictions.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_events.c  | 14 +++++++-------
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  1 +
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c | 16 +++++++++++++---
+ 3 files changed, 21 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_events.c b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+index cb92d4b..93aae5c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+@@ -441,7 +441,7 @@ void kfd_signal_event_interrupt(unsigned int pasid, uint32_t partial_id,
+ 	/*
+ 	 * Because we are called from arbitrary context (workqueue) as opposed
+ 	 * to process context, kfd_process could attempt to exit while we are
+-	 * running so the lookup function returns a locked process.
++	 * running so the lookup function increments the process ref count.
+ 	 */
+ 	struct kfd_process *p = kfd_lookup_process_by_pasid(pasid);
+ 
+@@ -493,7 +493,7 @@ void kfd_signal_event_interrupt(unsigned int pasid, uint32_t partial_id,
+ 	}
+ 
+ 	mutex_unlock(&p->event_mutex);
+-	mutex_unlock(&p->mutex);
++	kfd_unref_process(p);
+ }
+ 
+ static struct kfd_event_waiter *alloc_event_waiters(uint32_t num_events)
+@@ -847,7 +847,7 @@ void kfd_signal_iommu_event(struct kfd_dev *dev, unsigned int pasid,
+ 	/*
+ 	 * Because we are called from arbitrary context (workqueue) as opposed
+ 	 * to process context, kfd_process could attempt to exit while we are
+-	 * running so the lookup function returns a locked process.
++	 * running so the lookup function increments the process ref count.
+ 	 */
+ 	struct kfd_process *p = kfd_lookup_process_by_pasid(pasid);
+ 	struct mm_struct *mm;
+@@ -860,7 +860,7 @@ void kfd_signal_iommu_event(struct kfd_dev *dev, unsigned int pasid,
+ 	 */
+ 	mm = get_task_mm(p->lead_thread);
+ 	if (!mm) {
+-		mutex_unlock(&p->mutex);
++		kfd_unref_process(p);
+ 		return; /* Process is exiting */
+ 	}
+ 
+@@ -903,7 +903,7 @@ void kfd_signal_iommu_event(struct kfd_dev *dev, unsigned int pasid,
+ 			&memory_exception_data);
+ 
+ 	mutex_unlock(&p->event_mutex);
+-	mutex_unlock(&p->mutex);
++	kfd_unref_process(p);
+ }
+ 
+ void kfd_signal_hw_exception_event(unsigned int pasid)
+@@ -911,7 +911,7 @@ void kfd_signal_hw_exception_event(unsigned int pasid)
+ 	/*
+ 	 * Because we are called from arbitrary context (workqueue) as opposed
+ 	 * to process context, kfd_process could attempt to exit while we are
+-	 * running so the lookup function returns a locked process.
++	 * running so the lookup function increments the process ref count.
+ 	 */
+ 	struct kfd_process *p = kfd_lookup_process_by_pasid(pasid);
+ 
+@@ -924,5 +924,5 @@ void kfd_signal_hw_exception_event(unsigned int pasid)
+ 	lookup_events_by_type_and_signal(p, KFD_EVENT_TYPE_HW_EXCEPTION, NULL);
+ 
+ 	mutex_unlock(&p->event_mutex);
+-	mutex_unlock(&p->mutex);
++	kfd_unref_process(p);
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 30e1476..1851e28 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -606,6 +606,7 @@ void kfd_process_destroy_wq(void);
+ struct kfd_process *kfd_create_process(struct file *filep);
+ struct kfd_process *kfd_get_process(const struct task_struct *);
+ struct kfd_process *kfd_lookup_process_by_pasid(unsigned int pasid);
++void kfd_unref_process(struct kfd_process *p);
+ 
+ struct kfd_process_device *kfd_bind_process_to_device(struct kfd_dev *dev,
+ 						struct kfd_process *p);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index e02e8a2..509f987 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -49,6 +49,7 @@ DEFINE_STATIC_SRCU(kfd_processes_srcu);
+ static struct workqueue_struct *kfd_process_wq;
+ 
+ static struct kfd_process *find_process(const struct task_struct *thread);
++static void kfd_process_ref_release(struct kref *ref);
+ static struct kfd_process *create_process(const struct task_struct *thread);
+ static int kfd_process_init_cwsr(struct kfd_process *p, struct file *filep);
+ 
+@@ -146,6 +147,11 @@ static struct kfd_process *find_process(const struct task_struct *thread)
+ 	return p;
+ }
+ 
++void kfd_unref_process(struct kfd_process *p)
++{
++	kref_put(&p->ref, kfd_process_ref_release);
++}
++
+ /* No process locking is needed in this function, because the process
+  * is not findable any more. We must assume that no other thread is
+  * using it any more, otherwise we couldn't safely free the process
+@@ -201,7 +207,7 @@ static void kfd_process_destroy_delayed(struct rcu_head *rcu)
+ {
+ 	struct kfd_process *p = container_of(rcu, struct kfd_process, rcu);
+ 
+-	kref_put(&p->ref, kfd_process_ref_release);
++	kfd_unref_process(p);
+ }
+ 
+ static void kfd_process_notifier_release(struct mmu_notifier *mn,
+@@ -525,6 +531,8 @@ void kfd_process_iommu_unbind_callback(struct kfd_dev *dev, unsigned int pasid)
+ 
+ 	mutex_unlock(kfd_get_dbgmgr_mutex());
+ 
++	mutex_lock(&p->mutex);
++
+ 	pdd = kfd_get_process_device_data(dev, p);
+ 	if (pdd)
+ 		/* For GPU relying on IOMMU, we need to dequeue here
+@@ -533,6 +541,8 @@ void kfd_process_iommu_unbind_callback(struct kfd_dev *dev, unsigned int pasid)
+ 		kfd_process_dequeue_from_device(pdd);
+ 
+ 	mutex_unlock(&p->mutex);
++
++	kfd_unref_process(p);
+ }
+ 
+ struct kfd_process_device *kfd_get_first_process_device_data(
+@@ -557,7 +567,7 @@ bool kfd_has_process_device_data(struct kfd_process *p)
+ 	return !(list_empty(&p->per_device_data));
+ }
+ 
+-/* This returns with process->mutex locked. */
++/* This increments the process->ref counter. */
+ struct kfd_process *kfd_lookup_process_by_pasid(unsigned int pasid)
+ {
+ 	struct kfd_process *p;
+@@ -567,7 +577,7 @@ struct kfd_process *kfd_lookup_process_by_pasid(unsigned int pasid)
+ 
+ 	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
+ 		if (p->pasid == pasid) {
+-			mutex_lock(&p->mutex);
++			kref_get(&p->ref);
+ 			break;
+ 		}
+ 	}
+-- 
+2.7.4
+

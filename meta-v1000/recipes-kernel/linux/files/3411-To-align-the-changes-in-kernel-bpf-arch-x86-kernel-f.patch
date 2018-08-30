@@ -1,0 +1,727 @@
+From f33992008f09bf3925ddf3bdd88138e2283abff9 Mon Sep 17 00:00:00 2001
+From: Sudheesh Mavila <sudheesh.mavila@amd.com>
+Date: Mon, 23 Apr 2018 15:15:26 +0530
+Subject: [PATCH 3411/5855] To align the changes in kernel/bpf
+ arch/x86/kernel/fpu and arch/x86/kvm with Linux-4.9.85
+
+Signed-off-by: Sudheesh Mavila <sudheesh.mavila@amd.com>
+---
+ arch/x86/include/asm/kvm_emulate.h |   5 +-
+ arch/x86/include/asm/msr-index.h   |   2 +
+ arch/x86/kernel/fpu/init.c         |   1 +
+ arch/x86/kernel/fpu/regset.c       |   9 +-
+ arch/x86/kernel/fpu/signal.c       |   4 +
+ arch/x86/kernel/fpu/xstate.c       |   1 +
+ include/linux/bpf.h                |   2 +
+ include/linux/kaiser.h             |   2 +-
+ kernel/bpf/arraymap.c              |  17 ++--
+ kernel/bpf/hashtab.c               |  22 ++---
+ kernel/bpf/stackmap.c              |  20 ++---
+ kernel/bpf/syscall.c               |  26 ++++++
+ kernel/bpf/verifier.c              | 170 +++++++++++++++++++++++++++++++++----
+ 13 files changed, 225 insertions(+), 56 deletions(-)
+ mode change 100644 => 100755 arch/x86/include/asm/kvm_emulate.h
+ mode change 100644 => 100755 arch/x86/include/asm/msr-index.h
+ mode change 100644 => 100755 arch/x86/kernel/fpu/init.c
+ mode change 100644 => 100755 arch/x86/kernel/fpu/regset.c
+ mode change 100644 => 100755 arch/x86/kernel/fpu/signal.c
+ mode change 100644 => 100755 arch/x86/kernel/fpu/xstate.c
+ mode change 100644 => 100755 include/linux/kaiser.h
+ mode change 100644 => 100755 kernel/bpf/arraymap.c
+ mode change 100644 => 100755 kernel/bpf/hashtab.c
+ mode change 100644 => 100755 kernel/bpf/stackmap.c
+ mode change 100644 => 100755 kernel/bpf/syscall.c
+ mode change 100644 => 100755 kernel/bpf/verifier.c
+
+diff --git a/arch/x86/include/asm/kvm_emulate.h b/arch/x86/include/asm/kvm_emulate.h
+old mode 100644
+new mode 100755
+index e9cd7be..fc3c7e4
+--- a/arch/x86/include/asm/kvm_emulate.h
++++ b/arch/x86/include/asm/kvm_emulate.h
+@@ -221,6 +221,9 @@ struct x86_emulate_ops {
+ 	void (*get_cpuid)(struct x86_emulate_ctxt *ctxt,
+ 			  u32 *eax, u32 *ebx, u32 *ecx, u32 *edx);
+ 	void (*set_nmi_mask)(struct x86_emulate_ctxt *ctxt, bool masked);
++
++	unsigned (*get_hflags)(struct x86_emulate_ctxt *ctxt);
++	void (*set_hflags)(struct x86_emulate_ctxt *ctxt, unsigned hflags);
+ };
+ 
+ typedef u32 __attribute__((vector_size(16))) sse128_t;
+@@ -290,10 +293,10 @@ struct x86_emulate_ctxt {
+ 
+ 	/* interruptibility state, as a result of execution of STI or MOV SS */
+ 	int interruptibility;
+-	int emul_flags;
+ 
+ 	bool perm_ok; /* do not check permissions if true */
+ 	bool ud;	/* inject an #UD if host doesn't support insn */
++	bool tf;	/* TF value before instruction (after for syscall/sysret) */
+ 
+ 	bool have_exception;
+ 	struct x86_exception exception;
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+old mode 100644
+new mode 100755
+index 0e4da8e..c768bc1
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -420,6 +420,8 @@
+ #define MSR_IA32_TSC_ADJUST             0x0000003b
+ #define MSR_IA32_BNDCFGS		0x00000d90
+ 
++#define MSR_IA32_BNDCFGS_RSVD		0x00000ffc
++
+ #define MSR_IA32_XSS			0x00000da0
+ 
+ #define FEATURE_CONTROL_LOCKED				(1<<0)
+diff --git a/arch/x86/kernel/fpu/init.c b/arch/x86/kernel/fpu/init.c
+old mode 100644
+new mode 100755
+index 2f2b8c7..6f0ab305
+--- a/arch/x86/kernel/fpu/init.c
++++ b/arch/x86/kernel/fpu/init.c
+@@ -101,6 +101,7 @@ static void fpu__init_system_early_generic(struct cpuinfo_x86 *c)
+  * Boot time FPU feature detection code:
+  */
+ unsigned int mxcsr_feature_mask __read_mostly = 0xffffffffu;
++EXPORT_SYMBOL_GPL(mxcsr_feature_mask);
+ 
+ static void __init fpu__init_system_mxcsr(void)
+ {
+diff --git a/arch/x86/kernel/fpu/regset.c b/arch/x86/kernel/fpu/regset.c
+old mode 100644
+new mode 100755
+index c114b13..7052d9a
+--- a/arch/x86/kernel/fpu/regset.c
++++ b/arch/x86/kernel/fpu/regset.c
+@@ -130,11 +130,16 @@ int xstateregs_set(struct task_struct *target, const struct user_regset *regset,
+ 
+ 	fpu__activate_fpstate_write(fpu);
+ 
+-	if (boot_cpu_has(X86_FEATURE_XSAVES))
++	if (boot_cpu_has(X86_FEATURE_XSAVES)) {
+ 		ret = copyin_to_xsaves(kbuf, ubuf, xsave);
+-	else
++	} else {
+ 		ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, xsave, 0, -1);
+ 
++		/* xcomp_bv must be 0 when using uncompacted format */
++		if (!ret && xsave->header.xcomp_bv)
++			ret = -EINVAL;
++	}
++
+ 	/*
+ 	 * In case of failure, mark all states as init:
+ 	 */
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+old mode 100644
+new mode 100755
+index a184c21..3ec0d2d
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -329,6 +329,10 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		} else {
+ 			err = __copy_from_user(&fpu->state.xsave,
+ 					       buf_fx, state_size);
++
++			/* xcomp_bv must be 0 when using uncompacted format */
++			if (!err && state_size > offsetof(struct xregs_state, header) && fpu->state.xsave.header.xcomp_bv)
++				err = -EINVAL;
+ 		}
+ 
+ 		if (err || __copy_from_user(&env, buf, sizeof(env))) {
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+old mode 100644
+new mode 100755
+index 095ef7d..abfbb61b
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -1077,6 +1077,7 @@ int copyin_to_xsaves(const void *kbuf, const void __user *ubuf,
+ 	 * Add back in the features that came in from userspace:
+ 	 */
+ 	xsave->header.xfeatures |= xfeatures;
++	xsave->header.xcomp_bv = XCOMP_BV_COMPACTED_FORMAT | xsave->header.xfeatures;
+ 
+ 	return 0;
+ }
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 80064c8..7995940 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -253,6 +253,8 @@ struct bpf_map *bpf_map_inc(struct bpf_map *map, bool uref);
+ void bpf_map_put_with_uref(struct bpf_map *map);
+ void bpf_map_put(struct bpf_map *map);
+ int bpf_map_precharge_memlock(u32 pages);
++void *bpf_map_area_alloc(size_t size);
++void bpf_map_area_free(void *base);
+ 
+ extern int sysctl_unprivileged_bpf_disabled;
+ 
+diff --git a/include/linux/kaiser.h b/include/linux/kaiser.h
+old mode 100644
+new mode 100755
+index 58c55b1..b56c190
+--- a/include/linux/kaiser.h
++++ b/include/linux/kaiser.h
+@@ -32,7 +32,7 @@ static inline void kaiser_init(void)
+ {
+ }
+ static inline int kaiser_add_mapping(unsigned long addr,
+-				     unsigned long size, unsigned long flags)
++				     unsigned long size, u64 flags)
+ {
+ 	return 0;
+ }
+diff --git a/kernel/bpf/arraymap.c b/kernel/bpf/arraymap.c
+old mode 100644
+new mode 100755
+index c6c0b62..a1c3d26
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -11,7 +11,6 @@
+  */
+ #include <linux/bpf.h>
+ #include <linux/err.h>
+-#include <linux/vmalloc.h>
+ #include <linux/slab.h>
+ #include <linux/mm.h>
+ #include <linux/filter.h>
+@@ -98,12 +97,9 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
+ 
+ 
+ 	/* allocate all map elements and zero-initialize them */
+-	array = kzalloc(array_size, GFP_USER | __GFP_NOWARN);
+-	if (!array) {
+-		array = vzalloc(array_size);
+-		if (!array)
+-			return ERR_PTR(-ENOMEM);
+-	}
++       array = bpf_map_area_alloc(array_size);
++       if (!array)
++               return ERR_PTR(-ENOMEM);
+ 	array->index_mask = index_mask;
+ 	array->map.unpriv_array = unpriv;
+ 
+@@ -121,7 +117,7 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
+ 
+ 	if (array_size >= U32_MAX - PAGE_SIZE ||
+ 	    elem_size > PCPU_MIN_UNIT_SIZE || bpf_array_alloc_percpu(array)) {
+-		kvfree(array);
++		bpf_map_area_free(array);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ out:
+@@ -287,7 +283,7 @@ static void array_map_free(struct bpf_map *map)
+ 	if (array->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
+ 		bpf_array_free_percpu(array);
+ 
+-	kvfree(array);
++	bpf_map_area_free(array);
+ }
+ 
+ static const struct bpf_map_ops array_ops = {
+@@ -344,7 +340,8 @@ static void fd_array_map_free(struct bpf_map *map)
+ 	/* make sure it's empty */
+ 	for (i = 0; i < array->map.max_entries; i++)
+ 		BUG_ON(array->ptrs[i] != NULL);
+-	kvfree(array);
++
++	bpf_map_area_free(array);
+ }
+ 
+ static void *fd_array_map_lookup_elem(struct bpf_map *map, void *key)
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+old mode 100644
+new mode 100755
+index ad1bc67..ad2f0ed
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -13,7 +13,6 @@
+ #include <linux/bpf.h>
+ #include <linux/jhash.h>
+ #include <linux/filter.h>
+-#include <linux/vmalloc.h>
+ #include "percpu_freelist.h"
+ 
+ struct bucket {
+@@ -84,14 +83,15 @@ static void htab_free_elems(struct bpf_htab *htab)
+ 		free_percpu(pptr);
+ 	}
+ free_elems:
+-	vfree(htab->elems);
++	bpf_map_area_free(htab->elems);
+ }
+ 
+ static int prealloc_elems_and_freelist(struct bpf_htab *htab)
+ {
+ 	int err = -ENOMEM, i;
+ 
+-	htab->elems = vzalloc(htab->elem_size * htab->map.max_entries);
++	htab->elems = bpf_map_area_alloc(htab->elem_size *
++					 htab->map.max_entries);
+ 	if (!htab->elems)
+ 		return -ENOMEM;
+ 
+@@ -227,14 +227,10 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ 		goto free_htab;
+ 
+ 	err = -ENOMEM;
+-	htab->buckets = kmalloc_array(htab->n_buckets, sizeof(struct bucket),
+-				      GFP_USER | __GFP_NOWARN);
+-
+-	if (!htab->buckets) {
+-		htab->buckets = vmalloc(htab->n_buckets * sizeof(struct bucket));
+-		if (!htab->buckets)
+-			goto free_htab;
+-	}
++	htab->buckets = bpf_map_area_alloc(htab->n_buckets *
++					   sizeof(struct bucket));
++	if (!htab->buckets)
++		goto free_htab;
+ 
+ 	for (i = 0; i < htab->n_buckets; i++) {
+ 		INIT_HLIST_HEAD(&htab->buckets[i].head);
+@@ -258,7 +254,7 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ free_extra_elems:
+ 	free_percpu(htab->extra_elems);
+ free_buckets:
+-	kvfree(htab->buckets);
++	bpf_map_area_free(htab->buckets);
+ free_htab:
+ 	kfree(htab);
+ 	return ERR_PTR(err);
+@@ -715,7 +711,7 @@ static void htab_map_free(struct bpf_map *map)
+ 		pcpu_freelist_destroy(&htab->freelist);
+ 	}
+ 	free_percpu(htab->extra_elems);
+-	kvfree(htab->buckets);
++	bpf_map_area_free(htab->buckets);
+ 	kfree(htab);
+ }
+ 
+diff --git a/kernel/bpf/stackmap.c b/kernel/bpf/stackmap.c
+old mode 100644
+new mode 100755
+index 732ae16..be85191
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@ -7,7 +7,6 @@
+ #include <linux/bpf.h>
+ #include <linux/jhash.h>
+ #include <linux/filter.h>
+-#include <linux/vmalloc.h>
+ #include <linux/stacktrace.h>
+ #include <linux/perf_event.h>
+ #include "percpu_freelist.h"
+@@ -32,7 +31,7 @@ static int prealloc_elems_and_freelist(struct bpf_stack_map *smap)
+ 	u32 elem_size = sizeof(struct stack_map_bucket) + smap->map.value_size;
+ 	int err;
+ 
+-	smap->elems = vzalloc(elem_size * smap->map.max_entries);
++	smap->elems = bpf_map_area_alloc(elem_size * smap->map.max_entries);
+ 	if (!smap->elems)
+ 		return -ENOMEM;
+ 
+@@ -45,7 +44,7 @@ static int prealloc_elems_and_freelist(struct bpf_stack_map *smap)
+ 	return 0;
+ 
+ free_elems:
+-	vfree(smap->elems);
++	bpf_map_area_free(smap->elems);
+ 	return err;
+ }
+ 
+@@ -76,12 +75,9 @@ static struct bpf_map *stack_map_alloc(union bpf_attr *attr)
+ 	if (cost >= U32_MAX - PAGE_SIZE)
+ 		return ERR_PTR(-E2BIG);
+ 
+-	smap = kzalloc(cost, GFP_USER | __GFP_NOWARN);
+-	if (!smap) {
+-		smap = vzalloc(cost);
+-		if (!smap)
+-			return ERR_PTR(-ENOMEM);
+-	}
++	smap = bpf_map_area_alloc(cost);
++	if (!smap)
++		return ERR_PTR(-ENOMEM);
+ 
+ 	err = -E2BIG;
+ 	cost += n_buckets * (value_size + sizeof(struct stack_map_bucket));
+@@ -112,7 +108,7 @@ static struct bpf_map *stack_map_alloc(union bpf_attr *attr)
+ put_buffers:
+ 	put_callchain_buffers();
+ free_smap:
+-	kvfree(smap);
++	bpf_map_area_free(smap);
+ 	return ERR_PTR(err);
+ }
+ 
+@@ -262,9 +258,9 @@ static void stack_map_free(struct bpf_map *map)
+ 	/* wait for bpf programs to complete before freeing stack map */
+ 	synchronize_rcu();
+ 
+-	vfree(smap->elems);
++	bpf_map_area_free(smap->elems);
+ 	pcpu_freelist_destroy(&smap->freelist);
+-	kvfree(smap);
++	bpf_map_area_free(smap);
+ 	put_callchain_buffers();
+ }
+ 
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+old mode 100644
+new mode 100755
+index 6ae783b..91a2d37
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -12,6 +12,8 @@
+ #include <linux/bpf.h>
+ #include <linux/syscalls.h>
+ #include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/mmzone.h>
+ #include <linux/anon_inodes.h>
+ #include <linux/file.h>
+ #include <linux/license.h>
+@@ -48,6 +50,30 @@ void bpf_register_map_type(struct bpf_map_type_list *tl)
+ 	list_add(&tl->list_node, &bpf_map_types);
+ }
+ 
++void *bpf_map_area_alloc(size_t size)
++{
++	/* We definitely need __GFP_NORETRY, so OOM killer doesn't
++	 * trigger under memory pressure as we really just want to
++	 * fail instead.
++	 */
++	const gfp_t flags = __GFP_NOWARN | __GFP_NORETRY | __GFP_ZERO;
++	void *area;
++
++	if (size <= (PAGE_SIZE << PAGE_ALLOC_COSTLY_ORDER)) {
++		area = kmalloc(size, GFP_USER | flags);
++		if (area != NULL)
++			return area;
++	}
++
++	return __vmalloc(size, GFP_KERNEL | __GFP_HIGHMEM | flags,
++			 PAGE_KERNEL);
++}
++
++void bpf_map_area_free(void *area)
++{
++	kvfree(area);
++}
++
+ int bpf_map_precharge_memlock(u32 pages)
+ {
+ 	struct user_struct *user = get_current_user();
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+old mode 100644
+new mode 100755
+index d24721d..a8e7527
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -139,7 +139,7 @@ struct bpf_verifier_stack_elem {
+ 	struct bpf_verifier_stack_elem *next;
+ };
+ 
+-#define BPF_COMPLEXITY_LIMIT_INSNS	65536
++#define BPF_COMPLEXITY_LIMIT_INSNS	98304
+ #define BPF_COMPLEXITY_LIMIT_STACK	1024
+ 
+ struct bpf_call_arg_meta {
+@@ -279,7 +279,8 @@ static const char *const bpf_jmp_string[16] = {
+ 	[BPF_EXIT >> 4] = "exit",
+ };
+ 
+-static void print_bpf_insn(struct bpf_insn *insn)
++static void print_bpf_insn(const struct bpf_verifier_env *env,
++			   const struct bpf_insn *insn)
+ {
+ 	u8 class = BPF_CLASS(insn->code);
+ 
+@@ -343,9 +344,19 @@ static void print_bpf_insn(struct bpf_insn *insn)
+ 				insn->code,
+ 				bpf_ldst_string[BPF_SIZE(insn->code) >> 3],
+ 				insn->src_reg, insn->imm);
+-		} else if (BPF_MODE(insn->code) == BPF_IMM) {
+-			verbose("(%02x) r%d = 0x%x\n",
+-				insn->code, insn->dst_reg, insn->imm);
++		} else if (BPF_MODE(insn->code) == BPF_IMM &&
++			   BPF_SIZE(insn->code) == BPF_DW) {
++			/* At this point, we already made sure that the second
++			 * part of the ldimm64 insn is accessible.
++			 */
++			u64 imm = ((u64)(insn + 1)->imm << 32) | (u32)insn->imm;
++			bool map_ptr = insn->src_reg == BPF_PSEUDO_MAP_FD;
++
++			if (map_ptr && !env->allow_ptr_leaks)
++				imm = 0;
++
++			verbose("(%02x) r%d = 0x%llx\n", insn->code,
++				insn->dst_reg, (unsigned long long)imm);
+ 		} else {
+ 			verbose("BUG_ld_%02x\n", insn->code);
+ 			return;
+@@ -691,6 +702,11 @@ static bool is_pointer_value(struct bpf_verifier_env *env, int regno)
+ 	return __is_pointer_value(env->allow_ptr_leaks, &env->cur_state.regs[regno]);
+ }
+ 
++static bool is_pointer_value(struct bpf_verifier_env *env, int regno)
++{
++	return __is_pointer_value(env->allow_ptr_leaks, &env->cur_state.regs[regno]);
++}
++
+ static bool is_ctx_reg(struct bpf_verifier_env *env, int regno)
+ {
+ 	const struct bpf_reg_state *reg = &env->cur_state.regs[regno];
+@@ -892,6 +908,11 @@ static int check_xadd(struct bpf_verifier_env *env, struct bpf_insn *insn)
+ 		return -EACCES;
+ 	}
+ 
++	if (is_pointer_value(env, insn->src_reg)) {
++		verbose("R%d leaks addr into mem\n", insn->src_reg);
++		return -EACCES;
++	}
++
+ 	if (is_ctx_reg(env, insn->dst_reg)) {
+ 		verbose("BPF_XADD stores into R%d context is not allowed\n",
+ 			insn->dst_reg);
+@@ -1482,6 +1503,65 @@ static int evaluate_reg_alu(struct bpf_verifier_env *env, struct bpf_insn *insn)
+ 	return 0;
+ }
+ 
++static int evaluate_reg_imm_alu_unknown(struct bpf_verifier_env *env,
++					struct bpf_insn *insn)
++{
++	struct bpf_reg_state *regs = env->cur_state.regs;
++	struct bpf_reg_state *dst_reg = &regs[insn->dst_reg];
++	struct bpf_reg_state *src_reg = &regs[insn->src_reg];
++	u8 opcode = BPF_OP(insn->code);
++	s64 imm_log2 = __ilog2_u64((long long)dst_reg->imm);
++
++	/* BPF_X code with src_reg->type UNKNOWN_VALUE here. */
++	if (src_reg->imm > 0 && dst_reg->imm) {
++		switch (opcode) {
++		case BPF_ADD:
++			/* dreg += sreg
++			 * where both have zero upper bits. Adding them
++			 * can only result making one more bit non-zero
++			 * in the larger value.
++			 * Ex. 0xffff (imm=48) + 1 (imm=63) = 0x10000 (imm=47)
++			 *     0xffff (imm=48) + 0xffff = 0x1fffe (imm=47)
++			 */
++			dst_reg->imm = min(src_reg->imm, 63 - imm_log2);
++			dst_reg->imm--;
++			break;
++		case BPF_AND:
++			/* dreg &= sreg
++			 * AND can not extend zero bits only shrink
++			 * Ex.  0x00..00ffffff
++			 *    & 0x0f..ffffffff
++			 *     ----------------
++			 *      0x00..00ffffff
++			 */
++			dst_reg->imm = max(src_reg->imm, 63 - imm_log2);
++			break;
++		case BPF_OR:
++			/* dreg |= sreg
++			 * OR can only extend zero bits
++			 * Ex.  0x00..00ffffff
++			 *    | 0x0f..ffffffff
++			 *     ----------------
++			 *      0x0f..00ffffff
++			 */
++			dst_reg->imm = min(src_reg->imm, 63 - imm_log2);
++			break;
++		case BPF_SUB:
++		case BPF_MUL:
++		case BPF_RSH:
++		case BPF_LSH:
++			/* These may be flushed out later */
++		default:
++			mark_reg_unknown_value(regs, insn->dst_reg);
++		}
++	} else {
++		mark_reg_unknown_value(regs, insn->dst_reg);
++	}
++
++	dst_reg->type = UNKNOWN_VALUE;
++	return 0;
++}
++
+ static int evaluate_reg_imm_alu(struct bpf_verifier_env *env,
+ 				struct bpf_insn *insn)
+ {
+@@ -1490,6 +1570,9 @@ static int evaluate_reg_imm_alu(struct bpf_verifier_env *env,
+ 	struct bpf_reg_state *src_reg = &regs[insn->src_reg];
+ 	u8 opcode = BPF_OP(insn->code);
+ 
++	if (BPF_SRC(insn->code) == BPF_X && src_reg->type == UNKNOWN_VALUE)
++		return evaluate_reg_imm_alu_unknown(env, insn);
++
+ 	/* dst_reg->type == CONST_IMM here, simulate execution of 'add' insn.
+ 	 * Don't care about overflow or negative values, just add them
+ 	 */
+@@ -1571,10 +1654,12 @@ static void adjust_reg_min_max_vals(struct bpf_verifier_env *env,
+ 	 * do our normal operations to the register, we need to set the values
+ 	 * to the min/max since they are undefined.
+ 	 */
+-	if (min_val == BPF_REGISTER_MIN_RANGE)
+-		dst_reg->min_value = BPF_REGISTER_MIN_RANGE;
+-	if (max_val == BPF_REGISTER_MAX_RANGE)
+-		dst_reg->max_value = BPF_REGISTER_MAX_RANGE;
++	if (opcode != BPF_SUB) {
++		if (min_val == BPF_REGISTER_MIN_RANGE)
++			dst_reg->min_value = BPF_REGISTER_MIN_RANGE;
++		if (max_val == BPF_REGISTER_MAX_RANGE)
++			dst_reg->max_value = BPF_REGISTER_MAX_RANGE;
++	}
+ 
+ 	switch (opcode) {
+ 	case BPF_ADD:
+@@ -1584,10 +1669,17 @@ static void adjust_reg_min_max_vals(struct bpf_verifier_env *env,
+ 			dst_reg->max_value += max_val;
+ 		break;
+ 	case BPF_SUB:
++		/* If one of our values was at the end of our ranges, then the
++		 * _opposite_ value in the dst_reg goes to the end of our range.
++		 */
++		if (min_val == BPF_REGISTER_MIN_RANGE)
++			dst_reg->max_value = BPF_REGISTER_MAX_RANGE;
++		if (max_val == BPF_REGISTER_MAX_RANGE)
++			dst_reg->min_value = BPF_REGISTER_MIN_RANGE;
+ 		if (dst_reg->min_value != BPF_REGISTER_MIN_RANGE)
+-			dst_reg->min_value -= min_val;
++			dst_reg->min_value -= max_val;
+ 		if (dst_reg->max_value != BPF_REGISTER_MAX_RANGE)
+-			dst_reg->max_value -= max_val;
++			dst_reg->max_value -= min_val;
+ 		break;
+ 	case BPF_MUL:
+ 		if (dst_reg->min_value != BPF_REGISTER_MIN_RANGE)
+@@ -1658,7 +1750,8 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+ 			}
+ 		} else {
+ 			if (insn->src_reg != BPF_REG_0 || insn->off != 0 ||
+-			    (insn->imm != 16 && insn->imm != 32 && insn->imm != 64)) {
++			    (insn->imm != 16 && insn->imm != 32 && insn->imm != 64) ||
++			    BPF_CLASS(insn->code) == BPF_ALU64) {
+ 				verbose("BPF_END uses reserved fields\n");
+ 				return -EINVAL;
+ 			}
+@@ -1806,6 +1899,35 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+ 			return 0;
+ 		} else if (opcode == BPF_ADD &&
+ 			   BPF_CLASS(insn->code) == BPF_ALU64 &&
++			   dst_reg->type == PTR_TO_STACK &&
++			   ((BPF_SRC(insn->code) == BPF_X &&
++			     regs[insn->src_reg].type == CONST_IMM) ||
++			    BPF_SRC(insn->code) == BPF_K)) {
++			if (BPF_SRC(insn->code) == BPF_X) {
++				/* check in case the register contains a big
++				 * 64-bit value
++				 */
++				if (regs[insn->src_reg].imm < -MAX_BPF_STACK ||
++				    regs[insn->src_reg].imm > MAX_BPF_STACK) {
++					verbose("R%d value too big in R%d pointer arithmetic\n",
++						insn->src_reg, insn->dst_reg);
++					return -EACCES;
++				}
++				dst_reg->imm += regs[insn->src_reg].imm;
++			} else {
++				/* safe against overflow: addition of 32-bit
++				 * numbers in 64-bit representation
++				 */
++				dst_reg->imm += insn->imm;
++			}
++			if (dst_reg->imm > 0 || dst_reg->imm < -MAX_BPF_STACK) {
++				verbose("R%d out-of-bounds pointer arithmetic\n",
++					insn->dst_reg);
++				return -EACCES;
++			}
++			return 0;
++		} else if (opcode == BPF_ADD &&
++			   BPF_CLASS(insn->code) == BPF_ALU64 &&
+ 			   (dst_reg->type == PTR_TO_PACKET ||
+ 			    (BPF_SRC(insn->code) == BPF_X &&
+ 			     regs[insn->src_reg].type == PTR_TO_PACKET))) {
+@@ -1838,6 +1960,7 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+ 		 * register as unknown.
+ 		 */
+ 		if (env->allow_ptr_leaks &&
++		    BPF_CLASS(insn->code) == BPF_ALU64 && opcode == BPF_ADD &&
+ 		    (dst_reg->type == PTR_TO_MAP_VALUE ||
+ 		     dst_reg->type == PTR_TO_MAP_VALUE_ADJ))
+ 			dst_reg->type = PTR_TO_MAP_VALUE_ADJ;
+@@ -1886,14 +2009,15 @@ static void find_good_pkt_pointers(struct bpf_verifier_state *state,
+ 
+ 	for (i = 0; i < MAX_BPF_REG; i++)
+ 		if (regs[i].type == PTR_TO_PACKET && regs[i].id == dst_reg->id)
+-			regs[i].range = dst_reg->off;
++			/* keep the maximum range already checked */
++			regs[i].range = max(regs[i].range, dst_reg->off);
+ 
+ 	for (i = 0; i < MAX_BPF_STACK; i += BPF_REG_SIZE) {
+ 		if (state->stack_slot_type[i] != STACK_SPILL)
+ 			continue;
+ 		reg = &state->spilled_regs[i / BPF_REG_SIZE];
+ 		if (reg->type == PTR_TO_PACKET && reg->id == dst_reg->id)
+-			reg->range = dst_reg->off;
++			reg->range = max(reg->range, dst_reg->off);
+ 	}
+ }
+ 
+@@ -2481,6 +2605,7 @@ static int check_cfg(struct bpf_verifier_env *env)
+ 				env->explored_states[t + 1] = STATE_LIST_MARK;
+ 		} else {
+ 			/* conditional jump with two edges */
++			env->explored_states[t] = STATE_LIST_MARK;
+ 			ret = push_insn(t, t + 1, FALLTHROUGH, env);
+ 			if (ret == 1)
+ 				goto peek_stack;
+@@ -2632,11 +2757,19 @@ static bool states_equal(struct bpf_verifier_env *env,
+ 
+ 		/* If we didn't map access then again we don't care about the
+ 		 * mismatched range values and it's ok if our old type was
+-		 * UNKNOWN and we didn't go to a NOT_INIT'ed reg.
++ 		 * UNKNOWN and we didn't go to a NOT_INIT'ed or pointer reg.
+ 		 */
+ 		if (rold->type == NOT_INIT ||
+ 		    (!varlen_map_access && rold->type == UNKNOWN_VALUE &&
+-		     rcur->type != NOT_INIT))
++                    rcur->type != NOT_INIT &&
++                    !__is_pointer_value(env->allow_ptr_leaks, rcur)))
++                       continue;
++
++               /* Don't care about the reg->id in this case. */
++               if (rold->type == PTR_TO_MAP_VALUE_OR_NULL &&
++                   rcur->type == PTR_TO_MAP_VALUE_OR_NULL &&
++                   rold->map_ptr == rcur->map_ptr)
++
+ 			continue;
+ 
+ 		if (rold->type == PTR_TO_PACKET && rcur->type == PTR_TO_PACKET &&
+@@ -2773,6 +2906,9 @@ static int do_check(struct bpf_verifier_env *env)
+ 			goto process_bpf_exit;
+ 		}
+ 
++		if (need_resched())
++			cond_resched();
++
+ 		if (log_level && do_print_state) {
+ 			verbose("\nfrom %d to %d:", prev_insn_idx, insn_idx);
+ 			print_verifier_state(&env->cur_state);
+@@ -2781,7 +2917,7 @@ static int do_check(struct bpf_verifier_env *env)
+ 
+ 		if (log_level) {
+ 			verbose("%d: ", insn_idx);
+-			print_bpf_insn(insn);
++			print_bpf_insn(env, insn);
+ 		}
+ 
+ 		err = ext_analyzer_insn_hook(env, insn_idx, prev_insn_idx);
+-- 
+2.7.4
+

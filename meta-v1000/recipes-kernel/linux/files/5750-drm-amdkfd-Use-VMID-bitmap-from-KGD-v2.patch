@@ -1,0 +1,164 @@
+From 27529c34655759fee2b842dc5323e1b6d13bc8c6 Mon Sep 17 00:00:00 2001
+From: Yong Zhao <yong.zhao@amd.com>
+Date: Wed, 20 Sep 2017 18:10:18 -0400
+Subject: [PATCH 5750/5855] drm/amdkfd: Use VMID bitmap from KGD v2
+
+The hard-coded values related to VMID were removed in KFD, as those
+values can be calculated in the KFD initialization function.
+
+v2: remove unnecessary local variable
+
+Signed-off-by: Yong Zhao <yong.zhao@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c                |  9 ++-------
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c                |  5 +++++
+ drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 15 +++++++--------
+ drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h  |  4 ----
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h                  |  7 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c |  2 +-
+ 6 files changed, 22 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c b/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
+index 0aa021a..7d5635f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
+@@ -769,13 +769,8 @@ int dbgdev_wave_reset_wavefronts(struct kfd_dev *dev, struct kfd_process *p)
+ 	union GRBM_GFX_INDEX_BITS reg_gfx_index;
+ 	struct kfd_process_device *pdd;
+ 	struct dbg_wave_control_info wac_info;
+-	int temp;
+-	int first_vmid_to_scan = 8;
+-	int last_vmid_to_scan = 15;
+-
+-	first_vmid_to_scan = ffs(dev->shared_resources.compute_vmid_bitmap) - 1;
+-	temp = dev->shared_resources.compute_vmid_bitmap >> first_vmid_to_scan;
+-	last_vmid_to_scan = first_vmid_to_scan + ffz(temp);
++	int first_vmid_to_scan = dev->vm_info.first_vmid_kfd;
++	int last_vmid_to_scan = dev->vm_info.last_vmid_kfd;
+ 
+ 	reg_sq_cmd.u32All = 0;
+ 	status = 0;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 569bfaa..6f5bd23 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -210,6 +210,11 @@ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+ 
+ 	kfd->shared_resources = *gpu_resources;
+ 
++	kfd->vm_info.first_vmid_kfd = ffs(gpu_resources->compute_vmid_bitmap)-1;
++	kfd->vm_info.last_vmid_kfd = fls(gpu_resources->compute_vmid_bitmap)-1;
++	kfd->vm_info.vmid_num_kfd = kfd->vm_info.last_vmid_kfd
++			- kfd->vm_info.first_vmid_kfd + 1;
++
+ 	/* calculate max size of mqds needed for queues */
+ 	size = max_num_of_queues_per_device *
+ 			kfd->device_info->mqd_size_aligned;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 2aa312d..f2b2c1d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -114,11 +114,11 @@ static int allocate_vmid(struct device_queue_manager *dqm,
+ 	if (dqm->vmid_bitmap == 0)
+ 		return -ENOMEM;
+ 
+-	bit = find_first_bit((unsigned long *)&dqm->vmid_bitmap, CIK_VMID_NUM);
++	bit = find_first_bit((unsigned long *)&dqm->vmid_bitmap,
++				dqm->dev->vm_info.vmid_num_kfd);
+ 	clear_bit(bit, (unsigned long *)&dqm->vmid_bitmap);
+ 
+-	/* Kaveri kfd vmid's starts from vmid 8 */
+-	allocated_vmid = bit + KFD_VMID_START_OFFSET;
++	allocated_vmid = bit + dqm->dev->vm_info.first_vmid_kfd;
+ 	pr_debug("vmid allocation %d\n", allocated_vmid);
+ 	qpd->vmid = allocated_vmid;
+ 	q->properties.vmid = allocated_vmid;
+@@ -133,7 +133,7 @@ static void deallocate_vmid(struct device_queue_manager *dqm,
+ 				struct qcm_process_device *qpd,
+ 				struct queue *q)
+ {
+-	int bit = qpd->vmid - KFD_VMID_START_OFFSET;
++	int bit = qpd->vmid - dqm->dev->vm_info.first_vmid_kfd;
+ 
+ 	/* Release the vmid mapping */
+ 	set_pasid_vmid_mapping(dqm, 0, qpd->vmid);
+@@ -508,8 +508,8 @@ static int initialize_nocpsch(struct device_queue_manager *dqm)
+                                      dqm->dev->shared_resources.queue_bitmap))
+                                 dqm->allocated_queues[pipe] |= 1 << queue;
+         }
+-
+-        dqm->vmid_bitmap = (1 << VMID_PER_DEVICE) - 1;
++	
++	dqm->vmid_bitmap = (1 << dqm->dev->vm_info.vmid_num_kfd) - 1;
+         dqm->sdma_bitmap = (1 << CIK_SDMA_QUEUES) - 1;	
+ 	return 0;
+ }
+@@ -616,8 +616,7 @@ static int set_sched_resources(struct device_queue_manager *dqm)
+ 	int i, mec;
+ 	struct scheduling_resources res;
+ 
+-        res.vmid_mask = (1 << VMID_PER_DEVICE) - 1;
+-        res.vmid_mask <<= KFD_VMID_START_OFFSET;
++	res.vmid_mask = dqm->dev->shared_resources.compute_vmid_bitmap;
+ 	
+ 	res.queue_mask = 0;
+ 	for (i = 0; i < KGD_MAX_QUEUES; ++i) {
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+index ae5f553..72e2c0d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+@@ -32,10 +32,6 @@
+ #define KFD_UNMAP_LATENCY_MS                   (4000)
+ #define QUEUE_PREEMPT_DEFAULT_TIMEOUT_MS (2 * KFD_UNMAP_LATENCY_MS + 1000)
+ 
+-#define CIK_VMID_NUM                           (8)
+-#define KFD_VMID_START_OFFSET                  (8)
+-#define VMID_PER_DEVICE                                CIK_VMID_NUM
+-#define KFD_DQM_FIRST_PIPE                     (0)
+ #define CIK_SDMA_QUEUES                                (4)
+ #define CIK_SDMA_QUEUES_PER_ENGINE             (2)
+ #define CIK_SDMA_ENGINE_NUM                    (2)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 70b1928..443cd08 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -141,6 +141,12 @@ struct kfd_mem_obj {
+ 	uint32_t *cpu_ptr;
+ };
+ 
++struct kfd_vmid_info {
++	uint32_t first_vmid_kfd;
++	uint32_t last_vmid_kfd;
++	uint32_t vmid_num_kfd;
++};
++
+ struct kfd_dev {
+ 	struct kgd_dev *kgd;
+ 
+@@ -162,6 +168,7 @@ struct kfd_dev {
+ 					   */
+ 
+ 	struct kgd2kfd_shared_resources shared_resources;
++	struct kfd_vmid_info vm_info;
+ 
+ 	const struct kfd2kgd_calls *kfd2kgd;
+ 	struct mutex doorbell_mutex;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+index 3a8c446..030426c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -188,7 +188,7 @@ int pqm_create_queue(struct process_queue_manager *pqm,
+ 	case KFD_QUEUE_TYPE_COMPUTE:
+ 		/* check if there is over subscription */
+                 if ((sched_policy == KFD_SCHED_POLICY_HWS_NO_OVERSUBSCRIPTION) &&
+-                ((dev->dqm->processes_count >= VMID_PER_DEVICE) ||
++		((dev->dqm->processes_count >= dev->vm_info.vmid_num_kfd) ||
+ 		(dev->dqm->queue_count >= get_queues_num(dev->dqm)))) {
+ 			pr_err("Over-subscription is not allowed in radeon_kfd.sched_policy == 1\n");
+ 			retval = -EPERM;
+-- 
+2.7.4
+

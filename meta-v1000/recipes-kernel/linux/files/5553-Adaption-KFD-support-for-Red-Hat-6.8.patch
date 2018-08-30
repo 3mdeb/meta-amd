@@ -1,0 +1,680 @@
+From 3526abc4d9c5f76e19aa8c00253613f2dcde31d0 Mon Sep 17 00:00:00 2001
+From: Yong Zhao <Yong.Zhao@amd.com>
+Date: Tue, 14 Mar 2017 17:18:50 -0400
+Subject: [PATCH 5553/5855] Adaption: KFD support for Red Hat 6.8
+
+Change-Id: Ifc9f0f9fdf6ae190309d70319617e01c4741aba3
+Signed-off-by: Yong Zhao <Yong.Zhao@amd.com>
+
+ Conflicts:
+        drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+        drivers/gpu/drm/amd/amdkcl/kcl_mn.c
+        include/kcl/kcl_mn.h
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c         | 16 ++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_crat.c            | 14 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c          | 37 +++++++++++++++---
+ drivers/gpu/drm/amd/amdkfd/kfd_events.c          | 27 +++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c     |  4 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c       | 14 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_ipc.c             |  8 ++++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c |  4 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c  |  4 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c  |  2 +
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h            |  2 +
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c         | 49 ++++++++++++++++++++++++
+ 12 files changed, 176 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 6b4991f..5f4c8d2 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -31,7 +31,11 @@
+ #include <uapi/linux/kfd_ioctl.h>
+ #include <linux/time.h>
+ #include <linux/mm.h>
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
++#include <asm-generic/mman-common.h>
++#else
+ #include <uapi/asm-generic/mman-common.h>
++#endif
+ #include <asm/processor.h>
+ #include <linux/ptrace.h>
+ 
+@@ -841,7 +845,11 @@ static int kfd_ioctl_get_clock_counters(struct file *filep,
+ {
+ 	struct kfd_ioctl_get_clock_counters_args *args = data;
+ 	struct kfd_dev *dev;
++#if (defined OS_NAME_RHEL) && (OS_VERSION_MAJOR == 6)
++	struct timespec time;
++#else
+ 	struct timespec64 time;
++#endif
+ 
+ 	dev = kfd_device_by_id(args->gpu_id);
+ 	if (dev)
+@@ -853,11 +861,19 @@ static int kfd_ioctl_get_clock_counters(struct file *filep,
+ 		args->gpu_clock_counter = 0;
+ 
+ 	/* No access to rdtsc. Using raw monotonic time */
++#if (defined OS_NAME_RHEL) && (OS_VERSION_MAJOR == 6)
++	getrawmonotonic(&time);
++	args->cpu_clock_counter = (uint64_t)timespec_to_ns(&time);
++
++	get_monotonic_boottime(&time);
++	args->system_clock_counter = (uint64_t)timespec_to_ns(&time);
++#else
+ 	getrawmonotonic64(&time);
+ 	args->cpu_clock_counter = (uint64_t)timespec64_to_ns(&time);
+ 
+ 	get_monotonic_boottime64(&time);
+ 	args->system_clock_counter = (uint64_t)timespec64_to_ns(&time);
++#endif
+ 
+ 	/* Since the counter is in nano-seconds we use 1GHz frequency */
+ 	args->system_clock_freq = 1000000000;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+index 054ac54..95ff6ec 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+@@ -1,7 +1,9 @@
+ #include <linux/kernel.h>
+ #include <linux/acpi.h>
+ #include <linux/mm.h>
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ #include <linux/amd-iommu.h>
++#endif
+ #include <linux/pci.h>
+ #include "kfd_crat.h"
+ #include "kfd_priv.h"
+@@ -117,8 +119,10 @@ static void kfd_populated_cu_info_cpu(struct kfd_topology_device *dev,
+ 
+ 	dev->node_props.cpu_cores_count = cu->num_cpu_cores;
+ 	dev->node_props.cpu_core_id_base = cu->processor_id_low;
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ 	if (cu->hsa_capability & CRAT_CU_FLAGS_IOMMU_PRESENT)
+ 		dev->node_props.capability |= HSA_CAP_ATS_PRESENT;
++#endif
+ 
+ 	pr_debug("CU CPU: cores=%d id_base=%d\n", cu->num_cpu_cores,
+ 			cu->processor_id_low);
+@@ -783,7 +787,11 @@ static int kfd_fill_mem_info_for_cpu(int numa_node_id, int *avail_size,
+ 	 * function */
+ 	pgdat = NODE_DATA(numa_node_id);
+ 	for (zone_type = 0; zone_type < MAX_NR_ZONES; zone_type++)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
++		mem_in_bytes += pgdat->node_zones[zone_type].present_pages;
++#else
+ 		mem_in_bytes += pgdat->node_zones[zone_type].managed_pages;
++#endif
+ 	mem_in_bytes <<= PAGE_SHIFT;
+ 
+ 	sub_type_hdr->length_low = lower_32_bits(mem_in_bytes);
+@@ -963,15 +971,19 @@ static int kfd_create_vcrat_image_gpu(void *pcrat_image,
+ 	struct crat_subtype_generic *sub_type_hdr;
+ 	struct crat_subtype_computeunit *cu;
+ 	struct kfd_cu_info cu_info;
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ 	struct amd_iommu_device_info iommu_info;
++#endif
+ 	int avail_size = *size;
+ 	uint32_t total_num_of_cu;
+ 	int num_of_cache_entries = 0;
+ 	int cache_mem_filled = 0;
+ 	int ret = 0;
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ 	const u32 required_iommu_flags = AMD_IOMMU_DEVICE_FLAG_ATS_SUP |
+ 								AMD_IOMMU_DEVICE_FLAG_PRI_SUP |
+ 								AMD_IOMMU_DEVICE_FLAG_PASID_SUP;
++#endif
+ 	struct kfd_local_mem_info local_mem_info;
+ 
+ 	if (pcrat_image == NULL || avail_size < VCRAT_SIZE_FOR_GPU)
+@@ -1027,6 +1039,7 @@ static int kfd_create_vcrat_image_gpu(void *pcrat_image,
+ 
+ 	cu->hsa_capability = 0;
+ 
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ 	/* Check if this node supports IOMMU. During parsing this flag will
+ 	 * translate to HSA_CAP_ATS_PRESENT */
+ 	iommu_info.flags = 0;
+@@ -1034,6 +1047,7 @@ static int kfd_create_vcrat_image_gpu(void *pcrat_image,
+ 		if ((iommu_info.flags & required_iommu_flags) == required_iommu_flags)
+ 			cu->hsa_capability |= CRAT_CU_FLAGS_IOMMU_PRESENT;
+ 	}
++#endif
+ 
+ 	crat_table->length += sub_type_hdr->length;
+ 	crat_table->total_entries++;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index cb9a5c9..26f8bef 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -20,8 +20,9 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+ 
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ #include <linux/amd-iommu.h>
+-#include <linux/bsearch.h>
++#endif
+ #include <linux/pci.h>
+ #include <linux/slab.h>
+ #include <linux/highmem.h>
+@@ -222,6 +223,11 @@ static void kfd_gtt_sa_fini(struct kfd_dev *kfd);
+ 
+ static int kfd_resume(struct kfd_dev *kfd);
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
++void kfd_init_processes_srcu(void);
++void kfd_cleanup_processes_srcu(void);
++#endif
++
+ static const struct kfd_device_info *lookup_device_info(unsigned short did)
+ {
+ 	size_t i;
+@@ -277,6 +283,7 @@ struct kfd_dev *kgd2kfd_probe(struct kgd_dev *kgd,
+ 	return kfd;
+ }
+ 
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ static bool device_iommu_pasid_init(struct kfd_dev *kfd)
+ {
+ 	const u32 required_iommu_flags = AMD_IOMMU_DEVICE_FLAG_ATS_SUP |
+@@ -344,6 +351,7 @@ static int iommu_invalid_ppr_cb(struct pci_dev *pdev, int pasid,
+ 
+ 	return AMD_IOMMU_INV_PRI_RSP_INVALID;
+ }
++#endif
+ 
+ static int kfd_cwsr_init(struct kfd_dev *kfd)
+ {
+@@ -497,6 +505,8 @@ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+                         kfd->pdev->vendor, kfd->pdev->device);
+ 		goto device_queue_manager_error;
+ 	}
++
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+         if (kfd->device_info->is_need_iommu_device) {
+                 if (!device_iommu_pasid_init(kfd)) {
+                         dev_err(kfd_device,
+@@ -505,8 +515,16 @@ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+                         goto device_iommu_pasid_error;
+                 }
+ 	}
++#endif
++	if (kfd_cwsr_init(kfd))
++                goto device_iommu_pasid_error;
+ 
+-	kfd_ib_mem_init(kfd);
++        kfd_ib_mem_init(kfd);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
++       kfd_init_processes_srcu();
++#endif
++	if (kfd_resume(kfd))
++                goto kfd_resume_error;
+ 
+ 	kfd->dbgmgr = NULL;
+ 
+@@ -540,6 +558,9 @@ void kgd2kfd_device_exit(struct kfd_dev *kfd)
+ {
+ 	if (kfd->init_complete) {
+ 		kgd2kfd_suspend(kfd);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
++		kfd_cleanup_processes_srcu();
++#endif
+ 		kfd_cwsr_fini(kfd);
+ 		device_queue_manager_uninit(kfd->dqm);
+ 		kfd_interrupt_exit(kfd);
+@@ -547,6 +568,7 @@ void kgd2kfd_device_exit(struct kfd_dev *kfd)
+ 		kfd_gtt_sa_fini(kfd);
+ 		kfd->kfd2kgd->free_gtt_mem(kfd->kgd, kfd->gtt_mem);
+ 	}
++#endif
+ 
+ 	kfree(kfd);
+ }
+@@ -559,6 +581,7 @@ void kgd2kfd_suspend(struct kfd_dev *kfd)
+                 return;
+ 
+         kfd->dqm->ops.stop(kfd->dqm);
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+         if (!kfd->device_info->is_need_iommu_device)
+                 return;
+ 
+@@ -567,13 +590,16 @@ void kgd2kfd_suspend(struct kfd_dev *kfd)
+         amd_iommu_set_invalidate_ctx_cb(kfd->pdev, NULL);
+         amd_iommu_set_invalid_ppr_cb(kfd->pdev, NULL);
+         amd_iommu_free_device(kfd->pdev);
+-
++#endif
+ }
+ 
+ int kgd2kfd_resume(struct kfd_dev *kfd)
+ {
+         BUG_ON(kfd == NULL);
+-
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
++	if (kfd->device_info->is_need_iommu_device) {
++                unsigned int pasid_limit = kfd_get_pasid_limit();
++	}
+        if (!kfd->init_complete)
+                return 0;
+ 
+@@ -612,9 +638,10 @@ static int kfd_resume(struct kfd_dev *kfd)
+        return err;
+ 
+ dqm_start_error:
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+        if (kfd->device_info->is_need_iommu_device)
+                amd_iommu_free_device(kfd->pdev);
+-
++#endif
+        return err;
+ 
+ }	
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_events.c b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+index 939b7e7..2ff1a8e 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+@@ -305,7 +305,13 @@ static struct kfd_event *lookup_event_by_id(struct kfd_process *p, uint32_t id)
+ {
+ 	struct kfd_event *ev;
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
++	struct hlist_node *node;
++
++	hash_for_each_possible(p->events, ev, node, events, id)
++#else
+ 	hash_for_each_possible(p->events, ev, events, id)
++#endif
+ 		if (ev->event_id == id)
+ 			return ev;
+ 
+@@ -463,7 +469,13 @@ static void destroy_events(struct kfd_process *p)
+ 	struct hlist_node *tmp;
+ 	unsigned int hash_bkt;
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
++	struct hlist_node *node;
++
++	hash_for_each_safe(p->events, hash_bkt, node, tmp, ev, events)
++#else
+ 	hash_for_each_safe(p->events, hash_bkt, tmp, ev, events)
++#endif
+ 		destroy_event(p, ev);
+ }
+ 
+@@ -978,7 +990,13 @@ static void lookup_events_by_type_and_signal(struct kfd_process *p,
+ 	int bkt;
+ 	bool send_signal = true;
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
++	struct hlist_node *node;
++
++	hash_for_each(p->events, bkt, node, ev, events) {
++#else
+ 	hash_for_each(p->events, bkt, ev, events) {
++#endif
+ 		if (ev->type == type) {
+ 			send_signal = false;
+ 			dev_dbg(kfd_device,
+@@ -1013,6 +1031,7 @@ static void lookup_events_by_type_and_signal(struct kfd_process *p,
+ 	}
+ }
+ 
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ void kfd_signal_iommu_event(struct kfd_dev *dev, unsigned int pasid,
+ 		unsigned long address, bool is_write_requested,
+ 		bool is_execute_requested)
+@@ -1082,6 +1101,7 @@ void kfd_signal_iommu_event(struct kfd_dev *dev, unsigned int pasid,
+ 
+ 	kfd_unref_process(p);
+ }
++#endif
+ 
+ void kfd_signal_hw_exception_event(unsigned int pasid)
+ {
+@@ -1111,6 +1131,9 @@ void kfd_signal_vm_fault_event(struct kfd_dev *dev, unsigned int pasid,
+ 	int bkt;
+ 	struct kfd_process *p = kfd_lookup_process_by_pasid(pasid);
+ 	struct kfd_hsa_memory_exception_data memory_exception_data;
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
++	struct hlist_node *node;
++#endif
+ 
+ 	if (!p)
+ 		return; /* Presumably process exited. */
+@@ -1130,7 +1153,11 @@ void kfd_signal_vm_fault_event(struct kfd_dev *dev, unsigned int pasid,
+ 	}
+ 	mutex_lock(&p->event_mutex);
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
++	hash_for_each(p->events, bkt, node, ev, events) {
++#else
+ 	hash_for_each(p->events, bkt, ev, events) {
++#endif
+ 		if (ev->type == KFD_EVENT_TYPE_MEMORY) {
+ 			ev->memory_exception_data = memory_exception_data;
+ 			set_event(ev);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c b/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c
+index e14bf8e..7d290bb 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c
+@@ -33,7 +33,11 @@
+ #include <linux/time.h>
+ #include "kfd_priv.h"
+ #include <linux/mm.h>
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
++#include <asm-generic/mman-common.h>
++#else
+ #include <uapi/asm-generic/mman-common.h>
++#endif
+ #include <asm/processor.h>
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c b/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
+index d737df0..c48fab5 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
+@@ -42,7 +42,11 @@
+ 
+ #include <linux/slab.h>
+ #include <linux/device.h>
++#if (defined OS_NAME_RHEL) && (OS_VERSION_MAJOR == 6)
++#include <linux/kfifo-new.h>
++#else
+ #include <linux/kfifo.h>
++#endif
+ #include "kfd_priv.h"
+ 
+ #define KFD_IH_NUM_ENTRIES 8192
+@@ -61,7 +65,11 @@ int kfd_interrupt_init(struct kfd_dev *kfd)
+ 		return r;
+ 	}
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
++	kfd->ih_wq = create_rt_workqueue("KFD IH");
++#else
+ 	kfd->ih_wq = alloc_workqueue("KFD IH", WQ_HIGHPRI, 1);
++#endif
+ 	spin_lock_init(&kfd->interrupt_lock);
+ 
+ 	INIT_WORK(&kfd->interrupt_work, interrupt_wq);
+@@ -111,9 +119,15 @@ bool enqueue_ih_ring_entry(struct kfd_dev *kfd,	const void *ih_ring_entry)
+ 	count = kfifo_in(&kfd->ih_fifo, ih_ring_entry,
+ 				kfd->device_info->ih_ring_entry_size);
+ 	if (count != kfd->device_info->ih_ring_entry_size) {
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
++		dev_err(kfd_chardev(),
++			"Interrupt ring overflow, dropping interrupt %d\n",
++			count);
++#else
+ 		dev_err_ratelimited(kfd_chardev(),
+ 			"Interrupt ring overflow, dropping interrupt %d\n",
+ 			count);
++#endif
+ 		return false;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c b/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c
+index 62aaeac..ba1e061 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c
+@@ -185,13 +185,21 @@ int kfd_ipc_import_handle(struct kfd_dev *dev, struct kfd_process *p,
+ {
+ 	int r;
+ 	struct kfd_ipc_obj *entry, *found = NULL;
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
++	struct hlist_node *tmp_node;
++#endif
+ 
+ 	mutex_lock(&kfd_ipc_handles.lock);
+ 	/* Convert the user provided handle to hash key and search only in that
+ 	 * bucket
+ 	 */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
++	hlist_for_each_entry(entry, tmp_node,
++		&kfd_ipc_handles.handles[HANDLE_TO_KEY(share_handle)], node) {
++#else
+ 	hlist_for_each_entry(entry,
+ 		&kfd_ipc_handles.handles[HANDLE_TO_KEY(share_handle)], node) {
++#endif
+ 		if (!memcmp(entry->share_handle, share_handle,
+ 			    sizeof(entry->share_handle))) {
+ 			found = entry;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+index b923fa6..a586c2c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -494,15 +494,19 @@ static int update_mqd_hiq(struct mqd_manager *mm, void *mqd,
+ 
+ static int debugfs_show_mqd(struct seq_file *m, void *data)
+ {
++#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 0, 0)
+ 	seq_hex_dump(m, "    ", DUMP_PREFIX_OFFSET, 32, 4,
+ 		     data, sizeof(struct cik_mqd), false);
++#endif
+ 	return 0;
+ }
+ 
+ static int debugfs_show_mqd_sdma(struct seq_file *m, void *data)
+ {
++#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 0, 0)
+ 	seq_hex_dump(m, "    ", DUMP_PREFIX_OFFSET, 32, 4,
+ 		     data, sizeof(struct cik_sdma_rlc_registers), false);
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+index acff097..563d37b 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -456,15 +456,19 @@ static bool is_occupied_sdma(struct mqd_manager *mm, void *mqd,
+ 
+ static int debugfs_show_mqd(struct seq_file *m, void *data)
+ {
++#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 0, 0)
+ 	seq_hex_dump(m, "    ", DUMP_PREFIX_OFFSET, 32, 4,
+ 		     data, sizeof(struct vi_mqd), false);
++#endif
+ 	return 0;
+ }
+ 
+ static int debugfs_show_mqd_sdma(struct seq_file *m, void *data)
+ {
++#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 0, 0)
+ 	seq_hex_dump(m, "    ", DUMP_PREFIX_OFFSET, 32, 4,
+ 		     data, sizeof(struct vi_sdma_mqd), false);
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+index 5d924e9..dd80381 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+@@ -881,8 +881,10 @@ int pm_debugfs_runlist(struct seq_file *m, void *data)
+ 		return 0;
+ 	}
+ 
++#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 0, 0)
+ 	seq_hex_dump(m, "  ", DUMP_PREFIX_OFFSET, 32, 4,
+ 		     pm->ib_buffer_obj->cpu_ptr, pm->ib_size_bytes, false);
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 5fe1abb..ea6f2b0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -745,8 +745,10 @@ void kfd_unref_process(struct kfd_process *p);
+ 
+ struct kfd_process_device *kfd_bind_process_to_device(struct kfd_dev *dev,
+ 						struct kfd_process *p);
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ int kfd_bind_processes_to_device(struct kfd_dev *dev);
+ void kfd_unbind_processes_from_device(struct kfd_dev *dev);
++#endif
+ void kfd_process_iommu_unbind_callback(struct kfd_dev *dev, unsigned int pasid);
+ struct kfd_process_device *kfd_get_process_device_data(struct kfd_dev *dev,
+ 							struct kfd_process *p);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 5e80a44..85589c6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -25,13 +25,19 @@
+ #include <linux/sched.h>
+ #include <linux/sched/mm.h>
+ #include <linux/slab.h>
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ #include <linux/amd-iommu.h>
++#endif
+ #include <linux/notifier.h>
+ #include <linux/compat.h>
+ #include <linux/mm.h>
+ #include <asm/tlb.h>
+ #include <linux/highmem.h>
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
++#include <asm-generic/mman-common.h>
++#else
+ #include <uapi/asm-generic/mman-common.h>
++#endif
+ #include "kfd_ipc.h"
+ 
+ struct mm_struct;
+@@ -47,7 +53,20 @@ struct mm_struct;
+ static DEFINE_HASHTABLE(kfd_processes_table, KFD_PROCESS_TABLE_SIZE);
+ static DEFINE_MUTEX(kfd_processes_mutex);
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
++static struct srcu_struct kfd_processes_srcu;
++void kfd_init_processes_srcu(void)
++{
++	init_srcu_struct(&kfd_processes_srcu);
++}
++
++void kfd_cleanup_processes_srcu(void)
++{
++	cleanup_srcu_struct(&kfd_processes_srcu);
++}
++#else
+ DEFINE_STATIC_SRCU(kfd_processes_srcu);
++#endif
+ 
+ static struct workqueue_struct *kfd_process_wq;
+ 
+@@ -65,7 +84,11 @@ static int kfd_process_init_cwsr(struct kfd_process *p, struct file *filep);
+ void kfd_process_create_wq(void)
+ {
+ 	if (!kfd_process_wq)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
++		kfd_process_wq = create_workqueue("kfd_process_wq");
++#else
+ 		kfd_process_wq = alloc_workqueue("kfd_process_wq", 0, 0);
++#endif
+ }
+ 
+ void kfd_process_destroy_wq(void)
+@@ -235,8 +258,15 @@ static struct kfd_process *find_process_by_mm(const struct mm_struct *mm)
+ {
+ 	struct kfd_process *process;
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
++	struct hlist_node *node;
++
++	hash_for_each_possible_rcu(kfd_processes_table, process, node,
++					kfd_processes, (uintptr_t)mm)
++#else
+ 	hash_for_each_possible_rcu(kfd_processes_table, process,
+ 					kfd_processes, (uintptr_t)mm)
++#endif
+ 		if (process->mm == mm)
+ 			return process;
+ 
+@@ -340,6 +370,7 @@ static void kfd_process_wq_release(struct work_struct *work)
+ 		pr_debug("Releasing pdd (topology id %d) for process (pasid %d)\n",
+ 				pdd->dev->id, p->pasid);
+ 
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ 		if (pdd->dev->device_info->is_need_iommu_device) {
+ 			if (pdd->bound == PDD_BOUND) {
+ 				amd_iommu_unbind_pasid(pdd->dev->pdev,
+@@ -347,6 +378,7 @@ static void kfd_process_wq_release(struct work_struct *work)
+ 				pdd->bound = PDD_UNBOUND;
+ 			}
+ 		}
++#endif
+ 	}
+ 
+ 	kfd_process_free_outstanding_kfd_bos(p);
+@@ -668,17 +700,20 @@ struct kfd_process_device *kfd_bind_process_to_device(struct kfd_dev *dev,
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ 	if (dev->device_info->is_need_iommu_device) {
+ 		err = amd_iommu_bind_pasid(dev->pdev, p->pasid, p->lead_thread);
+ 		if (err < 0)
+ 			return ERR_PTR(err);
+ 	}
++#endif
+ 
+ 	pdd->bound = PDD_BOUND;
+ 
+ 	return pdd;
+ }
+ 
++#if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ int kfd_bind_processes_to_device(struct kfd_dev *dev)
+ {
+ 	struct kfd_process_device *pdd;
+@@ -722,6 +757,7 @@ void kfd_unbind_processes_from_device(struct kfd_dev *dev)
+ 
+ 	int idx = srcu_read_lock(&kfd_processes_srcu);
+ 
++
+ 	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
+ 		down_write(&p->lock);
+ 		pdd = kfd_get_process_device_data(dev, p);
+@@ -777,6 +813,7 @@ void kfd_process_iommu_unbind_callback(struct kfd_dev *dev, unsigned int pasid)
+ 
+ 	kfd_unref_process(p);
+ }
++#endif
+ 
+ struct kfd_process_device *kfd_get_first_process_device_data(struct kfd_process *p)
+ {
+@@ -926,7 +963,13 @@ struct kfd_process *kfd_lookup_process_by_pasid(unsigned int pasid)
+ 
+ 	int idx = srcu_read_lock(&kfd_processes_srcu);
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
++	struct hlist_node *node;
++
++	hash_for_each_rcu(kfd_processes_table, temp, node, p, kfd_processes) {
++#else
+ 	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
++#endif
+ 		if (p->pasid == pasid) {
+ 			kref_get(&p->ref);
+ 			ret_p = p;
+@@ -998,7 +1041,13 @@ int kfd_debugfs_mqds_by_process(struct seq_file *m, void *data)
+ 
+ 	int idx = srcu_read_lock(&kfd_processes_srcu);
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
++	struct hlist_node *node;
++
++	hash_for_each_rcu(kfd_processes_table, temp, node, p, kfd_processes) {
++#else
+ 	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
++#endif
+ 		seq_printf(m, "Process %d PASID %d:\n",
+ 			   p->lead_thread->tgid, p->pasid);
+ 
+-- 
+2.7.4
+

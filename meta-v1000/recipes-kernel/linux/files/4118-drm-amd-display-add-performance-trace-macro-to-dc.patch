@@ -1,0 +1,586 @@
+From b01e89a8ac9e72a8c0bb46454bf787d48e70b324 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Fri, 6 Oct 2017 15:40:07 -0400
+Subject: [PATCH 4118/5855] drm/amd/display: add performance trace macro to dc
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_services.c |  6 ++
+ drivers/gpu/drm/amd/display/dc/basics/logger.c     | 78 ++++++----------------
+ drivers/gpu/drm/amd/display/dc/basics/logger.h     | 37 ----------
+ drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c   |  5 +-
+ drivers/gpu/drm/amd/display/dc/dc.h                |  1 +
+ .../gpu/drm/amd/display/dc/dce/dce_link_encoder.c  |  5 --
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  | 40 +++++------
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_resource.c  |  1 +
+ drivers/gpu/drm/amd/display/dc/dm_services.h       |  2 +
+ .../gpu/drm/amd/display/include/logger_interface.h | 28 ++++++++
+ drivers/gpu/drm/amd/display/include/logger_types.h | 36 +++++++++-
+ 11 files changed, 118 insertions(+), 121 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_services.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_services.c
+index 43bf829..82269ca 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_services.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_services.c
+@@ -35,6 +35,12 @@
+ #include "amdgpu_dm_irq.h"
+ #include "amdgpu_pm.h"
+ 
++unsigned long long dm_get_timestamp(struct dc_context *ctx)
++{
++	/* TODO: return actual timestamp */
++	return 0;
++}
++
+ bool dm_write_persistent_data(struct dc_context *ctx,
+ 		const struct dc_sink *sink,
+ 		const char *module_name,
+diff --git a/drivers/gpu/drm/amd/display/dc/basics/logger.c b/drivers/gpu/drm/amd/display/dc/basics/logger.c
+index afb6d2d..e04e8ec 100644
+--- a/drivers/gpu/drm/amd/display/dc/basics/logger.c
++++ b/drivers/gpu/drm/amd/display/dc/basics/logger.c
+@@ -80,8 +80,6 @@ static bool construct(struct dc_context *ctx, struct dal_logger *logger,
+ 	logger->buffer_read_offset = 0;
+ 	logger->buffer_write_offset = 0;
+ 
+-	logger->write_wrap_count = 0;
+-	logger->read_wrap_count = 0;
+ 	logger->open_count = 0;
+ 
+ 	logger->flags.bits.ENABLE_CONSOLE = 1;
+@@ -162,23 +160,24 @@ static void log_to_debug_console(struct log_entry *entry)
+ }
+ 
+ /* Print everything unread existing in log_buffer to debug console*/
+-static void flush_to_debug_console(struct dal_logger *logger)
++void dm_logger_flush_buffer(struct dal_logger *logger, bool should_warn)
+ {
+-	int i = logger->buffer_read_offset;
+-	char *string_start = &logger->log_buffer[i];
++	char *string_start = &logger->log_buffer[logger->buffer_read_offset];
+ 
+-	dm_output_to_console(
+-		"---------------- FLUSHING LOG BUFFER ----------------\n");
+-	while (i < logger->buffer_write_offset)	{
++	if (should_warn)
++		dm_output_to_console(
++			"---------------- FLUSHING LOG BUFFER ----------------\n");
++	while (logger->buffer_read_offset < logger->buffer_write_offset) {
+ 
+-		if (logger->log_buffer[i] == '\0') {
++		if (logger->log_buffer[logger->buffer_read_offset] == '\0') {
+ 			dm_output_to_console("%s", string_start);
+-			string_start = (char *)logger->log_buffer + i + 1;
++			string_start = logger->log_buffer + logger->buffer_read_offset + 1;
+ 		}
+-		i++;
++		logger->buffer_read_offset++;
+ 	}
+-	dm_output_to_console(
+-		"-------------- END FLUSHING LOG BUFFER --------------\n\n");
++	if (should_warn)
++		dm_output_to_console(
++			"-------------- END FLUSHING LOG BUFFER --------------\n\n");
+ }
+ 
+ static void log_to_internal_buffer(struct log_entry *entry)
+@@ -195,35 +194,17 @@ static void log_to_internal_buffer(struct log_entry *entry)
+ 
+ 	if (size > 0 && size < logger->log_buffer_size) {
+ 
+-		int total_free_space = 0;
+-		int space_before_wrap = 0;
+-
+-		if (logger->buffer_write_offset > logger->buffer_read_offset) {
+-			total_free_space = logger->log_buffer_size -
+-					logger->buffer_write_offset +
+-					logger->buffer_read_offset;
+-			space_before_wrap = logger->log_buffer_size -
+-					logger->buffer_write_offset;
+-		} else if (logger->buffer_write_offset <
+-				logger->buffer_read_offset) {
+-			total_free_space = logger->log_buffer_size -
+-					logger->buffer_read_offset +
+-					logger->buffer_write_offset;
+-			space_before_wrap = total_free_space;
+-		} else if (logger->write_wrap_count !=
+-				logger->read_wrap_count) {
+-			/* Buffer is completely full already */
+-			total_free_space = 0;
+-			space_before_wrap = 0;
+-		} else {
++		int buffer_space = logger->log_buffer_size -
++				logger->buffer_write_offset;
++
++		if (logger->buffer_write_offset == logger->buffer_read_offset) {
+ 			/* Buffer is empty, start writing at beginning */
+-			total_free_space = logger->log_buffer_size;
+-			space_before_wrap = logger->log_buffer_size;
++			buffer_space = logger->log_buffer_size;
+ 			logger->buffer_write_offset = 0;
+ 			logger->buffer_read_offset = 0;
+ 		}
+ 
+-		if (space_before_wrap > size) {
++		if (buffer_space > size) {
+ 			/* No wrap around, copy 'size' bytes
+ 			 * from 'entry->buf' to 'log_buffer'
+ 			 */
+@@ -232,28 +213,12 @@ static void log_to_internal_buffer(struct log_entry *entry)
+ 					entry->buf, size);
+ 			logger->buffer_write_offset += size;
+ 
+-		} else if (total_free_space > size) {
+-			/* We have enough room without flushing,
+-			 * but need to wrap around */
+-
+-			int space_after_wrap = total_free_space -
+-					space_before_wrap;
+-
+-			memmove(logger->log_buffer +
+-					logger->buffer_write_offset,
+-					entry->buf, space_before_wrap);
+-			memmove(logger->log_buffer, entry->buf +
+-					space_before_wrap, space_after_wrap);
+-
+-			logger->buffer_write_offset = space_after_wrap;
+-			logger->write_wrap_count++;
+-
+ 		} else {
+ 			/* Not enough room remaining, we should flush
+ 			 * existing logs */
+ 
+ 			/* Flush existing unread logs to console */
+-			flush_to_debug_console(logger);
++			dm_logger_flush_buffer(logger, true);
+ 
+ 			/* Start writing to beginning of buffer */
+ 			memmove(logger->log_buffer, entry->buf, size);
+@@ -325,9 +290,10 @@ void dm_logger_write(
+ 		log_heading(&entry);
+ 
+ 		size = dm_log_to_buffer(
+-			buffer, LOG_MAX_LINE_SIZE, msg, args);
++			buffer, LOG_MAX_LINE_SIZE - 1, msg, args);
+ 
+-		entry.buf_offset += size;
++		buffer[entry.buf_offset + size] = '\0';
++		entry.buf_offset += size + 1;
+ 
+ 		/* --Flush log_entry buffer-- */
+ 		/* print to kernel console */
+diff --git a/drivers/gpu/drm/amd/display/dc/basics/logger.h b/drivers/gpu/drm/amd/display/dc/basics/logger.h
+index 2f7a5df..09722f0 100644
+--- a/drivers/gpu/drm/amd/display/dc/basics/logger.h
++++ b/drivers/gpu/drm/amd/display/dc/basics/logger.h
+@@ -26,42 +26,5 @@
+ #ifndef __DAL_LOGGER_H__
+ #define __DAL_LOGGER_H__
+ 
+-/* Structure for keeping track of offsets, buffer, etc */
+-
+-#define DAL_LOGGER_BUFFER_MAX_SIZE 2048
+-
+-/*Connectivity log needs to output EDID, which needs at lease 256x3 bytes,
+- * change log line size to 896 to meet the request.
+- */
+-#define LOG_MAX_LINE_SIZE 896
+-
+-#include "include/logger_types.h"
+-
+-struct dal_logger {
+-
+-	/* How far into the circular buffer has been read by dsat
+-	 * Read offset should never cross write offset. Write \0's to
+-	 * read data just to be sure?
+-	 */
+-	uint32_t buffer_read_offset;
+-
+-	/* How far into the circular buffer we have written
+-	 * Write offset should never cross read offset
+-	 */
+-	uint32_t buffer_write_offset;
+-
+-	uint32_t write_wrap_count;
+-	uint32_t read_wrap_count;
+-
+-	uint32_t open_count;
+-
+-	char *log_buffer;	/* Pointer to malloc'ed buffer */
+-	uint32_t log_buffer_size; /* Size of circular buffer */
+-
+-	uint32_t mask; /*array of masks for major elements*/
+-
+-	union logger_flags flags;
+-	struct dc_context *ctx;
+-};
+ 
+ #endif /* __DAL_LOGGER_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c b/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c
+index cf0c145..e151523 100644
+--- a/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c
++++ b/drivers/gpu/drm/amd/display/dc/calcs/dcn_calcs.c
+@@ -682,6 +682,7 @@ bool dcn_validate_bandwidth(
+ 	bool bw_limit_pass;
+ 	float bw_limit;
+ 
++	PERFORMANCE_TRACE_START();
+ 	if (dcn_bw_apply_registry_override(dc))
+ 		dcn_bw_sync_calcs_and_dml(dc);
+ 
+@@ -1089,6 +1090,8 @@ bool dcn_validate_bandwidth(
+ 
+ 	kernel_fpu_end();
+ 
++	PERFORMANCE_TRACE_END();
++
+ 	if (bw_limit_pass && v->voltage_level != 5)
+ 		return true;
+ 	else
+@@ -1223,7 +1226,7 @@ unsigned int dcn_find_dcfclk_suits_all(
+ 	else
+ 		dcf_clk =  dc->dcn_soc->dcfclkv_min0p65*1000;
+ 
+-	dm_logger_write(dc->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(dc->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"\tdcf_clk for voltage = %d\n", dcf_clk);
+ 	return dcf_clk;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 26518fd..131cee7 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -224,6 +224,7 @@ struct dc_debug {
+ 	bool disable_dpp_pg;
+ 	bool disable_stereo_support;
+ 	bool vsr_support;
++	bool performance_trace;
+ };
+ struct dc_state;
+ struct resource_pool;
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+index 0cf0fff..fe88852 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+@@ -757,11 +757,6 @@ void dce110_link_encoder_construct(
+ 		enc110->base.preferred_engine = ENGINE_ID_UNKNOWN;
+ 	}
+ 
+-	dm_logger_write(init_data->ctx->logger, LOG_I2C_AUX,
+-			"Using channel: %s [%d]\n",
+-			DECODE_CHANNEL_ID(init_data->channel),
+-			init_data->channel);
+-
+ 	/* Override features with DCE-specific values */
+ 	if (BP_RESULT_OK == bp_funcs->get_encoder_cap_info(
+ 			enc110->base.ctx->dc_bios, enc110->base.id,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index da0c854..088dbb1 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -471,7 +471,7 @@ static void program_watermarks(
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A, prog_wm_value);
+ 
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"URGENCY_WATERMARK_A calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->a.urgent_ns, prog_wm_value);
+@@ -479,7 +479,7 @@ static void program_watermarks(
+ 	prog_wm_value = convert_and_clamp(watermarks->a.pte_meta_urgent_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_PTE_META_URGENCY_WATERMARK_A, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"PTE_META_URGENCY_WATERMARK_A calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->a.pte_meta_urgent_ns, prog_wm_value);
+@@ -490,7 +490,7 @@ static void program_watermarks(
+ 			refclk_mhz, 0x1fffff);
+ 
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_SR_ENTER_WATERMARK_A, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"SR_ENTER_EXIT_WATERMARK_A calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->a.cstate_pstate.cstate_enter_plus_exit_ns, prog_wm_value);
+@@ -500,7 +500,7 @@ static void program_watermarks(
+ 			watermarks->a.cstate_pstate.cstate_exit_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_SR_EXIT_WATERMARK_A, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"SR_EXIT_WATERMARK_A calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->a.cstate_pstate.cstate_exit_ns, prog_wm_value);
+@@ -510,7 +510,7 @@ static void program_watermarks(
+ 			watermarks->a.cstate_pstate.pstate_change_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_DRAM_CLK_CHANGE_WATERMARK_A, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"DRAM_CLK_CHANGE_WATERMARK_A calculated =%d\n"
+ 		"HW register value = 0x%x\n\n",
+ 		watermarks->a.cstate_pstate.pstate_change_ns, prog_wm_value);
+@@ -520,7 +520,7 @@ static void program_watermarks(
+ 	prog_wm_value = convert_and_clamp(
+ 			watermarks->b.urgent_ns, refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_B, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"URGENCY_WATERMARK_B calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->b.urgent_ns, prog_wm_value);
+@@ -530,7 +530,7 @@ static void program_watermarks(
+ 			watermarks->b.pte_meta_urgent_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_PTE_META_URGENCY_WATERMARK_B, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"PTE_META_URGENCY_WATERMARK_B calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->b.pte_meta_urgent_ns, prog_wm_value);
+@@ -540,7 +540,7 @@ static void program_watermarks(
+ 			watermarks->b.cstate_pstate.cstate_enter_plus_exit_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_SR_ENTER_WATERMARK_B, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"SR_ENTER_WATERMARK_B calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->b.cstate_pstate.cstate_enter_plus_exit_ns, prog_wm_value);
+@@ -550,7 +550,7 @@ static void program_watermarks(
+ 			watermarks->b.cstate_pstate.cstate_exit_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_SR_EXIT_WATERMARK_B, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"SR_EXIT_WATERMARK_B calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->b.cstate_pstate.cstate_exit_ns, prog_wm_value);
+@@ -559,7 +559,7 @@ static void program_watermarks(
+ 			watermarks->b.cstate_pstate.pstate_change_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_DRAM_CLK_CHANGE_WATERMARK_B, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"DRAM_CLK_CHANGE_WATERMARK_B calculated =%d\n\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->b.cstate_pstate.pstate_change_ns, prog_wm_value);
+@@ -568,7 +568,7 @@ static void program_watermarks(
+ 	prog_wm_value = convert_and_clamp(
+ 			watermarks->c.urgent_ns, refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_C, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"URGENCY_WATERMARK_C calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->c.urgent_ns, prog_wm_value);
+@@ -578,7 +578,7 @@ static void program_watermarks(
+ 			watermarks->c.pte_meta_urgent_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_PTE_META_URGENCY_WATERMARK_C, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"PTE_META_URGENCY_WATERMARK_C calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->c.pte_meta_urgent_ns, prog_wm_value);
+@@ -588,7 +588,7 @@ static void program_watermarks(
+ 			watermarks->c.cstate_pstate.cstate_enter_plus_exit_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_SR_ENTER_WATERMARK_C, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"SR_ENTER_WATERMARK_C calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->c.cstate_pstate.cstate_enter_plus_exit_ns, prog_wm_value);
+@@ -598,7 +598,7 @@ static void program_watermarks(
+ 			watermarks->c.cstate_pstate.cstate_exit_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_SR_EXIT_WATERMARK_C, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"SR_EXIT_WATERMARK_C calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->c.cstate_pstate.cstate_exit_ns, prog_wm_value);
+@@ -608,7 +608,7 @@ static void program_watermarks(
+ 			watermarks->c.cstate_pstate.pstate_change_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_DRAM_CLK_CHANGE_WATERMARK_C, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"DRAM_CLK_CHANGE_WATERMARK_C calculated =%d\n\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->c.cstate_pstate.pstate_change_ns, prog_wm_value);
+@@ -617,7 +617,7 @@ static void program_watermarks(
+ 	prog_wm_value = convert_and_clamp(
+ 			watermarks->d.urgent_ns, refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_D, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"URGENCY_WATERMARK_D calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->d.urgent_ns, prog_wm_value);
+@@ -626,7 +626,7 @@ static void program_watermarks(
+ 			watermarks->d.pte_meta_urgent_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_PTE_META_URGENCY_WATERMARK_D, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"PTE_META_URGENCY_WATERMARK_D calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->d.pte_meta_urgent_ns, prog_wm_value);
+@@ -636,7 +636,7 @@ static void program_watermarks(
+ 			watermarks->d.cstate_pstate.cstate_enter_plus_exit_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_SR_ENTER_WATERMARK_D, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"SR_ENTER_WATERMARK_D calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->d.cstate_pstate.cstate_enter_plus_exit_ns, prog_wm_value);
+@@ -646,7 +646,7 @@ static void program_watermarks(
+ 			watermarks->d.cstate_pstate.cstate_exit_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_SR_EXIT_WATERMARK_D, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"SR_EXIT_WATERMARK_D calculated =%d\n"
+ 		"HW register value = 0x%x\n",
+ 		watermarks->d.cstate_pstate.cstate_exit_ns, prog_wm_value);
+@@ -656,7 +656,7 @@ static void program_watermarks(
+ 			watermarks->d.cstate_pstate.pstate_change_ns,
+ 			refclk_mhz, 0x1fffff);
+ 	REG_WRITE(DCHUBBUB_ARB_ALLOW_DRAM_CLK_CHANGE_WATERMARK_D, prog_wm_value);
+-	dm_logger_write(hws->ctx->logger, LOG_HW_MARKS,
++	dm_logger_write(hws->ctx->logger, LOG_BANDWIDTH_CALCS,
+ 		"DRAM_CLK_CHANGE_WATERMARK_D calculated =%d\n"
+ 		"HW register value = 0x%x\n\n",
+ 		watermarks->d.cstate_pstate.pstate_change_ns, prog_wm_value);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+index fecbef9..297ec97 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_resource.c
+@@ -434,6 +434,7 @@ static const struct dc_debug debug_defaults_drv = {
+ 		.voltage_align_fclk = true,
+ 		.disable_stereo_support = true,
+ 		.vsr_support = true,
++		.performance_trace = false,
+ };
+ 
+ static const struct dc_debug debug_defaults_diags = {
+diff --git a/drivers/gpu/drm/amd/display/dc/dm_services.h b/drivers/gpu/drm/amd/display/dc/dm_services.h
+index c8829e4..0f01ca2 100644
+--- a/drivers/gpu/drm/amd/display/dc/dm_services.h
++++ b/drivers/gpu/drm/amd/display/dc/dm_services.h
+@@ -414,6 +414,8 @@ bool dm_dmcu_set_pipe(struct dc_context *ctx, unsigned int controller_id);
+ #define dm_log_to_buffer(buffer, size, fmt, args)\
+ 	vsnprintf(buffer, size, fmt, args)
+ 
++unsigned long long dm_get_timestamp(struct dc_context *ctx);
++
+ /*
+  * Debug and verification hooks
+  */
+diff --git a/drivers/gpu/drm/amd/display/include/logger_interface.h b/drivers/gpu/drm/amd/display/include/logger_interface.h
+index 5aaf2da..8e1fe70 100644
+--- a/drivers/gpu/drm/amd/display/include/logger_interface.h
++++ b/drivers/gpu/drm/amd/display/include/logger_interface.h
+@@ -44,6 +44,8 @@ struct dal_logger *dal_logger_create(struct dc_context *ctx, uint32_t log_mask);
+ 
+ uint32_t dal_logger_destroy(struct dal_logger **logger);
+ 
++void dm_logger_flush_buffer(struct dal_logger *logger, bool should_warn);
++
+ void dm_logger_write(
+ 		struct dal_logger *logger,
+ 		enum dc_log_type log_type,
+@@ -157,4 +159,30 @@ void context_clock_trace(
+ #define DTN_INFO_END() \
+ 	dm_dtn_log_end(dc_ctx)
+ 
++#define PERFORMANCE_TRACE_START() \
++	unsigned long long perf_trc_start_stmp = dm_get_timestamp(dc->ctx); \
++	unsigned long long perf_trc_start_log_msk = dc->ctx->logger->mask; \
++	unsigned int perf_trc_start_log_flags = dc->ctx->logger->flags.value; \
++	if (dc->debug.performance_trace) {\
++		dm_logger_flush_buffer(dc->ctx->logger, false);\
++		dc->ctx->logger->mask = 1<<LOG_PERF_TRACE;\
++		dc->ctx->logger->flags.bits.ENABLE_CONSOLE = 0;\
++		dc->ctx->logger->flags.bits.ENABLE_BUFFER = 1;\
++	}
++
++#define PERFORMANCE_TRACE_END() do {\
++	unsigned long long perf_trc_end_stmp = dm_get_timestamp(dc->ctx);\
++	if (dc->debug.performance_trace) {\
++		dm_logger_write(dc->ctx->logger, \
++				LOG_PERF_TRACE, \
++				"%s duration: %d ticks\n", __func__,\
++				perf_trc_end_stmp - perf_trc_start_stmp); \
++		if (perf_trc_start_log_msk != 1<<LOG_PERF_TRACE) {\
++			dc->ctx->logger->mask = perf_trc_start_log_msk;\
++			dc->ctx->logger->flags.value = perf_trc_start_log_flags;\
++			dm_logger_flush_buffer(dc->ctx->logger, false);\
++		} \
++	} \
++} while (0)
++
+ #endif /* __DAL_LOGGER_INTERFACE_H__ */
+diff --git a/drivers/gpu/drm/amd/display/include/logger_types.h b/drivers/gpu/drm/amd/display/include/logger_types.h
+index 1f22e84..e2ff8cd 100644
+--- a/drivers/gpu/drm/amd/display/include/logger_types.h
++++ b/drivers/gpu/drm/amd/display/include/logger_types.h
+@@ -64,8 +64,7 @@ enum dc_log_type {
+ 	LOG_EVENT_LINK_LOSS,
+ 	LOG_EVENT_UNDERFLOW,
+ 	LOG_IF_TRACE,
+-	LOG_HW_MARKS,
+-	LOG_PPLIB,
++	LOG_PERF_TRACE,
+ 
+ 	LOG_SECTION_TOTAL_COUNT
+ };
+@@ -131,4 +130,37 @@ struct dc_log_type_info {
+ 	char name[MAX_NAME_LEN];
+ };
+ 
++/* Structure for keeping track of offsets, buffer, etc */
++
++#define DAL_LOGGER_BUFFER_MAX_SIZE 2048
++
++/*Connectivity log needs to output EDID, which needs at lease 256x3 bytes,
++ * change log line size to 896 to meet the request.
++ */
++#define LOG_MAX_LINE_SIZE 896
++
++struct dal_logger {
++
++	/* How far into the circular buffer has been read by dsat
++	 * Read offset should never cross write offset. Write \0's to
++	 * read data just to be sure?
++	 */
++	uint32_t buffer_read_offset;
++
++	/* How far into the circular buffer we have written
++	 * Write offset should never cross read offset
++	 */
++	uint32_t buffer_write_offset;
++
++	uint32_t open_count;
++
++	char *log_buffer;	/* Pointer to malloc'ed buffer */
++	uint32_t log_buffer_size; /* Size of circular buffer */
++
++	uint32_t mask; /*array of masks for major elements*/
++
++	union logger_flags flags;
++	struct dc_context *ctx;
++};
++
+ #endif /* __DAL_LOGGER_TYPES_H__ */
+-- 
+2.7.4
+

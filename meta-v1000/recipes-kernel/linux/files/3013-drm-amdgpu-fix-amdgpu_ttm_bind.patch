@@ -1,0 +1,123 @@
+From d5ce3c6d22eea5d52a3c3d5a69fe768189f19224 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 22 Aug 2017 16:58:07 +0200
+Subject: [PATCH 3013/5855] drm/amdgpu: fix amdgpu_ttm_bind
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Use ttm_bo_mem_space instead of manually allocating GART space.
+
+This allows us to evict BOs when there isn't enought GART space any more.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c | 14 +++++--------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c     | 31 +++++++++++++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h     |  4 ----
+ 3 files changed, 30 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
+index 03f455f..e57e178 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
+@@ -108,10 +108,10 @@ bool amdgpu_gtt_mgr_is_allocated(struct ttm_mem_reg *mem)
+  *
+  * Allocate the address space for a node.
+  */
+-int amdgpu_gtt_mgr_alloc(struct ttm_mem_type_manager *man,
+-			 struct ttm_buffer_object *tbo,
+-			 const struct ttm_place *place,
+-			 struct ttm_mem_reg *mem)
++static int amdgpu_gtt_mgr_alloc(struct ttm_mem_type_manager *man,
++				struct ttm_buffer_object *tbo,
++				const struct ttm_place *place,
++				struct ttm_mem_reg *mem)
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(man->bdev);
+ 	struct amdgpu_gtt_mgr *mgr = man->priv;
+@@ -145,12 +145,8 @@ int amdgpu_gtt_mgr_alloc(struct ttm_mem_type_manager *man,
+ 						fpfn, lpfn, sflags, aflags);
+ 	spin_unlock(&mgr->lock);
+ 
+-	if (!r) {
++	if (!r) 
+ 		mem->start = node->start;
+-		if (&tbo->mem == mem)
+-			tbo->offset = (tbo->mem.start << PAGE_SHIFT) +
+-			    tbo->bdev->man[tbo->mem.mem_type].gpu_offset;
+-	}
+ 
+ 	return r;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 9f14aa6..7bb37cf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -895,20 +895,39 @@ bool amdgpu_ttm_is_bound(struct ttm_tt *ttm)
+ 
+ int amdgpu_ttm_bind(struct ttm_buffer_object *bo, struct ttm_mem_reg *bo_mem)
+ {
++	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->bdev);
+ 	struct ttm_tt *ttm = bo->ttm;
++	struct ttm_mem_reg tmp;
++
++	struct ttm_placement placement;
++	struct ttm_place placements;
+ 	int r;
+ 
+ 	if (!ttm || amdgpu_ttm_is_bound(ttm))
+ 		return 0;
+ 
+-	r = amdgpu_gtt_mgr_alloc(&bo->bdev->man[TTM_PL_TT], bo,
+-				 NULL, bo_mem);
+-	if (r) {
+-		DRM_ERROR("Failed to allocate GTT address space (%d)\n", r);
++	tmp = bo->mem;
++	tmp.mm_node = NULL;
++	placement.num_placement = 1;
++	placement.placement = &placements;
++	placement.num_busy_placement = 1;
++	placement.busy_placement = &placements;
++	placements.fpfn = 0;
++	placements.lpfn = adev->mc.gart_size >> PAGE_SHIFT;
++	placements.flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_TT;
++
++	r = ttm_bo_mem_space(bo, &placement, &tmp, true, false);
++	if (unlikely(r))
+ 		return r;
+-	}
+ 
+-	return amdgpu_ttm_do_bind(ttm, bo_mem);
++	r = ttm_bo_move_ttm(bo, true, false, &tmp);
++	if (unlikely(r))
++		ttm_bo_mem_put(bo, &tmp);
++	else
++		bo->offset = (bo->mem.start << PAGE_SHIFT) +
++			bo->bdev->man[bo->mem.mem_type].gpu_offset;
++
++	return r;
+ }
+ 
+ int amdgpu_ttm_recover_gart(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 79c8c38..a9d24d5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -66,10 +66,6 @@ extern const struct ttm_mem_type_manager_func amdgpu_gtt_mgr_func;
+ extern const struct ttm_mem_type_manager_func amdgpu_vram_mgr_func;
+ 
+ bool amdgpu_gtt_mgr_is_allocated(struct ttm_mem_reg *mem);
+-int amdgpu_gtt_mgr_alloc(struct ttm_mem_type_manager *man,
+-			 struct ttm_buffer_object *tbo,
+-			 const struct ttm_place *place,
+-			 struct ttm_mem_reg *mem);
+ uint64_t amdgpu_gtt_mgr_usage(struct ttm_mem_type_manager *man);
+ 
+ uint64_t amdgpu_vram_mgr_usage(struct ttm_mem_type_manager *man);
+-- 
+2.7.4
+
