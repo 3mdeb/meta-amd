@@ -24,7 +24,7 @@
 #
 # Features are classified as:
 #
-# * amd-common-pkgs		: Common packages to be added to all machines
+# * amd-misc-pkgs		: Intended for Platform Specific Packages, Common Packages to be added to all machines, etc.
 # * amd-feature-multimedia	: Multimedia packages (it does not depend on graphics because a machine may not have a GUI but could play videos and sounds from console)
 # * amd-feature-graphics	: Graphics packages
 # * amd-feature-networking	: Networking packages
@@ -32,7 +32,7 @@
 # * <add more features here>	: <feature summary>
 
 # Add common feartures to be supported for all machines here
-EXTRA_IMAGE_FEATURES += "amd-common-pkgs"
+EXTRA_IMAGE_FEATURES += "amd-misc-pkgs"
 EXTRA_IMAGE_FEATURES_append_amdgpu = " amd-feature-multimedia"
 EXTRA_IMAGE_FEATURES_append_radeon = " amd-feature-multimedia"
 
@@ -50,13 +50,15 @@ DPDK_PKGS ?= ""
 
 # Additional packages can be added to the following feature specific
 # variables from each machine's config file
+AMD_PLATFORM_SPECIFIC_PKGS ?= ""
 AMD_FEATURE_MULTIMEDIA_PKGS ?= ""
 AMD_FEATURE_GRAPHICS_PKGS ?= ""
 AMD_FEATURE_NETWORKING_PKGS ?= ""
 AMD_FEATURE_DEBUG_PROFILE_PKGS ?= ""
 
-FEATURE_PACKAGES_amd-common-pkgs = "\
+FEATURE_PACKAGES_amd-misc-pkgs = "\
     bc \
+    ${AMD_PLATFORM_SPECIFIC_PKGS} \
 "
 
 FEATURE_PACKAGES_amd-feature-multimedia = "\
