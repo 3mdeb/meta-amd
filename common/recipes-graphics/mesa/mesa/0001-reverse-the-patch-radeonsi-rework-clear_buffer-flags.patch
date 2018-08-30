@@ -1,0 +1,281 @@
+From 3f58e21b9bcd15eda2f4939a90e98172bd00d5c9 Mon Sep 17 00:00:00 2001
+From: Sanjay R Mehta <Sanju.Mehta@amd.com>
+Date: Mon, 13 Mar 2017 17:55:10 +0530
+Subject: [PATCH] reverse the patch radeonsi: rework clear_buffer flags
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+don't flush DB for fast color clears
+don't flush any caches for initial clears
+remove the flag from si_copy_buffer, always assume shader coherency
+
+Reviewed-by: Nicolai Hähnle <nicolai.haehnle@amd.com>
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+---
+ src/gallium/drivers/r600/r600_blit.c          |  2 +-
+ src/gallium/drivers/radeon/r600_pipe_common.c |  4 +--
+ src/gallium/drivers/radeon/r600_pipe_common.h | 10 ++-----
+ src/gallium/drivers/radeon/r600_texture.c     | 11 ++++----
+ src/gallium/drivers/radeon/radeon_video.c     |  2 +-
+ src/gallium/drivers/radeonsi/si_blit.c        |  5 ++--
+ src/gallium/drivers/radeonsi/si_cp_dma.c      | 38 +++++++++++----------------
+ src/gallium/drivers/radeonsi/si_pipe.c        |  3 +--
+ src/gallium/drivers/radeonsi/si_pipe.h        |  3 ++-
+ 9 files changed, 32 insertions(+), 46 deletions(-)
+
+diff --git a/src/gallium/drivers/r600/r600_blit.c b/src/gallium/drivers/r600/r600_blit.c
+index 9230b40..b1bb0cd 100644
+--- a/src/gallium/drivers/r600/r600_blit.c
++++ b/src/gallium/drivers/r600/r600_blit.c
+@@ -582,7 +582,7 @@ static void r600_copy_global_buffer(struct pipe_context *ctx,
+ 
+ static void r600_clear_buffer(struct pipe_context *ctx, struct pipe_resource *dst,
+ 			      uint64_t offset, uint64_t size, unsigned value,
+-			      enum r600_coherency coher)
++			      bool is_framebuffer)
+ {
+ 	struct r600_context *rctx = (struct r600_context*)ctx;
+ 
+diff --git a/src/gallium/drivers/radeon/r600_pipe_common.c b/src/gallium/drivers/radeon/r600_pipe_common.c
+index c00e584..61799a5 100644
+--- a/src/gallium/drivers/radeon/r600_pipe_common.c
++++ b/src/gallium/drivers/radeon/r600_pipe_common.c
+@@ -1069,12 +1069,12 @@ bool r600_can_dump_shader(struct r600_common_screen *rscreen,
+ 
+ void r600_screen_clear_buffer(struct r600_common_screen *rscreen, struct pipe_resource *dst,
+ 			      uint64_t offset, uint64_t size, unsigned value,
+-			      enum r600_coherency coher)
++			      bool is_framebuffer)
+ {
+ 	struct r600_common_context *rctx = (struct r600_common_context*)rscreen->aux_context;
+ 
+ 	pipe_mutex_lock(rscreen->aux_context_lock);
+-	rctx->clear_buffer(&rctx->b, dst, offset, size, value, coher);
++	rctx->clear_buffer(&rctx->b, dst, offset, size, value, is_framebuffer);
+ 	rscreen->aux_context->flush(rscreen->aux_context, NULL, 0);
+ 	pipe_mutex_unlock(rscreen->aux_context_lock);
+ }
+diff --git a/src/gallium/drivers/radeon/r600_pipe_common.h b/src/gallium/drivers/radeon/r600_pipe_common.h
+index 3e54534..90227e8 100644
+--- a/src/gallium/drivers/radeon/r600_pipe_common.h
++++ b/src/gallium/drivers/radeon/r600_pipe_common.h
+@@ -102,12 +102,6 @@
+ #define R600_MAP_BUFFER_ALIGNMENT 64
+ #define R600_MAX_VIEWPORTS        16
+ 
+-enum r600_coherency {
+-	R600_COHERENCY_NONE, /* no cache flushes needed */
+-	R600_COHERENCY_SHADER,
+-	R600_COHERENCY_CB_META,
+-};
+-
+ #ifdef PIPE_ARCH_BIG_ENDIAN
+ #define R600_BIG_ENDIAN 1
+ #else
+@@ -522,7 +516,7 @@ struct r600_common_context {
+ 
+ 	void (*clear_buffer)(struct pipe_context *ctx, struct pipe_resource *dst,
+ 			     uint64_t offset, uint64_t size, unsigned value,
+-			     enum r600_coherency coher);
++			     bool is_framebuffer);
+ 
+ 	void (*blit_decompress_depth)(struct pipe_context *ctx,
+ 				      struct r600_texture *texture,
+@@ -593,7 +587,7 @@ bool r600_can_dump_shader(struct r600_common_screen *rscreen,
+ 			  unsigned processor);
+ void r600_screen_clear_buffer(struct r600_common_screen *rscreen, struct pipe_resource *dst,
+ 			      uint64_t offset, uint64_t size, unsigned value,
+-			      enum r600_coherency coher);
++			      bool is_framebuffer);
+ struct pipe_resource *r600_resource_create_common(struct pipe_screen *screen,
+ 						  const struct pipe_resource *templ);
+ const char *r600_get_llvm_processor_name(enum radeon_family family);
+diff --git a/src/gallium/drivers/radeon/r600_texture.c b/src/gallium/drivers/radeon/r600_texture.c
+index 23ddff4..c7bd4ff 100644
+--- a/src/gallium/drivers/radeon/r600_texture.c
++++ b/src/gallium/drivers/radeon/r600_texture.c
+@@ -815,7 +815,7 @@ static void r600_texture_allocate_htile(struct r600_common_screen *rscreen,
+ 		R600_ERR("Failed to create buffer object for htile buffer.\n");
+ 	} else {
+ 		r600_screen_clear_buffer(rscreen, &rtex->htile_buffer->b.b, 0,
+-					 htile_size, 0, R600_COHERENCY_NONE);
++					 htile_size, 0, true);
+ 	}
+ }
+ 
+@@ -990,13 +990,13 @@ r600_texture_create_object(struct pipe_screen *screen,
+ 		/* Initialize the cmask to 0xCC (= compressed state). */
+ 		r600_screen_clear_buffer(rscreen, &rtex->cmask_buffer->b.b,
+ 					 rtex->cmask.offset, rtex->cmask.size,
+-					 0xCCCCCCCC, R600_COHERENCY_NONE);
++					 0xCCCCCCCC, true);
+ 	}
+ 	if (rtex->dcc_offset) {
+ 		r600_screen_clear_buffer(rscreen, &rtex->resource.b.b,
+ 					 rtex->dcc_offset,
+ 					 rtex->surface.dcc_size,
+-					 0xFFFFFFFF, R600_COHERENCY_NONE);
++					 0xFFFFFFFF, true);
+ 	}
+ 
+ 	/* Initialize the CMASK base register value. */
+@@ -1704,7 +1704,7 @@ void evergreen_do_fast_color_clear(struct r600_common_context *rctx,
+ 
+ 			rctx->clear_buffer(&rctx->b, &tex->resource.b.b,
+ 					   tex->dcc_offset, tex->surface.dcc_size,
+-					   reset_value, R600_COHERENCY_CB_META);
++					   reset_value, true);
+ 
+ 			if (clear_words_needed)
+ 				tex->dirty_level_mask |= 1 << fb->cbufs[i]->u.tex.level;
+@@ -1721,8 +1721,7 @@ void evergreen_do_fast_color_clear(struct r600_common_context *rctx,
+ 
+ 			/* Do the fast clear. */
+ 			rctx->clear_buffer(&rctx->b, &tex->cmask_buffer->b.b,
+-					   tex->cmask.offset, tex->cmask.size, 0,
+-					   R600_COHERENCY_CB_META);
++					tex->cmask.offset, tex->cmask.size, 0, true);
+ 
+ 			tex->dirty_level_mask |= 1 << fb->cbufs[i]->u.tex.level;
+ 		}
+diff --git a/src/gallium/drivers/radeon/radeon_video.c b/src/gallium/drivers/radeon/radeon_video.c
+index aba1404..5d4e096 100644
+--- a/src/gallium/drivers/radeon/radeon_video.c
++++ b/src/gallium/drivers/radeon/radeon_video.c
+@@ -122,7 +122,7 @@ void rvid_clear_buffer(struct pipe_context *context, struct rvid_buffer* buffer)
+ 	struct r600_common_context *rctx = (struct r600_common_context*)context;
+ 
+ 	rctx->clear_buffer(context, &buffer->res->b.b, 0, buffer->res->buf->size,
+-			   0, R600_COHERENCY_NONE);
++			   0, false);
+ 	context->flush(context, NULL, 0);
+ }
+ 
+diff --git a/src/gallium/drivers/radeonsi/si_blit.c b/src/gallium/drivers/radeonsi/si_blit.c
+index 716a522..d4dc33a 100644
+--- a/src/gallium/drivers/radeonsi/si_blit.c
++++ b/src/gallium/drivers/radeonsi/si_blit.c
+@@ -630,7 +630,7 @@ void si_resource_copy_region(struct pipe_context *ctx,
+ 
+ 	/* Handle buffers first. */
+ 	if (dst->target == PIPE_BUFFER && src->target == PIPE_BUFFER) {
+-		si_copy_buffer(sctx, dst, src, dstx, src_box->x, src_box->width);
++		si_copy_buffer(sctx, dst, src, dstx, src_box->x, src_box->width, false);
+ 		return;
+ 	}
+ 
+@@ -950,8 +950,7 @@ static void si_pipe_clear_buffer(struct pipe_context *ctx,
+ 		dword_value = *(uint32_t*)clear_value_ptr;
+ 	}
+ 
+-	sctx->b.clear_buffer(ctx, dst, offset, size, dword_value,
+-			     R600_COHERENCY_SHADER);
++	sctx->b.clear_buffer(ctx, dst, offset, size, dword_value, false);
+ }
+ 
+ void si_init_blit_functions(struct si_context *sctx)
+diff --git a/src/gallium/drivers/radeonsi/si_cp_dma.c b/src/gallium/drivers/radeonsi/si_cp_dma.c
+index cbb84b0..bca9cc5 100644
+--- a/src/gallium/drivers/radeonsi/si_cp_dma.c
++++ b/src/gallium/drivers/radeonsi/si_cp_dma.c
+@@ -107,26 +107,19 @@ static void si_emit_cp_dma_clear_buffer(struct si_context *sctx,
+ 	}
+ }
+ 
+-static unsigned get_flush_flags(struct si_context *sctx, enum r600_coherency coher)
++static unsigned get_flush_flags(struct si_context *sctx, bool is_framebuffer)
+ {
+-	switch (coher) {
+-	default:
+-	case R600_COHERENCY_NONE:
+-		return 0;
+-	case R600_COHERENCY_SHADER:
+-		return SI_CONTEXT_INV_SMEM_L1 |
+-		       SI_CONTEXT_INV_VMEM_L1 |
+-		       (sctx->b.chip_class == SI ? SI_CONTEXT_INV_GLOBAL_L2 : 0);
+-	case R600_COHERENCY_CB_META:
+-		return SI_CONTEXT_FLUSH_AND_INV_CB |
+-		       SI_CONTEXT_FLUSH_AND_INV_CB_META;
+-	}
++	if (is_framebuffer)
++		return SI_CONTEXT_FLUSH_AND_INV_FRAMEBUFFER;
++
++	return SI_CONTEXT_INV_SMEM_L1 |
++	       SI_CONTEXT_INV_VMEM_L1 |
++	       (sctx->b.chip_class == SI ? SI_CONTEXT_INV_GLOBAL_L2 : 0);
+ }
+ 
+-static unsigned get_tc_l2_flag(struct si_context *sctx, enum r600_coherency coher)
++static unsigned get_tc_l2_flag(struct si_context *sctx, bool is_framebuffer)
+ {
+-	return coher == R600_COHERENCY_SHADER &&
+-	       sctx->b.chip_class >= CIK ? CIK_CP_DMA_USE_L2 : 0;
++	return is_framebuffer || sctx->b.chip_class == SI ? 0 : CIK_CP_DMA_USE_L2;
+ }
+ 
+ static void si_cp_dma_prepare(struct si_context *sctx, struct pipe_resource *dst,
+@@ -166,11 +159,11 @@ static void si_cp_dma_prepare(struct si_context *sctx, struct pipe_resource *dst
+ 
+ static void si_clear_buffer(struct pipe_context *ctx, struct pipe_resource *dst,
+ 			    uint64_t offset, uint64_t size, unsigned value,
+-			    enum r600_coherency coher)
++			    bool is_framebuffer)
+ {
+ 	struct si_context *sctx = (struct si_context*)ctx;
+-	unsigned tc_l2_flag = get_tc_l2_flag(sctx, coher);
+-	unsigned flush_flags = get_flush_flags(sctx, coher);
++	unsigned tc_l2_flag = get_tc_l2_flag(sctx, is_framebuffer);
++	unsigned flush_flags = get_flush_flags(sctx, is_framebuffer);
+ 
+ 	if (!size)
+ 		return;
+@@ -256,13 +249,14 @@ static void si_cp_dma_realign_engine(struct si_context *sctx, unsigned size)
+ 
+ void si_copy_buffer(struct si_context *sctx,
+ 		    struct pipe_resource *dst, struct pipe_resource *src,
+-		    uint64_t dst_offset, uint64_t src_offset, unsigned size)
++		    uint64_t dst_offset, uint64_t src_offset, unsigned size,
++		    bool is_framebuffer)
+ {
+ 	uint64_t main_dst_offset, main_src_offset;
+ 	unsigned skipped_size = 0;
+ 	unsigned realign_size = 0;
+-	unsigned tc_l2_flag = get_tc_l2_flag(sctx, R600_COHERENCY_SHADER);
+-	unsigned flush_flags = get_flush_flags(sctx, R600_COHERENCY_SHADER);
++	unsigned tc_l2_flag = get_tc_l2_flag(sctx, is_framebuffer);
++	unsigned flush_flags = get_flush_flags(sctx, is_framebuffer);
+ 
+ 	if (!size)
+ 		return;
+diff --git a/src/gallium/drivers/radeonsi/si_pipe.c b/src/gallium/drivers/radeonsi/si_pipe.c
+index 9dd9ef5..0feee5b 100644
+--- a/src/gallium/drivers/radeonsi/si_pipe.c
++++ b/src/gallium/drivers/radeonsi/si_pipe.c
+@@ -239,8 +239,7 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen,
+ 
+ 		/* Clear the NULL constant buffer, because loads should return zeros. */
+ 		sctx->b.clear_buffer(&sctx->b.b, sctx->null_const_buf.buffer, 0,
+-				     sctx->null_const_buf.buffer->width0, 0,
+-				     R600_COHERENCY_SHADER);
++				     sctx->null_const_buf.buffer->width0, 0, false);
+ 	}
+ 
+ 	/* XXX: This is the maximum value allowed.  I'm not sure how to compute
+diff --git a/src/gallium/drivers/radeonsi/si_pipe.h b/src/gallium/drivers/radeonsi/si_pipe.h
+index 2661972..1d4b7ee 100644
+--- a/src/gallium/drivers/radeonsi/si_pipe.h
++++ b/src/gallium/drivers/radeonsi/si_pipe.h
+@@ -349,7 +349,8 @@ void si_resource_copy_region(struct pipe_context *ctx,
+ /* si_cp_dma.c */
+ void si_copy_buffer(struct si_context *sctx,
+ 		    struct pipe_resource *dst, struct pipe_resource *src,
+-		    uint64_t dst_offset, uint64_t src_offset, unsigned size);
++		    uint64_t dst_offset, uint64_t src_offset, unsigned size,
++		    bool is_framebuffer);
+ void si_init_cp_dma_functions(struct si_context *sctx);
+ 
+ /* si_debug.c */
+-- 
+2.7.4
+
