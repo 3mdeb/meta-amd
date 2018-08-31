@@ -6,18 +6,11 @@ PV_v1000 = "18.1.0+git${SRCPV}"
 
 MESA_LLVM_RELEASE_v1000 = "6.0"
 
-export LLVM_CONFIG = "${STAGING_BINDIR_NATIVE}/llvm-config${MESA_LLVM_RELEASE_v1000}"
-export YOCTO_ALTERNATE_EXE_PATH = "${STAGING_LIBDIR}/llvm${MESA_LLVM_RELEASE}/llvm-config"
-
 PACKAGECONFIG_append_v1000 = " dri3"
-
-PACKAGECONFIG[gallium-llvm] = "--enable-llvm --enable-llvm-shared-libs, --disable-llvm, llvm${MESA_LLVM_RELEASE} llvm-native \
-                              ${@'elfutils' if ${GALLIUMDRIVERS_LLVM33_ENABLED} else ''}"
 
 EXTRA_OECONF_remove_v1000 = "--enable-omx --with-omx-libdir=${libdir}/bellagio --enable-nls"
 EXTRA_OECONF_append_v1000 = "--enable-omx-bellagio \
-                             --with-omx-bellagio-libdir=${libdir}/bellagio \
-                             --with-llvm-prefix=${STAGING_LIBDIR}/llvm${MESA_LLVM_RELEASE}"
+                             --with-omx-bellagio-libdir=${libdir}/bellagio"
 
 SRC_URI_v1000 = "\
 			git://anongit.freedesktop.org/mesa/mesa;branch=master \
@@ -37,6 +30,3 @@ SRC_URI_v1000 = "\
                         file://0001-configure.ac-obey-llvm_prefix-if-available.patch \
                         file://0001-configure.ac-adjust-usage-of-LLVM-flags.patch \
 "
-
-MESA_CRYPTO_v1000 = ""
-
