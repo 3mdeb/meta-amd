@@ -2,12 +2,9 @@ require recipes-graphics/mesa/${BPN}.inc
 
 S = "${WORKDIR}/git"
 
-DEPENDS_remove = " python3-mako-native"
 DEPENDS_append = " python-mako-native"
-
 inherit pythonnative
 
-#FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 SRCREV_amd = "09460b8cf7ddac4abb46eb6439314b29954c76a6"
 LIC_FILES_CHKSUM_amd = "file://docs/license.html;md5=899fbe7e42d494c7c8c159c7001693d5"
 PV_amd = "12.0.3+git${SRCPV}"
@@ -17,6 +14,8 @@ PACKAGECONFIG[va] = "--enable-va,--disable-va,libva"
 PACKAGECONFIG_append_amd = " xvmc gallium r600 gallium-llvm xa"
 PACKAGECONFIG_append_radeon = " va"
 PACKAGECONFIG_append_amdgpu = " va"
+
+PACKAGECONFIG_remove_amd = "vulkan"
 PACKAGECONFIG_remove_amdfalconx86 = "xvmc"
 
 LIBVA_PLATFORMS  = "libva"
