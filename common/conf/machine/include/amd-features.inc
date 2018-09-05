@@ -33,8 +33,10 @@
 
 # Add common feartures to be supported for all machines here
 EXTRA_IMAGE_FEATURES += "amd-misc-pkgs"
-EXTRA_IMAGE_FEATURES_append_amdgpu = " amd-feature-multimedia"
-EXTRA_IMAGE_FEATURES_append_radeon = " amd-feature-multimedia"
+EXTRA_IMAGE_FEATURES_append_amdgpu = " amd-feature-multimedia \
+                                       ${@bb.utils.contains("DISTRO", "mel", "multimedia", "", d)}"
+EXTRA_IMAGE_FEATURES_append_radeon = " amd-feature-multimedia \
+                                       ${@bb.utils.contains("DISTRO", "mel", "multimedia", "", d)}"
 
 GSTREAMER_PKGS ?= " \
     ${@bb.utils.contains("IMAGE_FEATURES", "x11-base", "gstreamer1.0-meta-x11-base", "", d)} \

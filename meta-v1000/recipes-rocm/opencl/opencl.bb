@@ -23,7 +23,7 @@ FILES_${PN}-amd-drivers = "${libdir}/libcltrace.so \
                            ${libdir}/libamdocl64.so"
 
 INSANE_SKIP_${PN} += "already-stripped build-deps ldflags"
-INSANE_SKIP_${PN}-amd-drivers += "ldflags"
+INSANE_SKIP_${PN}-amd-drivers += "ldflags file-rdeps"
 
 do_install () {
     # Install the binary components
