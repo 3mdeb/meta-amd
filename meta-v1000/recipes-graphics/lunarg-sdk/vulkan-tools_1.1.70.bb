@@ -17,13 +17,15 @@ LIC_FILES_CHKSUM = "file://LICENSE.txt;md5=99c647ca3d4f6a4b9d8628f757aad156"
 
 S = "${WORKDIR}/git"
 
-SRCREV = "2e2aca87835dbbeeee567cac99c917cd8171f9a1"
+SRCREV = "b94505e03c1169e745bc9a67697a8f6943c18c8f"
+SRCREV_loader = "1fede1a6b8d6103cc9fcacb567747aa2af167849"
 SRC_URI = "git://github.com/LunarG/VulkanTools;branch=sdk-${PV} \
+           git://github.com/KhronosGroup/Vulkan-LoaderAndValidationLayers;branch=sdk-${PV};name=loader;destsuffix=${S}/submodules/Vulkan-LoaderAndValidationLayers \
            file://0002-vktrace-do-not-link-to-internal-loader.patch \
-           file://0004-CMakeLists-add-include-path-so-Xlib.h-is-found-as-ne.patch \
            file://0005-vktrace_layer-force-linker-flags.patch \
-           file://0009-CMakeLists-add-include-paths-for-xcb-and-Xlib.patch \
-           file://0010-layersvt-drop-device_sim-as-we-don-t-have-jsoncpp-fo.patch \
+           file://0001-CMakeLists-add-include-paths-so-Xlib-and-XCB-are-fou.patch \
+           file://0002-layersvt-drop-device_sim-as-we-don-t-have-jsoncpp-fo.patch \
+           file://0003-CMakeLists.txt-use-a-fixed-header-for-spirv_commit.patch \
 "
 
 EXTRA_OECMAKE = " \
