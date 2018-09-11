@@ -19,11 +19,13 @@ LIC_FILES_CHKSUM = "file://LICENSE.txt;md5=99c647ca3d4f6a4b9d8628f757aad156"
 
 S = "${WORKDIR}/git"
 
-SRCREV = "4569d5658bbba977aa35bed2f456572582debd27"
+SRCREV = "1fede1a6b8d6103cc9fcacb567747aa2af167849"
 SRC_URI = "git://github.com/KhronosGroup/Vulkan-LoaderAndValidationLayers;branch=sdk-${PV} \
            file://0001-CMakeLists-add-include-path-so-Xlib.h-is-found-as-ne.patch \
-           file://0002-install-demos.patch \
-           file://0003-demos-make-shader-location-relative.patch"
+           file://0002-demos-CMakeLists.txt-install-demos.patch \
+           file://0003-CMakeLists.txt-use-a-fixed-header-for-spirv_commit.patch \
+           file://0004-layer_validation_tests-include-math.h.patch \
+           file://0005-demos-cube-use-absolute-location-for-data-files.patch"
 
 EXTRA_OECMAKE = " \
     -DCUSTOM_GLSLANG_BIN_ROOT=1 \
@@ -39,12 +41,16 @@ PACKAGES =+ "${PN}-layer-libs"
 FILES_${PN}-layer-libs = "${libdir}/libVkLayer_*.so"
 
 FILES_SOLIBSDEV = ""
-FILES_${PN} += "${libdir}/libvulkan.so"
+FILES_${PN} += "${libdir}/libvulkan.so \
+                ${datadir}"
 INSANE_SKIP_${PN} = "dev-so"
 
 do_install_append() {
-    cp -f ${B}/demos/*.spv ${D}${bindir}
-    cp -f ${B}/demos/*.ppm ${D}${bindir}
     mv ${D}${bindir}/cube ${D}${bindir}/cube-vulkan
     mv ${D}${bindir}/cubepp ${D}${bindir}/cubepp-vulkan
+
+    install -D ${B}/demos/lunarg.ppm ${D}${datadir}/vulkan-data/lunarg.ppm
+
+    # drop the spirv_tools_commit_id.h from installation
+    rm -f ${D}${includedir}/vulkan/spirv_tools_commit_id.h
 }
