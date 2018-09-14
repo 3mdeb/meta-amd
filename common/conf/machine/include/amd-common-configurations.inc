@@ -22,8 +22,6 @@ MACHINE_EXTRA_RRECOMMENDS += "rtc-test watchdog-test spi-test smbus-test gpio-te
 MACHINE_EXTRA_RRECOMMENDS += "amd-wdt amd-spi"
 MACHINE_EXTRA_RRECOMMENDS += "${@bb.utils.contains_any("DISTRO", "mel mel-lite", "firmware-wireless", "", d)}"
 
-RELEASE_IMAGE ?= "core-image-sato"
-
 # Add serial consoles to kernel commandline, these should occur before the tty0
 KERNEL_SERIAL_CONSOLE ??= ""
 APPEND += "${KERNEL_SERIAL_CONSOLE}"
