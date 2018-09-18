@@ -1,0 +1,98 @@
+From 1e6cac33a250c63865a02b82a073457b26ddb120 Mon Sep 17 00:00:00 2001
+From: Gert Wollny <gw.fossdev@gmail.com>
+Date: Tue, 6 Mar 2018 18:36:40 +0100
+Subject: [PATCH 13/13] mesa/st/glsl_to_tgsi: Properly resolve life times for
+ simple if/else + use constructs
+
+In constructs like
+
+  while (foo)  {
+    ...
+    if (a) {
+       ...
+       if (b)
+         foo = ...
+       else
+         foo = ...
+       x = foo;
+       ...
+    }
+     ...
+  }
+
+currently the live range estimation extends the live range of t unnecessarily
+to the whole loop because it was not detected that t is only read in the
+"if (a)" scope that encloses the "if (b)/else" constructs where t is written
+in both branches.
+
+This patch corrects the minimal live range estimation and adds an according
+unit test for this case.
+
+Signed-off-by: Gert Wollny <gw.fossdev@gmail.com>
+---
+ .../state_tracker/st_glsl_to_tgsi_temprename.cpp   | 14 +++++++++++++
+ .../tests/test_glsl_to_tgsi_lifetime.cpp           | 23 ++++++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.cpp b/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.cpp
+index eafe4cd..115dca7 100644
+--- a/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.cpp
++++ b/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.cpp
+@@ -838,6 +838,20 @@ void temp_comp_access::record_else_write(const prog_scope& scope)
+          } else {
+             current_unpaired_if_write_scope = nullptr;
+          }
++         /* Promote the first write scope to the enclosing scope because the
++          * current IF/ELSE pair is now irrelevant for the analysis. This is
++          * needed to obtain the minimum live range for t in constructs like:
++          * {
++          *    var t;
++          *    if (a)
++          *      t = ...
++          *    else
++          *      t = ...
++          *    x = t;
++          *    ...
++          * }
++          */
++         first_write_scope = scope.parent();
+ 
+          /* If some parent is IF/ELSE and in a loop then propagate the
+           * write to that scope. Otherwise the write is unconditional
+diff --git a/src/mesa/state_tracker/tests/test_glsl_to_tgsi_lifetime.cpp b/src/mesa/state_tracker/tests/test_glsl_to_tgsi_lifetime.cpp
+index dbf74cc..a665d9d 100644
+--- a/src/mesa/state_tracker/tests/test_glsl_to_tgsi_lifetime.cpp
++++ b/src/mesa/state_tracker/tests/test_glsl_to_tgsi_lifetime.cpp
+@@ -794,6 +794,29 @@ TEST_F(LifetimeEvaluatorExactTest, WriteInIfElseBranchSecondIfInLoop)
+    run (code, temp_lt_expect({{-1,-1}, {2,9}}));
+ }
+ 
++/*
++  Test for write in IF and ELSE and read in enclosing IF in loop.
++*/
++
++TEST_F(LifetimeEvaluatorExactTest, DeeplyNestedinLoop)
++{
++   const vector<FakeCodeline> code = {
++      { TGSI_OPCODE_BGNLOOP },
++      {   TGSI_OPCODE_UIF, {}, {in0}, {}},
++      {     TGSI_OPCODE_FSEQ, {1}, {in1,in2}, {}},
++      {     TGSI_OPCODE_UIF, {}, {1}, {}},
++      {       TGSI_OPCODE_MOV, {2}, {in1}, {}},
++      {     TGSI_OPCODE_ELSE },
++      {       TGSI_OPCODE_MOV, {2}, {in2}, {}},
++      {     TGSI_OPCODE_ENDIF },
++      {     TGSI_OPCODE_MOV, {3}, {2}, {}},
++      {   TGSI_OPCODE_ENDIF },
++      {   TGSI_OPCODE_ADD, {out0}, {3, in1}, {}},
++      { TGSI_OPCODE_ENDLOOP }
++   };
++   run (code, temp_lt_expect({{-1,-1}, {2,3}, {4, 8}, {0,11}}));
++}
++
+ /** Regression test for bug #104803,
+  *  Read and write in if/else path outside loop and later read in conditional
+  *  within a loop. The first write is to be considered the dominant write.
+-- 
+2.7.4
+

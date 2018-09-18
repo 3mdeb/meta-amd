@@ -1,0 +1,115 @@
+From 29e0c16b314e7e8e14f20e30dd8f7973130f2c8b Mon Sep 17 00:00:00 2001
+From: Robin Murphy <robin.murphy@arm.com>
+Date: Tue, 16 May 2017 12:26:48 +0100
+Subject: [PATCH 4992/5855] iommu/iova: Sort out rbtree limit_pfn handling
+
+When walking the rbtree, the fact that iovad->start_pfn and limit_pfn
+are both inclusive limits creates an ambiguity once limit_pfn reaches
+the bottom of the address space and they overlap. Commit 5016bdb796b3
+("iommu/iova: Fix underflow bug in __alloc_and_insert_iova_range") fixed
+the worst side-effect of this, that of underflow wraparound leading to
+bogus allocations, but the remaining fallout is that any attempt to
+allocate start_pfn itself erroneously fails.
+
+The cleanest way to resolve the ambiguity is to simply make limit_pfn an
+exclusive limit when inside the guts of the rbtree. Since we're working
+with PFNs, representing one past the top of the address space is always
+possible without fear of overflow, and elsewhere it just makes life a
+little more straightforward.
+
+Reported-by: Aaron Sierra <asierra@xes-inc.com>
+Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/dma-iommu.c |  2 +-
+ drivers/iommu/iova.c      | 21 +++++++++------------
+ 2 files changed, 10 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/iommu/dma-iommu.c b/drivers/iommu/dma-iommu.c
+index 62618e7..f1db869 100644
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -314,7 +314,7 @@ int iommu_dma_init_domain(struct iommu_domain *domain, dma_addr_t base,
+ 		 * If we have devices with different DMA masks, move the free
+ 		 * area cache limit down for the benefit of the smaller one.
+ 		 */
+-		iovad->dma_32bit_pfn = min(end_pfn, iovad->dma_32bit_pfn);
++		iovad->dma_32bit_pfn = min(end_pfn + 1, iovad->dma_32bit_pfn);
+ 
+ 		return 0;
+ 	}
+diff --git a/drivers/iommu/iova.c b/drivers/iommu/iova.c
+index 5c88ba7..3f24c9a 100644
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@ -48,7 +48,7 @@ init_iova_domain(struct iova_domain *iovad, unsigned long granule,
+ 	iovad->cached32_node = NULL;
+ 	iovad->granule = granule;
+ 	iovad->start_pfn = start_pfn;
+-	iovad->dma_32bit_pfn = pfn_32bit;
++	iovad->dma_32bit_pfn = pfn_32bit + 1;
+ 	init_iova_rcaches(iovad);
+ }
+ EXPORT_SYMBOL_GPL(init_iova_domain);
+@@ -63,7 +63,7 @@ __get_cached_rbnode(struct iova_domain *iovad, unsigned long *limit_pfn)
+ 		struct rb_node *prev_node = rb_prev(iovad->cached32_node);
+ 		struct iova *curr_iova =
+ 			rb_entry(iovad->cached32_node, struct iova, node);
+-		*limit_pfn = curr_iova->pfn_lo - 1;
++		*limit_pfn = curr_iova->pfn_lo;
+ 		return prev_node;
+ 	}
+ }
+@@ -135,7 +135,7 @@ iova_insert_rbtree(struct rb_root *root, struct iova *iova,
+ static unsigned int
+ iova_get_pad_size(unsigned int size, unsigned int limit_pfn)
+ {
+-	return (limit_pfn + 1 - size) & (__roundup_pow_of_two(size) - 1);
++	return (limit_pfn - size) & (__roundup_pow_of_two(size) - 1);
+ }
+ 
+ static int __alloc_and_insert_iova_range(struct iova_domain *iovad,
+@@ -155,18 +155,15 @@ static int __alloc_and_insert_iova_range(struct iova_domain *iovad,
+ 	while (curr) {
+ 		struct iova *curr_iova = rb_entry(curr, struct iova, node);
+ 
+-		if (limit_pfn < curr_iova->pfn_lo)
++		if (limit_pfn <= curr_iova->pfn_lo) {
+ 			goto move_left;
+-		else if (limit_pfn < curr_iova->pfn_hi)
+-			goto adjust_limit_pfn;
+-		else {
++		} else if (limit_pfn > curr_iova->pfn_hi) {
+ 			if (size_aligned)
+ 				pad_size = iova_get_pad_size(size, limit_pfn);
+-			if ((curr_iova->pfn_hi + size + pad_size) <= limit_pfn)
++			if ((curr_iova->pfn_hi + size + pad_size) < limit_pfn)
+ 				break;	/* found a free slot */
+ 		}
+-adjust_limit_pfn:
+-		limit_pfn = curr_iova->pfn_lo ? (curr_iova->pfn_lo - 1) : 0;
++		limit_pfn = curr_iova->pfn_lo;
+ move_left:
+ 		prev = curr;
+ 		curr = rb_prev(curr);
+@@ -182,7 +179,7 @@ static int __alloc_and_insert_iova_range(struct iova_domain *iovad,
+ 	}
+ 
+ 	/* pfn_lo will point to size aligned address if size_aligned is set */
+-	new->pfn_lo = limit_pfn - (size + pad_size) + 1;
++	new->pfn_lo = limit_pfn - (size + pad_size);
+ 	new->pfn_hi = new->pfn_lo + size - 1;
+ 
+ 	/* If we have 'prev', it's a valid place to start the insertion. */
+@@ -269,7 +266,7 @@ alloc_iova(struct iova_domain *iovad, unsigned long size,
+ 	if (!new_iova)
+ 		return NULL;
+ 
+-	ret = __alloc_and_insert_iova_range(iovad, size, limit_pfn,
++	ret = __alloc_and_insert_iova_range(iovad, size, limit_pfn + 1,
+ 			new_iova, size_aligned);
+ 
+ 	if (ret) {
+-- 
+2.7.4
+

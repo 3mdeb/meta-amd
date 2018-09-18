@@ -1,0 +1,256 @@
+From a83cdcac21682bb39540ec30b0edf384a27a8f24 Mon Sep 17 00:00:00 2001
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Tue, 21 Nov 2017 13:29:14 +0800
+Subject: [PATCH 3876/5855] drm/amdgpu:partially revert
+ 1cfd8e237f0318e330190ac21d63c58ae6a1f66c
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+found RING0 test fail after S3 resume regression, which is
+introduced by 1cfd8e237f0318e330190ac21d63c58ae6a1f66c
+
+Because after suspend VRAM will be cleared, so driver must
+unpin the GART table(resident in VRAM) during suspend so it
+can be evicted to system ram and must correspondingly pin it
+during resume so the GART table could be restored to VRAM.
+
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c | 79 +++++++++++++++++++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gart.h |  2 +
+ drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c    |  7 ++-
+ drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c    |  7 ++-
+ drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c    |  7 ++-
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c    |  4 ++
+ 6 files changed, 94 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
+index d76dd62..6344bb7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c
+@@ -65,9 +65,75 @@
+  */
+ int amdgpu_gart_table_vram_alloc(struct amdgpu_device *adev)
+ {
+-	return amdgpu_bo_create_kernel(adev, adev->gart.table_size, PAGE_SIZE,
+-					AMDGPU_GEM_DOMAIN_VRAM, &adev->gart.robj,
+-					&adev->gart.table_addr, &adev->gart.ptr);
++	int r;
++
++	if (adev->gart.robj == NULL) {
++		r = amdgpu_bo_create(adev, adev->gart.table_size,
++				     PAGE_SIZE, true, AMDGPU_GEM_DOMAIN_VRAM,
++				     AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED |
++				     AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS,
++				     NULL, NULL, 0, &adev->gart.robj);
++		if (r) {
++			return r;
++		}
++	}
++	return 0;
++}
++
++/**
++ * amdgpu_gart_table_vram_pin - pin gart page table in vram
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * Pin the GART page table in vram so it will not be moved
++ * by the memory manager (pcie r4xx, r5xx+).  These asics require the
++ * gart table to be in video memory.
++ * Returns 0 for success, error for failure.
++ */
++int amdgpu_gart_table_vram_pin(struct amdgpu_device *adev)
++{
++	uint64_t gpu_addr;
++	int r;
++
++	r = amdgpu_bo_reserve(adev->gart.robj, false);
++	if (unlikely(r != 0))
++		return r;
++	r = amdgpu_bo_pin(adev->gart.robj,
++				AMDGPU_GEM_DOMAIN_VRAM, &gpu_addr);
++	if (r) {
++		amdgpu_bo_unreserve(adev->gart.robj);
++		return r;
++	}
++	r = amdgpu_bo_kmap(adev->gart.robj, &adev->gart.ptr);
++	if (r)
++		amdgpu_bo_unpin(adev->gart.robj);
++	amdgpu_bo_unreserve(adev->gart.robj);
++	adev->gart.table_addr = gpu_addr;
++	return r;
++}
++
++/**
++ * amdgpu_gart_table_vram_unpin - unpin gart page table in vram
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * Unpin the GART page table in vram (pcie r4xx, r5xx+).
++ * These asics require the gart table to be in video memory.
++ */
++void amdgpu_gart_table_vram_unpin(struct amdgpu_device *adev)
++{
++	int r;
++
++	if (adev->gart.robj == NULL) {
++		return;
++	}
++	r = amdgpu_bo_reserve(adev->gart.robj, true);
++	if (likely(r == 0)) {
++		amdgpu_bo_kunmap(adev->gart.robj);
++		amdgpu_bo_unpin(adev->gart.robj);
++		amdgpu_bo_unreserve(adev->gart.robj);
++		adev->gart.ptr = NULL;
++	}
+ }
+ 
+ /**
+@@ -81,9 +147,10 @@ int amdgpu_gart_table_vram_alloc(struct amdgpu_device *adev)
+  */
+ void amdgpu_gart_table_vram_free(struct amdgpu_device *adev)
+ {
+-	amdgpu_bo_free_kernel(&adev->gart.robj,
+-				&adev->gart.table_addr,
+-				&adev->gart.ptr);
++	if (adev->gart.robj == NULL) {
++		return;
++	}
++	amdgpu_bo_unref(&adev->gart.robj);
+ }
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.h
+index 5eb1a68..d4a4330 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.h
+@@ -58,6 +58,8 @@ struct amdgpu_gart {
+ 
+ int amdgpu_gart_table_vram_alloc(struct amdgpu_device *adev);
+ void amdgpu_gart_table_vram_free(struct amdgpu_device *adev);
++int amdgpu_gart_table_vram_pin(struct amdgpu_device *adev);
++void amdgpu_gart_table_vram_unpin(struct amdgpu_device *adev);
+ int amdgpu_gart_init(struct amdgpu_device *adev);
+ void amdgpu_gart_fini(struct amdgpu_device *adev);
+ int amdgpu_gart_unbind(struct amdgpu_device *adev, uint64_t offset,
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+index b87b30d..3d4adc4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v6_0.c
+@@ -472,14 +472,16 @@ static void gmc_v6_0_set_prt(struct amdgpu_device *adev, bool enable)
+ 
+ static int gmc_v6_0_gart_enable(struct amdgpu_device *adev)
+ {
+-	int i;
++	int r, i;
+ 	u32 field;
+ 
+ 	if (adev->gart.robj == NULL) {
+ 		dev_err(adev->dev, "No VRAM object for PCIE GART.\n");
+ 		return -EINVAL;
+ 	}
+-
++	r = amdgpu_gart_table_vram_pin(adev);
++	if (r)
++		return r;
+ 	/* Setup TLB control */
+ 	WREG32(mmMC_VM_MX_L1_TLB_CNTL,
+ 	       (0xA << 7) |
+@@ -606,6 +608,7 @@ static void gmc_v6_0_gart_disable(struct amdgpu_device *adev)
+ 	WREG32(mmVM_L2_CNTL3,
+ 	       VM_L2_CNTL3__L2_CACHE_BIGK_ASSOCIATIVITY_MASK |
+ 	       (0UL << VM_L2_CNTL3__L2_CACHE_BIGK_FRAGMENT_SIZE__SHIFT));
++	amdgpu_gart_table_vram_unpin(adev);
+ }
+ 
+ static void gmc_v6_0_gart_fini(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+index 23d7c12..0b6f387 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c
+@@ -576,14 +576,16 @@ static void gmc_v7_0_set_prt(struct amdgpu_device *adev, bool enable)
+  */
+ static int gmc_v7_0_gart_enable(struct amdgpu_device *adev)
+ {
+-	int i;
++	int r, i;
+ 	u32 tmp, field;
+ 
+ 	if (adev->gart.robj == NULL) {
+ 		dev_err(adev->dev, "No VRAM object for PCIE GART.\n");
+ 		return -EINVAL;
+ 	}
+-
++	r = amdgpu_gart_table_vram_pin(adev);
++	if (r)
++		return r;
+ 	/* Setup TLB control */
+ 	tmp = RREG32(mmMC_VM_MX_L1_TLB_CNTL);
+ 	tmp = REG_SET_FIELD(tmp, MC_VM_MX_L1_TLB_CNTL, ENABLE_L1_TLB, 1);
+@@ -716,6 +718,7 @@ static void gmc_v7_0_gart_disable(struct amdgpu_device *adev)
+ 	tmp = REG_SET_FIELD(tmp, VM_L2_CNTL, ENABLE_L2_CACHE, 0);
+ 	WREG32(mmVM_L2_CNTL, tmp);
+ 	WREG32(mmVM_L2_CNTL2, 0);
++	amdgpu_gart_table_vram_unpin(adev);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index b77778f..21e81aa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -779,14 +779,16 @@ static void gmc_v8_0_set_prt(struct amdgpu_device *adev, bool enable)
+  */
+ static int gmc_v8_0_gart_enable(struct amdgpu_device *adev)
+ {
+-	int i;
++	int r, i;
+ 	u32 tmp, field;
+ 
+ 	if (adev->gart.robj == NULL) {
+ 		dev_err(adev->dev, "No VRAM object for PCIE GART.\n");
+ 		return -EINVAL;
+ 	}
+-
++	r = amdgpu_gart_table_vram_pin(adev);
++	if (r)
++		return r;
+ 	/* Setup TLB control */
+ 	tmp = RREG32(mmMC_VM_MX_L1_TLB_CNTL);
+ 	tmp = REG_SET_FIELD(tmp, MC_VM_MX_L1_TLB_CNTL, ENABLE_L1_TLB, 1);
+@@ -936,6 +938,7 @@ static void gmc_v8_0_gart_disable(struct amdgpu_device *adev)
+ 	tmp = REG_SET_FIELD(tmp, VM_L2_CNTL, ENABLE_L2_CACHE, 0);
+ 	WREG32(mmVM_L2_CNTL, tmp);
+ 	WREG32(mmVM_L2_CNTL2, 0);
++	amdgpu_gart_table_vram_unpin(adev);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 07a7e49..8678d63 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -928,6 +928,9 @@ static int gmc_v9_0_gart_enable(struct amdgpu_device *adev)
+ 		dev_err(adev->dev, "No VRAM object for PCIE GART.\n");
+ 		return -EINVAL;
+ 	}
++	r = amdgpu_gart_table_vram_pin(adev);
++	if (r)
++		return r;
+ 
+ 	switch (adev->asic_type) {
+ 	case CHIP_RAVEN:
+@@ -1005,6 +1008,7 @@ static void gmc_v9_0_gart_disable(struct amdgpu_device *adev)
+ {
+ 	gfxhub_v1_0_gart_disable(adev);
+ 	mmhub_v1_0_gart_disable(adev);
++	amdgpu_gart_table_vram_unpin(adev);
+ }
+ 
+ static int gmc_v9_0_hw_fini(void *handle)
+-- 
+2.7.4
+

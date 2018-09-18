@@ -14,7 +14,7 @@ LIC_FILES_CHKSUM = "file://glslang/Include/Types.h;beginline=1;endline=36;md5=9d
 
 S = "${WORKDIR}/git"
 
-SRCREV = "715c353a15836e5ae192a64a4cf54e2ce7e8d66a"
+SRCREV = "2651ccaec8170b3257642b3c438f50dc4f181fdd"
 SRC_URI = "git://github.com/KhronosGroup/glslang \
            file://0002-spirv-do-not-install-conflicting-headers.patch"
 

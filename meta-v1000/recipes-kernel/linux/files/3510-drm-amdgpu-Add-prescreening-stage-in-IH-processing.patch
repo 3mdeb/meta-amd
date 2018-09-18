@@ -1,0 +1,258 @@
+From 1b96fdbe4b1dafa77d808f16a4f138329e3cea5e Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Sat, 26 Aug 2017 02:40:45 -0400
+Subject: [PATCH 3510/5855] drm/amdgpu: Add prescreening stage in IH processing
+
+To filter out high-frequency interrupts that can be safely ignored.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c  |  6 ++++++
+ drivers/gpu/drm/amd/amdgpu/cik_ih.c     | 15 +++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/cz_ih.c      | 15 +++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/iceland_ih.c | 15 +++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/si_ih.c      | 14 ++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/tonga_ih.c   | 14 ++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/vega10_ih.c  | 15 +++++++++++++++
+ 8 files changed, 96 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index d09a29f..8977382 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -352,6 +352,7 @@ struct amdgpu_gart_funcs {
+ struct amdgpu_ih_funcs {
+ 	/* ring read/write ptr handling, called from interrupt context */
+ 	u32 (*get_wptr)(struct amdgpu_device *adev);
++        bool (*prescreen_iv)(struct amdgpu_device *adev);
+ 	void (*decode_iv)(struct amdgpu_device *adev,
+ 			  struct amdgpu_iv_entry *entry);
+ 	void (*set_rptr)(struct amdgpu_device *adev);
+@@ -1846,6 +1847,7 @@ amdgpu_get_sdma_instance(struct amdgpu_ring *ring)
+ #define amdgpu_ring_init_cond_exec(r) (r)->funcs->init_cond_exec((r))
+ #define amdgpu_ring_patch_cond_exec(r,o) (r)->funcs->patch_cond_exec((r),(o))
+ #define amdgpu_ih_get_wptr(adev) (adev)->irq.ih_funcs->get_wptr((adev))
++#define amdgpu_ih_prescreen_iv(adev) (adev)->irq.ih_funcs->prescreen_iv((adev))
+ #define amdgpu_ih_decode_iv(adev, iv) (adev)->irq.ih_funcs->decode_iv((adev), (iv))
+ #define amdgpu_ih_set_rptr(adev) (adev)->irq.ih_funcs->set_rptr((adev))
+ #define amdgpu_display_vblank_get_counter(adev, crtc) (adev)->mode_info.funcs->vblank_get_counter((adev), (crtc))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
+index 3ab4c65..fceb850 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
+@@ -169,6 +169,12 @@ int amdgpu_ih_process(struct amdgpu_device *adev)
+ 	while (adev->irq.ih.rptr != wptr) {
+ 		u32 ring_index = adev->irq.ih.rptr >> 2;
+ 
++                /* Prescreening of high-frequency interrupts */
++                if (!amdgpu_ih_prescreen_iv(adev)) {
++                        adev->irq.ih.rptr &= adev->irq.ih.ptr_mask;
++                        continue;
++                }
++
+ 		/* Before dispatching irq to IP blocks, send it to amdkfd */
+ 		amdgpu_amdkfd_interrupt(adev,
+ 				(const void *) &adev->irq.ih.ring[ring_index]);
+diff --git a/drivers/gpu/drm/amd/amdgpu/cik_ih.c b/drivers/gpu/drm/amd/amdgpu/cik_ih.c
+index b891843..4d8debf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cik_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/cik_ih.c
+@@ -228,6 +228,20 @@ static u32 cik_ih_get_wptr(struct amdgpu_device *adev)
+  * [127:96] - reserved
+  */
+ 
++/**
++ * cik_ih_prescreen_iv - prescreen an interrupt vector
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * Returns true if the interrupt vector should be further processed.
++ */
++static bool cik_ih_prescreen_iv(struct amdgpu_device *adev)
++{
++        /* Process all interrupts */
++        return true;
++}
++
++
+  /**
+  * cik_ih_decode_iv - decode an interrupt vector
+  *
+@@ -433,6 +447,7 @@ static const struct amd_ip_funcs cik_ih_ip_funcs = {
+ 
+ static const struct amdgpu_ih_funcs cik_ih_funcs = {
+ 	.get_wptr = cik_ih_get_wptr,
++        .prescreen_iv = cik_ih_prescreen_iv,
+ 	.decode_iv = cik_ih_decode_iv,
+ 	.set_rptr = cik_ih_set_rptr
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/cz_ih.c b/drivers/gpu/drm/amd/amdgpu/cz_ih.c
+index 0c1209c..2410104 100644
+--- a/drivers/gpu/drm/amd/amdgpu/cz_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/cz_ih.c
+@@ -207,6 +207,20 @@ static u32 cz_ih_get_wptr(struct amdgpu_device *adev)
+ 	return (wptr & adev->irq.ih.ptr_mask);
+ }
+ 
++ /**
++ * cz_ih_prescreen_iv - prescreen an interrupt vector
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * Returns true if the interrupt vector should be further processed.
++ */
++static bool cz_ih_prescreen_iv(struct amdgpu_device *adev)
++{
++        /* Process all interrupts */
++        return true;
++}
++
++
+ /**
+  * cz_ih_decode_iv - decode an interrupt vector
+  *
+@@ -414,6 +428,7 @@ static const struct amd_ip_funcs cz_ih_ip_funcs = {
+ 
+ static const struct amdgpu_ih_funcs cz_ih_funcs = {
+ 	.get_wptr = cz_ih_get_wptr,
++        .prescreen_iv = cz_ih_prescreen_iv,
+ 	.decode_iv = cz_ih_decode_iv,
+ 	.set_rptr = cz_ih_set_rptr
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/iceland_ih.c b/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
+index 7a0ea27..49c7b17 100644
+--- a/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/iceland_ih.c
+@@ -207,6 +207,20 @@ static u32 iceland_ih_get_wptr(struct amdgpu_device *adev)
+ 	return (wptr & adev->irq.ih.ptr_mask);
+ }
+ 
++ /**
++ * iceland_ih_prescreen_iv - prescreen an interrupt vector
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * Returns true if the interrupt vector should be further processed.
++ */
++static bool iceland_ih_prescreen_iv(struct amdgpu_device *adev)
++{
++        /* Process all interrupts */
++        return true;
++}
++
++
+ /**
+  * iceland_ih_decode_iv - decode an interrupt vector
+  *
+@@ -412,6 +426,7 @@ static const struct amd_ip_funcs iceland_ih_ip_funcs = {
+ 
+ static const struct amdgpu_ih_funcs iceland_ih_funcs = {
+ 	.get_wptr = iceland_ih_get_wptr,
++        .prescreen_iv = iceland_ih_prescreen_iv,
+ 	.decode_iv = iceland_ih_decode_iv,
+ 	.set_rptr = iceland_ih_set_rptr
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/si_ih.c b/drivers/gpu/drm/amd/amdgpu/si_ih.c
+index ce25e03..4a0d5e5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/si_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/si_ih.c
+@@ -118,6 +118,19 @@ static u32 si_ih_get_wptr(struct amdgpu_device *adev)
+ 	return (wptr & adev->irq.ih.ptr_mask);
+ }
+ 
++/**
++ * si_ih_prescreen_iv - prescreen an interrupt vector
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * Returns true if the interrupt vector should be further processed.
++ */
++static bool si_ih_prescreen_iv(struct amdgpu_device *adev)
++{
++        /* Process all interrupts */
++        return true;
++}
++
+ static void si_ih_decode_iv(struct amdgpu_device *adev,
+ 			     struct amdgpu_iv_entry *entry)
+ {
+@@ -288,6 +301,7 @@ static const struct amd_ip_funcs si_ih_ip_funcs = {
+ 
+ static const struct amdgpu_ih_funcs si_ih_funcs = {
+ 	.get_wptr = si_ih_get_wptr,
++        .prescreeen_iv = si_ih_prescreen_iv,
+ 	.decode_iv = si_ih_decode_iv,
+ 	.set_rptr = si_ih_set_rptr
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/tonga_ih.c b/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
+index 923df2c..4228070 100644
+--- a/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/tonga_ih.c
+@@ -218,6 +218,19 @@ static u32 tonga_ih_get_wptr(struct amdgpu_device *adev)
+ 	return (wptr & adev->irq.ih.ptr_mask);
+ }
+ 
++ /**
++ * tonga_ih_prescreen_iv - prescreen an interrupt vector
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * Returns true if the interrupt vector should be further processed.
++ */
++static bool tonga_ih_prescreen_iv(struct amdgpu_device *adev)
++{
++        /* Process all interrupts */
++        return true;
++}
++
+ /**
+  * tonga_ih_decode_iv - decode an interrupt vector
+  *
+@@ -478,6 +491,7 @@ static const struct amd_ip_funcs tonga_ih_ip_funcs = {
+ 
+ static const struct amdgpu_ih_funcs tonga_ih_funcs = {
+ 	.get_wptr = tonga_ih_get_wptr,
++        .prescreen_iv = tonga_ih_prescreen_iv,
+ 	.decode_iv = tonga_ih_decode_iv,
+ 	.set_rptr = tonga_ih_set_rptr
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/vega10_ih.c b/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
+index 56150e8..16dff8e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
+@@ -226,6 +226,20 @@ static u32 vega10_ih_get_wptr(struct amdgpu_device *adev)
+ 	return (wptr & adev->irq.ih.ptr_mask);
+ }
+ 
++ /**
++ * vega10_ih_prescreen_iv - prescreen an interrupt vector
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * Returns true if the interrupt vector should be further processed.
++ */
++static bool vega10_ih_prescreen_iv(struct amdgpu_device *adev)
++{
++        /* TODO: Filter known pending page faults */
++        return true;
++}
++
++
+ /**
+  * vega10_ih_decode_iv - decode an interrupt vector
+  *
+@@ -410,6 +424,7 @@ const struct amd_ip_funcs vega10_ih_ip_funcs = {
+ 
+ static const struct amdgpu_ih_funcs vega10_ih_funcs = {
+ 	.get_wptr = vega10_ih_get_wptr,
++        .prescreen_iv = vega10_ih_prescreen_iv,
+ 	.decode_iv = vega10_ih_decode_iv,
+ 	.set_rptr = vega10_ih_set_rptr
+ };
+-- 
+2.7.4
+

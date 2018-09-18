@@ -1,0 +1,286 @@
+From d8567d08fc14be3bd277a0044ea8713adf44f8ee Mon Sep 17 00:00:00 2001
+From: Kent Russell <kent.russell@amd.com>
+Date: Thu, 18 Aug 2016 13:15:39 -0400
+Subject: [PATCH 5508/5855] drm/amdkfd Fix CU masking for more than 32 CUs
+
+The initial implementation of CU masking used a single uint32 instead of
+an array, which limited the number of CUs that could be masked to 32.
+Match the thunk/kernel spec and pass in the cu_mask_count (number of
+bits total) and a uint32 array to mask properly.
+BUG:KFD-277
+
+Change-Id: I61d17685809d9beb62fdc9a47a1c19d8a2107a54
+Signed-off-by: Kent Russell <kent.russell@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c           | 36 +++++++++++--
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c      |  1 +
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c   | 59 +++++++++++-----------
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c    | 59 +++++++++++-----------
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h              |  3 +-
+ .../gpu/drm/amd/amdkfd/kfd_process_queue_manager.c |  7 +++
+ 6 files changed, 101 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 9349511..fd0e550 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -391,14 +391,44 @@ static int kfd_ioctl_set_cu_mask(struct file *filp, struct kfd_process *p,
+ 					void *data)
+ {
+ 	int retval;
++	const int max_num_cus = 1024;
+ 	struct kfd_ioctl_set_cu_mask_args *args = data;
+ 	struct queue_properties properties;
+ 	uint32_t __user *cu_mask_ptr = (uint32_t __user *)args->cu_mask_ptr;
++	size_t cu_mask_size = sizeof(uint32_t) * (args->num_cu_mask / 32);
+ 
+-	if (get_user(properties.cu_mask, cu_mask_ptr))
++	if ((args->num_cu_mask % 32) != 0) {
++		pr_debug("kfd: num_cu_mask (0x%x) must be a multiple of 32",
++				args->num_cu_mask);
++		return -EINVAL;
++	}
++
++	properties.cu_mask_count = args->num_cu_mask;
++	if (properties.cu_mask_count == 0) {
++		pr_debug("kfd: CU Mask cannot be 0");
++		return -EINVAL;
++	}
++
++	/* To prevent an unreasonably large CU mask size, set an arbitrary
++	 * limit of max_num_cus bits.  We can then just drop any CU mask bits
++	 * past max_num_cus bits and just use the first max_num_cus bits.
++	 */
++	if (properties.cu_mask_count > max_num_cus) {
++		pr_debug("kfd: CU mask cannot be greater than 1024 bits");
++		properties.cu_mask_count = max_num_cus;
++		cu_mask_size = sizeof(uint32_t) * (max_num_cus/32);
++	}
++
++	properties.cu_mask = kzalloc(cu_mask_size, GFP_KERNEL);
++	if (!properties.cu_mask)
++		return -ENOMEM;
++
++	retval = copy_from_user(properties.cu_mask, cu_mask_ptr, cu_mask_size);
++	if (retval) {
++		pr_debug("kfd: Could not copy cu mask from userspace");
++		kfree(properties.cu_mask);
+ 		return -EFAULT;
+-	if (properties.cu_mask == 0)
+-		return 0;
++	}
+ 
+ 	down_write(&p->lock);
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+index 162a83f..f19f2b3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+@@ -123,6 +123,7 @@ static bool initialize(struct kernel_queue *kq, struct kfd_dev *dev,
+ 	prop.write_ptr = (uint32_t *) kq->wptr_gpu_addr;
+ 	prop.eop_ring_buffer_address = kq->eop_gpu_addr;
+ 	prop.eop_ring_buffer_size = PAGE_SIZE;
++	prop.cu_mask = NULL;
+ 
+ 	if (init_queue(&kq->queue, &prop) != 0)
+ 		goto err_init_queue;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+index 1badce1..959a7f1 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -48,12 +48,12 @@ static void update_cu_mask(struct mqd_manager *mm, void *mqd,
+ {
+ 	struct cik_mqd *m;
+ 	struct kfd_cu_info cu_info;
+-	uint32_t mgmt_se_mask;
+-	uint32_t cu_sh_mask, cu_sh_shift;
+-	uint32_t cu_mask;
+-	int se, sh;
++	uint32_t se_mask[4] = {0}; /* 4 is the max # of SEs */
++	uint32_t cu_mask_count = q->cu_mask_count;
++	const uint32_t *cu_mask = q->cu_mask;
++	int se, cu_per_sh, cu_index, i;
+ 
+-	if (q->cu_mask == 0)
++	if (WARN_ON(cu_mask_count == 0))
+ 		return;
+ 
+ 	m = get_mqd(mqd);
+@@ -63,32 +63,31 @@ static void update_cu_mask(struct mqd_manager *mm, void *mqd,
+ 	m->compute_static_thread_mgmt_se3 = 0;
+ 
+ 	mm->dev->kfd2kgd->get_cu_info(mm->dev->kgd, &cu_info);
+-	cu_mask = q->cu_mask;
+-	for (se = 0; se < cu_info.num_shader_engines && cu_mask; se++) {
+-		mgmt_se_mask = 0;
+-		for (sh = 0; sh < 2 && cu_mask; sh++) {
+-			cu_sh_shift = hweight32(cu_info.cu_bitmap[se][sh]);
+-			cu_sh_mask = (1 << cu_sh_shift) - 1;
+-			mgmt_se_mask |= (cu_mask & cu_sh_mask) << (sh * 16);
+-			cu_mask >>= cu_sh_shift;
+-		}
+-		switch (se) {
+-		case 0:
+-			m->compute_static_thread_mgmt_se0 = mgmt_se_mask;
+-			break;
+-		case 1:
+-			m->compute_static_thread_mgmt_se1 = mgmt_se_mask;
+-			break;
+-		case 2:
+-			m->compute_static_thread_mgmt_se2 = mgmt_se_mask;
+-			break;
+-		case 3:
+-			m->compute_static_thread_mgmt_se3 = mgmt_se_mask;
+-			break;
+-		default:
+-			break;
+-		}
++
++	/* If # CU mask bits > # CUs, set it to the # of CUs */
++	if (cu_mask_count > cu_info.cu_active_number)
++		cu_mask_count = cu_info.cu_active_number;
++
++	cu_index = 0;
++	for (se = 0; se < cu_info.num_shader_engines; se++) {
++		cu_per_sh = 0;
++
++		/* Get the number of CUs on this Shader Engine */
++		for (i = 0; i < 4; i++)
++			cu_per_sh += hweight32(cu_info.cu_bitmap[se][i]);
++
++		se_mask[se] = cu_mask[cu_index / 32] >> (cu_index % 32);
++		if ((cu_per_sh + (cu_index % 32)) > 32)
++			se_mask[se] |= cu_mask[(cu_index / 32) + 1]
++					<< (32 - (cu_index % 32));
++		se_mask[se] &= (1 << cu_per_sh) - 1;
++		cu_index += cu_per_sh;
+ 	}
++	m->compute_static_thread_mgmt_se0 = se_mask[0];
++	m->compute_static_thread_mgmt_se1 = se_mask[1];
++	m->compute_static_thread_mgmt_se2 = se_mask[2];
++	m->compute_static_thread_mgmt_se3 = se_mask[3];
++
+ 	pr_debug("kfd: update cu mask to %#x %#x %#x %#x\n",
+ 		m->compute_static_thread_mgmt_se0,
+ 		m->compute_static_thread_mgmt_se1,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+index d78964c..59bc27e 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -48,12 +48,12 @@ static void update_cu_mask(struct mqd_manager *mm, void *mqd,
+ {
+ 	struct vi_mqd *m;
+ 	struct kfd_cu_info cu_info;
+-	uint32_t mgmt_se_mask;
+-	uint32_t cu_sh_mask, cu_sh_shift;
+-	uint32_t cu_mask;
+-	int se, sh;
++	uint32_t se_mask[4] = {0}; /* 4 is the max # of SEs */
++	uint32_t cu_mask_count = q->cu_mask_count;
++	const uint32_t *cu_mask = q->cu_mask;
++	int se, cu_per_sh, cu_index, i;
+ 
+-	if (q->cu_mask == 0)
++	if (WARN_ON(cu_mask_count == 0))
+ 		return;
+ 
+ 	m = get_mqd(mqd);
+@@ -63,32 +63,31 @@ static void update_cu_mask(struct mqd_manager *mm, void *mqd,
+ 	m->compute_static_thread_mgmt_se3 = 0;
+ 
+ 	mm->dev->kfd2kgd->get_cu_info(mm->dev->kgd, &cu_info);
+-	cu_mask = q->cu_mask;
+-	for (se = 0; se < cu_info.num_shader_engines && cu_mask; se++) {
+-		mgmt_se_mask = 0;
+-		for (sh = 0; sh < 2 && cu_mask; sh++) {
+-			cu_sh_shift = hweight32(cu_info.cu_bitmap[se][sh]);
+-			cu_sh_mask = (1 << cu_sh_shift) - 1;
+-			mgmt_se_mask |= (cu_mask & cu_sh_mask) << (sh * 16);
+-			cu_mask >>= cu_sh_shift;
+-		}
+-		switch (se) {
+-		case 0:
+-			m->compute_static_thread_mgmt_se0 = mgmt_se_mask;
+-			break;
+-		case 1:
+-			m->compute_static_thread_mgmt_se1 = mgmt_se_mask;
+-			break;
+-		case 2:
+-			m->compute_static_thread_mgmt_se2 = mgmt_se_mask;
+-			break;
+-		case 3:
+-			m->compute_static_thread_mgmt_se3 = mgmt_se_mask;
+-			break;
+-		default:
+-			break;
+-		}
++
++	/* If # CU mask bits > # CUs, set it to the # of CUs */
++	if (cu_mask_count > cu_info.cu_active_number)
++		cu_mask_count = cu_info.cu_active_number;
++
++	cu_index = 0;
++	for (se = 0; se < cu_info.num_shader_engines; se++) {
++		cu_per_sh = 0;
++
++		/* Get the number of CUs on this Shader Engine */
++		for (i = 0; i < 4; i++)
++			cu_per_sh += hweight32(cu_info.cu_bitmap[se][i]);
++
++		se_mask[se] = cu_mask[cu_index / 32] >> (cu_index % 32);
++		if ((cu_per_sh + (cu_index % 32)) > 32)
++			se_mask[se] |= cu_mask[(cu_index / 32) + 1]
++					<< (32 - (cu_index % 32));
++		se_mask[se] &= (1 << cu_per_sh) - 1;
++		cu_index += cu_per_sh;
+ 	}
++	m->compute_static_thread_mgmt_se0 = se_mask[0];
++	m->compute_static_thread_mgmt_se1 = se_mask[1];
++	m->compute_static_thread_mgmt_se2 = se_mask[2];
++	m->compute_static_thread_mgmt_se3 = se_mask[3];
++
+ 	pr_debug("kfd: update cu mask to %#x %#x %#x %#x\n",
+ 		m->compute_static_thread_mgmt_se0,
+ 		m->compute_static_thread_mgmt_se1,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 34ec7a0..f016b22 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -425,7 +425,8 @@ struct queue_properties {
+ 	uint64_t tba_addr;
+ 	uint64_t tma_addr;
+ 	/* Relevant for CU */
+-	uint32_t cu_mask;
++	uint32_t cu_mask_count; /* Must be a multiple of 32 */
++	uint32_t *cu_mask;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+index fab11fa..ad21ce3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -337,6 +337,7 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
+ 
+ 	if (pqn->q) {
+ 		dqm = pqn->q->device->dqm;
++		kfree(pqn->q->properties.cu_mask);
+ 		retval = dqm->ops.destroy_queue(dqm, &pdd->qpd, pqn->q);
+ 		if (retval != 0) {
+ 			if (retval == -ETIME)
+@@ -400,6 +401,12 @@ int pqm_set_cu_mask(struct process_queue_manager *pqm, unsigned int qid,
+ 		return -EFAULT;
+ 	}
+ 
++	/* Free the old CU mask memory if it is already allocated, then
++	 * allocate memory for the new CU mask.
++	 */
++	kfree(pqn->q->properties.cu_mask);
++
++	pqn->q->properties.cu_mask_count = p->cu_mask_count;
+ 	pqn->q->properties.cu_mask = p->cu_mask;
+ 
+ 	retval = pqn->q->device->dqm->ops.update_queue(pqn->q->device->dqm,
+-- 
+2.7.4
+

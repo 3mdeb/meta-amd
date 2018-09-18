@@ -1,0 +1,649 @@
+From c6b04f8d42fad968fec709a9851e6bcfc3876870 Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Wed, 6 Sep 2017 16:08:03 +0800
+Subject: [PATCH 3242/5855] drm/amd/powerplay: use struct amd_pm_funcs in
+ powerplay
+
+Change-Id: I2ee1b0dacc43d023cb4a74d048ac9cba80b208eb
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+---
+ drivers/gpu/drm/amd/include/amd_shared.h           | 15 +++++++
+ drivers/gpu/drm/amd/powerplay/amd_powerplay.c      | 50 +++++++++++-----------
+ .../drm/amd/powerplay/hwmgr/cz_clockpowergating.c  |  8 +---
+ .../drm/amd/powerplay/hwmgr/cz_clockpowergating.h  |  4 +-
+ drivers/gpu/drm/amd/powerplay/hwmgr/cz_hwmgr.c     |  4 +-
+ .../gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c  | 18 --------
+ drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.c     |  4 +-
+ .../amd/powerplay/hwmgr/smu7_clockpowergating.c    |  6 +--
+ .../amd/powerplay/hwmgr/smu7_clockpowergating.h    |  4 +-
+ drivers/gpu/drm/amd/powerplay/hwmgr/smu7_hwmgr.c   | 20 ++++-----
+ drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c | 28 ++++++------
+ drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h  | 43 +------------------
+ .../gpu/drm/amd/powerplay/inc/hardwaremanager.h    |  2 -
+ drivers/gpu/drm/amd/powerplay/inc/hwmgr.h          | 12 +++---
+ 14 files changed, 80 insertions(+), 138 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/include/amd_shared.h b/drivers/gpu/drm/amd/include/amd_shared.h
+index 5d2d58b..48c4439 100644
+--- a/drivers/gpu/drm/amd/include/amd_shared.h
++++ b/drivers/gpu/drm/amd/include/amd_shared.h
+@@ -232,6 +232,10 @@ struct amd_ip_funcs {
+ 	void (*get_clockgating_state)(void *handle, u32 *flags);
+ };
+ 
++enum amd_pp_task;
++
++struct pp_states_info;
++
+ struct amd_pm_funcs {
+ 	int (*get_temperature)(void *handle);
+ 	int (*pre_set_power_state)(void *handle);
+@@ -273,6 +277,17 @@ struct amd_pm_funcs {
+ 			struct amd_pp_profile *request);
+ 	int (*switch_power_profile)(void *handle,
+ 			enum amd_pp_profile_type type);
++	int (*load_firmware)(void *handle);
++	int (*wait_for_fw_loading_complete)(void *handle);
++	enum amd_dpm_forced_level (*get_performance_level)(void *handle);
++	enum amd_pm_state_type (*get_current_power_state)(void *handle);
++	int (*dispatch_tasks)(void *handle, enum amd_pp_task task_id,
++				   void *input, void *output);
++	int (*get_fan_speed_rpm)(void *handle, uint32_t *rpm);
++	int (*get_pp_num_states)(void *handle, struct pp_states_info *data);
++	int (*get_pp_table)(void *handle, char **table);
++	int (*set_pp_table)(void *handle, const char *buf, size_t size);
+ };
+ 
++
+ #endif /* __AMD_SHARED_H__ */
+diff --git a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+index aef9351..9f51222 100644
+--- a/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
++++ b/drivers/gpu/drm/amd/powerplay/amd_powerplay.c
+@@ -376,11 +376,12 @@ static enum amd_dpm_forced_level pp_dpm_get_performance_level(
+ 	return level;
+ }
+ 
+-static int pp_dpm_get_sclk(void *handle, bool low)
++static uint32_t pp_dpm_get_sclk(void *handle, bool low)
+ {
+ 	struct pp_hwmgr  *hwmgr;
+ 	struct pp_instance *pp_handle = (struct pp_instance *)handle;
+ 	int ret = 0;
++	uint32_t clk = 0;
+ 
+ 	ret = pp_check(pp_handle);
+ 
+@@ -394,16 +395,17 @@ static int pp_dpm_get_sclk(void *handle, bool low)
+ 		return 0;
+ 	}
+ 	mutex_lock(&pp_handle->pp_lock);
+-	ret = hwmgr->hwmgr_func->get_sclk(hwmgr, low);
++	clk = hwmgr->hwmgr_func->get_sclk(hwmgr, low);
+ 	mutex_unlock(&pp_handle->pp_lock);
+-	return ret;
++	return clk;
+ }
+ 
+-static int pp_dpm_get_mclk(void *handle, bool low)
++static uint32_t pp_dpm_get_mclk(void *handle, bool low)
+ {
+ 	struct pp_hwmgr  *hwmgr;
+ 	struct pp_instance *pp_handle = (struct pp_instance *)handle;
+ 	int ret = 0;
++	uint32_t clk = 0;
+ 
+ 	ret = pp_check(pp_handle);
+ 
+@@ -417,12 +419,12 @@ static int pp_dpm_get_mclk(void *handle, bool low)
+ 		return 0;
+ 	}
+ 	mutex_lock(&pp_handle->pp_lock);
+-	ret = hwmgr->hwmgr_func->get_mclk(hwmgr, low);
++	clk = hwmgr->hwmgr_func->get_mclk(hwmgr, low);
+ 	mutex_unlock(&pp_handle->pp_lock);
+-	return ret;
++	return clk;
+ }
+ 
+-static int pp_dpm_powergate_vce(void *handle, bool gate)
++static void pp_dpm_powergate_vce(void *handle, bool gate)
+ {
+ 	struct pp_hwmgr  *hwmgr;
+ 	struct pp_instance *pp_handle = (struct pp_instance *)handle;
+@@ -431,21 +433,20 @@ static int pp_dpm_powergate_vce(void *handle, bool gate)
+ 	ret = pp_check(pp_handle);
+ 
+ 	if (ret != 0)
+-		return ret;
++		return;
+ 
+ 	hwmgr = pp_handle->hwmgr;
+ 
+ 	if (hwmgr->hwmgr_func->powergate_vce == NULL) {
+ 		pr_info("%s was not implemented.\n", __func__);
+-		return 0;
++		return;
+ 	}
+ 	mutex_lock(&pp_handle->pp_lock);
+-	ret = hwmgr->hwmgr_func->powergate_vce(hwmgr, gate);
++	hwmgr->hwmgr_func->powergate_vce(hwmgr, gate);
+ 	mutex_unlock(&pp_handle->pp_lock);
+-	return ret;
+ }
+ 
+-static int pp_dpm_powergate_uvd(void *handle, bool gate)
++static void pp_dpm_powergate_uvd(void *handle, bool gate)
+ {
+ 	struct pp_hwmgr  *hwmgr;
+ 	struct pp_instance *pp_handle = (struct pp_instance *)handle;
+@@ -454,18 +455,17 @@ static int pp_dpm_powergate_uvd(void *handle, bool gate)
+ 	ret = pp_check(pp_handle);
+ 
+ 	if (ret != 0)
+-		return ret;
++		return;
+ 
+ 	hwmgr = pp_handle->hwmgr;
+ 
+ 	if (hwmgr->hwmgr_func->powergate_uvd == NULL) {
+ 		pr_info("%s was not implemented.\n", __func__);
+-		return 0;
++		return;
+ 	}
+ 	mutex_lock(&pp_handle->pp_lock);
+-	ret = hwmgr->hwmgr_func->powergate_uvd(hwmgr, gate);
++	hwmgr->hwmgr_func->powergate_uvd(hwmgr, gate);
+ 	mutex_unlock(&pp_handle->pp_lock);
+-	return ret;
+ }
+ 
+ static int pp_dpm_dispatch_tasks(void *handle, enum amd_pp_task task_id,
+@@ -530,7 +530,7 @@ static enum amd_pm_state_type pp_dpm_get_current_power_state(void *handle)
+ 	return pm_type;
+ }
+ 
+-static int pp_dpm_set_fan_control_mode(void *handle, uint32_t mode)
++static void pp_dpm_set_fan_control_mode(void *handle, uint32_t mode)
+ {
+ 	struct pp_hwmgr  *hwmgr;
+ 	struct pp_instance *pp_handle = (struct pp_instance *)handle;
+@@ -539,25 +539,25 @@ static int pp_dpm_set_fan_control_mode(void *handle, uint32_t mode)
+ 	ret = pp_check(pp_handle);
+ 
+ 	if (ret != 0)
+-		return ret;
++		return;
+ 
+ 	hwmgr = pp_handle->hwmgr;
+ 
+ 	if (hwmgr->hwmgr_func->set_fan_control_mode == NULL) {
+ 		pr_info("%s was not implemented.\n", __func__);
+-		return 0;
++		return;
+ 	}
+ 	mutex_lock(&pp_handle->pp_lock);
+-	ret = hwmgr->hwmgr_func->set_fan_control_mode(hwmgr, mode);
++	hwmgr->hwmgr_func->set_fan_control_mode(hwmgr, mode);
+ 	mutex_unlock(&pp_handle->pp_lock);
+-	return ret;
+ }
+ 
+-static int pp_dpm_get_fan_control_mode(void *handle)
++static uint32_t pp_dpm_get_fan_control_mode(void *handle)
+ {
+ 	struct pp_hwmgr  *hwmgr;
+ 	struct pp_instance *pp_handle = (struct pp_instance *)handle;
+ 	int ret = 0;
++	uint32_t mode = 0;
+ 
+ 	ret = pp_check(pp_handle);
+ 
+@@ -571,9 +571,9 @@ static int pp_dpm_get_fan_control_mode(void *handle)
+ 		return 0;
+ 	}
+ 	mutex_lock(&pp_handle->pp_lock);
+-	ret = hwmgr->hwmgr_func->get_fan_control_mode(hwmgr);
++	mode = hwmgr->hwmgr_func->get_fan_control_mode(hwmgr);
+ 	mutex_unlock(&pp_handle->pp_lock);
+-	return ret;
++	return mode;
+ }
+ 
+ static int pp_dpm_set_fan_speed_percent(void *handle, uint32_t percent)
+@@ -1096,7 +1096,7 @@ static int pp_dpm_switch_power_profile(void *handle,
+ 	return 0;
+ }
+ 
+-const struct amd_powerplay_funcs pp_dpm_funcs = {
++const struct amd_pm_funcs pp_dpm_funcs = {
+ 	.get_temperature = pp_dpm_get_temperature,
+ 	.load_firmware = pp_dpm_load_fw,
+ 	.wait_for_fw_loading_complete = pp_dpm_fw_loading_complete,
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/cz_clockpowergating.c b/drivers/gpu/drm/amd/powerplay/hwmgr/cz_clockpowergating.c
+index 5baf1a4..576b61e 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/cz_clockpowergating.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/cz_clockpowergating.c
+@@ -147,7 +147,7 @@ int cz_enable_disable_vce_dpm(struct pp_hwmgr *hwmgr, bool enable)
+ }
+ 
+ 
+-int cz_dpm_powergate_uvd(struct pp_hwmgr *hwmgr, bool bgate)
++void cz_dpm_powergate_uvd(struct pp_hwmgr *hwmgr, bool bgate)
+ {
+ 	struct cz_hwmgr *cz_hwmgr = (struct cz_hwmgr *)(hwmgr->backend);
+ 
+@@ -173,10 +173,9 @@ int cz_dpm_powergate_uvd(struct pp_hwmgr *hwmgr, bool bgate)
+ 		cz_dpm_update_uvd_dpm(hwmgr, false);
+ 	}
+ 
+-	return 0;
+ }
+ 
+-int cz_dpm_powergate_vce(struct pp_hwmgr *hwmgr, bool bgate)
++void cz_dpm_powergate_vce(struct pp_hwmgr *hwmgr, bool bgate)
+ {
+ 	struct cz_hwmgr *cz_hwmgr = (struct cz_hwmgr *)(hwmgr->backend);
+ 
+@@ -205,9 +204,6 @@ int cz_dpm_powergate_vce(struct pp_hwmgr *hwmgr, bool bgate)
+ 					AMD_CG_STATE_UNGATE);
+ 		cz_dpm_update_vce_dpm(hwmgr);
+ 		cz_enable_disable_vce_dpm(hwmgr, true);
+-		return 0;
+ 	}
+-
+-	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/cz_clockpowergating.h b/drivers/gpu/drm/amd/powerplay/hwmgr/cz_clockpowergating.h
+index 1954cea..92f707b 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/cz_clockpowergating.h
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/cz_clockpowergating.h
+@@ -29,8 +29,8 @@
+ 
+ extern int cz_phm_set_asic_block_gating(struct pp_hwmgr *hwmgr, enum PHM_AsicBlock block, enum PHM_ClockGateSetting gating);
+ extern const struct phm_master_table_header cz_phm_enable_clock_power_gatings_master;
+-extern int cz_dpm_powergate_vce(struct pp_hwmgr *hwmgr, bool bgate);
+-extern int cz_dpm_powergate_uvd(struct pp_hwmgr *hwmgr, bool bgate);
++extern void cz_dpm_powergate_vce(struct pp_hwmgr *hwmgr, bool bgate);
++extern void cz_dpm_powergate_uvd(struct pp_hwmgr *hwmgr, bool bgate);
+ extern int cz_enable_disable_vce_dpm(struct pp_hwmgr *hwmgr, bool enable);
+ extern int cz_enable_disable_uvd_dpm(struct pp_hwmgr *hwmgr, bool enable);
+ #endif /* _CZ_CLOCK_POWER_GATING_H_ */
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/cz_hwmgr.c b/drivers/gpu/drm/amd/powerplay/hwmgr/cz_hwmgr.c
+index d3b4646..045fdb3 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/cz_hwmgr.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/cz_hwmgr.c
+@@ -1393,14 +1393,14 @@ int cz_dpm_powerup_vce(struct pp_hwmgr *hwmgr)
+ 	return 0;
+ }
+ 
+-static int cz_dpm_get_mclk(struct pp_hwmgr *hwmgr, bool low)
++static uint32_t cz_dpm_get_mclk(struct pp_hwmgr *hwmgr, bool low)
+ {
+ 	struct cz_hwmgr *cz_hwmgr = (struct cz_hwmgr *)(hwmgr->backend);
+ 
+ 	return cz_hwmgr->sys_info.bootup_uma_clock;
+ }
+ 
+-static int cz_dpm_get_sclk(struct pp_hwmgr *hwmgr, bool low)
++static uint32_t cz_dpm_get_sclk(struct pp_hwmgr *hwmgr, bool low)
+ {
+ 	struct pp_power_state  *ps;
+ 	struct cz_power_state  *cz_ps;
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c b/drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c
+index fa4fbc2..7462f95 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/hardwaremanager.c
+@@ -155,24 +155,6 @@ int phm_powerdown_uvd(struct pp_hwmgr *hwmgr)
+ 	return 0;
+ }
+ 
+-int phm_powergate_uvd(struct pp_hwmgr *hwmgr, bool gate)
+-{
+-	PHM_FUNC_CHECK(hwmgr);
+-
+-	if (hwmgr->hwmgr_func->powergate_uvd != NULL)
+-		return hwmgr->hwmgr_func->powergate_uvd(hwmgr, gate);
+-	return 0;
+-}
+-
+-int phm_powergate_vce(struct pp_hwmgr *hwmgr, bool gate)
+-{
+-	PHM_FUNC_CHECK(hwmgr);
+-
+-	if (hwmgr->hwmgr_func->powergate_vce != NULL)
+-		return hwmgr->hwmgr_func->powergate_vce(hwmgr, gate);
+-	return 0;
+-}
+-
+ int phm_enable_clock_power_gatings(struct pp_hwmgr *hwmgr)
+ {
+ 	PHM_FUNC_CHECK(hwmgr);
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.c b/drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.c
+index da14206..9adaa0b 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/rv_hwmgr.c
+@@ -521,12 +521,12 @@ static int rv_dpm_force_dpm_level(struct pp_hwmgr *hwmgr,
+ 	return 0;
+ }
+ 
+-static int rv_dpm_get_mclk(struct pp_hwmgr *hwmgr, bool low)
++static uint32_t rv_dpm_get_mclk(struct pp_hwmgr *hwmgr, bool low)
+ {
+ 	return 0;
+ }
+ 
+-static int rv_dpm_get_sclk(struct pp_hwmgr *hwmgr, bool low)
++static uint32_t rv_dpm_get_sclk(struct pp_hwmgr *hwmgr, bool low)
+ {
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_clockpowergating.c b/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_clockpowergating.c
+index 261b828..48f60de 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_clockpowergating.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_clockpowergating.c
+@@ -140,7 +140,7 @@ int smu7_disable_clock_power_gating(struct pp_hwmgr *hwmgr)
+ 	return 0;
+ }
+ 
+-int smu7_powergate_uvd(struct pp_hwmgr *hwmgr, bool bgate)
++void smu7_powergate_uvd(struct pp_hwmgr *hwmgr, bool bgate)
+ {
+ 	struct smu7_hwmgr *data = (struct smu7_hwmgr *)(hwmgr->backend);
+ 
+@@ -166,10 +166,9 @@ int smu7_powergate_uvd(struct pp_hwmgr *hwmgr, bool bgate)
+ 		smu7_update_uvd_dpm(hwmgr, false);
+ 	}
+ 
+-	return 0;
+ }
+ 
+-int smu7_powergate_vce(struct pp_hwmgr *hwmgr, bool bgate)
++void smu7_powergate_vce(struct pp_hwmgr *hwmgr, bool bgate)
+ {
+ 	struct smu7_hwmgr *data = (struct smu7_hwmgr *)(hwmgr->backend);
+ 
+@@ -194,7 +193,6 @@ int smu7_powergate_vce(struct pp_hwmgr *hwmgr, bool bgate)
+ 						AMD_PG_STATE_UNGATE);
+ 		smu7_update_vce_dpm(hwmgr, false);
+ 	}
+-	return 0;
+ }
+ 
+ int smu7_powergate_samu(struct pp_hwmgr *hwmgr, bool bgate)
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_clockpowergating.h b/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_clockpowergating.h
+index c96ed9e..7b54d48 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_clockpowergating.h
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_clockpowergating.h
+@@ -27,8 +27,8 @@
+ #include "smu7_hwmgr.h"
+ #include "pp_asicblocks.h"
+ 
+-int smu7_powergate_vce(struct pp_hwmgr *hwmgr, bool bgate);
+-int smu7_powergate_uvd(struct pp_hwmgr *hwmgr, bool bgate);
++void smu7_powergate_vce(struct pp_hwmgr *hwmgr, bool bgate);
++void smu7_powergate_uvd(struct pp_hwmgr *hwmgr, bool bgate);
+ int smu7_powerdown_uvd(struct pp_hwmgr *hwmgr);
+ int smu7_powergate_samu(struct pp_hwmgr *hwmgr, bool bgate);
+ int smu7_powergate_acp(struct pp_hwmgr *hwmgr, bool bgate);
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_hwmgr.c b/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_hwmgr.c
+index 8b8e202..f1f1e4b 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_hwmgr.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/smu7_hwmgr.c
+@@ -2798,7 +2798,7 @@ static int smu7_apply_state_adjust_rules(struct pp_hwmgr *hwmgr,
+ }
+ 
+ 
+-static int smu7_dpm_get_mclk(struct pp_hwmgr *hwmgr, bool low)
++static uint32_t smu7_dpm_get_mclk(struct pp_hwmgr *hwmgr, bool low)
+ {
+ 	struct pp_power_state  *ps;
+ 	struct smu7_power_state  *smu7_ps;
+@@ -2820,7 +2820,7 @@ static int smu7_dpm_get_mclk(struct pp_hwmgr *hwmgr, bool low)
+ 				[smu7_ps->performance_level_count-1].memory_clock;
+ }
+ 
+-static int smu7_dpm_get_sclk(struct pp_hwmgr *hwmgr, bool low)
++static uint32_t smu7_dpm_get_sclk(struct pp_hwmgr *hwmgr, bool low)
+ {
+ 	struct pp_power_state  *ps;
+ 	struct smu7_power_state  *smu7_ps;
+@@ -4302,31 +4302,27 @@ static int smu7_print_clock_levels(struct pp_hwmgr *hwmgr,
+ 	return size;
+ }
+ 
+-static int smu7_set_fan_control_mode(struct pp_hwmgr *hwmgr, uint32_t mode)
++static void smu7_set_fan_control_mode(struct pp_hwmgr *hwmgr, uint32_t mode)
+ {
+-	int result = 0;
+-
+ 	switch (mode) {
+ 	case AMD_FAN_CTRL_NONE:
+-		result = smu7_fan_ctrl_set_fan_speed_percent(hwmgr, 100);
++		smu7_fan_ctrl_set_fan_speed_percent(hwmgr, 100);
+ 		break;
+ 	case AMD_FAN_CTRL_MANUAL:
+ 		if (phm_cap_enabled(hwmgr->platform_descriptor.platformCaps,
+ 			PHM_PlatformCaps_MicrocodeFanControl))
+-			result = smu7_fan_ctrl_stop_smc_fan_control(hwmgr);
++			smu7_fan_ctrl_stop_smc_fan_control(hwmgr);
+ 		break;
+ 	case AMD_FAN_CTRL_AUTO:
+-		result = smu7_fan_ctrl_set_static_mode(hwmgr, mode);
+-		if (!result)
+-			result = smu7_fan_ctrl_start_smc_fan_control(hwmgr);
++		if (!smu7_fan_ctrl_set_static_mode(hwmgr, mode))
++			smu7_fan_ctrl_start_smc_fan_control(hwmgr);
+ 		break;
+ 	default:
+ 		break;
+ 	}
+-	return result;
+ }
+ 
+-static int smu7_get_fan_control_mode(struct pp_hwmgr *hwmgr)
++static uint32_t smu7_get_fan_control_mode(struct pp_hwmgr *hwmgr)
+ {
+ 	return hwmgr->fan_ctrl_enabled ? AMD_FAN_CTRL_AUTO : AMD_FAN_CTRL_MANUAL;
+ }
+diff --git a/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c b/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c
+index e376ae5..1a4b965 100644
+--- a/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c
++++ b/drivers/gpu/drm/amd/powerplay/hwmgr/vega10_hwmgr.c
+@@ -3872,7 +3872,7 @@ static int vega10_set_power_state_tasks(struct pp_hwmgr *hwmgr,
+ 	return 0;
+ }
+ 
+-static int vega10_dpm_get_sclk(struct pp_hwmgr *hwmgr, bool low)
++static uint32_t vega10_dpm_get_sclk(struct pp_hwmgr *hwmgr, bool low)
+ {
+ 	struct pp_power_state *ps;
+ 	struct vega10_power_state *vega10_ps;
+@@ -3894,7 +3894,7 @@ static int vega10_dpm_get_sclk(struct pp_hwmgr *hwmgr, bool low)
+ 				[vega10_ps->performance_level_count - 1].gfx_clock;
+ }
+ 
+-static int vega10_dpm_get_mclk(struct pp_hwmgr *hwmgr, bool low)
++static uint32_t vega10_dpm_get_mclk(struct pp_hwmgr *hwmgr, bool low)
+ {
+ 	struct pp_power_state *ps;
+ 	struct vega10_power_state *vega10_ps;
+@@ -4216,27 +4216,23 @@ static int vega10_get_profiling_clk_mask(struct pp_hwmgr *hwmgr, enum amd_dpm_fo
+ 	return 0;
+ }
+ 
+-static int vega10_set_fan_control_mode(struct pp_hwmgr *hwmgr, uint32_t mode)
++static void vega10_set_fan_control_mode(struct pp_hwmgr *hwmgr, uint32_t mode)
+ {
+-	int result = 0;
+-
+ 	switch (mode) {
+ 	case AMD_FAN_CTRL_NONE:
+-		result = vega10_fan_ctrl_set_fan_speed_percent(hwmgr, 100);
++		vega10_fan_ctrl_set_fan_speed_percent(hwmgr, 100);
+ 		break;
+ 	case AMD_FAN_CTRL_MANUAL:
+ 		if (PP_CAP(PHM_PlatformCaps_MicrocodeFanControl))
+-			result = vega10_fan_ctrl_stop_smc_fan_control(hwmgr);
++			vega10_fan_ctrl_stop_smc_fan_control(hwmgr);
+ 		break;
+ 	case AMD_FAN_CTRL_AUTO:
+-		result = vega10_fan_ctrl_set_static_mode(hwmgr, mode);
+-		if (!result)
+-			result = vega10_fan_ctrl_start_smc_fan_control(hwmgr);
++		if (!vega10_fan_ctrl_set_static_mode(hwmgr, mode))
++			vega10_fan_ctrl_start_smc_fan_control(hwmgr);
+ 		break;
+ 	default:
+ 		break;
+ 	}
+-	return result;
+ }
+ 
+ static int vega10_dpm_force_dpm_level(struct pp_hwmgr *hwmgr,
+@@ -4282,7 +4278,7 @@ static int vega10_dpm_force_dpm_level(struct pp_hwmgr *hwmgr,
+ 	return ret;
+ }
+ 
+-static int vega10_get_fan_control_mode(struct pp_hwmgr *hwmgr)
++static uint32_t vega10_get_fan_control_mode(struct pp_hwmgr *hwmgr)
+ {
+ 	struct vega10_hwmgr *data = (struct vega10_hwmgr *)(hwmgr->backend);
+ 
+@@ -4697,20 +4693,20 @@ int vega10_enable_disable_uvd_dpm(struct pp_hwmgr *hwmgr, bool enable)
+ 	return 0;
+ }
+ 
+-static int vega10_power_gate_vce(struct pp_hwmgr *hwmgr, bool bgate)
++static void vega10_power_gate_vce(struct pp_hwmgr *hwmgr, bool bgate)
+ {
+ 	struct vega10_hwmgr *data = (struct vega10_hwmgr *)(hwmgr->backend);
+ 
+ 	data->vce_power_gated = bgate;
+-	return vega10_enable_disable_vce_dpm(hwmgr, !bgate);
++	vega10_enable_disable_vce_dpm(hwmgr, !bgate);
+ }
+ 
+-static int vega10_power_gate_uvd(struct pp_hwmgr *hwmgr, bool bgate)
++static void vega10_power_gate_uvd(struct pp_hwmgr *hwmgr, bool bgate)
+ {
+ 	struct vega10_hwmgr *data = (struct vega10_hwmgr *)(hwmgr->backend);
+ 
+ 	data->uvd_power_gated = bgate;
+-	return vega10_enable_disable_uvd_dpm(hwmgr, !bgate);
++	vega10_enable_disable_uvd_dpm(hwmgr, !bgate);
+ }
+ 
+ static inline bool vega10_are_power_levels_equal(
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+index 832340b..435da26 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/amd_powerplay.h
+@@ -31,7 +31,7 @@
+ #include "dm_pp_interface.h"
+ 
+ extern const struct amd_ip_funcs pp_ip_funcs;
+-extern const struct amd_powerplay_funcs pp_dpm_funcs;
++extern const struct amd_pm_funcs pp_dpm_funcs;
+ 
+ #define PP_DPM_DISABLED 0xCCCC
+ 
+@@ -267,49 +267,10 @@ struct pp_display_clock_request {
+ 								support << PP_STATE_SUPPORT_SHIFT |\
+ 								state << PP_STATE_SHIFT)
+ 
+-struct amd_powerplay_funcs {
+-	int (*get_temperature)(void *handle);
+-	int (*load_firmware)(void *handle);
+-	int (*wait_for_fw_loading_complete)(void *handle);
+-	int (*force_performance_level)(void *handle, enum amd_dpm_forced_level level);
+-	enum amd_dpm_forced_level (*get_performance_level)(void *handle);
+-	enum amd_pm_state_type (*get_current_power_state)(void *handle);
+-	int (*get_sclk)(void *handle, bool low);
+-	int (*get_mclk)(void *handle, bool low);
+-	int (*powergate_vce)(void *handle, bool gate);
+-	int (*powergate_uvd)(void *handle, bool gate);
+-	int (*dispatch_tasks)(void *handle, enum amd_pp_task task_id,
+-				   void *input, void *output);
+-	int (*set_fan_control_mode)(void *handle, uint32_t mode);
+-	int (*get_fan_control_mode)(void *handle);
+-	int (*set_fan_speed_percent)(void *handle, uint32_t percent);
+-	int (*get_fan_speed_percent)(void *handle, uint32_t *speed);
+-	int (*get_fan_speed_rpm)(void *handle, uint32_t *rpm);
+-	int (*get_pp_num_states)(void *handle, struct pp_states_info *data);
+-	int (*get_pp_table)(void *handle, char **table);
+-	int (*set_pp_table)(void *handle, const char *buf, size_t size);
+-	int (*force_clock_level)(void *handle, enum pp_clock_type type, uint32_t mask);
+-	int (*print_clock_levels)(void *handle, enum pp_clock_type type, char *buf);
+-	int (*get_sclk_od)(void *handle);
+-	int (*set_sclk_od)(void *handle, uint32_t value);
+-	int (*get_mclk_od)(void *handle);
+-	int (*set_mclk_od)(void *handle, uint32_t value);
+-	int (*read_sensor)(void *handle, int idx, void *value, int *size);
+-	struct amd_vce_state* (*get_vce_clock_state)(void *handle, unsigned idx);
+-	int (*reset_power_profile_state)(void *handle,
+-			struct amd_pp_profile *request);
+-	int (*get_power_profile_state)(void *handle,
+-			struct amd_pp_profile *query);
+-	int (*set_power_profile_state)(void *handle,
+-			struct amd_pp_profile *request);
+-	int (*switch_power_profile)(void *handle,
+-			enum amd_pp_profile_type type);
+-};
+-
+ struct amd_powerplay {
+ 	void *pp_handle;
+ 	const struct amd_ip_funcs *ip_funcs;
+-	const struct amd_powerplay_funcs *pp_funcs;
++	const struct amd_pm_funcs *pp_funcs;
+ };
+ 
+ int amd_powerplay_create(struct amd_pp_init *pp_init,
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h b/drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h
+index 03adece..629990f 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/hardwaremanager.h
+@@ -375,8 +375,6 @@ struct phm_odn_clock_levels {
+ 
+ extern int phm_disable_clock_power_gatings(struct pp_hwmgr *hwmgr);
+ extern int phm_enable_clock_power_gatings(struct pp_hwmgr *hwmgr);
+-extern int phm_powergate_uvd(struct pp_hwmgr *hwmgr, bool gate);
+-extern int phm_powergate_vce(struct pp_hwmgr *hwmgr, bool gate);
+ extern int phm_powerdown_uvd(struct pp_hwmgr *hwmgr);
+ extern int phm_setup_asic(struct pp_hwmgr *hwmgr);
+ extern int phm_enable_dynamic_state_management(struct pp_hwmgr *hwmgr);
+diff --git a/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+index 2a10d81..f4b6f0e 100644
+--- a/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
++++ b/drivers/gpu/drm/amd/powerplay/inc/hwmgr.h
+@@ -270,10 +270,10 @@ struct pp_hwmgr_func {
+ 			    unsigned long, struct pp_power_state *);
+ 	int (*get_num_of_pp_table_entries)(struct pp_hwmgr *hwmgr);
+ 	int (*powerdown_uvd)(struct pp_hwmgr *hwmgr);
+-	int (*powergate_vce)(struct pp_hwmgr *hwmgr, bool bgate);
+-	int (*powergate_uvd)(struct pp_hwmgr *hwmgr, bool bgate);
+-	int (*get_mclk)(struct pp_hwmgr *hwmgr, bool low);
+-	int (*get_sclk)(struct pp_hwmgr *hwmgr, bool low);
++	void (*powergate_vce)(struct pp_hwmgr *hwmgr, bool bgate);
++	void (*powergate_uvd)(struct pp_hwmgr *hwmgr, bool bgate);
++	uint32_t (*get_mclk)(struct pp_hwmgr *hwmgr, bool low);
++	uint32_t (*get_sclk)(struct pp_hwmgr *hwmgr, bool low);
+ 	int (*power_state_set)(struct pp_hwmgr *hwmgr,
+ 						const void *state);
+ 	int (*enable_clock_power_gating)(struct pp_hwmgr *hwmgr);
+@@ -287,8 +287,8 @@ struct pp_hwmgr_func {
+ 	int (*get_temperature)(struct pp_hwmgr *hwmgr);
+ 	int (*stop_thermal_controller)(struct pp_hwmgr *hwmgr);
+ 	int (*get_fan_speed_info)(struct pp_hwmgr *hwmgr, struct phm_fan_speed_info *fan_speed_info);
+-	int (*set_fan_control_mode)(struct pp_hwmgr *hwmgr, uint32_t mode);
+-	int (*get_fan_control_mode)(struct pp_hwmgr *hwmgr);
++	void (*set_fan_control_mode)(struct pp_hwmgr *hwmgr, uint32_t mode);
++	uint32_t (*get_fan_control_mode)(struct pp_hwmgr *hwmgr);
+ 	int (*set_fan_speed_percent)(struct pp_hwmgr *hwmgr, uint32_t percent);
+ 	int (*get_fan_speed_percent)(struct pp_hwmgr *hwmgr, uint32_t *speed);
+ 	int (*set_fan_speed_rpm)(struct pp_hwmgr *hwmgr, uint32_t percent);
+-- 
+2.7.4
+

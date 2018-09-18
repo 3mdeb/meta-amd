@@ -1,0 +1,216 @@
+From 69169a88ca51d84a20992cc6e80a108762f3503c Mon Sep 17 00:00:00 2001
+From: Andres Rodriguez <andresx7@gmail.com>
+Date: Thu, 22 Dec 2016 17:06:50 -0500
+Subject: [PATCH 3647/5855] drm/amdgpu: add parameter to allocate high priority
+ contexts v11
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a new context creation parameter to express a global context priority.
+
+The priority ranking in descending order is as follows:
+ * AMDGPU_CTX_PRIORITY_HIGH_HW
+ * AMDGPU_CTX_PRIORITY_HIGH_SW
+ * AMDGPU_CTX_PRIORITY_NORMAL
+ * AMDGPU_CTX_PRIORITY_LOW_SW
+ * AMDGPU_CTX_PRIORITY_LOW_HW
+
+The driver will attempt to schedule work to the hardware according to
+the priorities. No latency or throughput guarantees are provided by
+this patch.
+
+This interface intends to service the EGL_IMG_context_priority
+extension, and vulkan equivalents.
+
+Setting a priority above NORMAL requires CAP_SYS_NICE or DRM_MASTER.
+
+v2: Instead of using flags, repurpose __pad
+v3: Swap enum values of _NORMAL _HIGH for backwards compatibility
+v4: Validate usermode priority and store it
+v5: Move priority validation into amdgpu_ctx_ioctl(), headline reword
+v6: add UAPI note regarding priorities requiring CAP_SYS_ADMIN
+v7: remove ctx->priority
+v8: added AMDGPU_CTX_PRIORITY_LOW, s/CAP_SYS_ADMIN/CAP_SYS_NICE
+v9: change the priority parameter to __s32
+v10: split priorities into _SW and _HW
+v11: Allow DRM_MASTER without CAP_SYS_NICE
+
+Reviewed-by: Emil Velikov <emil.l.velikov@gmail.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Andres Rodriguez <andresx7@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c       | 61 +++++++++++++++++++++++++--
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  5 ++-
+ include/uapi/drm/amdgpu_drm.h                 | 10 ++++-
+ 3 files changed, 70 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index ec6d26d..1241b91 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -23,13 +23,40 @@
+  */
+ 
+ #include <drm/drmP.h>
++#include <drm/drm_auth.h>
+ #include "amdgpu.h"
+ 
+-static int amdgpu_ctx_init(struct amdgpu_device *adev, struct amdgpu_ctx *ctx)
++static int amdgpu_ctx_priority_permit(struct drm_file *filp,
++				      enum amd_sched_priority priority)
++{
++	/* NORMAL and below are accessible by everyone */
++	if (priority <= AMD_SCHED_PRIORITY_NORMAL)
++		return 0;
++
++	if (capable(CAP_SYS_NICE))
++		return 0;
++
++	if (drm_is_current_master(filp))
++		return 0;
++
++	return -EACCES;
++}
++
++static int amdgpu_ctx_init(struct amdgpu_device *adev,
++			   enum amd_sched_priority priority,
++			   struct drm_file *filp,
++			   struct amdgpu_ctx *ctx)
+ {
+ 	unsigned i, j;
+ 	int r;
+ 
++	if (priority < 0 || priority >= AMD_SCHED_PRIORITY_MAX)
++		return -EINVAL;
++
++	r = amdgpu_ctx_priority_permit(filp, priority);
++	if (r)
++		return r;
++
+ 	memset(ctx, 0, sizeof(*ctx));
+ 	ctx->adev = adev;
+ 	kref_init(&ctx->refcount);
+@@ -53,7 +80,7 @@ static int amdgpu_ctx_init(struct amdgpu_device *adev, struct amdgpu_ctx *ctx)
+ 		struct amdgpu_ring *ring = adev->rings[i];
+ 		struct amd_sched_rq *rq;
+ 
+-		rq = &ring->sched.sched_rq[AMD_SCHED_PRIORITY_NORMAL];
++		rq = &ring->sched.sched_rq[priority];
+ 
+ 		if (ring == &adev->gfx.kiq.ring)
+ 			continue;
+@@ -117,6 +144,8 @@ static void amdgpu_ctx_fini(struct amdgpu_ctx *ctx)
+ 
+ static int amdgpu_ctx_alloc(struct amdgpu_device *adev,
+ 			    struct amdgpu_fpriv *fpriv,
++			    struct drm_file *filp,
++			    enum amd_sched_priority priority,
+ 			    uint32_t *id)
+ {
+ 	struct amdgpu_ctx_mgr *mgr = &fpriv->ctx_mgr;
+@@ -134,8 +163,9 @@ static int amdgpu_ctx_alloc(struct amdgpu_device *adev,
+ 		kfree(ctx);
+ 		return r;
+ 	}
++
+ 	*id = (uint32_t)r;
+-	r = amdgpu_ctx_init(adev, ctx);
++	r = amdgpu_ctx_init(adev, priority, filp, ctx);
+ 	if (r) {
+ 		idr_remove(&mgr->ctx_handles, *id);
+ 		*id = 0;
+@@ -209,11 +239,30 @@ static int amdgpu_ctx_query(struct amdgpu_device *adev,
+ 	return 0;
+ }
+ 
++static enum amd_sched_priority amdgpu_to_sched_priority(int amdgpu_priority)
++{
++	switch (amdgpu_priority) {
++	case AMDGPU_CTX_PRIORITY_HIGH_HW:
++		return AMD_SCHED_PRIORITY_HIGH_HW;
++	case AMDGPU_CTX_PRIORITY_HIGH_SW:
++		return AMD_SCHED_PRIORITY_HIGH_SW;
++	case AMDGPU_CTX_PRIORITY_NORMAL:
++		return AMD_SCHED_PRIORITY_NORMAL;
++	case AMDGPU_CTX_PRIORITY_LOW_SW:
++	case AMDGPU_CTX_PRIORITY_LOW_HW:
++		return AMD_SCHED_PRIORITY_LOW;
++	default:
++		WARN(1, "Invalid context priority %d\n", amdgpu_priority);
++		return AMD_SCHED_PRIORITY_NORMAL;
++	}
++}
++
+ int amdgpu_ctx_ioctl(struct drm_device *dev, void *data,
+ 		     struct drm_file *filp)
+ {
+ 	int r;
+ 	uint32_t id;
++	enum amd_sched_priority priority;
+ 
+ 	union drm_amdgpu_ctx *args = data;
+ 	struct amdgpu_device *adev = dev->dev_private;
+@@ -221,10 +270,14 @@ int amdgpu_ctx_ioctl(struct drm_device *dev, void *data,
+ 
+ 	r = 0;
+ 	id = args->in.ctx_id;
++	priority = amdgpu_to_sched_priority(args->in.priority);
++
++	if (priority >= AMD_SCHED_PRIORITY_MAX)
++		return -EINVAL;
+ 
+ 	switch (args->in.op) {
+ 	case AMDGPU_CTX_OP_ALLOC_CTX:
+-		r = amdgpu_ctx_alloc(adev, fpriv, &id);
++		r = amdgpu_ctx_alloc(adev, fpriv, filp, priority, &id);
+ 		args->out.alloc.ctx_id = id;
+ 		break;
+ 	case AMDGPU_CTX_OP_FREE_CTX:
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index da1b3c1..d5dada5 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -115,7 +115,10 @@ struct amd_sched_backend_ops {
+ 
+ enum amd_sched_priority {
+ 	AMD_SCHED_PRIORITY_MIN,
+-	AMD_SCHED_PRIORITY_NORMAL = AMD_SCHED_PRIORITY_MIN,
++	AMD_SCHED_PRIORITY_LOW = AMD_SCHED_PRIORITY_MIN,
++	AMD_SCHED_PRIORITY_NORMAL,
++	AMD_SCHED_PRIORITY_HIGH_SW,
++	AMD_SCHED_PRIORITY_HIGH_HW,
+ 	AMD_SCHED_PRIORITY_KERNEL,
+ 	AMD_SCHED_PRIORITY_MAX
+ };
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 0774c1d..94f8e67 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -190,13 +190,21 @@ union drm_amdgpu_bo_list {
+ /* unknown cause */
+ #define AMDGPU_CTX_UNKNOWN_RESET	3
+ 
++/* Context priority level */
++#define AMDGPU_CTX_PRIORITY_LOW_HW      -1023
++#define AMDGPU_CTX_PRIORITY_LOW_SW      -512
++#define AMDGPU_CTX_PRIORITY_NORMAL      0
++/* Selecting a priority above NORMAL requires CAP_SYS_NICE or DRM_MASTER */
++#define AMDGPU_CTX_PRIORITY_HIGH_SW     512
++#define AMDGPU_CTX_PRIORITY_HIGH_HW     1023
++
+ struct drm_amdgpu_ctx_in {
+ 	/** AMDGPU_CTX_OP_* */
+ 	__u32	op;
+ 	/** For future use, no flags defined so far */
+ 	__u32	flags;
+ 	__u32	ctx_id;
+-	__u32	_pad;
++	__s32	priority;
+ };
+ 
+ union drm_amdgpu_ctx_out {
+-- 
+2.7.4
+

@@ -1,0 +1,250 @@
+From e3faffc3132a4f7350652bfdf0b5ee333ece3cbe Mon Sep 17 00:00:00 2001
+From: Ken Wang <Ken.Wang@amd.com>
+Date: Thu, 14 Sep 2017 16:25:19 +0800
+Subject: [PATCH 3521/5855] drm/amdgpu: Add GPU reset functionality for Vega10
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+V2
+
+Signed-off-by: Ken Wang <Ken.Wang@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c    | 21 +++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h    |  5 +++++
+ drivers/gpu/drm/amd/amdgpu/psp_v10_0.c     |  6 +++++
+ drivers/gpu/drm/amd/amdgpu/psp_v10_0.h     |  2 ++
+ drivers/gpu/drm/amd/amdgpu/psp_v3_1.c      | 35 ++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/psp_v3_1.h      |  1 +
+ drivers/gpu/drm/amd/amdgpu/soc15.c         | 27 ++++++++++++-----------
+ 8 files changed, 85 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index ebb23ec..39fed45 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2667,7 +2667,8 @@ static bool amdgpu_need_full_reset(struct amdgpu_device *adev)
+ 		if ((adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_GMC) ||
+ 		    (adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_SMC) ||
+ 		    (adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_ACP) ||
+-		    (adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_DCE)) {
++                    (adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_DCE) ||
++                     adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_PSP) {
+ 			if (adev->ip_blocks[i].status.hang) {
+ 				DRM_INFO("Some block need full reset!\n");
+ 				return true;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index 84bd6ed..695e85c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -62,6 +62,7 @@ static int psp_sw_init(void *handle)
+ 		psp->cmd_submit = psp_v3_1_cmd_submit;
+ 		psp->compare_sram_data = psp_v3_1_compare_sram_data;
+ 		psp->smu_reload_quirk = psp_v3_1_smu_reload_quirk;
++                psp->mode1_reset = psp_v3_1_mode1_reset;
+ 		break;
+ 	case CHIP_RAVEN:
+ 		psp->init_microcode = psp_v10_0_init_microcode;
+@@ -72,6 +73,7 @@ static int psp_sw_init(void *handle)
+ 		psp->ring_destroy = psp_v10_0_ring_destroy;
+ 		psp->cmd_submit = psp_v10_0_cmd_submit;
+ 		psp->compare_sram_data = psp_v10_0_compare_sram_data;
++                psp->mode1_reset = psp_v10_0_mode1_reset;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -497,6 +499,22 @@ static int psp_resume(void *handle)
+ 	return ret;
+ }
+ 
++static bool psp_check_reset(void* handle)
++{
++        struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++ 
++        if (adev->flags & AMD_IS_APU)
++                return true;
++ 
++        return false;
++}
++
++static int psp_reset(void* handle)
++{
++        struct amdgpu_device *adev = (struct amdgpu_device *)handle;
++        return psp_mode1_reset(&adev->psp);
++}
++
+ static bool psp_check_fw_loading_status(struct amdgpu_device *adev,
+ 					enum AMDGPU_UCODE_ID ucode_type)
+ {
+@@ -540,8 +558,9 @@ const struct amd_ip_funcs psp_ip_funcs = {
+ 	.suspend = psp_suspend,
+ 	.resume = psp_resume,
+ 	.is_idle = NULL,
++        .check_soft_reset = psp_check_reset,
+ 	.wait_for_idle = NULL,
+-	.soft_reset = NULL,
++	.soft_reset = psp_reset,
+ 	.set_clockgating_state = psp_set_clockgating_state,
+ 	.set_powergating_state = psp_set_powergating_state,
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+index 1b7d12d..3cf644a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+@@ -77,6 +77,8 @@ struct psp_context
+ 				  enum AMDGPU_UCODE_ID ucode_type);
+ 	bool (*smu_reload_quirk)(struct psp_context *psp);
+ 
++        int (*mode1_reset)(struct psp_context *psp);
++
+ 	/* fence buffer */
+ 	struct amdgpu_bo 		*fw_pri_bo;
+ 	uint64_t 			fw_pri_mc_addr;
+@@ -140,6 +142,9 @@ struct amdgpu_psp_funcs {
+ #define psp_smu_reload_quirk(psp) \
+ 		((psp)->smu_reload_quirk ? (psp)->smu_reload_quirk((psp)) : false)
+ 
++#define psp_mode1_reset(psp) \
++               ((psp)->mode1_reset ? (psp)->mode1_reset((psp)) : false)
++
+ extern const struct amd_ip_funcs psp_ip_funcs;
+ 
+ extern const struct amdgpu_ip_block_version psp_v3_1_ip_block;
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v10_0.c b/drivers/gpu/drm/amd/amdgpu/psp_v10_0.c
+index 77cab1f..301f5fa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v10_0.c
+@@ -407,3 +407,9 @@ bool psp_v10_0_compare_sram_data(struct psp_context *psp,
+ 
+ 	return true;
+ }
++
++int psp_v10_0_mode1_reset(struct psp_context *psp)
++{
++        DRM_INFO("psp mode 1 reset not supported now! \n");
++        return -EINVAL;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v10_0.h b/drivers/gpu/drm/amd/amdgpu/psp_v10_0.h
+index 3af3ad1..451e830 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v10_0.h
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v10_0.h
+@@ -45,4 +45,6 @@ extern int psp_v10_0_cmd_submit(struct psp_context *psp,
+ extern bool psp_v10_0_compare_sram_data(struct psp_context *psp,
+ 				       struct amdgpu_firmware_info *ucode,
+ 				       enum AMDGPU_UCODE_ID ucode_type);
++
++extern int psp_v10_0_mode1_reset(struct psp_context *psp);
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
+index bcbe30d..46218d9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
+@@ -530,3 +530,38 @@ bool psp_v3_1_smu_reload_quirk(struct psp_context *psp)
+ 	reg = RREG32_SOC15(NBIO, 0, mmPCIE_DATA2);
+ 	return (reg & MP1_FIRMWARE_FLAGS__INTERRUPTS_ENABLED_MASK) ? true : false;
+ }
++
++int psp_v3_1_mode1_reset(struct psp_context *psp)
++{
++        int ret;
++        uint32_t offset;
++        struct amdgpu_device *adev = psp->adev;
++
++        offset = SOC15_REG_OFFSET(MP0, 0, mmMP0_SMN_C2PMSG_64);
++ 
++        ret = psp_wait_for(psp, offset, 0x80000000, 0x8000FFFF, false);
++
++        if (ret) {
++                DRM_INFO("psp is not working correctly before mode1 reset!\n");
++                return -EINVAL;
++        }
++
++        /*send the mode 1 reset command*/
++        WREG32(offset, 0x70000);
++ 
++        mdelay(1000);
++
++        offset = SOC15_REG_OFFSET(MP0, 0, mmMP0_SMN_C2PMSG_33);
++
++        ret = psp_wait_for(psp, offset, 0x80000000, 0x80000000, false);
++ 
++        if (ret) {
++                DRM_INFO("psp mode 1 reset failed!\n");
++                return -EINVAL;
++        }
++
++        DRM_INFO("psp mode1 reset succeed \n");
++
++       return 0;
++}
++
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h
+index 5af2231..b05dbad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.h
+@@ -53,4 +53,5 @@ extern bool psp_v3_1_compare_sram_data(struct psp_context *psp,
+ 				       struct amdgpu_firmware_info *ucode,
+ 				       enum AMDGPU_UCODE_ID ucode_type);
+ extern bool psp_v3_1_smu_reload_quirk(struct psp_context *psp);
++extern int psp_v3_1_mode1_reset(struct psp_context *psp);
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/soc15.c b/drivers/gpu/drm/amd/amdgpu/soc15.c
+index aa07d17..585fa6e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/soc15.c
++++ b/drivers/gpu/drm/amd/amdgpu/soc15.c
+@@ -404,18 +404,27 @@ static int soc15_read_register(struct amdgpu_device *adev, u32 se_num,
+ 	return -EINVAL;
+ }
+ 
+-static void soc15_gpu_pci_config_reset(struct amdgpu_device *adev)
++static int soc15_asic_reset(struct amdgpu_device *adev)
+ {
+ 	u32 i;
+ 
+-	dev_info(adev->dev, "GPU pci config reset\n");
++        amdgpu_atombios_scratch_regs_engine_hung(adev, true);
++
++        dev_info(adev->dev, "GPU reset\n");
+ 
+ 	/* disable BM */
+ 	pci_clear_master(adev->pdev);
+-	/* reset */
+-	amdgpu_pci_config_reset(adev);
+ 
+-	udelay(100);
++        pci_save_state(adev->pdev);
++
++        for (i = 0; i < AMDGPU_MAX_IP_NUM; i++) {
++                if (adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_PSP){
++                        adev->ip_blocks[i].version->funcs->soft_reset((void *)adev);
++                        break;
++                }
++        }
++ 
++        pci_restore_state(adev->pdev);
+ 
+ 	/* wait for asic to come out of reset */
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+@@ -427,14 +436,6 @@ static void soc15_gpu_pci_config_reset(struct amdgpu_device *adev)
+ 		udelay(1);
+ 	}
+ 
+-}
+-
+-static int soc15_asic_reset(struct amdgpu_device *adev)
+-{
+-	amdgpu_atombios_scratch_regs_engine_hung(adev, true);
+-
+-	soc15_gpu_pci_config_reset(adev);
+-
+ 	amdgpu_atombios_scratch_regs_engine_hung(adev, false);
+ 
+ 	return 0;
+-- 
+2.7.4
+

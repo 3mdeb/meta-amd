@@ -1,0 +1,712 @@
+From 9155859bf5453674db0f923dd39c7c25ce4c5c98 Mon Sep 17 00:00:00 2001
+From: Yue Hin Lau <Yuehin.Lau@amd.com>
+Date: Mon, 23 Oct 2017 16:01:36 -0400
+Subject: [PATCH 4211/5855] drm/amd/display: create new structure for hubbub
+
+instantiating new structure hubbub in resource.c
+
+Signed-off-by: Yue Hin Lau <Yuehin.Lau@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |   4 +-
+ drivers/gpu/drm/amd/display/dc/dc.h                |   7 +
+ drivers/gpu/drm/amd/display/dc/dc_types.h          |   5 -
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c   |  31 ++++-
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h   | 153 +++++++++++----------
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_dpp_cm.c    |  45 ++++--
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  |  74 +++++++++-
+ drivers/gpu/drm/amd/display/dc/inc/hw/dpp.h        |  10 +-
+ drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h  |  14 ++
+ drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h        |   6 +-
+ drivers/gpu/drm/amd/display/dc/inc/hw/transform.h  |   6 +-
+ 11 files changed, 257 insertions(+), 98 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index b1136c1..9b61637 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1084,6 +1084,7 @@ static enum surface_update_type get_plane_info_update_type(
+ 	temp_plane_info.plane_size = u->surface->plane_size;
+ 	temp_plane_info.rotation = u->surface->rotation;
+ 	temp_plane_info.stereo_format = u->surface->stereo_format;
++	temp_plane_info.input_csc_enabled = u->surface->input_csc_color_matrix.enable_adjustment;
+ 
+ 	if (surface_index == 0)
+ 		temp_plane_info.visible = u->plane_info->visible;
+@@ -1164,7 +1165,8 @@ static enum surface_update_type det_surface_update(
+ 		overall_type = type;
+ 
+ 	if (u->in_transfer_func ||
+-		u->hdr_static_metadata) {
++		u->hdr_static_metadata ||
++		u->input_csc_color_matrix) {
+ 		if (overall_type < UPDATE_TYPE_MED)
+ 			overall_type = UPDATE_TYPE_MED;
+ 	}
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index afc7a48..eee9a9d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -435,6 +435,9 @@ struct dc_plane_state {
+ 
+ 	struct dc_gamma *gamma_correction;
+ 	struct dc_transfer_func *in_transfer_func;
++	struct dc_bias_and_scale *bias_and_scale;
++	struct csc_transform input_csc_color_matrix;
++	struct fixed31_32 coeff_reduction_factor;
+ 
+ 	// sourceContentAttribute cache
+ 	bool is_source_input_valid;
+@@ -472,6 +475,7 @@ struct dc_plane_info {
+ 	bool horizontal_mirror;
+ 	bool visible;
+ 	bool per_pixel_alpha;
++	bool input_csc_enabled;
+ };
+ 
+ struct dc_scaling_info {
+@@ -495,6 +499,9 @@ struct dc_surface_update {
+ 	struct dc_gamma *gamma;
+ 	struct dc_transfer_func *in_transfer_func;
+ 	struct dc_hdr_static_metadata *hdr_static_metadata;
++
++	struct csc_transform *input_csc_color_matrix;
++	struct fixed31_32 *coeff_reduction_factor;
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_types.h b/drivers/gpu/drm/amd/display/dc/dc_types.h
+index a8698e3..9291a60 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_types.h
+@@ -638,11 +638,6 @@ struct colorspace_transform {
+ 	bool enable_remap;
+ };
+ 
+-struct csc_transform {
+-	uint16_t matrix[12];
+-	bool enable_adjustment;
+-};
+-
+ enum i2c_mot_mode {
+ 	I2C_MOT_UNDEF,
+ 	I2C_MOT_TRUE,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
+index 309e0d2..54af12f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
+@@ -263,8 +263,10 @@ static void dpp1_set_degamma_format_float(
+ 
+ void dpp1_cnv_setup (
+ 		struct dpp *dpp_base,
+-		enum surface_pixel_format input_format,
+-		enum expansion_mode mode)
++		enum surface_pixel_format format,
++		enum expansion_mode mode,
++		struct csc_transform input_csc_color_matrix,
++		enum dc_color_space input_color_space)
+ {
+ 	uint32_t pixel_format;
+ 	uint32_t alpha_en;
+@@ -274,8 +276,10 @@ void dpp1_cnv_setup (
+ 	bool is_float;
+ 	struct dcn10_dpp *dpp = TO_DCN10_DPP(dpp_base);
+ 	bool force_disable_cursor = false;
++	struct out_csc_color_matrix tbl_entry;
++	int i = 0;
+ 
+-	dpp1_setup_format_flags(input_format, &fmt);
++	dpp1_setup_format_flags(format, &fmt);
+ 	alpha_en = 1;
+ 	pixel_format = 0;
+ 	color_space = COLOR_SPACE_SRGB;
+@@ -305,7 +309,7 @@ void dpp1_cnv_setup (
+ 
+ 	dpp1_set_degamma_format_float(dpp_base, is_float);
+ 
+-	switch (input_format) {
++	switch (format) {
+ 	case SURFACE_PIXEL_FORMAT_GRPH_ARGB1555:
+ 		pixel_format = 1;
+ 		break;
+@@ -361,7 +365,23 @@ void dpp1_cnv_setup (
+ 			CNVC_SURFACE_PIXEL_FORMAT, pixel_format);
+ 	REG_UPDATE(FORMAT_CONTROL, FORMAT_CONTROL__ALPHA_EN, alpha_en);
+ 
+-	dpp1_program_input_csc(dpp_base, color_space, select);
++	// if input adjustments exist, program icsc with those values
++
++	if (input_csc_color_matrix.enable_adjustment
++				== true) {
++		for (i = 0; i < 12; i++)
++			tbl_entry.regval[i] = input_csc_color_matrix.matrix[i];
++
++		tbl_entry.color_space = input_color_space;
++
++		if (color_space >= COLOR_SPACE_YCBCR601)
++			select = INPUT_CSC_SELECT_ICSC;
++		else
++			select = INPUT_CSC_SELECT_BYPASS;
++
++		dpp1_program_input_csc(dpp_base, color_space, select, &tbl_entry);
++	} else
++		dpp1_program_input_csc(dpp_base, color_space, select, NULL);
+ 
+ 	if (force_disable_cursor) {
+ 		REG_UPDATE(CURSOR_CONTROL,
+@@ -434,6 +454,7 @@ static const struct dpp_funcs dcn10_dpp_funcs = {
+ 		.opp_program_regamma_luta_settings = dpp1_cm_program_regamma_luta_settings,
+ 		.opp_program_regamma_pwl = dpp1_cm_set_regamma_pwl,
+ 		.opp_set_regamma_mode = dpp1_cm_set_regamma_mode,
++		.ipp_program_bias_and_scale = dpp1_program_bias_and_scale,
+ 		.ipp_set_degamma = dpp1_set_degamma,
+ 		.ipp_program_input_lut		= dpp1_program_input_lut,
+ 		.ipp_program_degamma_pwl	= dpp1_set_degamma_pwl,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
+index 0488650..49ec2e9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
+@@ -73,9 +73,6 @@
+ 	SRI(RECOUT_START, DSCL, id), \
+ 	SRI(RECOUT_SIZE, DSCL, id), \
+ 	SRI(OBUF_CONTROL, DSCL, id), \
+-	SRI(CM_ICSC_CONTROL, CM, id), \
+-	SRI(CM_ICSC_C11_C12, CM, id), \
+-	SRI(CM_ICSC_C33_C34, CM, id), \
+ 	SRI(CM_DGAM_RAMB_START_CNTL_B, CM, id), \
+ 	SRI(CM_DGAM_RAMB_START_CNTL_G, CM, id), \
+ 	SRI(CM_DGAM_RAMB_START_CNTL_R, CM, id), \
+@@ -92,9 +89,6 @@
+ 	SRI(CM_DGAM_RAMB_REGION_14_15, CM, id), \
+ 	SRI(CM_DGAM_RAMA_START_CNTL_B, CM, id), \
+ 	SRI(CM_DGAM_RAMA_START_CNTL_G, CM, id), \
+-	SRI(CM_DGAM_RAMA_START_CNTL_R, CM, id), \
+-	SRI(CM_DGAM_RAMA_SLOPE_CNTL_B, CM, id), \
+-	SRI(CM_DGAM_RAMA_SLOPE_CNTL_G, CM, id), \
+ 	SRI(CM_DGAM_RAMA_SLOPE_CNTL_R, CM, id), \
+ 	SRI(CM_DGAM_RAMA_END_CNTL1_B, CM, id), \
+ 	SRI(CM_DGAM_RAMA_END_CNTL2_B, CM, id), \
+@@ -127,6 +121,12 @@
+ 	SRI(CM_OCSC_CONTROL, CM, id), \
+ 	SRI(CM_OCSC_C11_C12, CM, id), \
+ 	SRI(CM_OCSC_C33_C34, CM, id), \
++	SRI(CM_ICSC_CONTROL, CM, id), \
++	SRI(CM_ICSC_C11_C12, CM, id), \
++	SRI(CM_ICSC_C33_C34, CM, id), \
++	SRI(CM_BNS_VALUES_R, CM, id), \
++	SRI(CM_BNS_VALUES_G, CM, id), \
++	SRI(CM_BNS_VALUES_B, CM, id), \
+ 	SRI(CM_MEM_PWR_CTRL, CM, id), \
+ 	SRI(CM_RGAM_LUT_DATA, CM, id), \
+ 	SRI(CM_RGAM_LUT_WRITE_EN_MASK, CM, id),\
+@@ -179,9 +179,6 @@
+ 	TF_SF(DSCL0_DSCL_EXT_OVERSCAN_TOP_BOTTOM, EXT_OVERSCAN_BOTTOM, mask_sh),\
+ 	TF_SF(DSCL0_DSCL_EXT_OVERSCAN_TOP_BOTTOM, EXT_OVERSCAN_TOP, mask_sh),\
+ 	TF_SF(DSCL0_OTG_H_BLANK, OTG_H_BLANK_START, mask_sh),\
+-	TF_SF(DSCL0_OTG_H_BLANK, OTG_H_BLANK_END, mask_sh),\
+-	TF_SF(DSCL0_OTG_V_BLANK, OTG_V_BLANK_START, mask_sh),\
+-	TF_SF(DSCL0_OTG_V_BLANK, OTG_V_BLANK_END, mask_sh),\
+ 	TF_SF(DSCL0_LB_DATA_FORMAT, INTERLEAVE_EN, mask_sh),\
+ 	TF2_SF(DSCL0, LB_DATA_FORMAT__ALPHA_EN, mask_sh),\
+ 	TF_SF(DSCL0_LB_MEMORY_CTRL, MEMORY_CONFIG, mask_sh),\
+@@ -236,14 +233,7 @@
+ 	TF_SF(DSCL0_SCL_MODE, SCL_CHROMA_COEF_MODE, mask_sh),\
+ 	TF_SF(DSCL0_SCL_MODE, SCL_COEF_RAM_SELECT_CURRENT, mask_sh), \
+ 	TF_SF(DSCL0_OBUF_CONTROL, OBUF_BYPASS, mask_sh), \
+-	TF_SF(CM0_CM_ICSC_CONTROL, CM_ICSC_MODE, mask_sh), \
+-	TF_SF(CM0_CM_ICSC_C11_C12, CM_ICSC_C11, mask_sh), \
+-	TF_SF(CM0_CM_ICSC_C11_C12, CM_ICSC_C12, mask_sh), \
+-	TF_SF(CM0_CM_ICSC_C33_C34, CM_ICSC_C33, mask_sh), \
+-	TF_SF(CM0_CM_ICSC_C33_C34, CM_ICSC_C34, mask_sh), \
+ 	TF_SF(CM0_CM_DGAM_RAMB_START_CNTL_B, CM_DGAM_RAMB_EXP_REGION_START_B, mask_sh), \
+-	TF_SF(CM0_CM_DGAM_RAMB_START_CNTL_B, CM_DGAM_RAMB_EXP_REGION_START_SEGMENT_B, mask_sh), \
+-	TF_SF(CM0_CM_DGAM_RAMB_START_CNTL_G, CM_DGAM_RAMB_EXP_REGION_START_G, mask_sh), \
+ 	TF_SF(CM0_CM_DGAM_RAMB_START_CNTL_G, CM_DGAM_RAMB_EXP_REGION_START_SEGMENT_G, mask_sh), \
+ 	TF_SF(CM0_CM_DGAM_RAMB_START_CNTL_R, CM_DGAM_RAMB_EXP_REGION_START_R, mask_sh), \
+ 	TF_SF(CM0_CM_DGAM_RAMB_START_CNTL_R, CM_DGAM_RAMB_EXP_REGION_START_SEGMENT_R, mask_sh), \
+@@ -289,6 +279,8 @@
+ 	TF_SF(CM0_CM_DGAM_RAMA_REGION_0_1, CM_DGAM_RAMA_EXP_REGION0_NUM_SEGMENTS, mask_sh), \
+ 	TF_SF(CM0_CM_DGAM_RAMA_REGION_0_1, CM_DGAM_RAMA_EXP_REGION1_LUT_OFFSET, mask_sh), \
+ 	TF_SF(CM0_CM_DGAM_RAMA_REGION_0_1, CM_DGAM_RAMA_EXP_REGION1_NUM_SEGMENTS, mask_sh), \
++	TF_SF(CM0_CM_DGAM_RAMA_REGION_0_1, CM_DGAM_RAMA_EXP_REGION1_LUT_OFFSET, mask_sh), \
++	TF_SF(CM0_CM_DGAM_RAMA_REGION_0_1, CM_DGAM_RAMA_EXP_REGION1_NUM_SEGMENTS, mask_sh), \
+ 	TF_SF(CM0_CM_DGAM_RAMA_REGION_14_15, CM_DGAM_RAMA_EXP_REGION14_LUT_OFFSET, mask_sh), \
+ 	TF_SF(CM0_CM_DGAM_RAMA_REGION_14_15, CM_DGAM_RAMA_EXP_REGION14_NUM_SEGMENTS, mask_sh), \
+ 	TF_SF(CM0_CM_DGAM_RAMA_REGION_14_15, CM_DGAM_RAMA_EXP_REGION15_LUT_OFFSET, mask_sh), \
+@@ -329,6 +321,17 @@
+ 	TF_SF(CM0_CM_OCSC_C11_C12, CM_OCSC_C12, mask_sh), \
+ 	TF_SF(CM0_CM_OCSC_C33_C34, CM_OCSC_C33, mask_sh), \
+ 	TF_SF(CM0_CM_OCSC_C33_C34, CM_OCSC_C34, mask_sh), \
++	TF_SF(CM0_CM_ICSC_CONTROL, CM_ICSC_MODE, mask_sh), \
++	TF_SF(CM0_CM_ICSC_C11_C12, CM_ICSC_C11, mask_sh), \
++	TF_SF(CM0_CM_ICSC_C11_C12, CM_ICSC_C12, mask_sh), \
++	TF_SF(CM0_CM_ICSC_C33_C34, CM_ICSC_C33, mask_sh), \
++	TF_SF(CM0_CM_ICSC_C33_C34, CM_ICSC_C34, mask_sh), \
++	TF_SF(CM0_CM_BNS_VALUES_R, CM_BNS_BIAS_R, mask_sh), \
++	TF_SF(CM0_CM_BNS_VALUES_G, CM_BNS_BIAS_G, mask_sh), \
++	TF_SF(CM0_CM_BNS_VALUES_B, CM_BNS_BIAS_B, mask_sh), \
++	TF_SF(CM0_CM_BNS_VALUES_R, CM_BNS_SCALE_R, mask_sh), \
++	TF_SF(CM0_CM_BNS_VALUES_G, CM_BNS_SCALE_G, mask_sh), \
++	TF_SF(CM0_CM_BNS_VALUES_B, CM_BNS_SCALE_B, mask_sh), \
+ 	TF_SF(CM0_CM_MEM_PWR_CTRL, RGAM_MEM_PWR_FORCE, mask_sh), \
+ 	TF_SF(CM0_CM_RGAM_LUT_DATA, CM_RGAM_LUT_DATA, mask_sh), \
+ 	TF_SF(CM0_CM_RGAM_LUT_WRITE_EN_MASK, CM_RGAM_LUT_WRITE_EN_MASK, mask_sh), \
+@@ -345,6 +348,15 @@
+ 	TF_SF(CM0_CM_RGAM_RAMB_SLOPE_CNTL_R, CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_R, mask_sh), \
+ 	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL1_B, CM_RGAM_RAMB_EXP_REGION_END_B, mask_sh), \
+ 	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL2_B, CM_RGAM_RAMB_EXP_REGION_END_SLOPE_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_START_CNTL_G, CM_RGAM_RAMB_EXP_REGION_START_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_START_CNTL_G, CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_START_CNTL_R, CM_RGAM_RAMB_EXP_REGION_START_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_START_CNTL_R, CM_RGAM_RAMB_EXP_REGION_START_SEGMENT_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_SLOPE_CNTL_B, CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_SLOPE_CNTL_G, CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_G, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_SLOPE_CNTL_R, CM_RGAM_RAMB_EXP_REGION_LINEAR_SLOPE_R, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL1_B, CM_RGAM_RAMB_EXP_REGION_END_B, mask_sh), \
++	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL2_B, CM_RGAM_RAMB_EXP_REGION_END_SLOPE_B, mask_sh), \
+ 	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL2_B, CM_RGAM_RAMB_EXP_REGION_END_BASE_B, mask_sh), \
+ 	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL1_G, CM_RGAM_RAMB_EXP_REGION_END_G, mask_sh), \
+ 	TF_SF(CM0_CM_RGAM_RAMB_END_CNTL2_G, CM_RGAM_RAMB_EXP_REGION_END_SLOPE_G, mask_sh), \
+@@ -887,15 +899,6 @@
+ 	type CM_SHAPER_RAMA_EXP_REGION24_NUM_SEGMENTS; \
+ 	type CM_SHAPER_RAMA_EXP_REGION25_LUT_OFFSET; \
+ 	type CM_SHAPER_RAMA_EXP_REGION25_NUM_SEGMENTS; \
+-	type CM_SHAPER_RAMA_EXP_REGION26_LUT_OFFSET; \
+-	type CM_SHAPER_RAMA_EXP_REGION26_NUM_SEGMENTS; \
+-	type CM_SHAPER_RAMA_EXP_REGION27_LUT_OFFSET; \
+-	type CM_SHAPER_RAMA_EXP_REGION27_NUM_SEGMENTS; \
+-	type CM_SHAPER_RAMA_EXP_REGION28_LUT_OFFSET; \
+-	type CM_SHAPER_RAMA_EXP_REGION28_NUM_SEGMENTS; \
+-	type CM_SHAPER_RAMA_EXP_REGION29_LUT_OFFSET; \
+-	type CM_SHAPER_RAMA_EXP_REGION29_NUM_SEGMENTS; \
+-	type CM_SHAPER_RAMA_EXP_REGION30_LUT_OFFSET; \
+ 	type CM_SHAPER_RAMA_EXP_REGION30_NUM_SEGMENTS; \
+ 	type CM_SHAPER_RAMA_EXP_REGION31_LUT_OFFSET; \
+ 	type CM_SHAPER_RAMA_EXP_REGION31_NUM_SEGMENTS; \
+@@ -913,6 +916,12 @@
+ 	type CM_ICSC_C12; \
+ 	type CM_ICSC_C33; \
+ 	type CM_ICSC_C34; \
++	type CM_BNS_BIAS_R; \
++	type CM_BNS_BIAS_G; \
++	type CM_BNS_BIAS_B; \
++	type CM_BNS_SCALE_R; \
++       type CM_BNS_SCALE_G; \
+++       type CM_BNS_SCALE_B; \
+ 	type CM_DGAM_RAMB_EXP_REGION_START_B; \
+ 	type CM_DGAM_RAMB_EXP_REGION_START_SEGMENT_B; \
+ 	type CM_DGAM_RAMB_EXP_REGION_START_G; \
+@@ -991,6 +1000,21 @@
+ 	type CURSOR_MODE; \
+ 	type CURSOR_PITCH; \
+ 	type CURSOR_LINES_PER_CHUNK; \
++	type CM_DGAM_LUT_WRITE_SEL; \
++	type CM_DGAM_LUT_INDEX; \
++	type CM_DGAM_LUT_DATA; \
++	type CM_DGAM_LUT_MODE; \
++	type CM_IGAM_LUT_MODE; \
++	type CM_IGAM_INPUT_FORMAT; \
++	type CM_IGAM_LUT_RW_INDEX; \
++	type CM_BYPASS_EN; \
++	type FORMAT_EXPANSION_MODE; \
++	type CNVC_BYPASS; \
++	type OUTPUT_FP; \
++	type CNVC_SURFACE_PIXEL_FORMAT; \
++	type CURSOR_MODE; \
++	type CURSOR_PITCH; \
++	type CURSOR_LINES_PER_CHUNK; \
+ 	type CURSOR_ENABLE; \
+ 	type CUR0_MODE; \
+ 	type CUR0_EXPANSION_MODE; \
+@@ -1206,6 +1230,9 @@ struct dcn_dpp_registers {
+ 	uint32_t CM_ICSC_CONTROL;
+ 	uint32_t CM_ICSC_C11_C12;
+ 	uint32_t CM_ICSC_C33_C34;
++	uint32_t CM_BNS_VALUES_R;
++	uint32_t CM_BNS_VALUES_G;
++	uint32_t CM_BNS_VALUES_B;
+ 	uint32_t CM_DGAM_RAMB_START_CNTL_B;
+ 	uint32_t CM_DGAM_RAMB_START_CNTL_G;
+ 	uint32_t CM_DGAM_RAMB_START_CNTL_R;
+@@ -1310,7 +1337,12 @@ void ippn10_power_on_degamma_lut(
+ void ippn10_program_input_csc(
+ 		struct transform *xfm_base,
+ 		enum dc_color_space color_space,
+-		enum dcn10_input_csc_select select);
++		enum dcn10_input_csc_select select,
++		const struct out_csc_color_matrix *tbl_entry);
++
++void dpp1_program_bias_and_scale(
++		struct dpp *dpp_base,
++		struct dc_bias_and_scale *params);
+ 
+ void ippn10_program_input_lut(
+ 		struct transform *xfm_base,
+@@ -1318,66 +1350,45 @@ void ippn10_program_input_lut(
+ 
+ void ippn10_full_bypass(struct transform *xfm_base);
+ 
+-void ippn10_set_degamma(
+-		struct transform *xfm_base,
+-		enum ipp_degamma_mode mode);
+-
+-void ippn10_set_degamma_pwl(struct transform *xfm_base,
+-								 const struct pwl_params *params);
+-
+-bool dpp_get_optimal_number_of_taps(
+-		struct transform *xfm,
+-		struct scaler_data *scl_data,
+-		const struct scaling_taps *in_taps);
+-
+-void dpp_reset(struct transform *xfm_base);
+-
+-void dcn10_dpp_cm_program_regamma_lut(
+-		struct transform *xfm_base,
+-		const struct pwl_result_data *rgb,
+-		uint32_t num);
+-
+-void dcn10_dpp_cm_power_on_regamma_lut(
+-	struct transform *xfm_base,
+-	bool power_on);
+-
+-void dcn10_dpp_cm_configure_regamma_lut(
+-		struct transform *xfm_base,
++		struct dpp *dpp_base,
+ 		bool is_ram_a);
+ 
+ /*program re gamma RAM A*/
+-void dcn10_dpp_cm_program_regamma_luta_settings(
+-		struct transform *xfm_base,
++void dpp1_cm_program_regamma_luta_settings(
++		struct dpp *dpp_base,
+ 		const struct pwl_params *params);
+ 
+ /*program re gamma RAM B*/
+-void dcn10_dpp_cm_program_regamma_lutb_settings(
+-		struct transform *xfm_base,
++void dpp1_cm_program_regamma_lutb_settings(
++		struct dpp *dpp_base,
+ 		const struct pwl_params *params);
+-void dcn10_dpp_cm_set_output_csc_adjustment(
+-		struct transform *xfm_base,
++
++void dpp1_cm_set_output_csc_adjustment(
++		struct dpp *dpp_base,
+ 		const struct out_csc_color_matrix *tbl_entry);
+ 
+-void dcn10_dpp_cm_set_output_csc_default(
+-		struct transform *xfm_base,
++void dpp1_cm_set_output_csc_default(
++		struct dpp *dpp_base,
+ 		const struct default_adjustment *default_adjust);
+ 
+-void dcn10_dpp_cm_set_gamut_remap(
+-	struct transform *xfm,
+-	const struct xfm_grph_csc_adjustment *adjust);
++void dpp1_cm_set_gamut_remap(
++		struct dpp *dpp,
++		const struct dpp_grph_csc_adjustment *adjust);
+ 
+-void dcn10_dpp_dscl_set_scaler_manual_scale(
+-	struct transform *xfm_base,
+-	const struct scaler_data *scl_data);
++void dpp1_dscl_set_scaler_manual_scale(
++		struct dpp *dpp_base,
++		const struct scaler_data *scl_data);
+ 
+-void ippn10_cnv_setup (
+-		struct transform *xfm_base,
+-		enum surface_pixel_format input_format,
+-		enum expansion_mode mode);
++void dpp1_cnv_setup (
++		struct dpp *dpp_base,
++		enum surface_pixel_format format,
++		enum expansion_mode mode,
++		struct csc_transform input_csc_color_matrix,
++		enum dc_color_space input_color_space);
+ 
+-void ippn10_full_bypass(struct transform *xfm_base);
++void dpp1_full_bypass(struct dpp *dpp_base);
+ 
+-void dcn10_dpp_construct(struct dcn10_dpp *xfm110,
++void dpp1_construct(struct dcn10_dpp *dpp1,
+ 	struct dc_context *ctx,
+ 	uint32_t inst,
+ 	const struct dcn_dpp_registers *tf_regs,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_cm.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_cm.c
+index bf4779f..5dc46d3 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_cm.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_cm.c
+@@ -530,7 +530,8 @@ void dpp1_cm_program_regamma_lutb_settings(
+ void dpp1_program_input_csc(
+ 		struct dpp *dpp_base,
+ 		enum dc_color_space color_space,
+-		enum dcn10_input_csc_select select)
++		enum dcn10_input_csc_select select,
++		const struct out_csc_color_matrix *tbl_entry)
+ {
+ 	struct dcn10_dpp *dpp = TO_DCN10_DPP(dpp_base);
+ 	int i;
+@@ -544,15 +545,19 @@ void dpp1_program_input_csc(
+ 		return;
+ 	}
+ 
+-	for (i = 0; i < arr_size; i++)
+-		if (dcn10_input_csc_matrix[i].color_space == color_space) {
+-			regval = dcn10_input_csc_matrix[i].regval;
+-			break;
++	if (tbl_entry == NULL) {
++		for (i = 0; i < arr_size; i++)
++			if (dcn10_input_csc_matrix[i].color_space == color_space) {
++				regval = dcn10_input_csc_matrix[i].regval;
++				break;
++			}
++
++		if (regval == NULL) {
++			BREAK_TO_DEBUGGER();
++			return;
++	        } else {
++			regval = tbl_entry->regval;
+ 		}
+-
+-	if (regval == NULL) {
+-		BREAK_TO_DEBUGGER();
+-		return;
+ 	}
+ 
+ 	if (select == INPUT_CSC_SELECT_COMA)
+@@ -587,6 +592,28 @@ void dpp1_program_input_csc(
+ 	}
+ }
+ 
++//keep here for now, decide multi dce support later
++void dpp1_program_bias_and_scale(
++	struct dpp *dpp_base,
++	struct dc_bias_and_scale *params)
++{
++	struct dcn10_dpp *dpp = TO_DCN10_DPP(dpp_base);
++
++	REG_SET_2(CM_BNS_VALUES_R, 0,
++		CM_BNS_SCALE_R, params->scale_red,
++		CM_BNS_BIAS_R, params->bias_red);
++
++	REG_SET_2(CM_BNS_VALUES_G, 0,
++		CM_BNS_SCALE_G, params->scale_green,
++		CM_BNS_BIAS_G, params->bias_green);
++
++	REG_SET_2(CM_BNS_VALUES_B, 0,
++		CM_BNS_SCALE_B, params->scale_blue,
++		CM_BNS_BIAS_B, params->bias_blue);
++
++}
++
++
+ /*program de gamma RAM B*/
+ void dpp1_program_degamma_lutb_settings(
+ 		struct dpp *dpp_base,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 661c270..92f45ab 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -1625,6 +1625,7 @@ static void program_csc_matrix(struct pipe_ctx *pipe_ctx,
+ 			pipe_ctx->plane_res.dpp->funcs->opp_set_csc_adjustment(pipe_ctx->plane_res.dpp, &tbl_entry);
+ 	}
+ }
++
+ static bool is_lower_pipe_tree_visible(struct pipe_ctx *pipe_ctx)
+ {
+ 	if (pipe_ctx->plane_state->visible)
+@@ -1712,6 +1713,68 @@ static void dcn10_get_surface_visual_confirm_color(
+ 	}
+ }
+ 
++static uint16_t fixed_point_to_int_frac(
++	struct fixed31_32 arg,
++	uint8_t integer_bits,
++	uint8_t fractional_bits)
++{
++	int32_t numerator;
++	int32_t divisor = 1 << fractional_bits;
++
++	uint16_t result;
++
++	uint16_t d = (uint16_t)dal_fixed31_32_floor(
++		dal_fixed31_32_abs(arg));
++
++	if (d <= (uint16_t)(1 << integer_bits) - (1 / (uint16_t)divisor))
++		numerator = (uint16_t)dal_fixed31_32_floor(
++			dal_fixed31_32_mul_int(
++				arg,
++				divisor));
++	else {
++		numerator = dal_fixed31_32_floor(
++			dal_fixed31_32_sub(
++				dal_fixed31_32_from_int(
++					1LL << integer_bits),
++				dal_fixed31_32_recip(
++					dal_fixed31_32_from_int(
++						divisor))));
++	}
++
++	if (numerator >= 0)
++		result = (uint16_t)numerator;
++	else
++		result = (uint16_t)(
++		(1 << (integer_bits + fractional_bits + 1)) + numerator);
++
++	if ((result != 0) && dal_fixed31_32_lt(
++		arg, dal_fixed31_32_zero))
++		result |= 1 << (integer_bits + fractional_bits);
++
++	return result;
++}
++
++void build_prescale_params(struct  dc_bias_and_scale *bias_and_scale,
++		const struct dc_plane_state *plane_state)
++{
++	if (plane_state->format >= SURFACE_PIXEL_FORMAT_VIDEO_BEGIN
++			&& plane_state->format != SURFACE_PIXEL_FORMAT_INVALID
++			&& plane_state->input_csc_color_matrix.enable_adjustment
++			&& plane_state->coeff_reduction_factor.value != 0) {
++		bias_and_scale->scale_blue = fixed_point_to_int_frac(
++                       dal_fixed31_32_mul(plane_state->coeff_reduction_factor,
++					dal_fixed31_32_from_fraction(256, 255)),
++			                2,
++					13);
++		bias_and_scale->scale_red = bias_and_scale->scale_blue;
++		bias_and_scale->scale_green = bias_and_scale->scale_blue;
++	} else {
++		bias_and_scale->scale_blue = 0x2000;
++		bias_and_scale->scale_red = 0x2000;
++		bias_and_scale->scale_green = 0x2000;
++	}
++}
++
+ static void mmhub_read_vm_system_aperture_settings(struct dcn10_hubp *hubp1,
+ 		struct vm_system_aperture_param *apt,
+ 		struct dce_hwseq *hws)
+@@ -1812,6 +1875,7 @@ static void update_dchubp_dpp(
+ 	struct mpcc_cfg mpcc_cfg = {0};
+ 	struct pipe_ctx *top_pipe;
+ 	bool per_pixel_alpha = plane_state->per_pixel_alpha && pipe_ctx->bottom_pipe;
++	struct dc_bias_and_scale bns_params = {0};
+ 
+ 	/* TODO: proper fix once fpga works */
+ 	/* depends on DML calculation, DPP clock value may change dynamically */
+@@ -1848,9 +1912,16 @@ static void update_dchubp_dpp(
+ 				hws
+ 				);
+ 
++	// program the input csc
+ 	dpp->funcs->ipp_setup(dpp,
+ 			plane_state->format,
+-			EXPANSION_MODE_ZERO);
++			EXPANSION_MODE_ZERO,
++			plane_state->input_csc_color_matrix,
++			COLOR_SPACE_YCBCR601_LIMITED);
++
++	//set scale and bias registers
++	build_prescale_params(&bns_params, plane_state);
++	dpp->funcs->ipp_program_bias_and_scale(dpp, &bns_params);
+ 
+ 	mpcc_cfg.dpp_id = hubp->inst;
+ 	mpcc_cfg.opp_id = pipe_ctx->stream_res.opp->inst;
+@@ -1890,6 +1961,7 @@ static void update_dchubp_dpp(
+ 			pipe_ctx->stream->output_color_space,
+ 			pipe_ctx->stream->csc_color_matrix.matrix);
+ 
++
+ 	hubp->funcs->hubp_program_surface_config(
+ 		hubp,
+ 		plane_state->format,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/dpp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/dpp.h
+index 83a6846..6eca959 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/dpp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/dpp.h
+@@ -98,6 +98,10 @@ struct dpp_funcs {
+ 			struct dpp *dpp_base,
+ 			enum opp_regamma mode);
+ 
++	void (*ipp_program_bias_and_scale)(
++			struct dpp *dpp,
++			struct dc_bias_and_scale *params);
++
+ 	void (*ipp_set_degamma)(
+ 			struct dpp *dpp_base,
+ 			enum ipp_degamma_mode mode);
+@@ -111,8 +115,10 @@ struct dpp_funcs {
+ 
+ 	void (*ipp_setup)(
+ 			struct dpp *dpp_base,
+-			enum surface_pixel_format input_format,
+-			enum expansion_mode mode);
++			enum surface_pixel_format format,
++			enum expansion_mode mode,
++			struct csc_transform input_csc_color_matrix,
++			enum dc_color_space input_color_space);
+ 
+ 	void (*ipp_full_bypass)(struct dpp *dpp_base);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h b/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h
+index 9602f26..fa3d100d 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/hw_shared.h
+@@ -138,4 +138,18 @@ enum opp_regamma {
+ 	OPP_REGAMMA_USER
+ };
+ 
++struct csc_transform {
++	uint16_t matrix[12];
++	bool enable_adjustment;
++};
++
++struct dc_bias_and_scale {
++	uint16_t scale_red;
++	uint16_t bias_red;
++	uint16_t scale_green;
++	uint16_t bias_green;
++	uint16_t scale_blue;
++	uint16_t bias_blue;
++};
++
+ #endif /* __DAL_HW_SHARED_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
+index f11aa48..2109eac 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
+@@ -85,8 +85,10 @@ struct ipp_funcs {
+ 	/* setup ipp to expand/convert input to pixel processor internal format */
+ 	void (*ipp_setup)(
+ 		struct input_pixel_processor *ipp,
+-		enum surface_pixel_format input_format,
+-		enum expansion_mode mode);
++		enum surface_pixel_format format,
++		enum expansion_mode mode,
++		struct csc_transform input_csc_color_matrix,
++		enum dc_color_space input_color_space);
+ 
+ 	/* DCE function to setup IPP.  TODO: see if we can consolidate to setup */
+ 	void (*ipp_program_prescale)(
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h b/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
+index 7c08bc6..d7b4441 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
+@@ -250,8 +250,10 @@ struct transform_funcs {
+ 
+ 	void (*ipp_setup)(
+ 			struct transform *xfm_base,
+-			enum surface_pixel_format input_format,
+-			enum expansion_mode mode);
++			enum surface_pixel_format format,
++			enum expansion_mode mode,
++			struct csc_transform input_csc_color_matrix,
++			enum dc_color_space input_color_space);
+ 
+ 	void (*ipp_full_bypass)(struct transform *xfm_base);
+ 
+-- 
+2.7.4
+

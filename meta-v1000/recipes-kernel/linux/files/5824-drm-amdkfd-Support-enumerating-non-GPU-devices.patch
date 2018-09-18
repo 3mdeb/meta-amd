@@ -1,0 +1,119 @@
+From 626ac30fbd99df5f4d541c7a4ec6b9ce35f55761 Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Date: Fri, 8 Dec 2017 23:08:53 -0500
+Subject: [PATCH 5824/5855] drm/amdkfd: Support enumerating non-GPU devices
+
+Modify kfd_topology_enum_kfd_devices(..) function to support non-GPU
+nodes. The function returned NULL when it encountered non-GPU (say CPU)
+nodes. This caused kfd_ioctl_create_event and kfd_init_apertures to fail
+for Intel + Tonga.
+
+kfd_topology_enum_kfd_devices will now parse all the nodes and return
+valid kfd_dev for nodes with GPU.
+
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c |  7 ++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_pasid.c       |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h        |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_topology.c    | 18 +++++++++++-------
+ 4 files changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c b/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c
+index c59384b..7377513 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c
+@@ -300,9 +300,14 @@ int kfd_init_apertures(struct kfd_process *process)
+ 	struct kfd_process_device *pdd;
+ 
+ 	/*Iterating over all devices*/
+-	while ((dev = kfd_topology_enum_kfd_devices(id)) != NULL &&
++	while (kfd_topology_enum_kfd_devices(id, &dev) == 0 &&
+ 		id < NUM_OF_SUPPORTED_GPUS) {
+ 
++		if (!dev) {
++			id++; /* Skip non GPU devices */
++			continue;
++		}
++
+ 		pdd = kfd_create_process_device_data(dev, process);
+ 		if (!pdd) {
+ 			pr_err("Failed to create process device data\n");
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_pasid.c b/drivers/gpu/drm/amd/amdkfd/kfd_pasid.c
+index d6a7961..15fff44 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_pasid.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_pasid.c
+@@ -59,7 +59,7 @@ unsigned int kfd_pasid_alloc(void)
+ 		struct kfd_dev *dev = NULL;
+ 		unsigned int i = 0;
+ 
+-		while ((dev = kfd_topology_enum_kfd_devices(i)) != NULL) {
++		while ((kfd_topology_enum_kfd_devices(i, &dev)) == 0) {
+ 			if (dev && dev->kfd2kgd) {
+ 				kfd2kgd = dev->kfd2kgd;
+ 				break;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 1851e28..d24b7715 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -670,7 +670,7 @@ int kfd_topology_add_device(struct kfd_dev *gpu);
+ int kfd_topology_remove_device(struct kfd_dev *gpu);
+ struct kfd_dev *kfd_device_by_id(uint32_t gpu_id);
+ struct kfd_dev *kfd_device_by_pci_dev(const struct pci_dev *pdev);
+-struct kfd_dev *kfd_topology_enum_kfd_devices(uint8_t idx);
++int kfd_topology_enum_kfd_devices(uint8_t idx, struct kfd_dev **kdev);
+ 
+ /* Interrupts */
+ int kfd_interrupt_init(struct kfd_dev *dev);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+index f64350b..b2d2b7e 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+@@ -927,22 +927,26 @@ int kfd_topology_remove_device(struct kfd_dev *gpu)
+ 	return res;
+ }
+ 
+-/*
+- * When idx is out of bounds, the function will return NULL
++/* kfd_topology_enum_kfd_devices - Enumerate through all devices in KFD
++ *	topology. If GPU device is found @idx, then valid kfd_dev pointer is
++ *	returned through @kdev
++ * Return -	0: On success (@kdev will be NULL for non GPU nodes)
++ *		-1: If end of list
+  */
+-struct kfd_dev *kfd_topology_enum_kfd_devices(uint8_t idx)
++int kfd_topology_enum_kfd_devices(uint8_t idx, struct kfd_dev **kdev)
+ {
+ 
+ 	struct kfd_topology_device *top_dev;
+-	struct kfd_dev *device = NULL;
+ 	uint8_t device_idx = 0;
+ 
++	*kdev = NULL;
+ 	down_read(&topology_lock);
+ 
+ 	list_for_each_entry(top_dev, &topology_device_list, list) {
+ 		if (device_idx == idx) {
+-			device = top_dev->gpu;
+-			break;
++			*kdev = top_dev->gpu;
++			up_read(&topology_lock);
++			return 0;
+ 		}
+ 
+ 		device_idx++;
+@@ -950,7 +954,7 @@ struct kfd_dev *kfd_topology_enum_kfd_devices(uint8_t idx)
+ 
+ 	up_read(&topology_lock);
+ 
+-	return device;
++	return -1;
+ 
+ }
+ 
+-- 
+2.7.4
+

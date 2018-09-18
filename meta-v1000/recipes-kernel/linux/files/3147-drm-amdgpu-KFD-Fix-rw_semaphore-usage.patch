@@ -1,0 +1,128 @@
+From aa3364edcdee0affdc97cef8ab631b1cc18d0c75 Mon Sep 17 00:00:00 2001
+From: "Le.Ma" <Le.Ma@amd.com>
+Date: Fri, 22 Sep 2017 10:56:57 +0800
+Subject: [PATCH 3147/5855] drm/amdgpu: [KFD] Fix rw_semaphore usage
+
+Avoid accessing current pointer in amdgpu_ttm_tt_get_user_pages(),
+which will cause NULL pointer oops. And remove uneeded rw_semaphore.
+
+This fix accords with kfd branch.
+
+Change-Id: I0a602b30a20eb444968d6e846f3adca6cfff841a
+Signed-off-by: Le.Ma <Le.Ma@amd.com>
+Reviewed-by: Junwei Zhang <Jerry.Zhang@amd.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c | 19 +++++--------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c          |  8 ++++----
+ 2 files changed, 9 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 0f3c5a6..87eb418 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -523,9 +523,7 @@ static int init_user_pages(struct kgd_mem *mem, struct mm_struct *mm,
+ 		goto unregister_out;
+ 	}
+ 
+-	down_read(&mm->mmap_sem);
+ 	ret = amdgpu_ttm_tt_get_user_pages(bo->tbo.ttm, mem->user_pages);
+-	up_read(&mm->mmap_sem);
+ 	if (ret) {
+ 		pr_err("%s: Failed to get user pages: %d\n", __func__, ret);
+ 		goto free_out;
+@@ -1945,7 +1943,7 @@ static int update_invalid_user_pages(struct amdkfd_process_info *process_info,
+ {
+ 	struct kgd_mem *mem, *tmp_mem;
+ 	struct amdgpu_bo *bo;
+-	int invalid, ret = 0;
++	int invalid, ret;
+ 
+ 	/* Move all invalidated BOs to the userptr_inval_list and
+ 	 * release their user pages by migration to the CPU domain
+@@ -1977,7 +1975,6 @@ static int update_invalid_user_pages(struct amdkfd_process_info *process_info,
+ 		return 0; /* All evicted userptr BOs were freed */
+ 
+ 	/* Go through userptr_inval_list and update any invalid user_pages */
+-	down_read(&mm->mmap_sem);
+ 	list_for_each_entry(mem, &process_info->userptr_inval_list,
+ 			    validate_list.head) {
+ 		invalid = atomic_read(&mem->invalid);
+@@ -1994,10 +1991,9 @@ static int update_invalid_user_pages(struct amdkfd_process_info *process_info,
+ 				drm_calloc_large(bo->tbo.ttm->num_pages,
+ 						 sizeof(struct page *));
+ 			if (!mem->user_pages) {
+-				ret = -ENOMEM;
+ 				pr_err("%s: Failed to allocate pages array\n",
+ 				       __func__);
+-				goto unlock_mmap_out;
++				return -ENOMEM;
+ 			}
+ 		} else if (mem->user_pages[0]) {
+ 			release_pages(mem->user_pages,
+@@ -2011,7 +2007,6 @@ static int update_invalid_user_pages(struct amdkfd_process_info *process_info,
+ 			mem->user_pages[0] = NULL;
+ 			pr_info("%s: Failed to get user pages: %d\n",
+ 				__func__, ret);
+-			ret = 0;
+ 			/* Pretend it succeeded. It will fail later
+ 			 * with a VM fault if the GPU tries to access
+ 			 * it. Better than hanging indefinitely with
+@@ -2022,14 +2017,10 @@ static int update_invalid_user_pages(struct amdkfd_process_info *process_info,
+ 		/* Mark the BO as valid unless it was invalidated
+ 		 * again concurrently
+ 		 */
+-		if (atomic_cmpxchg(&mem->invalid, invalid, 0) != invalid) {
+-			ret = -EAGAIN;
+-			goto unlock_mmap_out;
+-		}
++		if (atomic_cmpxchg(&mem->invalid, invalid, 0) != invalid)
++			return -EAGAIN;
+ 	}
+-unlock_mmap_out:
+-	up_read(&mm->mmap_sem);
+-	return ret;
++	return 0;
+ }
+ 
+ /* Validate invalid userptr BOs
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index c406e0c..c3713e0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -689,7 +689,7 @@ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages)
+ 	if (!(gtt->userflags & AMDGPU_GEM_USERPTR_READONLY))
+ 		flags |= FOLL_WRITE;
+ 
+-	down_read(&current->mm->mmap_sem);
++	down_read(&mm->mmap_sem);
+ 
+ 	if (gtt->userflags & AMDGPU_GEM_USERPTR_ANONONLY) {
+ 		/* check that we only use anonymous memory
+@@ -699,7 +699,7 @@ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages)
+ 
+ 		vma = find_vma(mm, gtt->userptr);
+ 		if (!vma || vma->vm_file || vma->vm_end < end) {
+-			up_read(&current->mm->mmap_sem);
++			up_read(&mm->mmap_sem);
+ 			return -EPERM;
+ 		}
+ 	}
+@@ -733,12 +733,12 @@ int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages)
+ 
+ 	} while (pinned < ttm->num_pages);
+ 
+-	up_read(&current->mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 	return 0;
+ 
+ release_pages:
+ 	release_pages(pages, pinned, 0);
+-	up_read(&current->mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 	return r;
+ }
+ 
+-- 
+2.7.4
+

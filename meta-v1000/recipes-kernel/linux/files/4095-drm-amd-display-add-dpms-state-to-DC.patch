@@ -1,0 +1,177 @@
+From 29135ed38dabbf1ec6041d2d7d0392ce3a01c893 Mon Sep 17 00:00:00 2001
+From: Hersen Wu <hersenxs.wu@amd.com>
+Date: Fri, 29 Sep 2017 16:36:34 -0400
+Subject: [PATCH 4095/5855] drm/amd/display: add dpms state to DC
+
+- avoid eDP screen flash 4 times when resume from s3
+- improve s3 and boot time
+
+Signed-off-by: Hersen Wu <hersenxs.wu@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           | 39 +++++++++++++++++++++-
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c      |  4 +++
+ drivers/gpu/drm/amd/display/dc/dc.h                |  5 +++
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    | 13 ++++----
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  | 11 +++---
+ 5 files changed, 58 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index a14a9d1..c4f9e2c 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -332,7 +332,16 @@ static void set_dither_option(struct dc_stream_state *stream,
+ {
+ 	struct bit_depth_reduction_params params;
+ 	struct dc_link *link = stream->status.link;
+-	struct pipe_ctx *pipes = link->dc->current_state->res_ctx.pipe_ctx;
++	struct pipe_ctx *pipes;
++	int i;
++
++	for (i = 0; i < MAX_PIPES; i++) {
++		if (link->dc->current_state->res_ctx.pipe_ctx[i].stream ==
++				stream) {
++			pipes = &link->dc->current_state->res_ctx.pipe_ctx[i];
++			break;
++		}
++	}
+ 
+ 	memset(&params, 0, sizeof(params));
+ 	if (!stream)
+@@ -349,6 +358,31 @@ static void set_dither_option(struct dc_stream_state *stream,
+ 		opp_program_bit_depth_reduction(pipes->stream_res.opp, &params);
+ }
+ 
++void set_dpms(
++	struct dc *dc,
++	struct dc_stream_state *stream,
++	bool dpms_off)
++{
++	struct pipe_ctx *pipe_ctx;
++	int i;
++
++	for (i = 0; i < MAX_PIPES; i++) {
++		if (dc->current_state->res_ctx.pipe_ctx[i].stream == stream) {
++			pipe_ctx = &dc->current_state->res_ctx.pipe_ctx[i];
++			break;
++		}
++	}
++
++	if (stream->dpms_off != dpms_off) {
++		stream->dpms_off = dpms_off;
++		if (dpms_off)
++			core_link_disable_stream(pipe_ctx,
++					KEEP_ACQUIRED_RESOURCE);
++		else
++			core_link_enable_stream(dc->current_state, pipe_ctx);
++	}
++}
++
+ static void allocate_dc_stream_funcs(struct dc  *dc)
+ {
+ 	if (dc->hwss.set_drr != NULL) {
+@@ -371,6 +405,9 @@ static void allocate_dc_stream_funcs(struct dc  *dc)
+ 	dc->stream_funcs.set_dither_option =
+ 			set_dither_option;
+ 
++	dc->stream_funcs.set_dpms =
++			set_dpms;
++
+ 	dc->link_funcs.set_drive_settings =
+ 			set_drive_settings;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index 2d59f77..72e56fb 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -2321,6 +2321,10 @@ void core_link_enable_stream(
+ 
+ 	if (pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT_MST)
+ 		allocate_mst_payload(pipe_ctx);
++
++	if (dc_is_dp_signal(pipe_ctx->stream->signal))
++		core_dc->hwss.unblank_stream(pipe_ctx,
++			&pipe_ctx->stream->sink->link->cur_link_settings);
+ }
+ 
+ void core_link_disable_stream(struct pipe_ctx *pipe_ctx, int option)
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 7a98760..6d39a8b 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -133,6 +133,10 @@ struct dc_stream_state_funcs {
+ 
+ 	void (*set_dither_option)(struct dc_stream_state *stream,
+ 			enum dc_dither_option option);
++
++	void (*set_dpms)(struct dc *dc,
++			struct dc_stream_state *stream,
++			bool dpms_off);
+ };
+ 
+ struct link_training_settings;
+@@ -582,6 +586,7 @@ struct dc_stream_state {
+ 
+ 	int phy_pix_clk;
+ 	enum signal_type signal;
++	bool dpms_off;
+ 
+ 	struct dc_stream_status status;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 2860944..9eb0218 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -1359,12 +1359,8 @@ static enum dc_status apply_single_controller_ctx_to_hw(
+ 	resource_build_info_frame(pipe_ctx);
+ 	dce110_update_info_frame(pipe_ctx);
+ 	if (!pipe_ctx_old->stream) {
+-		core_link_enable_stream(context, pipe_ctx);
+-
+-
+-		if (dc_is_dp_signal(pipe_ctx->stream->signal))
+-			dce110_unblank_stream(pipe_ctx,
+-				&stream->sink->link->cur_link_settings);
++		if (!pipe_ctx->stream->dpms_off)
++			core_link_enable_stream(context, pipe_ctx);
+ 	}
+ 
+ 	pipe_ctx->plane_res.scl_data.lb_params.alpha_en = pipe_ctx->bottom_pipe != 0;
+@@ -1876,7 +1872,10 @@ static void dce110_reset_hw_ctx_wrap(
+ 				pipe_need_reprogram(pipe_ctx_old, pipe_ctx)) {
+ 			struct clock_source *old_clk = pipe_ctx_old->clock_source;
+ 
+-			core_link_disable_stream(pipe_ctx_old, FREE_ACQUIRED_RESOURCE);
++			/* disable already, no need to disable again */
++			if (!pipe_ctx->stream->dpms_off)
++				core_link_disable_stream(pipe_ctx_old, FREE_ACQUIRED_RESOURCE);
++
+ 			pipe_ctx_old->stream_res.tg->funcs->set_blank(pipe_ctx_old->stream_res.tg, true);
+ 			if (!hwss_wait_for_blank_complete(pipe_ctx_old->stream_res.tg)) {
+ 				dm_error("DC: failed to blank crtc!\n");
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 953231f..a0d55ec 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -1090,12 +1090,11 @@ static void reset_back_end_for_pipe(
+ 		return;
+ 	}
+ 
+-	/* TODOFPGA break core_link_disable_stream into 2 functions:
+-	 * disable_stream and disable_link. disable_link will disable PHYPLL
+-	 * which is used by otg. Move disable_link after disable_crtc
+-	 */
+-	if (!IS_FPGA_MAXIMUS_DC(dc->ctx->dce_environment))
+-		core_link_disable_stream(pipe_ctx, FREE_ACQUIRED_RESOURCE);
++	if (!IS_FPGA_MAXIMUS_DC(dc->ctx->dce_environment)) {
++		/* DPMS may already disable */
++		if (!pipe_ctx->stream->dpms_off)
++			core_link_disable_stream(pipe_ctx, FREE_ACQUIRED_RESOURCE);
++	}
+ 
+ 	/* by upper caller loop, parent pipe: pipe0, will be reset last.
+ 	 * back end share by all pipes and will be disable only when disable
+-- 
+2.7.4
+

@@ -1,0 +1,158 @@
+From e672d76cb61f2182a56aa1fd471990d340976238 Mon Sep 17 00:00:00 2001
+From: Charlene Liu <charlene.liu@amd.com>
+Date: Wed, 9 Aug 2017 14:03:34 -0400
+Subject: [PATCH 3438/5855] drm/amd/display: fix eDP bootup/S4 backlight on
+
+also pass-in correct dispclk tor DMCU
+
+Signed-off-by: Charlene Liu <charlene.liu@amd.com>
+Reviewed-by: Anthony Koo <Anthony.Koo@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_resource.c  | 12 +++++-------
+ drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c    | 22 ++++++++++++++--------
+ .../gpu/drm/amd/display/dc/dce/dce_link_encoder.c  |  2 ++
+ .../gpu/drm/amd/display/dc/inc/hw/display_clock.h  |  2 +-
+ 4 files changed, 22 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 611a095..071d5ba 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -169,16 +169,14 @@ static void update_num_audio(
+ 	unsigned int *num_audio,
+ 	struct audio_support *aud_support)
+ {
++	aud_support->dp_audio = true;
++	aud_support->hdmi_audio_native = false;
++	aud_support->hdmi_audio_on_dongle = false;
++
+ 	if (straps->hdmi_disable == 0) {
+-		aud_support->hdmi_audio_native = true;
+-		aud_support->hdmi_audio_on_dongle = true;
+-		aud_support->dp_audio = true;
+-	} else {
+ 		if (straps->dc_pinstraps_audio & 0x2) {
+ 			aud_support->hdmi_audio_on_dongle = true;
+-			aud_support->dp_audio = true;
+-		} else {
+-			aud_support->dp_audio = true;
++			aud_support->hdmi_audio_native = true;
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c b/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c
+index a73228b..7bb2eaf 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_clocks.c
+@@ -327,13 +327,14 @@ static bool dce_clock_set_min_clocks_state(
+ 	return true;
+ }
+ 
+-static void dce_set_clock(
++static int dce_set_clock(
+ 	struct display_clock *clk,
+ 	int requested_clk_khz)
+ {
+ 	struct dce_disp_clk *clk_dce = TO_DCE_CLOCKS(clk);
+ 	struct bp_pixel_clock_parameters pxl_clk_params = { 0 };
+ 	struct dc_bios *bp = clk->ctx->dc_bios;
++	int actual_clock = requested_clk_khz;
+ 
+ 	/* Make sure requested clock isn't lower than minimum threshold*/
+ 	if (requested_clk_khz > 0)
+@@ -351,15 +352,17 @@ static void dce_set_clock(
+ 		/* Cache the fixed display clock*/
+ 		clk_dce->dfs_bypass_disp_clk =
+ 			pxl_clk_params.dfs_bypass_display_clock;
++		actual_clock = pxl_clk_params.dfs_bypass_display_clock;
+ 	}
+ 
+ 	/* from power down, we need mark the clock state as ClocksStateNominal
+ 	 * from HWReset, so when resume we will call pplib voltage regulator.*/
+ 	if (requested_clk_khz == 0)
+ 		clk->cur_min_clks_state = DM_PP_CLOCKS_STATE_NOMINAL;
++	return actual_clock;
+ }
+ 
+-static void dce_psr_set_clock(
++static int dce_psr_set_clock(
+ 	struct display_clock *clk,
+ 	int requested_clk_khz)
+ {
+@@ -367,13 +370,15 @@ static void dce_psr_set_clock(
+ 	struct dc_context *ctx = clk_dce->base.ctx;
+ 	struct core_dc *core_dc = DC_TO_CORE(ctx->dc);
+ 	struct dmcu *dmcu = core_dc->res_pool->dmcu;
++	int actual_clk_khz = requested_clk_khz;
+ 
+-	dce_set_clock(clk, requested_clk_khz);
++	actual_clk_khz = dce_set_clock(clk, requested_clk_khz);
+ 
+-	dmcu->funcs->set_psr_wait_loop(dmcu, requested_clk_khz / 1000 / 7);
++	dmcu->funcs->set_psr_wait_loop(dmcu, actual_clk_khz / 1000 / 7);
++	return actual_clk_khz;
+ }
+ 
+-static void dce112_set_clock(
++static int dce112_set_clock(
+ 	struct display_clock *clk,
+ 	int requested_clk_khz)
+ {
+@@ -383,7 +388,7 @@ static void dce112_set_clock(
+ 	struct core_dc *core_dc = DC_TO_CORE(clk->ctx->dc);
+ 	struct abm *abm =  core_dc->res_pool->abm;
+ 	struct dmcu *dmcu = core_dc->res_pool->dmcu;
+-
++	int actual_clock = requested_clk_khz;
+ 	/* Prepare to program display clock*/
+ 	memset(&dce_clk_params, 0, sizeof(dce_clk_params));
+ 
+@@ -397,6 +402,7 @@ static void dce112_set_clock(
+ 	dce_clk_params.clock_type = DCECLOCK_TYPE_DISPLAY_CLOCK;
+ 
+ 	bp->funcs->set_dce_clock(bp, &dce_clk_params);
++	actual_clock = dce_clk_params.target_clock_frequency;
+ 
+ 	/* from power down, we need mark the clock state as ClocksStateNominal
+ 	 * from HWReset, so when resume we will call pplib voltage regulator.*/
+@@ -415,8 +421,8 @@ static void dce112_set_clock(
+ 
+ 	if (abm->funcs->is_dmcu_initialized(abm))
+ 		dmcu->funcs->set_psr_wait_loop(dmcu,
+-				requested_clk_khz / 1000 / 7);
+-
++				actual_clock / 1000 / 7);
++	return actual_clock;
+ }
+ 
+ static void dce_clock_read_integrated_info(struct dce_disp_clk *clk_dce)
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+index 7e9afab8..0dab5ba 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+@@ -1288,6 +1288,8 @@ void dce110_link_encoder_disable_output(
+ 		/* OF_SKIP_POWER_DOWN_INACTIVE_ENCODER */
+ 		return;
+ 	}
++	if (enc110->base.connector.id == CONNECTOR_ID_EDP)
++		dce110_link_encoder_edp_backlight_control(enc, false);
+ 	/* Power-down RX and disable GPU PHY should be paired.
+ 	 * Disabling PHY without powering down RX may cause
+ 	 * symbol lock loss, on which we will get DP Sink interrupt. */
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/display_clock.h b/drivers/gpu/drm/amd/display/dc/inc/hw/display_clock.h
+index 879c3db..f5f69cd 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/display_clock.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/display_clock.h
+@@ -62,7 +62,7 @@ struct display_clock {
+ };
+ 
+ struct display_clock_funcs {
+-	void (*set_clock)(struct display_clock *disp_clk,
++	int (*set_clock)(struct display_clock *disp_clk,
+ 		int requested_clock_khz);
+ 
+ 	enum dm_pp_clocks_state (*get_required_clocks_state)(
+-- 
+2.7.4
+

@@ -1,0 +1,147 @@
+From 1ff0423ee7ae5c4f7740cec26d8dfdb8d90195e4 Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Date: Wed, 8 Nov 2017 17:12:31 -0500
+Subject: [PATCH 5704/5855] drm/amdkfd: Fix suspend / resume
+
+When suspend callback is called for the first KFD device, suspend queues
+of all the processes.
+During resume, after the last KFD device is resumed, start restore
+worker thread for each process
+
+Change-Id: Ibebabec9e1778ec8bcc7c486a5333217e85bb156
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c  | 18 ++++++++++++++--
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  3 +++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c | 37 ++++++++++++++++++++++++++++++++
+ 3 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 71c0fad..871cc30 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -33,6 +33,7 @@
+ #include "cwsr_trap_handler_gfx9.asm"
+ 
+ #define MQD_SIZE_ALIGNED 768
++static atomic_t kfd_device_suspended = ATOMIC_INIT(0);
+ 
+ #if defined(CONFIG_AMD_IOMMU_V2_MODULE) || defined(CONFIG_AMD_IOMMU_V2)
+ static const struct kfd_device_info kaveri_device_info = {
+@@ -691,6 +692,10 @@ void kgd2kfd_suspend(struct kfd_dev *kfd)
+         if (!kfd->init_complete)
+                 return;
+ 
++        /* For first KFD device suspend all the KFD processes */
++        if (atomic_inc_return(&kfd_device_suspended) == 1)
++                kfd_suspend_all_processes();
++
+         kfd->dqm->ops.stop(kfd->dqm);
+ #if defined(CONFIG_AMD_IOMMU_V2_MODULE) || defined(CONFIG_AMD_IOMMU_V2)
+         if (!kfd->device_info->is_need_iommu_device)
+@@ -706,6 +711,7 @@ void kgd2kfd_suspend(struct kfd_dev *kfd)
+ 
+ int kgd2kfd_resume(struct kfd_dev *kfd)
+ {
++	int ret;
+ #if !defined(KFD_NO_IOMMU_V2_SUPPORT)
+ 	if (kfd->device_info->is_need_iommu_device) {
+                 unsigned int pasid_limit = kfd_get_pasid_limit();
+@@ -713,7 +719,15 @@ int kgd2kfd_resume(struct kfd_dev *kfd)
+        if (!kfd->init_complete)
+                return 0;
+ 
+-       return kfd_resume(kfd);
++        ret = kfd_resume(kfd);
++        if (ret)
++                return ret;
++
++        if (atomic_dec_return(&kfd_device_suspended) == 0)
++                ret = kfd_resume_all_processes();
++        WARN(atomic_read(&kfd_device_suspended) < 0,
++             "KFD suspend / resume ref. error\n");
++        return ret;
+ 
+ }
+ 
+@@ -787,7 +801,7 @@ void kgd2kfd_interrupt(struct kfd_dev *kfd, const void *ih_ring_entry)
+ /* quiesce_process_mm -
+  *  Quiesce all user queues that belongs to given process p
+  */
+-static int quiesce_process_mm(struct kfd_process *p)
++int quiesce_process_mm(struct kfd_process *p)
+ {
+ 	struct kfd_process_device *pdd;
+ 	int r = 0;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 870fb55..724371b 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -603,6 +603,7 @@ void kfd_evict_bo_worker(struct work_struct *work);
+ void kfd_restore_bo_worker(struct work_struct *work);
+ int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
+ 					       struct dma_fence *fence);
++int quiesce_process_mm(struct kfd_process *p);
+ 
+ 
+ /* 8 byte handle containing GPU ID in the most significant 4 bytes and
+@@ -767,6 +768,8 @@ struct kfd_process *kfd_get_process(const struct task_struct *task);
+ struct kfd_process *kfd_lookup_process_by_pasid(unsigned int pasid);
+ struct kfd_process *kfd_lookup_process_by_mm(const struct mm_struct *mm);
+ void kfd_unref_process(struct kfd_process *p);
++void kfd_suspend_all_processes(void);
++int kfd_resume_all_processes(void);
+ 
+ struct kfd_process_device *kfd_bind_process_to_device(struct kfd_dev *dev,
+ 							struct kfd_process *p);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index e8fe04e..404124c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -1052,6 +1052,43 @@ struct kfd_process *kfd_lookup_process_by_pasid(unsigned int pasid)
+ 	return ret_p;
+ }
+ 
++void kfd_suspend_all_processes(void)
++{
++	struct kfd_process *p;
++	unsigned int temp;
++	int idx = srcu_read_lock(&kfd_processes_srcu);
++
++	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
++		if (cancel_delayed_work_sync(&p->eviction_work.dwork))
++			dma_fence_put(p->eviction_work.quiesce_fence);
++		cancel_delayed_work_sync(&p->restore_work);
++
++		if (quiesce_process_mm(p))
++			pr_err("Failed to suspend process %d\n", p->pasid);
++		dma_fence_signal(p->ef);
++		dma_fence_put(p->ef);
++		p->ef = NULL;
++	}
++	srcu_read_unlock(&kfd_processes_srcu, idx);
++}
++
++int kfd_resume_all_processes(void)
++{
++	struct kfd_process *p;
++	unsigned int temp;
++	int ret = 0, idx = srcu_read_lock(&kfd_processes_srcu);
++
++	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
++		if (!schedule_delayed_work(&p->restore_work, 0)) {
++			pr_err("Restore process %d failed during resume\n",
++			       p->pasid);
++			ret = -EFAULT;
++		}
++	}
++	srcu_read_unlock(&kfd_processes_srcu, idx);
++	return ret;
++}
++
+ /* This increments the process->ref counter. */
+ struct kfd_process *kfd_lookup_process_by_mm(const struct mm_struct *mm)
+ {
+-- 
+2.7.4
+

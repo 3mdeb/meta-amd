@@ -1,0 +1,1304 @@
+From 75876f197c5967c050e32dc6fcc260a0fd437b9f Mon Sep 17 00:00:00 2001
+From: Eric Bernstein <eric.bernstein@amd.com>
+Date: Mon, 6 Nov 2017 16:38:55 -0500
+Subject: [PATCH 4396/5855] drm/amd/display: Integrating MPC pseudocode
+
+Integrating MPC pseudocode to support new blending cases
+with secondary MPCC list.
+This includes a design change to MPC data structures and
+interfaces.
+
+Signed-off-by: Eric Bernstein <eric.bernstein@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/dc_hw_types.h       |   2 -
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  | 144 +++---
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c   | 535 ++++++++++++---------
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.h   |  93 +++-
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.c   |   9 +-
+ drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h        | 164 ++++++-
+ drivers/gpu/drm/amd/display/dc/inc/hw/opp.h        |   3 +-
+ 7 files changed, 594 insertions(+), 356 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+index 1badf20..02ff6a2 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+@@ -582,8 +582,6 @@ enum dc_timing_standard {
+ 	TIMING_STANDARD_MAX
+ };
+ 
+-
+-
+ enum dc_color_depth {
+ 	COLOR_DEPTH_UNDEFINED,
+ 	COLOR_DEPTH_666,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 346a3b0..a470797 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -626,28 +626,25 @@ static void plane_atomic_disconnect(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ 	int fe_idx = pipe_ctx->pipe_idx;
+ 	struct hubp *hubp = dc->res_pool->hubps[fe_idx];
+ 	struct mpc *mpc = dc->res_pool->mpc;
+-	int opp_id, z_idx;
+-	int mpcc_id = -1;
++	int opp_id;
++	struct mpc_tree *mpc_tree_params;
++	struct mpcc *mpcc_to_remove = NULL;
+ 
+ 	/* look at tree rather than mi here to know if we already reset */
+ 	for (opp_id = 0; opp_id < dc->res_pool->pipe_count; opp_id++) {
+ 		struct output_pixel_processor *opp = dc->res_pool->opps[opp_id];
+ 
+-		for (z_idx = 0; z_idx < opp->mpc_tree.num_pipes; z_idx++) {
+-			if (opp->mpc_tree.dpp[z_idx] == fe_idx) {
+-				mpcc_id = opp->mpc_tree.mpcc[z_idx];
+-				break;
+-			}
+-		}
+-		if (mpcc_id != -1)
++		mpc_tree_params = &(opp->mpc_tree_params);
++		mpcc_to_remove = mpc->funcs->get_mpcc_for_dpp(mpc_tree_params, fe_idx);
++		if (mpcc_to_remove != NULL)
+ 			break;
+ 	}
++
+ 	/*Already reset*/
+ 	if (opp_id == dc->res_pool->pipe_count)
+ 		return;
+ 
+-	mpc->funcs->remove(mpc, &(dc->res_pool->opps[opp_id]->mpc_tree),
+-					dc->res_pool->opps[opp_id]->inst, fe_idx);
++	mpc->funcs->remove_mpcc(mpc, mpc_tree_params, mpcc_to_remove);
+ 
+ 	if (hubp->funcs->hubp_disconnect)
+ 		hubp->funcs->hubp_disconnect(hubp);
+@@ -705,7 +702,7 @@ static void plane_atomic_disable(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ 	REG_UPDATE(DPP_CONTROL[fe_idx],
+ 			DPP_CLOCK_ENABLE, 0);
+ 
+-	if (opp_id != 0xf && dc->res_pool->opps[opp_id]->mpc_tree.num_pipes == 0)
++	if (opp_id != 0xf && dc->res_pool->opps[opp_id]->mpc_tree_params.opp_list == NULL)
+ 		REG_UPDATE(OPP_PIPE_CONTROL[opp_id],
+ 				OPP_PIPE_CLOCK_EN, 0);
+ 
+@@ -730,7 +727,7 @@ static void dcn10_disable_plane(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ 
+ static void dcn10_init_hw(struct dc *dc)
+ {
+-	int i;
++	int i, opp_id;
+ 	struct abm *abm = dc->res_pool->abm;
+ 	struct dmcu *dmcu = dc->res_pool->dmcu;
+ 	struct dce_hwseq *hws = dc->hwseq;
+@@ -793,17 +790,19 @@ static void dcn10_init_hw(struct dc *dc)
+ 		}
+ 	}
+ 
++	/* Initialize MPC tree based on HW values */
++	for (opp_id = 0; opp_id < dc->res_pool->pipe_count; opp_id++) {
++		struct output_pixel_processor *opp = dc->res_pool->opps[opp_id];
++		struct mpc_tree *mpc_tree_params = &(opp->mpc_tree_params);
++
++		dc->res_pool->mpc->funcs->init_mpcc_list_from_hw(dc->res_pool->mpc, mpc_tree_params);
++	}
++
+ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+ 		struct timing_generator *tg = dc->res_pool->timing_generators[i];
+ 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
+-		struct output_pixel_processor *opp = dc->res_pool->opps[i];
+-		struct mpc_tree_cfg *mpc_tree = &opp->mpc_tree;
+ 		struct hubp *hubp = dc->res_pool->hubps[i];
+ 
+-		mpc_tree->dpp[0] = i;
+-		mpc_tree->mpcc[0] = i;
+-		mpc_tree->num_pipes = 1;
+-
+ 		pipe_ctx->stream_res.tg = tg;
+ 		pipe_ctx->pipe_idx = i;
+ 
+@@ -1753,38 +1752,6 @@ static void program_csc_matrix(struct pipe_ctx *pipe_ctx,
+ 	}
+ }
+ 
+-static void set_mpc_output_csc(struct dc *dc,
+-		struct pipe_ctx *pipe_ctx,
+-		enum dc_color_space colorspace,
+-		uint16_t *matrix,
+-		int opp_id)
+-{
+-	struct mpc *mpc = dc->res_pool->mpc;
+-	int i;
+-	struct out_csc_color_matrix tbl_entry;
+-	enum mpc_output_csc_mode ocsc_mode = MPC_OUTPUT_CSC_COEF_A;
+-
+-
+-	if (pipe_ctx->stream->csc_color_matrix.enable_adjustment == true) {
+-		//uint16_t matrix[12];
+-		for (i = 0; i < 12; i++)
+-			tbl_entry.regval[i] = matrix[i];
+-		tbl_entry.color_space = colorspace;
+-
+-		if (mpc->funcs->set_output_csc != NULL)
+-			mpc->funcs->set_output_csc(mpc,
+-					opp_id,
+-					&tbl_entry,
+-					ocsc_mode);
+-	} else {
+-		if (mpc->funcs->set_ocsc_default != NULL)
+-			mpc->funcs->set_ocsc_default(mpc,
+-					opp_id,
+-					colorspace,
+-					ocsc_mode);
+-	}
+-}
+-
+ static void program_output_csc(struct dc *dc,
+ 		struct pipe_ctx *pipe_ctx,
+ 		enum dc_color_space colorspace,
+@@ -1795,13 +1762,6 @@ static void program_output_csc(struct dc *dc,
+ 		program_csc_matrix(pipe_ctx,
+ 				colorspace,
+ 				matrix);
+-	else
+-		set_mpc_output_csc(dc,
+-			pipe_ctx,
+-			colorspace,
+-			matrix,
+-			opp_id);
+-
+ }
+ 
+ static bool is_lower_pipe_tree_visible(struct pipe_ctx *pipe_ctx)
+@@ -1972,35 +1932,73 @@ static void update_dpp(struct dpp *dpp, struct dc_plane_state *plane_state)
+ 
+ static void update_mpcc(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ {
+-	struct mpcc_cfg mpcc_cfg = {0};
+ 	struct hubp *hubp = pipe_ctx->plane_res.hubp;
+-	struct pipe_ctx *top_pipe;
+-	bool per_pixel_alpha =
+-			pipe_ctx->plane_state->per_pixel_alpha && pipe_ctx->bottom_pipe;
++	struct mpcc_blnd_cfg blnd_cfg;
++	bool per_pixel_alpha = pipe_ctx->plane_state->per_pixel_alpha && pipe_ctx->bottom_pipe;
++	int mpcc_id;
++	struct mpcc *new_mpcc;
++	struct mpc *mpc = dc->res_pool->mpc;
++	struct mpc_tree *mpc_tree_params = &(pipe_ctx->stream_res.opp->mpc_tree_params);
+ 
+ 	/* TODO: proper fix once fpga works */
+ 
+-	mpcc_cfg.dpp_id = hubp->inst;
+-	mpcc_cfg.opp_id = pipe_ctx->stream_res.opp->inst;
+-	mpcc_cfg.tree_cfg = &(pipe_ctx->stream_res.opp->mpc_tree);
+-	for (top_pipe = pipe_ctx->top_pipe; top_pipe; top_pipe = top_pipe->top_pipe)
+-		mpcc_cfg.z_index++;
+ 	if (dc->debug.surface_visual_confirm)
+ 		dcn10_get_surface_visual_confirm_color(
+-				pipe_ctx, &mpcc_cfg.black_color);
++				pipe_ctx, &blnd_cfg.black_color);
+ 	else
+ 		color_space_to_black_color(
+ 			dc, pipe_ctx->stream->output_color_space,
+-			&mpcc_cfg.black_color);
+-	mpcc_cfg.per_pixel_alpha = per_pixel_alpha;
++			&blnd_cfg.black_color);
++
++	if (per_pixel_alpha)
++		blnd_cfg.alpha_mode = MPCC_ALPHA_BLEND_MODE_PER_PIXEL_ALPHA;
++	else
++		blnd_cfg.alpha_mode = MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA;
++
++	blnd_cfg.overlap_only = false;
++	blnd_cfg.global_alpha = 0xff;
++	blnd_cfg.global_gain = 0xff;
++
+ 	/* DCN1.0 has output CM before MPC which seems to screw with
+ 	 * pre-multiplied alpha.
+ 	 */
+-	mpcc_cfg.pre_multiplied_alpha = is_rgb_cspace(
++	blnd_cfg.pre_multiplied_alpha = is_rgb_cspace(
+ 			pipe_ctx->stream->output_color_space)
+ 					&& per_pixel_alpha;
+-	hubp->mpcc_id = dc->res_pool->mpc->funcs->add(dc->res_pool->mpc, &mpcc_cfg);
+-	hubp->opp_id = mpcc_cfg.opp_id;
++
++	/*
++	 * TODO: remove hack
++	 * Note: currently there is a bug in init_hw such that
++	 * on resume from hibernate, BIOS sets up MPCC0, and
++	 * we do mpcc_remove but the mpcc cannot go to idle
++	 * after remove. This cause us to pick mpcc1 here,
++	 * which causes a pstate hang for yet unknown reason.
++	 */
++	mpcc_id = hubp->inst;
++
++	/* check if this MPCC is already being used */
++	new_mpcc = mpc->funcs->get_mpcc_for_dpp(mpc_tree_params, mpcc_id);
++	/* remove MPCC if being used */
++	if (new_mpcc != NULL)
++		mpc->funcs->remove_mpcc(mpc, mpc_tree_params, new_mpcc);
++
++	if (dc->debug.sanity_checks)
++		mpc->funcs->assert_mpcc_idle_before_connect(
++				dc->res_pool->mpc, mpcc_id);
++
++	/* Call MPC to insert new plane */
++	new_mpcc = mpc->funcs->insert_plane(dc->res_pool->mpc,
++			mpc_tree_params,
++			&blnd_cfg,
++			NULL,
++			NULL,
++			hubp->inst,
++			mpcc_id);
++
++	ASSERT(new_mpcc != NULL);
++
++	hubp->opp_id = pipe_ctx->stream_res.opp->inst;
++	hubp->mpcc_id = mpcc_id;
+ }
+ 
+ static void update_scaler(struct pipe_ctx *pipe_ctx)
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c
+index b016f4c..e926c29 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c
+@@ -25,8 +25,6 @@
+ 
+ #include "reg_helper.h"
+ #include "dcn10_mpc.h"
+-#include "dc.h"
+-#include "mem_input.h"
+ 
+ #define REG(reg)\
+ 	mpc10->mpc_regs->reg
+@@ -38,17 +36,13 @@
+ #define FN(reg_name, field_name) \
+ 	mpc10->mpc_shift->field_name, mpc10->mpc_mask->field_name
+ 
+-#define MODE_TOP_ONLY 1
+-#define MODE_BLEND 3
+-#define BLND_PP_ALPHA 0
+-#define BLND_GLOBAL_ALPHA 2
+ 
+-
+-static void mpc10_set_bg_color(
+-		struct dcn10_mpc *mpc10,
++void mpc1_set_bg_color(struct mpc *mpc,
+ 		struct tg_color *bg_color,
+-		int id)
++		int mpcc_id)
+ {
++	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
++
+ 	/* mpc color is 12 bit.  tg_color is 10 bit */
+ 	/* todo: might want to use 16 bit to represent color and have each
+ 	 * hw block translate to correct color depth.
+@@ -57,15 +51,47 @@ static void mpc10_set_bg_color(
+ 	uint32_t bg_g_y = bg_color->color_g_y << 2;
+ 	uint32_t bg_b_cb = bg_color->color_b_cb << 2;
+ 
+-	REG_SET(MPCC_BG_R_CR[id], 0,
++	REG_SET(MPCC_BG_R_CR[mpcc_id], 0,
+ 			MPCC_BG_R_CR, bg_r_cr);
+-	REG_SET(MPCC_BG_G_Y[id], 0,
++	REG_SET(MPCC_BG_G_Y[mpcc_id], 0,
+ 			MPCC_BG_G_Y, bg_g_y);
+-	REG_SET(MPCC_BG_B_CB[id], 0,
++	REG_SET(MPCC_BG_B_CB[mpcc_id], 0,
+ 			MPCC_BG_B_CB, bg_b_cb);
+ }
+ 
+-void mpc10_assert_idle_mpcc(struct mpc *mpc, int id)
++static void mpc1_update_blending(
++	struct mpc *mpc,
++	struct mpcc_blnd_cfg *blnd_cfg,
++	int mpcc_id)
++{
++	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
++
++	REG_UPDATE_5(MPCC_CONTROL[mpcc_id],
++			MPCC_ALPHA_BLND_MODE,		blnd_cfg->alpha_mode,
++			MPCC_ALPHA_MULTIPLIED_MODE,	blnd_cfg->pre_multiplied_alpha,
++			MPCC_BLND_ACTIVE_OVERLAP_ONLY,	blnd_cfg->overlap_only,
++			MPCC_GLOBAL_ALPHA,		blnd_cfg->global_alpha,
++			MPCC_GLOBAL_GAIN,		blnd_cfg->global_gain);
++
++	mpc1_set_bg_color(mpc, &blnd_cfg->black_color, mpcc_id);
++}
++
++void mpc1_update_stereo_mix(
++	struct mpc *mpc,
++	struct mpcc_sm_cfg *sm_cfg,
++	int mpcc_id)
++{
++	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
++
++	REG_UPDATE_6(MPCC_SM_CONTROL[mpcc_id],
++			MPCC_SM_EN,			sm_cfg->enable,
++			MPCC_SM_MODE,			sm_cfg->sm_mode,
++			MPCC_SM_FRAME_ALT,		sm_cfg->frame_alt,
++			MPCC_SM_FIELD_ALT,		sm_cfg->field_alt,
++			MPCC_SM_FORCE_NEXT_FRAME_POL,	sm_cfg->force_next_frame_porlarity,
++			MPCC_SM_FORCE_NEXT_TOP_POL,	sm_cfg->force_next_field_polarity);
++}
++void mpc1_assert_idle_mpcc(struct mpc *mpc, int id)
+ {
+ 	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
+ 
+@@ -75,39 +101,62 @@ void mpc10_assert_idle_mpcc(struct mpc *mpc, int id)
+ 			1, 100000);
+ }
+ 
+-static int mpc10_get_idle_mpcc_id(struct dcn10_mpc *mpc10)
++static int mpc1_get_opp_id(struct mpc *mpc, int mpcc_id)
+ {
+-	int i;
+-	int last_free_mpcc_id = -1;
++	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
++	unsigned int opp_id = 0xF;
+ 
+-	for (i = 0; i < mpc10->num_mpcc; i++) {
+-		uint32_t is_idle = 0;
++	REG_GET(MPCC_OPP_ID[mpcc_id], MPCC_OPP_ID, &opp_id);
+ 
+-		if (mpc10->mpcc_in_use_mask & 1 << i)
+-			continue;
++	return opp_id;
++}
+ 
+-		last_free_mpcc_id = i;
+-		REG_GET(MPCC_STATUS[i], MPCC_IDLE, &is_idle);
+-		if (is_idle)
+-			return i;
+-	}
++struct mpcc *mpc1_get_mpcc(struct mpc *mpc, int mpcc_id)
++{
++	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
+ 
+-	/* This assert should never trigger, we have mpcc leak if it does */
+-	ASSERT(last_free_mpcc_id != -1);
++	ASSERT(mpcc_id < mpc10->num_mpcc);
++	return &(mpc->mpcc_array[mpcc_id]);
++}
++
++struct mpcc *mpc1_get_mpcc_for_dpp(struct mpc_tree *tree, int dpp_id)
++{
++	struct mpcc *tmp_mpcc = tree->opp_list;
++
++	while (tmp_mpcc != NULL) {
++		if (tmp_mpcc->dpp_id == dpp_id)
++			return tmp_mpcc;
++		tmp_mpcc = tmp_mpcc->mpcc_bot;
++	}
++	return NULL;
++}
+ 
+-	mpc10_assert_idle_mpcc(&mpc10->base, last_free_mpcc_id);
+-	return last_free_mpcc_id;
++bool mpc1_is_mpcc_idle(struct mpc *mpc, int mpcc_id)
++{
++	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
++	unsigned int top_sel;
++	unsigned int opp_id;
++	unsigned int idle;
++
++	REG_GET(MPCC_TOP_SEL[mpcc_id], MPCC_TOP_SEL, &top_sel);
++	REG_GET(MPCC_OPP_ID[mpcc_id],  MPCC_OPP_ID, &opp_id);
++	REG_GET(MPCC_STATUS[mpcc_id],  MPCC_IDLE,   &idle);
++	if (top_sel == 0xf && opp_id == 0xf && idle)
++		return true;
++	else
++		return false;
+ }
+ 
+-static void mpc10_assert_mpcc_idle_before_connect(struct dcn10_mpc *mpc10, int id)
++void mpc1_assert_mpcc_idle_before_connect(struct mpc *mpc, int mpcc_id)
+ {
++	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
+ 	unsigned int top_sel, mpc_busy, mpc_idle;
+ 
+-	REG_GET(MPCC_TOP_SEL[id],
++	REG_GET(MPCC_TOP_SEL[mpcc_id],
+ 			MPCC_TOP_SEL, &top_sel);
+ 
+ 	if (top_sel == 0xf) {
+-		REG_GET_2(MPCC_STATUS[id],
++		REG_GET_2(MPCC_STATUS[mpcc_id],
+ 				MPCC_BUSY, &mpc_busy,
+ 				MPCC_IDLE, &mpc_idle);
+ 
+@@ -116,241 +165,258 @@ static void mpc10_assert_mpcc_idle_before_connect(struct dcn10_mpc *mpc10, int i
+ 	}
+ }
+ 
+-void mpc10_mpcc_remove(
+-		struct mpc *mpc,
+-		struct mpc_tree_cfg *tree_cfg,
+-		int opp_id,
+-		int dpp_id)
+-{
+-	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
+-	int mpcc_id, z_idx;
+-
+-	/* find z_idx for the dpp to be removed */
+-	for (z_idx = 0; z_idx < tree_cfg->num_pipes; z_idx++)
+-		if (tree_cfg->dpp[z_idx] == dpp_id)
+-			break;
+-
+-	if (z_idx == tree_cfg->num_pipes) {
+-		/* In case of resume from S3/S4, remove mpcc from bios left over */
+-		REG_SET(MPCC_OPP_ID[dpp_id], 0,
+-				MPCC_OPP_ID, 0xf);
+-		REG_SET(MPCC_TOP_SEL[dpp_id], 0,
+-				MPCC_TOP_SEL, 0xf);
+-		REG_SET(MPCC_BOT_SEL[dpp_id], 0,
+-				MPCC_BOT_SEL, 0xf);
+-		return;
+-	}
+-
+-	mpcc_id = tree_cfg->mpcc[z_idx];
+-
+-	REG_SET(MPCC_OPP_ID[mpcc_id], 0,
+-			MPCC_OPP_ID, 0xf);
+-	REG_SET(MPCC_TOP_SEL[mpcc_id], 0,
+-			MPCC_TOP_SEL, 0xf);
+-	REG_SET(MPCC_BOT_SEL[mpcc_id], 0,
+-			MPCC_BOT_SEL, 0xf);
+-
+-	if (z_idx > 0) {
+-		int top_mpcc_id = tree_cfg->mpcc[z_idx - 1];
+-
+-		if (z_idx + 1 < tree_cfg->num_pipes)
+-			/* mpcc to be removed is in the middle of the tree */
+-			REG_SET(MPCC_BOT_SEL[top_mpcc_id], 0,
+-					MPCC_BOT_SEL, tree_cfg->mpcc[z_idx + 1]);
+-		else {
+-			/* mpcc to be removed is at the bottom of the tree */
+-			REG_SET(MPCC_BOT_SEL[top_mpcc_id], 0,
+-					MPCC_BOT_SEL, 0xf);
+-			REG_UPDATE(MPCC_CONTROL[top_mpcc_id],
+-					MPCC_MODE, MODE_TOP_ONLY);
+-		}
+-	} else if (tree_cfg->num_pipes > 1)
+-		/* mpcc to be removed is at the top of the tree */
+-		REG_SET(MUX[opp_id], 0,
+-				MPC_OUT_MUX, tree_cfg->mpcc[z_idx + 1]);
+-	else
+-		/* mpcc to be removed is the only one in the tree */
+-		REG_SET(MUX[opp_id], 0, MPC_OUT_MUX, 0xf);
+-
+-	/* mark this mpcc as not in use */
+-	mpc10->mpcc_in_use_mask &= ~(1 << mpcc_id);
+-	tree_cfg->num_pipes--;
+-	for (; z_idx < tree_cfg->num_pipes; z_idx++) {
+-		tree_cfg->dpp[z_idx] = tree_cfg->dpp[z_idx + 1];
+-		tree_cfg->mpcc[z_idx] = tree_cfg->mpcc[z_idx + 1];
+-	}
+-	tree_cfg->dpp[tree_cfg->num_pipes] = 0xdeadbeef;
+-	tree_cfg->mpcc[tree_cfg->num_pipes] = 0xdeadbeef;
+-}
+-
+-static void mpc10_add_to_tree_cfg(
++/*
++ * Insert DPP into MPC tree based on specified blending position.
++ * Only used for planes that are part of blending chain for OPP output
++ *
++ * Parameters:
++ * [in/out] mpc		- MPC context.
++ * [in/out] tree	- MPC tree structure that plane will be added to.
++ * [in]	blnd_cfg	- MPCC blending configuration for the new blending layer.
++ * [in]	sm_cfg		- MPCC stereo mix configuration for the new blending layer.
++ *			  stereo mix must disable for the very bottom layer of the tree config.
++ * [in]	insert_above_mpcc - Insert new plane above this MPCC.  If NULL, insert as bottom plane.
++ * [in]	dpp_id		- DPP instance for the plane to be added.
++ * [in]	mpcc_id		- The MPCC physical instance to use for blending.
++ *
++ * Return:  struct mpcc* - MPCC that was added.
++ */
++struct mpcc *mpc1_insert_plane(
+ 	struct mpc *mpc,
+-	struct mpcc_cfg *cfg,
++	struct mpc_tree *tree,
++	struct mpcc_blnd_cfg *blnd_cfg,
++	struct mpcc_sm_cfg *sm_cfg,
++	struct mpcc *insert_above_mpcc,
++	int dpp_id,
+ 	int mpcc_id)
+ {
+ 	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
+-	int mpcc_mode = MODE_TOP_ONLY;
+-	int position = cfg->z_index;
+-	struct mpc_tree_cfg *tree_cfg = cfg->tree_cfg;
+-	int alpha_blnd_mode = cfg->per_pixel_alpha ?
+-			BLND_PP_ALPHA : BLND_GLOBAL_ALPHA;
+-	int z_idx;
++	struct mpcc *new_mpcc = NULL;
+ 
+-	REG_SET(MPCC_OPP_ID[mpcc_id], 0,
+-			MPCC_OPP_ID, cfg->opp_id);
++	/* sanity check parameters */
++	ASSERT(mpcc_id < mpc10->num_mpcc);
++	ASSERT(!(mpc10->mpcc_in_use_mask & 1 << mpcc_id));
+ 
+-	REG_SET(MPCC_TOP_SEL[mpcc_id], 0,
+-			MPCC_TOP_SEL, cfg->dpp_id);
++	if (insert_above_mpcc) {
++		/* check insert_above_mpcc exist in tree->opp_list */
++		struct mpcc *temp_mpcc = tree->opp_list;
+ 
+-	if (position == 0) {
+-		/* idle dpp/mpcc is added to the top layer of tree */
++		while (temp_mpcc && temp_mpcc->mpcc_bot != insert_above_mpcc)
++			temp_mpcc = temp_mpcc->mpcc_bot;
++		if (temp_mpcc == NULL)
++			return NULL;
++	}
+ 
+-		if (tree_cfg->num_pipes > 0) {
+-			/* get instance of previous top mpcc */
+-			int prev_top_mpcc_id = tree_cfg->mpcc[0];
++	/* Get and update MPCC struct parameters */
++	new_mpcc = mpc1_get_mpcc(mpc, mpcc_id);
++	new_mpcc->dpp_id = dpp_id;
+ 
+-			REG_SET(MPCC_BOT_SEL[mpcc_id], 0,
+-					MPCC_BOT_SEL, prev_top_mpcc_id);
+-			mpcc_mode = MODE_BLEND;
++	/* program mux and MPCC_MODE */
++	if (insert_above_mpcc) {
++		new_mpcc->mpcc_bot = insert_above_mpcc;
++		REG_SET(MPCC_BOT_SEL[mpcc_id], 0, MPCC_BOT_SEL, insert_above_mpcc->mpcc_id);
++		REG_UPDATE(MPCC_CONTROL[mpcc_id], MPCC_MODE, MPCC_BLEND_MODE_TOP_BOT_BLENDING);
++	} else {
++		new_mpcc->mpcc_bot = NULL;
++		REG_SET(MPCC_BOT_SEL[mpcc_id], 0, MPCC_BOT_SEL, 0xf);
++		REG_UPDATE(MPCC_CONTROL[mpcc_id], MPCC_MODE, MPCC_BLEND_MODE_TOP_LAYER_PASSTHROUGH);
++	}
++	REG_SET(MPCC_TOP_SEL[mpcc_id], 0, MPCC_TOP_SEL, dpp_id);
++	REG_SET(MPCC_OPP_ID[mpcc_id], 0, MPCC_OPP_ID, tree->opp_id);
++
++	/* update mpc tree mux setting */
++	if (tree->opp_list == insert_above_mpcc) {
++		/* insert the toppest mpcc */
++		tree->opp_list = new_mpcc;
++		REG_SET(MUX[tree->opp_id], 0, MPC_OUT_MUX, mpcc_id);
++	} else {
++		/* find insert position */
++		struct mpcc *temp_mpcc = tree->opp_list;
++
++		while (temp_mpcc && temp_mpcc->mpcc_bot != insert_above_mpcc)
++			temp_mpcc = temp_mpcc->mpcc_bot;
++		if (temp_mpcc && temp_mpcc->mpcc_bot == insert_above_mpcc) {
++			REG_SET(MPCC_BOT_SEL[temp_mpcc->mpcc_id], 0, MPCC_BOT_SEL, mpcc_id);
++			temp_mpcc->mpcc_bot = new_mpcc;
++			if (!insert_above_mpcc)
++				REG_UPDATE(MPCC_CONTROL[temp_mpcc->mpcc_id],
++						MPCC_MODE, MPCC_BLEND_MODE_TOP_BOT_BLENDING);
+ 		}
++	}
+ 
+-		/* opp will get new output. from new added mpcc */
+-		REG_SET(MUX[cfg->opp_id], 0, MPC_OUT_MUX, mpcc_id);
+-
+-	} else if (position == tree_cfg->num_pipes) {
+-		/* idle dpp/mpcc is added to the bottom layer of tree */
+-
+-		/* get instance of previous bottom mpcc, set to middle layer */
+-		int prev_bot_mpcc_id = tree_cfg->mpcc[tree_cfg->num_pipes - 1];
+-
+-		REG_SET(MPCC_BOT_SEL[prev_bot_mpcc_id], 0,
+-				MPCC_BOT_SEL, mpcc_id);
+-		REG_UPDATE(MPCC_CONTROL[prev_bot_mpcc_id],
+-				MPCC_MODE, MODE_BLEND);
+-
+-		/* mpcc_id become new bottom mpcc*/
+-		REG_SET(MPCC_BOT_SEL[mpcc_id], 0,
+-				MPCC_BOT_SEL, 0xf);
++	/* update the blending configuration */
++	new_mpcc->blnd_cfg = *blnd_cfg;
++	mpc->funcs->update_blending(mpc, &new_mpcc->blnd_cfg, mpcc_id);
+ 
+-	} else {
+-		/* idle dpp/mpcc is added to middle of tree */
+-		int above_mpcc_id = tree_cfg->mpcc[position - 1];
+-		int below_mpcc_id = tree_cfg->mpcc[position];
+-
+-		/* mpcc above new mpcc_id has new bottom mux*/
+-		REG_SET(MPCC_BOT_SEL[above_mpcc_id], 0,
+-				MPCC_BOT_SEL, mpcc_id);
+-		REG_UPDATE(MPCC_CONTROL[above_mpcc_id],
+-				MPCC_MODE, MODE_BLEND);
+-
+-		/* mpcc_id bottom mux is from below mpcc*/
+-		REG_SET(MPCC_BOT_SEL[mpcc_id], 0,
+-				MPCC_BOT_SEL, below_mpcc_id);
+-		mpcc_mode = MODE_BLEND;
++	/* update the stereo mix settings, if provided */
++	if (sm_cfg != NULL) {
++		new_mpcc->sm_cfg = *sm_cfg;
++		mpc1_update_stereo_mix(mpc, sm_cfg, mpcc_id);
+ 	}
+ 
+-	REG_SET_4(MPCC_CONTROL[mpcc_id], 0xffffffff,
+-		MPCC_MODE, mpcc_mode,
+-		MPCC_ALPHA_BLND_MODE, alpha_blnd_mode,
+-		MPCC_ALPHA_MULTIPLIED_MODE, cfg->pre_multiplied_alpha,
+-		MPCC_BLND_ACTIVE_OVERLAP_ONLY, false);
++	/* mark this mpcc as in use */
++	mpc10->mpcc_in_use_mask |= 1 << mpcc_id;
+ 
+-	/* update mpc_tree_cfg with new mpcc */
+-	for (z_idx = tree_cfg->num_pipes; z_idx > position; z_idx--) {
+-		tree_cfg->dpp[z_idx] = tree_cfg->dpp[z_idx - 1];
+-		tree_cfg->mpcc[z_idx] = tree_cfg->mpcc[z_idx - 1];
+-	}
+-	tree_cfg->dpp[position] = cfg->dpp_id;
+-	tree_cfg->mpcc[position] = mpcc_id;
+-	tree_cfg->num_pipes++;
++	return new_mpcc;
+ }
+ 
+-int mpc10_mpcc_add(struct mpc *mpc, struct mpcc_cfg *cfg)
++/*
++ * Remove a specified MPCC from the MPC tree.
++ *
++ * Parameters:
++ * [in/out] mpc		- MPC context.
++ * [in/out] tree	- MPC tree structure that plane will be removed from.
++ * [in/out] mpcc	- MPCC to be removed from tree.
++ *
++ * Return:  void
++ */
++void mpc1_remove_mpcc(
++	struct mpc *mpc,
++	struct mpc_tree *tree,
++	struct mpcc *mpcc_to_remove)
+ {
+ 	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
+-	int mpcc_id, z_idx;
+-
+-	ASSERT(cfg->z_index < mpc10->num_mpcc);
+-
+-	/* check in dpp already exists in mpc tree */
+-	for (z_idx = 0; z_idx < cfg->tree_cfg->num_pipes; z_idx++)
+-		if (cfg->tree_cfg->dpp[z_idx] == cfg->dpp_id)
+-			break;
+-	if (z_idx == cfg->tree_cfg->num_pipes) {
+-		ASSERT(cfg->z_index <= cfg->tree_cfg->num_pipes);
+-		mpcc_id = mpc10_get_idle_mpcc_id(mpc10);
+-
+-		/*
+-		 * TODO: remove hack
+-		 * Note: currently there is a bug in init_hw such that
+-		 * on resume from hibernate, BIOS sets up MPCC0, and
+-		 * we do mpcc_remove but the mpcc cannot go to idle
+-		 * after remove. This cause us to pick mpcc1 here,
+-		 * which causes a pstate hang for yet unknown reason.
+-		 */
+-		mpcc_id = cfg->dpp_id;
+-		/* end hack*/
+-
+-		ASSERT(!(mpc10->mpcc_in_use_mask & 1 << mpcc_id));
+-
+-		if (mpc->ctx->dc->debug.sanity_checks)
+-			mpc10_assert_mpcc_idle_before_connect(mpc10, mpcc_id);
++	bool found = false;
++	int mpcc_id = mpcc_to_remove->mpcc_id;
++
++	if (tree->opp_list == mpcc_to_remove) {
++		found = true;
++		/* remove MPCC from top of tree */
++		if (mpcc_to_remove->mpcc_bot) {
++			/* set the next MPCC in list to be the top MPCC */
++			tree->opp_list = mpcc_to_remove->mpcc_bot;
++			REG_SET(MUX[tree->opp_id], 0, MPC_OUT_MUX, tree->opp_list->mpcc_id);
++		} else {
++			/* there are no other MPCC is list */
++			tree->opp_list = NULL;
++			REG_SET(MUX[tree->opp_id], 0, MPC_OUT_MUX, 0xf);
++		}
+ 	} else {
+-		ASSERT(cfg->z_index < cfg->tree_cfg->num_pipes);
+-		mpcc_id = cfg->tree_cfg->mpcc[z_idx];
+-		mpc10_mpcc_remove(mpc, cfg->tree_cfg, cfg->opp_id, cfg->dpp_id);
++		/* find mpcc to remove MPCC list */
++		struct mpcc *temp_mpcc = tree->opp_list;
++
++		while (temp_mpcc && temp_mpcc->mpcc_bot != mpcc_to_remove)
++			temp_mpcc = temp_mpcc->mpcc_bot;
++
++		if (temp_mpcc && temp_mpcc->mpcc_bot == mpcc_to_remove) {
++			found = true;
++			if (mpcc_to_remove->mpcc_bot) {
++				/* remove MPCC in middle of list */
++				REG_SET(MPCC_BOT_SEL[temp_mpcc->mpcc_id], 0,
++						MPCC_BOT_SEL, mpcc_to_remove->mpcc_bot->mpcc_id);
++				temp_mpcc->mpcc_bot = mpcc_to_remove->mpcc_bot;
++			} else {
++				/* remove MPCC from bottom of list */
++				REG_SET(MPCC_BOT_SEL[temp_mpcc->mpcc_id], 0,
++						MPCC_BOT_SEL, 0xf);
++				REG_UPDATE(MPCC_CONTROL[temp_mpcc->mpcc_id],
++						MPCC_MODE, MPCC_BLEND_MODE_TOP_LAYER_PASSTHROUGH);
++			}
++		}
+ 	}
+ 
+-	/* add dpp/mpcc pair to mpc_tree_cfg and update mpcc registers */
+-	mpc10_add_to_tree_cfg(mpc, cfg, mpcc_id);
+-
+-	/* set background color */
+-	mpc10_set_bg_color(mpc10, &cfg->black_color, mpcc_id);
+-
+-	/* mark this mpcc as in use */
+-	mpc10->mpcc_in_use_mask |= 1 << mpcc_id;
++	if (found) {
++		/* turn off MPCC mux registers */
++		REG_SET(MPCC_TOP_SEL[mpcc_id], 0, MPCC_TOP_SEL, 0xf);
++		REG_SET(MPCC_BOT_SEL[mpcc_id], 0, MPCC_BOT_SEL, 0xf);
++		REG_SET(MPCC_OPP_ID[mpcc_id],  0, MPCC_OPP_ID,  0xf);
+ 
+-	return mpcc_id;
++		/* mark this mpcc as not in use */
++		mpc10->mpcc_in_use_mask &= ~(1 << mpcc_id);
++		mpcc_to_remove->dpp_id = 0xf;
++		mpcc_to_remove->mpcc_bot = NULL;
++	} else {
++		/* In case of resume from S3/S4, remove mpcc from bios left over */
++		REG_SET(MPCC_TOP_SEL[mpcc_id], 0, MPCC_TOP_SEL, 0xf);
++		REG_SET(MPCC_BOT_SEL[mpcc_id], 0, MPCC_BOT_SEL, 0xf);
++		REG_SET(MPCC_OPP_ID[mpcc_id],  0, MPCC_OPP_ID,  0xf);
++	}
+ }
+ 
+-void mpc10_update_blend_mode(
+-		struct mpc *mpc,
+-		struct mpcc_cfg *cfg)
++/*
++ * Reset the MPCC HW status by disconnecting all muxes.
++ *
++ * Parameters:
++ * [in/out] mpc		- MPC context.
++ * [in]     mpcc_id	- The MPCC physical instance to reset.
++ *
++ * Return:  void
++ */
++void mpc1_reset_mpcc(
++	struct mpc *mpc,
++	int mpcc_id)
+ {
+ 	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
+-	int mpcc_id, z_idx;
+-	int alpha_blnd_mode = cfg->per_pixel_alpha ?
+-			BLND_PP_ALPHA : BLND_GLOBAL_ALPHA;
+-
+-	/* find z_idx for the dpp that requires blending mode update*/
+-	for (z_idx = 0; z_idx < cfg->tree_cfg->num_pipes; z_idx++)
+-		if (cfg->tree_cfg->dpp[z_idx] == cfg->dpp_id)
+-			break;
+ 
+-	ASSERT(z_idx < cfg->tree_cfg->num_pipes);
+-	mpcc_id = cfg->tree_cfg->mpcc[z_idx];
+-
+-	REG_UPDATE_2(MPCC_CONTROL[mpcc_id],
+-			MPCC_ALPHA_BLND_MODE, alpha_blnd_mode,
+-			MPCC_ALPHA_MULTIPLIED_MODE, cfg->pre_multiplied_alpha);
++	REG_SET(MPCC_TOP_SEL[mpcc_id], 0, MPCC_TOP_SEL, 0xf);
++	REG_SET(MPCC_BOT_SEL[mpcc_id], 0, MPCC_BOT_SEL, 0xf);
++	REG_SET(MPCC_OPP_ID[mpcc_id],  0, MPCC_OPP_ID,  0xf);
+ }
+ 
+-int mpc10_get_opp_id(struct mpc *mpc, int mpcc_id)
++void mpc1_init_mpcc_list_from_hw(
++	struct mpc *mpc,
++	struct mpc_tree *tree)
+ {
+ 	struct dcn10_mpc *mpc10 = TO_DCN10_MPC(mpc);
+-	int opp_id = 0xF;
+-
+-	REG_GET(MPCC_OPP_ID[mpcc_id], MPCC_OPP_ID, &opp_id);
++	unsigned int opp_id;
++	unsigned int top_sel;
++	unsigned int bot_sel;
++	unsigned int out_mux;
++	struct mpcc *mpcc;
++	int mpcc_id;
++	int bot_mpcc_id;
++
++	REG_GET(MUX[tree->opp_id], MPC_OUT_MUX, &out_mux);
++
++	if (out_mux != 0xf) {
++		for (mpcc_id = 0; mpcc_id < mpc10->num_mpcc; mpcc_id++) {
++			REG_GET(MPCC_OPP_ID[mpcc_id],  MPCC_OPP_ID,  &opp_id);
++			REG_GET(MPCC_TOP_SEL[mpcc_id], MPCC_TOP_SEL, &top_sel);
++			REG_GET(MPCC_STATUS[mpcc_id],  MPCC_BOT_SEL, &bot_sel);
++
++			if ((opp_id == tree->opp_id) && (top_sel != 0xf)) {
++				mpcc = mpc1_get_mpcc(mpc, mpcc_id);
++				mpcc->dpp_id = top_sel;
++				mpc10->mpcc_in_use_mask |= 1 << mpcc_id;
++
++				if (out_mux == mpcc_id)
++					tree->opp_list = mpcc;
++				if (bot_sel != 0xf && bot_sel < mpc10->num_mpcc) {
++					bot_mpcc_id = bot_sel;
++					REG_GET(MPCC_OPP_ID[bot_mpcc_id],  MPCC_OPP_ID,  &opp_id);
++					REG_GET(MPCC_TOP_SEL[bot_mpcc_id], MPCC_TOP_SEL, &top_sel);
++					if ((opp_id == tree->opp_id) && (top_sel != 0xf)) {
++						struct mpcc *mpcc_bottom = mpc1_get_mpcc(mpc, bot_mpcc_id);
++
++						mpcc->mpcc_bot = mpcc_bottom;
++					}
++				}
++			}
++		}
++	}
++}
+ 
+-	return opp_id;
++static void mpc1_init_mpcc(struct mpcc *mpcc, int mpcc_inst)
++{
++	mpcc->mpcc_id = mpcc_inst;
++	mpcc->dpp_id = 0xf;
++	mpcc->mpcc_bot = NULL;
++	mpcc->blnd_cfg.overlap_only = false;
++	mpcc->blnd_cfg.global_alpha = 0xff;
++	mpcc->blnd_cfg.global_gain = 0xff;
++	mpcc->sm_cfg.enable = false;
+ }
+ 
+ const struct mpc_funcs dcn10_mpc_funcs = {
+-		.add = mpc10_mpcc_add,
+-		.remove = mpc10_mpcc_remove,
+-		.wait_for_idle = mpc10_assert_idle_mpcc,
+-		.update_blend_mode = mpc10_update_blend_mode,
+-		.get_opp_id = mpc10_get_opp_id,
++	.insert_plane = mpc1_insert_plane,
++	.remove_mpcc = mpc1_remove_mpcc,
++	.reset_mpcc = mpc1_reset_mpcc,
++	.get_mpcc_for_dpp = mpc1_get_mpcc_for_dpp,
++	.wait_for_idle = mpc1_assert_idle_mpcc,
++	.assert_mpcc_idle_before_connect = mpc1_assert_mpcc_idle_before_connect,
++	.init_mpcc_list_from_hw = mpc1_init_mpcc_list_from_hw,
++	.update_blending = mpc1_update_blending,
++	.get_opp_id = mpc1_get_opp_id,
+ };
+ 
+ void dcn10_mpc_construct(struct dcn10_mpc *mpc10,
+@@ -360,6 +426,8 @@ void dcn10_mpc_construct(struct dcn10_mpc *mpc10,
+ 	const struct dcn_mpc_mask *mpc_mask,
+ 	int num_mpcc)
+ {
++	int i;
++
+ 	mpc10->base.ctx = ctx;
+ 
+ 	mpc10->base.funcs = &dcn10_mpc_funcs;
+@@ -370,5 +438,8 @@ void dcn10_mpc_construct(struct dcn10_mpc *mpc10,
+ 
+ 	mpc10->mpcc_in_use_mask = 0;
+ 	mpc10->num_mpcc = num_mpcc;
++
++	for (i = 0; i < MAX_MPCC; i++)
++		mpc1_init_mpcc(&mpc10->base.mpcc_array[i], i);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.h b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.h
+index e85e1f3..aa2cd40 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.h
+@@ -30,9 +30,6 @@
+ #define TO_DCN10_MPC(mpc_base) \
+ 	container_of(mpc_base, struct dcn10_mpc, base)
+ 
+-#define MAX_MPCC 6
+-#define MAX_OPP 6
+-
+ #define MPC_COMMON_REG_LIST_DCN1_0(inst) \
+ 	SRII(MPCC_TOP_SEL, MPCC, inst),\
+ 	SRII(MPCC_BOT_SEL, MPCC, inst),\
+@@ -42,7 +39,8 @@
+ 	SRII(MPCC_BG_G_Y, MPCC, inst),\
+ 	SRII(MPCC_BG_R_CR, MPCC, inst),\
+ 	SRII(MPCC_BG_B_CB, MPCC, inst),\
+-	SRII(MPCC_BG_B_CB, MPCC, inst)
++	SRII(MPCC_BG_B_CB, MPCC, inst),\
++	SRII(MPCC_SM_CONTROL, MPCC, inst)
+ 
+ #define MPC_OUT_MUX_COMMON_REG_LIST_DCN1_0(inst) \
+ 	SRII(MUX, MPC_OUT, inst)
+@@ -56,6 +54,7 @@
+ 	uint32_t MPCC_BG_G_Y[MAX_MPCC]; \
+ 	uint32_t MPCC_BG_R_CR[MAX_MPCC]; \
+ 	uint32_t MPCC_BG_B_CB[MAX_MPCC]; \
++	uint32_t MPCC_SM_CONTROL[MAX_MPCC]; \
+ 	uint32_t MUX[MAX_OPP];
+ 
+ #define MPC_COMMON_MASK_SH_LIST_DCN1_0(mask_sh)\
+@@ -65,12 +64,20 @@
+ 	SF(MPCC0_MPCC_CONTROL, MPCC_ALPHA_BLND_MODE, mask_sh),\
+ 	SF(MPCC0_MPCC_CONTROL, MPCC_ALPHA_MULTIPLIED_MODE, mask_sh),\
+ 	SF(MPCC0_MPCC_CONTROL, MPCC_BLND_ACTIVE_OVERLAP_ONLY, mask_sh),\
++	SF(MPCC0_MPCC_CONTROL, MPCC_GLOBAL_ALPHA, mask_sh),\
++	SF(MPCC0_MPCC_CONTROL, MPCC_GLOBAL_GAIN, mask_sh),\
+ 	SF(MPCC0_MPCC_STATUS, MPCC_IDLE, mask_sh),\
+ 	SF(MPCC0_MPCC_STATUS, MPCC_BUSY, mask_sh),\
+ 	SF(MPCC0_MPCC_OPP_ID, MPCC_OPP_ID, mask_sh),\
+ 	SF(MPCC0_MPCC_BG_G_Y, MPCC_BG_G_Y, mask_sh),\
+ 	SF(MPCC0_MPCC_BG_R_CR, MPCC_BG_R_CR, mask_sh),\
+ 	SF(MPCC0_MPCC_BG_B_CB, MPCC_BG_B_CB, mask_sh),\
++	SF(MPCC0_MPCC_SM_CONTROL, MPCC_SM_EN, mask_sh),\
++	SF(MPCC0_MPCC_SM_CONTROL, MPCC_SM_MODE, mask_sh),\
++	SF(MPCC0_MPCC_SM_CONTROL, MPCC_SM_FRAME_ALT, mask_sh),\
++	SF(MPCC0_MPCC_SM_CONTROL, MPCC_SM_FIELD_ALT, mask_sh),\
++	SF(MPCC0_MPCC_SM_CONTROL, MPCC_SM_FORCE_NEXT_FRAME_POL, mask_sh),\
++	SF(MPCC0_MPCC_SM_CONTROL, MPCC_SM_FORCE_NEXT_TOP_POL, mask_sh),\
+ 	SF(MPC_OUT0_MUX, MPC_OUT_MUX, mask_sh)
+ 
+ #define MPC_REG_FIELD_LIST(type) \
+@@ -80,12 +87,20 @@
+ 	type MPCC_ALPHA_BLND_MODE;\
+ 	type MPCC_ALPHA_MULTIPLIED_MODE;\
+ 	type MPCC_BLND_ACTIVE_OVERLAP_ONLY;\
++	type MPCC_GLOBAL_ALPHA;\
++	type MPCC_GLOBAL_GAIN;\
+ 	type MPCC_IDLE;\
+ 	type MPCC_BUSY;\
+ 	type MPCC_OPP_ID;\
+ 	type MPCC_BG_G_Y;\
+ 	type MPCC_BG_R_CR;\
+ 	type MPCC_BG_B_CB;\
++	type MPCC_SM_EN;\
++	type MPCC_SM_MODE;\
++	type MPCC_SM_FRAME_ALT;\
++	type MPCC_SM_FIELD_ALT;\
++	type MPCC_SM_FORCE_NEXT_FRAME_POL;\
++	type MPCC_SM_FORCE_NEXT_TOP_POL;\
+ 	type MPC_OUT_MUX;
+ 
+ struct dcn_mpc_registers {
+@@ -117,23 +132,57 @@ void dcn10_mpc_construct(struct dcn10_mpc *mpcc10,
+ 	const struct dcn_mpc_mask *mpc_mask,
+ 	int num_mpcc);
+ 
+-int mpc10_mpcc_add(
+-		struct mpc *mpc,
+-		struct mpcc_cfg *cfg);
+-
+-void mpc10_mpcc_remove(
+-		struct mpc *mpc,
+-		struct mpc_tree_cfg *tree_cfg,
+-		int opp_id,
+-		int dpp_id);
+-
+-void mpc10_assert_idle_mpcc(
+-		struct mpc *mpc,
+-		int id);
+-
+-void mpc10_update_blend_mode(
+-		struct mpc *mpc,
+-		struct mpcc_cfg *cfg);
+-int mpc10_get_opp_id(struct mpc *mpc, int mpcc_id);
++struct mpcc *mpc1_insert_plane(
++	struct mpc *mpc,
++	struct mpc_tree *tree,
++	struct mpcc_blnd_cfg *blnd_cfg,
++	struct mpcc_sm_cfg *sm_cfg,
++	struct mpcc *insert_above_mpcc,
++	int dpp_id,
++	int mpcc_id);
++
++void mpc1_remove_mpcc(
++	struct mpc *mpc,
++	struct mpc_tree *tree,
++	struct mpcc *mpcc);
++
++void mpc1_reset_mpcc(
++	struct mpc *mpc,
++	int mpcc_id);
++
++
++void mpc1_assert_idle_mpcc(
++	struct mpc *mpc,
++	int id);
++
++void mpc1_set_bg_color(
++	struct mpc *mpc,
++	struct tg_color *bg_color,
++	int id);
++
++void mpc1_update_stereo_mix(
++	struct mpc *mpc,
++	struct mpcc_sm_cfg *sm_cfg,
++	int mpcc_id);
++
++bool mpc1_is_mpcc_idle(
++	struct mpc *mpc,
++	int mpcc_id);
++
++void mpc1_assert_mpcc_idle_before_connect(
++	struct mpc *mpc,
++	int mpcc_id);
++
++void mpc1_init_mpcc_list_from_hw(
++	struct mpc *mpc,
++	struct mpc_tree *tree);
++
++struct mpcc *mpc1_get_mpcc(
++	struct mpc *mpc,
++	int mpcc_id);
++
++struct mpcc *mpc1_get_mpcc_for_dpp(
++	struct mpc_tree *tree,
++	int dpp_id);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.c
+index 9d09bfc..d8ba23c 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_opp.c
+@@ -329,12 +329,19 @@ void dcn10_opp_construct(struct dcn10_opp *oppn10,
+ 	const struct dcn10_opp_shift *opp_shift,
+ 	const struct dcn10_opp_mask *opp_mask)
+ {
++	int i;
++
+ 	oppn10->base.ctx = ctx;
+ 	oppn10->base.inst = inst;
+ 	oppn10->base.funcs = &dcn10_opp_funcs;
+ 
++	oppn10->base.mpc_tree_params.opp_id = inst;
++	oppn10->base.mpc_tree_params.opp_list = NULL;
++
++	for (i = 0; i < MAX_PIPES; i++)
++		oppn10->base.mpcc_disconnect_pending[i] = false;
++
+ 	oppn10->regs = regs;
+ 	oppn10->opp_shift = opp_shift;
+ 	oppn10->opp_mask = opp_mask;
+ }
+-
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h b/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
+index 72ea335..2396b15 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
+@@ -26,7 +26,10 @@
+ #define __DC_MPCC_H__
+ 
+ #include "dc_hw_types.h"
+-#include "opp.h"
++#include "hw_shared.h"
++
++#define MAX_MPCC 6
++#define MAX_OPP 6
+ 
+ enum mpc_output_csc_mode {
+ 	MPC_OUTPUT_CSC_DISABLE = 0,
+@@ -34,45 +37,156 @@ enum mpc_output_csc_mode {
+ 	MPC_OUTPUT_CSC_COEF_B
+ };
+ 
+-struct mpcc_cfg {
+-	int dpp_id;
+-	int opp_id;
+-	struct mpc_tree_cfg *tree_cfg;
+-	unsigned int z_index;
+ 
+-	struct tg_color black_color;
+-	bool per_pixel_alpha;
+-	bool pre_multiplied_alpha;
++enum mpcc_blend_mode {
++	MPCC_BLEND_MODE_BYPASS,
++	MPCC_BLEND_MODE_TOP_LAYER_PASSTHROUGH,
++	MPCC_BLEND_MODE_TOP_LAYER_ONLY,
++	MPCC_BLEND_MODE_TOP_BOT_BLENDING
++};
++
++enum mpcc_alpha_blend_mode {
++	MPCC_ALPHA_BLEND_MODE_PER_PIXEL_ALPHA,
++	MPCC_ALPHA_BLEND_MODE_PER_PIXEL_ALPHA_COMBINED_GLOBAL_GAIN,
++	MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA
++};
++
++/*
++ * MPCC blending configuration
++ */
++struct mpcc_blnd_cfg {
++	struct tg_color black_color;	/* background color */
++	enum mpcc_alpha_blend_mode alpha_mode;	/* alpha blend mode */
++	bool pre_multiplied_alpha;	/* alpha pre-multiplied mode flag */
++	int global_gain;
++	int global_alpha;
++	bool overlap_only;
++
++};
++
++struct mpcc_sm_cfg {
++	bool enable;
++	/* 0-single plane,2-row subsampling,4-column subsampling,6-checkboard subsampling */
++	int sm_mode;
++	/* 0- disable frame alternate, 1- enable frame alternate */
++	bool frame_alt;
++	/* 0- disable field alternate, 1- enable field alternate */
++	bool field_alt;
++	/* 0-no force,2-force frame polarity from top,3-force frame polarity from bottom */
++	int force_next_frame_porlarity;
++	/* 0-no force,2-force field polarity from top,3-force field polarity from bottom */
++	int force_next_field_polarity;
++};
++
++/*
++ * MPCC connection and blending configuration for a single MPCC instance.
++ * This struct is used as a node in an MPC tree.
++ */
++struct mpcc {
++	int mpcc_id;			/* MPCC physical instance */
++	int dpp_id;			/* DPP input to this MPCC */
++	struct mpcc *mpcc_bot;		/* pointer to bottom layer MPCC.  NULL when not connected */
++	struct mpcc_blnd_cfg blnd_cfg;	/* The blending configuration for this MPCC */
++	struct mpcc_sm_cfg sm_cfg;	/* stereo mix setting for this MPCC */
++};
++
++/*
++ * MPC tree represents all MPCC connections for a pipe.
++ */
++struct mpc_tree {
++	int opp_id;			/* The OPP instance that owns this MPC tree */
++	struct mpcc *opp_list;		/* The top MPCC layer of the MPC tree that outputs to OPP endpoint */
+ };
+ 
+ struct mpc {
+ 	const struct mpc_funcs *funcs;
+ 	struct dc_context *ctx;
++
++	struct mpcc mpcc_array[MAX_MPCC];
+ };
+ 
+ struct mpc_funcs {
+-	int (*add)(struct mpc *mpc, struct mpcc_cfg *cfg);
++	/*
++	 * Insert DPP into MPC tree based on specified blending position.
++	 * Only used for planes that are part of blending chain for OPP output
++	 *
++	 * Parameters:
++	 * [in/out] mpc		- MPC context.
++	 * [in/out] tree	- MPC tree structure that plane will be added to.
++	 * [in]	blnd_cfg	- MPCC blending configuration for the new blending layer.
++	 * [in]	sm_cfg		- MPCC stereo mix configuration for the new blending layer.
++	 *			  stereo mix must disable for the very bottom layer of the tree config.
++	 * [in]	insert_above_mpcc - Insert new plane above this MPCC.  If NULL, insert as bottom plane.
++	 * [in]	dpp_id		 - DPP instance for the plane to be added.
++	 * [in]	mpcc_id		 - The MPCC physical instance to use for blending.
++	 *
++	 * Return:  struct mpcc* - MPCC that was added.
++	 */
++	struct mpcc* (*insert_plane)(
++			struct mpc *mpc,
++			struct mpc_tree *tree,
++			struct mpcc_blnd_cfg *blnd_cfg,
++			struct mpcc_sm_cfg *sm_cfg,
++			struct mpcc *insert_above_mpcc,
++			int dpp_id,
++			int mpcc_id);
+ 
+-	void (*remove)(struct mpc *mpc,
+-			struct mpc_tree_cfg *tree_cfg,
+-			int opp_id,
+-			int mpcc_inst);
++	/*
++	 * Remove a specified MPCC from the MPC tree.
++	 *
++	 * Parameters:
++	 * [in/out] mpc		- MPC context.
++	 * [in/out] tree	- MPC tree structure that plane will be removed from.
++	 * [in/out] mpcc	- MPCC to be removed from tree.
++	 *
++	 * Return:  void
++	 */
++	void (*remove_mpcc)(
++			struct mpc *mpc,
++			struct mpc_tree *tree,
++			struct mpcc *mpcc);
+ 
+-	void (*wait_for_idle)(struct mpc *mpc, int id);
++	/*
++	 * Reset the MPCC HW status by disconnecting all muxes.
++	 *
++	 * Parameters:
++	 * [in/out] mpc		- MPC context.
++	 * [in]     mpcc_id	- The MPCC physical instance to reset.
++	 *
++	 * Return:  void
++	 */
++	void (*reset_mpcc)(
++		struct mpc *mpc,
++		int mpcc_id);
+ 
+-	void (*update_blend_mode)(struct mpc *mpc, struct mpcc_cfg *cfg);
++	/*
++	 * Update the blending configuration for a specified MPCC.
++	 *
++	 * Parameters:
++	 * [in/out] mpc		- MPC context.
++	 * [in]     blnd_cfg	- MPCC blending configuration.
++	 * [in]     mpcc_id	- The MPCC physical instance.
++	 *
++	 * Return:  void
++	 */
++	void (*update_blending)(
++		struct mpc *mpc,
++		struct mpcc_blnd_cfg *blnd_cfg,
++		int mpcc_id);
+ 
+-	int (*get_opp_id)(struct mpc *mpc, int mpcc_id);
++	struct mpcc* (*get_mpcc_for_dpp)(
++			struct mpc_tree *tree,
++			int dpp_id);
++
++	void (*wait_for_idle)(struct mpc *mpc, int id);
+ 
+-	void (*set_output_csc)(struct mpc *mpc,
+-			int opp_id,
+-			const struct out_csc_color_matrix *tbl_entry,
+-			enum mpc_output_csc_mode ocsc_mode);
++	void (*assert_mpcc_idle_before_connect)(struct mpc *mpc, int mpcc_id);
+ 
+-	void (*set_ocsc_default)(struct mpc *mpc,
+-			int opp_id,
+-			enum dc_color_space color_space,
+-			enum mpc_output_csc_mode ocsc_mode);
++	void (*init_mpcc_list_from_hw)(
++		struct mpc *mpc,
++		struct mpc_tree *tree);
++
++	int (*get_opp_id)(struct mpc *mpc, int mpcc_id);
+ 
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
+index 7d33e07..aae5b41 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
+@@ -29,6 +29,7 @@
+ #include "hw_shared.h"
+ #include "dc_hw_types.h"
+ #include "transform.h"
++#include "mpc.h"
+ 
+ struct fixed31_32;
+ 
+@@ -204,7 +205,7 @@ struct output_pixel_processor {
+ 	struct dc_context *ctx;
+ 	uint32_t inst;
+ 	struct pwl_params regamma_params;
+-	struct mpc_tree_cfg mpc_tree;
++	struct mpc_tree mpc_tree_params;
+ 	bool mpcc_disconnect_pending[MAX_PIPES];
+ 	const struct opp_funcs *funcs;
+ };
+-- 
+2.7.4
+

@@ -1,0 +1,160 @@
+From 9602c9d4230a2de18aa343392f95214e5ee88997 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Fri, 27 Oct 2017 19:35:28 -0400
+Subject: [PATCH 5775/5855] drm/amdkfd: Use IH context ID for signal lookup
+
+This speeds up signal lookup when the IH ring entry includes a
+valid context ID or partial context ID. Only if the context ID is
+found to be invalid, fall back to an exhaustive search of all
+signaled events.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c |  7 ++-
+ drivers/gpu/drm/amd/amdkfd/kfd_events.c          | 73 +++++++++++++++++++-----
+ 2 files changed, 64 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c b/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c
+index 66164aa..3d5ccb3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c
++++ b/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c
+@@ -47,6 +47,7 @@ static void cik_event_interrupt_wq(struct kfd_dev *dev,
+ 	unsigned int pasid;
+ 	const struct cik_ih_ring_entry *ihre =
+ 			(const struct cik_ih_ring_entry *)ih_ring_entry;
++	uint32_t context_id = ihre->data & 0xfffffff;
+ 
+ 	pasid = (ihre->ring_id & 0xffff0000) >> 16;
+ 
+@@ -54,11 +55,11 @@ static void cik_event_interrupt_wq(struct kfd_dev *dev,
+ 		return;
+ 
+ 	if (ihre->source_id == CIK_INTSRC_CP_END_OF_PIPE)
+-		kfd_signal_event_interrupt(pasid, 0, 0);
++		kfd_signal_event_interrupt(pasid, context_id, 28);
+ 	else if (ihre->source_id == CIK_INTSRC_SDMA_TRAP)
+-		kfd_signal_event_interrupt(pasid, 0, 0);
++		kfd_signal_event_interrupt(pasid, context_id, 28);
+ 	else if (ihre->source_id == CIK_INTSRC_SQ_INTERRUPT_MSG)
+-		kfd_signal_event_interrupt(pasid, ihre->data & 0xFF, 8);
++		kfd_signal_event_interrupt(pasid, context_id & 0xff, 8);
+ 	else if (ihre->source_id == CIK_INTSRC_CP_BAD_OPCODE)
+ 		kfd_signal_hw_exception_event(pasid);
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_events.c b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+index 41580e0..26e8045 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+@@ -53,12 +53,6 @@ struct kfd_signal_page {
+ 	uint64_t __user *user_address;
+ };
+ 
+-/*
+- * For signal events, the event ID is used as the interrupt user data.
+- * For SQ s_sendmsg interrupts, this is limited to 8 bits.
+- */
+-
+-#define INTERRUPT_DATA_BITS 8
+ 
+ static uint64_t *page_slots(struct kfd_signal_page *page)
+ {
+@@ -125,6 +119,54 @@ static struct kfd_event *lookup_event_by_id(struct kfd_process *p, uint32_t id)
+ 	return idr_find(&p->event_idr, id);
+ }
+ 
++/**
++ * lookup_signaled_event_by_partial_id - Lookup signaled event from partial ID
++ * @p:     Pointer to struct kfd_process
++ * @id:    ID to look up
++ * @bits:  Number of valid bits in @id
++ *
++ * Finds the first signaled event with a matching partial ID. If no
++ * matching signaled event is found, returns NULL. In that case the
++ * caller should assume that the partial ID is invalid and do an
++ * exhaustive search of all siglaned events.
++ *
++ * If multiple events with the same partial ID signal at the same
++ * time, they will be found one interrupt at a time, not necessarily
++ * in the same order the interrupts occurred. As long as the number of
++ * interrupts is correct, all signaled events will be seen by the
++ * driver.
++ */
++static struct kfd_event *lookup_signaled_event_by_partial_id(
++	struct kfd_process *p, uint32_t id, uint32_t bits)
++{
++	struct kfd_event *ev;
++
++	if (!p->signal_page || id >= KFD_SIGNAL_EVENT_LIMIT)
++		return NULL;
++
++	/* Fast path for the common case that @id is not a partial ID
++	 * and we only need a single lookup.
++	 */
++	if (bits > 31 || (1U << bits) >= KFD_SIGNAL_EVENT_LIMIT) {
++		if (page_slots(p->signal_page)[id] == UNSIGNALED_EVENT_SLOT)
++			return NULL;
++
++		return idr_find(&p->event_idr, id);
++	}
++
++	/* General case for partial IDs: Iterate over all matching IDs
++	 * and find the first one that has signaled.
++	 */
++	for (ev = NULL; id < KFD_SIGNAL_EVENT_LIMIT && !ev; id += 1U << bits) {
++		if (page_slots(p->signal_page)[id] == UNSIGNALED_EVENT_SLOT)
++			continue;
++
++		ev = idr_find(&p->event_idr, id);
++	}
++
++	return ev;
++}
++
+ static int create_signal_event(struct file *devkfd,
+ 				struct kfd_process *p,
+ 				struct kfd_event *ev)
+@@ -385,7 +427,7 @@ static void set_event_from_interrupt(struct kfd_process *p,
+ void kfd_signal_event_interrupt(unsigned int pasid, uint32_t partial_id,
+ 				uint32_t valid_id_bits)
+ {
+-	struct kfd_event *ev;
++	struct kfd_event *ev = NULL;
+ 
+ 	/*
+ 	 * Because we are called from arbitrary context (workqueue) as opposed
+@@ -399,19 +441,24 @@ void kfd_signal_event_interrupt(unsigned int pasid, uint32_t partial_id,
+ 
+ 	mutex_lock(&p->event_mutex);
+ 
+-	if (valid_id_bits >= INTERRUPT_DATA_BITS) {
+-		/* Partial ID is a full ID. */
+-		ev = lookup_event_by_id(p, partial_id);
++	if (valid_id_bits)
++		ev = lookup_signaled_event_by_partial_id(p, partial_id,
++							 valid_id_bits);
++	if (ev) {
+ 		set_event_from_interrupt(p, ev);
+ 	} else if (p->signal_page) {
+ 		/*
+-		 * Partial ID is in fact partial. For now we completely
+-		 * ignore it, but we could use any bits we did receive to
+-		 * search faster.
++		 * Partial ID lookup failed. Assume that the event ID
++		 * in the interrupt payload was invalid and do an
++		 * exhaustive search of signaled events.
+ 		 */
+ 		uint64_t *slots = page_slots(p->signal_page);
+ 		uint32_t id;
+ 
++		if (valid_id_bits)
++			pr_debug_ratelimited("Partial ID invalid: %u (%u valid bits)\n",
++					     partial_id, valid_id_bits);
++
+ 		if (p->signal_event_count < KFD_SIGNAL_EVENT_LIMIT/2) {
+ 			/* With relatively few events, it's faster to
+ 			 * iterate over the event IDR
+-- 
+2.7.4
+

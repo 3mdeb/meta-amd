@@ -1,0 +1,798 @@
+From 08c8b9dde1e19c9e2f698e46b95e6c022f8a2507 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Fri, 8 Dec 2017 13:07:58 -0500
+Subject: [PATCH 4458/5855] drm/amdgpu: convert nbio to use callbacks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Cleans up and consolidates all of the per-asic logic.
+
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |  50 ++++++++++++--
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c     |   7 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c     |  15 +----
+ drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c    |  81 ++++++++++++++---------
+ drivers/gpu/drm/amd/amdgpu/nbio_v6_1.h    |  25 -------
+ drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c    | 105 +++++++++++++++++++++++++-----
+ drivers/gpu/drm/amd/amdgpu/nbio_v7_0.h    |  19 ------
+ drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c    |  13 +---
+ drivers/gpu/drm/amd/amdgpu/soc15.c        |  40 ++++--------
+ drivers/gpu/drm/amd/amdgpu/soc15_common.h |  16 -----
+ drivers/gpu/drm/amd/amdgpu/vega10_ih.c    |  11 +---
+ 11 files changed, 204 insertions(+), 178 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index e522e1c..c4e7403 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1495,16 +1495,52 @@ struct amdgpu_ssg {
+ /*
+  * amdgpu nbio functions
+  *
+- * Fix me :
+- * 	Put more NBIO specifc func wraper here , for now just try to minimize the
+- *	change to avoid use SOC15_REG_OFFSET in the constant array
+  */
++struct nbio_hdp_flush_reg {
++	u32 ref_and_mask_cp0;
++	u32 ref_and_mask_cp1;
++	u32 ref_and_mask_cp2;
++	u32 ref_and_mask_cp3;
++	u32 ref_and_mask_cp4;
++	u32 ref_and_mask_cp5;
++	u32 ref_and_mask_cp6;
++	u32 ref_and_mask_cp7;
++	u32 ref_and_mask_cp8;
++	u32 ref_and_mask_cp9;
++	u32 ref_and_mask_sdma0;
++	u32 ref_and_mask_sdma1;
++};
+ 
+ struct amdgpu_nbio_funcs {
+-	u32 (*get_hdp_flush_req_offset)(struct amdgpu_device*);
+-	u32 (*get_hdp_flush_done_offset)(struct amdgpu_device*);
+-	u32 (*get_pcie_index_offset)(struct amdgpu_device*);
+-	u32 (*get_pcie_data_offset)(struct amdgpu_device*);
++	const struct nbio_hdp_flush_reg *hdp_flush_reg;
++	u32 (*get_hdp_flush_req_offset)(struct amdgpu_device *adev);
++	u32 (*get_hdp_flush_done_offset)(struct amdgpu_device *adev);
++	u32 (*get_pcie_index_offset)(struct amdgpu_device *adev);
++	u32 (*get_pcie_data_offset)(struct amdgpu_device *adev);
++	u32 (*get_rev_id)(struct amdgpu_device *adev);
++	u32 (*get_atombios_scratch_regs)(struct amdgpu_device *adev, uint32_t idx);
++	void (*set_atombios_scratch_regs)(struct amdgpu_device *adev,
++					  uint32_t idx, uint32_t val);
++	void (*mc_access_enable)(struct amdgpu_device *adev, bool enable);
++	void (*hdp_flush)(struct amdgpu_device *adev);
++	u32 (*get_memsize)(struct amdgpu_device *adev);
++	void (*sdma_doorbell_range)(struct amdgpu_device *adev, int instance,
++				    bool use_doorbell, int doorbell_index);
++	void (*enable_doorbell_aperture)(struct amdgpu_device *adev,
++					 bool enable);
++	void (*enable_doorbell_selfring_aperture)(struct amdgpu_device *adev,
++						  bool enable);
++	void (*ih_doorbell_range)(struct amdgpu_device *adev,
++				  bool use_doorbell, int doorbell_index);
++	void (*update_medium_grain_clock_gating)(struct amdgpu_device *adev,
++						 bool enable);
++	void (*update_medium_grain_light_sleep)(struct amdgpu_device *adev,
++						bool enable);
++	void (*get_clockgating_state)(struct amdgpu_device *adev,
++				      u32 *flags);
++	void (*ih_control)(struct amdgpu_device *adev);
++	void (*init_registers)(struct amdgpu_device *adev);
++	void (*detect_hw_virt)(struct amdgpu_device *adev);
+ };
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index 667ec73..ae07f6b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -3549,12 +3549,7 @@ static void gfx_v9_0_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	u32 ref_and_mask, reg_mem_engine;
+-	const struct nbio_hdp_flush_reg *nbio_hf_reg;
+-
+-	if (ring->adev->flags & AMD_IS_APU)
+-		nbio_hf_reg = &nbio_v7_0_hdp_flush_reg;
+-	else
+-		nbio_hf_reg = &nbio_v6_1_hdp_flush_reg;
++	const struct nbio_hdp_flush_reg *nbio_hf_reg = adev->nbio_funcs->hdp_flush_reg;
+ 
+ 	if (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE) {
+ 		switch (ring->me) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index a2943c9..231a928 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -38,8 +38,6 @@
+ #include "soc15_common.h"
+ #include "umc/umc_6_0_sh_mask.h"
+ 
+-#include "nbio_v6_1.h"
+-#include "nbio_v7_0.h"
+ #include "gfxhub_v1_0.h"
+ #include "mmhub_v1_0.h"
+ 
+@@ -332,10 +330,7 @@ static void gmc_v9_0_gart_flush_gpu_tlb(struct amdgpu_device *adev,
+ 	unsigned i, j;
+ 
+ 	/* flush hdp cache */
+-	if (adev->flags & AMD_IS_APU)
+-		nbio_v7_0_hdp_flush(adev);
+-	else
+-		nbio_v6_1_hdp_flush(adev);
++	adev->nbio_funcs->hdp_flush(adev);
+ 
+ 	spin_lock(&adev->mc.invalidate_lock);
+ 
+@@ -702,8 +697,7 @@ static int gmc_v9_0_mc_init(struct amdgpu_device *adev)
+ 
+ 	/* size in MB on si */
+ 	adev->mc.mc_vram_size =
+-		((adev->flags & AMD_IS_APU) ? nbio_v7_0_get_memsize(adev) :
+-		 nbio_v6_1_get_memsize(adev)) * 1024ULL * 1024ULL;
++		adev->nbio_funcs->get_memsize(adev) * 1024ULL * 1024ULL;
+ 	adev->mc.real_vram_size = adev->mc.mc_vram_size;
+ 
+ 	adev->mc.aper_base = pci_resource_start(adev->pdev, 0);
+@@ -946,10 +940,7 @@ static int gmc_v9_0_gart_enable(struct amdgpu_device *adev)
+ 	WREG32_SOC15(HDP, 0, mmHDP_HOST_PATH_CNTL, tmp);
+ 
+         /* After HDP is initialized, flush HDP.*/
+-        if (adev->flags & AMD_IS_APU)
+-                nbio_v7_0_hdp_flush(adev);
+-        else
+-                nbio_v6_1_hdp_flush(adev);
++	adev->nbio_funcs->hdp_flush(adev);
+ 
+ 	if (amdgpu_vm_fault_stop == AMDGPU_VM_FAULT_STOP_ALWAYS)
+ 		value = false;
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
+index 947d6e4..0d35148 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
+@@ -33,7 +33,7 @@
+ #define smnPCIE_CNTL2                                                                                   0x11180070
+ #define smnPCIE_CONFIG_CNTL                                                                             0x11180044
+ 
+-u32 nbio_v6_1_get_rev_id(struct amdgpu_device *adev)
++static u32 nbio_v6_1_get_rev_id(struct amdgpu_device *adev)
+ {
+         u32 tmp = RREG32_SOC15(NBIO, 0, mmRCC_DEV0_EPF0_STRAP0);
+ 
+@@ -43,19 +43,19 @@ u32 nbio_v6_1_get_rev_id(struct amdgpu_device *adev)
+ 	return tmp;
+ }
+ 
+-u32 nbio_v6_1_get_atombios_scratch_regs(struct amdgpu_device *adev,
+-					uint32_t idx)
++static u32 nbio_v6_1_get_atombios_scratch_regs(struct amdgpu_device *adev,
++					       uint32_t idx)
+ {
+ 	return RREG32_SOC15_OFFSET(NBIO, 0, mmBIOS_SCRATCH_0, idx);
+ }
+ 
+-void nbio_v6_1_set_atombios_scratch_regs(struct amdgpu_device *adev,
+-					 uint32_t idx, uint32_t val)
++static void nbio_v6_1_set_atombios_scratch_regs(struct amdgpu_device *adev,
++						uint32_t idx, uint32_t val)
+ {
+ 	WREG32_SOC15_OFFSET(NBIO, 0, mmBIOS_SCRATCH_0, idx, val);
+ }
+ 
+-void nbio_v6_1_mc_access_enable(struct amdgpu_device *adev, bool enable)
++static void nbio_v6_1_mc_access_enable(struct amdgpu_device *adev, bool enable)
+ {
+ 	if (enable)
+ 		WREG32_SOC15(NBIO, 0, mmBIF_FB_EN,
+@@ -65,17 +65,17 @@ void nbio_v6_1_mc_access_enable(struct amdgpu_device *adev, bool enable)
+ 		WREG32_SOC15(NBIO, 0, mmBIF_FB_EN, 0);
+ }
+ 
+-void nbio_v6_1_hdp_flush(struct amdgpu_device *adev)
++static void nbio_v6_1_hdp_flush(struct amdgpu_device *adev)
+ {
+ 	WREG32_SOC15_NO_KIQ(NBIO, 0, mmBIF_BX_PF0_HDP_MEM_COHERENCY_FLUSH_CNTL, 0);
+ }
+ 
+-u32 nbio_v6_1_get_memsize(struct amdgpu_device *adev)
++static u32 nbio_v6_1_get_memsize(struct amdgpu_device *adev)
+ {
+ 	return RREG32_SOC15(NBIO, 0, mmRCC_PF_0_0_RCC_CONFIG_MEMSIZE);
+ }
+ 
+-void nbio_v6_1_sdma_doorbell_range(struct amdgpu_device *adev, int instance,
++static void nbio_v6_1_sdma_doorbell_range(struct amdgpu_device *adev, int instance,
+ 				  bool use_doorbell, int doorbell_index)
+ {
+ 	u32 reg = instance == 0 ? SOC15_REG_OFFSET(NBIO, 0, mmBIF_SDMA0_DOORBELL_RANGE) :
+@@ -93,14 +93,14 @@ void nbio_v6_1_sdma_doorbell_range(struct amdgpu_device *adev, int instance,
+ 
+ }
+ 
+-void nbio_v6_1_enable_doorbell_aperture(struct amdgpu_device *adev,
+-					bool enable)
++static void nbio_v6_1_enable_doorbell_aperture(struct amdgpu_device *adev,
++					       bool enable)
+ {
+ 	WREG32_FIELD15(NBIO, 0, RCC_PF_0_0_RCC_DOORBELL_APER_EN, BIF_DOORBELL_APER_EN, enable ? 1 : 0);
+ }
+ 
+-void nbio_v6_1_enable_doorbell_selfring_aperture(struct amdgpu_device *adev,
+-					bool enable)
++static void nbio_v6_1_enable_doorbell_selfring_aperture(struct amdgpu_device *adev,
++							bool enable)
+ {
+ 	u32 tmp = 0;
+ 
+@@ -119,8 +119,8 @@ void nbio_v6_1_enable_doorbell_selfring_aperture(struct amdgpu_device *adev,
+ }
+ 
+ 
+-void nbio_v6_1_ih_doorbell_range(struct amdgpu_device *adev,
+-				bool use_doorbell, int doorbell_index)
++static void nbio_v6_1_ih_doorbell_range(struct amdgpu_device *adev,
++					bool use_doorbell, int doorbell_index)
+ {
+ 	u32 ih_doorbell_range = RREG32_SOC15(NBIO, 0 , mmBIF_IH_DOORBELL_RANGE);
+ 
+@@ -133,7 +133,7 @@ void nbio_v6_1_ih_doorbell_range(struct amdgpu_device *adev,
+ 	WREG32_SOC15(NBIO, 0, mmBIF_IH_DOORBELL_RANGE, ih_doorbell_range);
+ }
+ 
+-void nbio_v6_1_ih_control(struct amdgpu_device *adev)
++static void nbio_v6_1_ih_control(struct amdgpu_device *adev)
+ {
+ 	u32 interrupt_cntl;
+ 
+@@ -149,8 +149,8 @@ void nbio_v6_1_ih_control(struct amdgpu_device *adev)
+ 	WREG32_SOC15(NBIO, 0, mmINTERRUPT_CNTL, interrupt_cntl);
+ }
+ 
+-void nbio_v6_1_update_medium_grain_clock_gating(struct amdgpu_device *adev,
+-						bool enable)
++static void nbio_v6_1_update_medium_grain_clock_gating(struct amdgpu_device *adev,
++						       bool enable)
+ {
+ 	uint32_t def, data;
+ 
+@@ -177,8 +177,8 @@ void nbio_v6_1_update_medium_grain_clock_gating(struct amdgpu_device *adev,
+ 		WREG32_PCIE(smnCPM_CONTROL, data);
+ }
+ 
+-void nbio_v6_1_update_medium_grain_light_sleep(struct amdgpu_device *adev,
+-					       bool enable)
++static void nbio_v6_1_update_medium_grain_light_sleep(struct amdgpu_device *adev,
++						      bool enable)
+ {
+ 	uint32_t def, data;
+ 
+@@ -197,7 +197,8 @@ void nbio_v6_1_update_medium_grain_light_sleep(struct amdgpu_device *adev,
+ 		WREG32_PCIE(smnPCIE_CNTL2, data);
+ }
+ 
+-void nbio_v6_1_get_clockgating_state(struct amdgpu_device *adev, u32 *flags)
++static void nbio_v6_1_get_clockgating_state(struct amdgpu_device *adev,
++					    u32 *flags)
+ {
+ 	int data;
+ 
+@@ -232,7 +233,7 @@ static u32 nbio_v6_1_get_pcie_data_offset(struct amdgpu_device *adev)
+ 	return SOC15_REG_OFFSET(NBIO, 0, mmPCIE_DATA);
+ }
+ 
+-const struct nbio_hdp_flush_reg nbio_v6_1_hdp_flush_reg = {
++static const struct nbio_hdp_flush_reg nbio_v6_1_hdp_flush_reg = {
+ 	.ref_and_mask_cp0 = BIF_BX_PF0_GPU_HDP_FLUSH_DONE__CP0_MASK,
+ 	.ref_and_mask_cp1 = BIF_BX_PF0_GPU_HDP_FLUSH_DONE__CP1_MASK,
+ 	.ref_and_mask_cp2 = BIF_BX_PF0_GPU_HDP_FLUSH_DONE__CP2_MASK,
+@@ -247,15 +248,7 @@ const struct nbio_hdp_flush_reg nbio_v6_1_hdp_flush_reg = {
+ 	.ref_and_mask_sdma1 = BIF_BX_PF0_GPU_HDP_FLUSH_DONE__SDMA1_MASK
+ };
+ 
+-const struct amdgpu_nbio_funcs nbio_v6_1_funcs = {
+-	.get_hdp_flush_req_offset = nbio_v6_1_get_hdp_flush_req_offset,
+-	.get_hdp_flush_done_offset = nbio_v6_1_get_hdp_flush_done_offset,
+-	.get_pcie_index_offset = nbio_v6_1_get_pcie_index_offset,
+-	.get_pcie_data_offset = nbio_v6_1_get_pcie_data_offset,
+-};
+-
+-
+-void nbio_v6_1_detect_hw_virt(struct amdgpu_device *adev)
++static void nbio_v6_1_detect_hw_virt(struct amdgpu_device *adev)
+ {
+ 	uint32_t reg;
+ 
+@@ -272,7 +265,7 @@ void nbio_v6_1_detect_hw_virt(struct amdgpu_device *adev)
+ 	}
+ }
+ 
+-void nbio_v6_1_init_registers(struct amdgpu_device *adev)
++static void nbio_v6_1_init_registers(struct amdgpu_device *adev)
+ {
+ 	uint32_t def, data;
+ 
+@@ -283,3 +276,27 @@ void nbio_v6_1_init_registers(struct amdgpu_device *adev)
+ 	if (def != data)
+ 		WREG32_PCIE(smnPCIE_CONFIG_CNTL, data);
+ }
++
++const struct amdgpu_nbio_funcs nbio_v6_1_funcs = {
++	.hdp_flush_reg = &nbio_v6_1_hdp_flush_reg,
++	.get_hdp_flush_req_offset = nbio_v6_1_get_hdp_flush_req_offset,
++	.get_hdp_flush_done_offset = nbio_v6_1_get_hdp_flush_done_offset,
++	.get_pcie_index_offset = nbio_v6_1_get_pcie_index_offset,
++	.get_pcie_data_offset = nbio_v6_1_get_pcie_data_offset,
++	.get_rev_id = nbio_v6_1_get_rev_id,
++	.get_atombios_scratch_regs = nbio_v6_1_get_atombios_scratch_regs,
++	.set_atombios_scratch_regs = nbio_v6_1_set_atombios_scratch_regs,
++	.mc_access_enable = nbio_v6_1_mc_access_enable,
++	.hdp_flush = nbio_v6_1_hdp_flush,
++	.get_memsize = nbio_v6_1_get_memsize,
++	.sdma_doorbell_range = nbio_v6_1_sdma_doorbell_range,
++	.enable_doorbell_aperture = nbio_v6_1_enable_doorbell_aperture,
++	.enable_doorbell_selfring_aperture = nbio_v6_1_enable_doorbell_selfring_aperture,
++	.ih_doorbell_range = nbio_v6_1_ih_doorbell_range,
++	.update_medium_grain_clock_gating = nbio_v6_1_update_medium_grain_clock_gating,
++	.update_medium_grain_light_sleep = nbio_v6_1_update_medium_grain_light_sleep,
++	.get_clockgating_state = nbio_v6_1_get_clockgating_state,
++	.ih_control = nbio_v6_1_ih_control,
++	.init_registers = nbio_v6_1_init_registers,
++	.detect_hw_virt = nbio_v6_1_detect_hw_virt,
++};
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.h b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.h
+index 973effe..0743a6f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.h
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.h
+@@ -26,31 +26,6 @@
+ 
+ #include "soc15_common.h"
+ 
+-extern const struct nbio_hdp_flush_reg nbio_v6_1_hdp_flush_reg;
+ extern const struct amdgpu_nbio_funcs nbio_v6_1_funcs;
+ 
+-int nbio_v6_1_init(struct amdgpu_device *adev);
+-u32 nbio_v6_1_get_atombios_scratch_regs(struct amdgpu_device *adev,
+-                                        uint32_t idx);
+-void nbio_v6_1_set_atombios_scratch_regs(struct amdgpu_device *adev,
+-                                         uint32_t idx, uint32_t val);
+-void nbio_v6_1_mc_access_enable(struct amdgpu_device *adev, bool enable);
+-void nbio_v6_1_hdp_flush(struct amdgpu_device *adev);
+-u32 nbio_v6_1_get_memsize(struct amdgpu_device *adev);
+-void nbio_v6_1_sdma_doorbell_range(struct amdgpu_device *adev, int instance,
+-				  bool use_doorbell, int doorbell_index);
+-void nbio_v6_1_enable_doorbell_aperture(struct amdgpu_device *adev,
+-					bool enable);
+-void nbio_v6_1_enable_doorbell_selfring_aperture(struct amdgpu_device *adev,
+-					bool enable);
+-void nbio_v6_1_ih_doorbell_range(struct amdgpu_device *adev,
+-				bool use_doorbell, int doorbell_index);
+-void nbio_v6_1_ih_control(struct amdgpu_device *adev);
+-u32 nbio_v6_1_get_rev_id(struct amdgpu_device *adev);
+-void nbio_v6_1_update_medium_grain_clock_gating(struct amdgpu_device *adev, bool enable);
+-void nbio_v6_1_update_medium_grain_light_sleep(struct amdgpu_device *adev, bool enable);
+-void nbio_v6_1_get_clockgating_state(struct amdgpu_device *adev, u32 *flags);
+-void nbio_v6_1_detect_hw_virt(struct amdgpu_device *adev);
+-void nbio_v6_1_init_registers(struct amdgpu_device *adev);
+-
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c b/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
+index 851f58e..29d7b4f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
+@@ -31,8 +31,10 @@
+ 
+ #define smnNBIF_MGCG_CTRL_LCLK	0x1013a05c
+ 
++#define smnCPM_CONTROL                                                                                  0x11180460
++#define smnPCIE_CNTL2                                                                                   0x11180070
+ 
+-u32 nbio_v7_0_get_rev_id(struct amdgpu_device *adev)
++static u32 nbio_v7_0_get_rev_id(struct amdgpu_device *adev)
+ {
+         u32 tmp = RREG32_SOC15(NBIO, 0, mmRCC_DEV0_EPF0_STRAP0);
+ 
+@@ -42,19 +44,19 @@ u32 nbio_v7_0_get_rev_id(struct amdgpu_device *adev)
+ 	return tmp;
+ }
+ 
+-u32 nbio_v7_0_get_atombios_scratch_regs(struct amdgpu_device *adev,
++static u32 nbio_v7_0_get_atombios_scratch_regs(struct amdgpu_device *adev,
+ 					uint32_t idx)
+ {
+ 	return RREG32_SOC15_OFFSET(NBIO, 0, mmBIOS_SCRATCH_0, idx);
+ }
+ 
+-void nbio_v7_0_set_atombios_scratch_regs(struct amdgpu_device *adev,
+-					 uint32_t idx, uint32_t val)
++static void nbio_v7_0_set_atombios_scratch_regs(struct amdgpu_device *adev,
++						uint32_t idx, uint32_t val)
+ {
+ 	WREG32_SOC15_OFFSET(NBIO, 0, mmBIOS_SCRATCH_0, idx, val);
+ }
+ 
+-void nbio_v7_0_mc_access_enable(struct amdgpu_device *adev, bool enable)
++static void nbio_v7_0_mc_access_enable(struct amdgpu_device *adev, bool enable)
+ {
+ 	if (enable)
+ 		WREG32_SOC15(NBIO, 0, mmBIF_FB_EN,
+@@ -63,18 +65,18 @@ void nbio_v7_0_mc_access_enable(struct amdgpu_device *adev, bool enable)
+ 		WREG32_SOC15(NBIO, 0, mmBIF_FB_EN, 0);
+ }
+ 
+-void nbio_v7_0_hdp_flush(struct amdgpu_device *adev)
++static void nbio_v7_0_hdp_flush(struct amdgpu_device *adev)
+ {
+ 	WREG32_SOC15_NO_KIQ(NBIO, 0, mmHDP_MEM_COHERENCY_FLUSH_CNTL, 0);
+ }
+ 
+-u32 nbio_v7_0_get_memsize(struct amdgpu_device *adev)
++static u32 nbio_v7_0_get_memsize(struct amdgpu_device *adev)
+ {
+ 	return RREG32_SOC15(NBIO, 0, mmRCC_CONFIG_MEMSIZE);
+ }
+ 
+-void nbio_v7_0_sdma_doorbell_range(struct amdgpu_device *adev, int instance,
+-				  bool use_doorbell, int doorbell_index)
++static void nbio_v7_0_sdma_doorbell_range(struct amdgpu_device *adev, int instance,
++					  bool use_doorbell, int doorbell_index)
+ {
+ 	u32 reg = instance == 0 ? SOC15_REG_OFFSET(NBIO, 0, mmBIF_SDMA0_DOORBELL_RANGE) :
+ 			SOC15_REG_OFFSET(NBIO, 0, mmBIF_SDMA1_DOORBELL_RANGE);
+@@ -90,14 +92,20 @@ void nbio_v7_0_sdma_doorbell_range(struct amdgpu_device *adev, int instance,
+ 	WREG32(reg, doorbell_range);
+ }
+ 
+-void nbio_v7_0_enable_doorbell_aperture(struct amdgpu_device *adev,
+-					bool enable)
++static void nbio_v7_0_enable_doorbell_aperture(struct amdgpu_device *adev,
++					       bool enable)
+ {
+ 	WREG32_FIELD15(NBIO, 0, RCC_DOORBELL_APER_EN, BIF_DOORBELL_APER_EN, enable ? 1 : 0);
+ }
+ 
+-void nbio_v7_0_ih_doorbell_range(struct amdgpu_device *adev,
+-				bool use_doorbell, int doorbell_index)
++static void nbio_v7_0_enable_doorbell_selfring_aperture(struct amdgpu_device *adev,
++							bool enable)
++{
++
++}
++
++static void nbio_v7_0_ih_doorbell_range(struct amdgpu_device *adev,
++					bool use_doorbell, int doorbell_index)
+ {
+ 	u32 ih_doorbell_range = RREG32_SOC15(NBIO, 0 , mmBIF_IH_DOORBELL_RANGE);
+ 
+@@ -127,8 +135,8 @@ static void nbio_7_0_write_syshub_ind_mmr(struct amdgpu_device *adev, uint32_t o
+ 	WREG32_SOC15(NBIO, 0, mmSYSHUB_DATA, data);
+ }
+ 
+-void nbio_v7_0_update_medium_grain_clock_gating(struct amdgpu_device *adev,
+-						bool enable)
++static void nbio_v7_0_update_medium_grain_clock_gating(struct amdgpu_device *adev,
++						       bool enable)
+ {
+ 	uint32_t def, data;
+ 
+@@ -166,7 +174,43 @@ void nbio_v7_0_update_medium_grain_clock_gating(struct amdgpu_device *adev,
+ 		nbio_7_0_write_syshub_ind_mmr(adev, ixSYSHUB_MMREG_IND_SYSHUB_MGCG_CTRL_SHUBCLK, data);
+ }
+ 
+-void nbio_v7_0_ih_control(struct amdgpu_device *adev)
++static void nbio_v7_0_update_medium_grain_light_sleep(struct amdgpu_device *adev,
++						      bool enable)
++{
++	uint32_t def, data;
++
++	def = data = RREG32_PCIE(smnPCIE_CNTL2);
++	if (enable && (adev->cg_flags & AMD_CG_SUPPORT_BIF_LS)) {
++		data |= (PCIE_CNTL2__SLV_MEM_LS_EN_MASK |
++			 PCIE_CNTL2__MST_MEM_LS_EN_MASK |
++			 PCIE_CNTL2__REPLAY_MEM_LS_EN_MASK);
++	} else {
++		data &= ~(PCIE_CNTL2__SLV_MEM_LS_EN_MASK |
++			  PCIE_CNTL2__MST_MEM_LS_EN_MASK |
++			  PCIE_CNTL2__REPLAY_MEM_LS_EN_MASK);
++	}
++
++	if (def != data)
++		WREG32_PCIE(smnPCIE_CNTL2, data);
++}
++
++static void nbio_v7_0_get_clockgating_state(struct amdgpu_device *adev,
++					    u32 *flags)
++{
++	int data;
++
++	/* AMD_CG_SUPPORT_BIF_MGCG */
++	data = RREG32_PCIE(smnCPM_CONTROL);
++	if (data & CPM_CONTROL__LCLK_DYN_GATE_ENABLE_MASK)
++		*flags |= AMD_CG_SUPPORT_BIF_MGCG;
++
++	/* AMD_CG_SUPPORT_BIF_LS */
++	data = RREG32_PCIE(smnPCIE_CNTL2);
++	if (data & PCIE_CNTL2__SLV_MEM_LS_EN_MASK)
++		*flags |= AMD_CG_SUPPORT_BIF_LS;
++}
++
++static void nbio_v7_0_ih_control(struct amdgpu_device *adev)
+ {
+ 	u32 interrupt_cntl;
+ 
+@@ -217,10 +261,37 @@ const struct nbio_hdp_flush_reg nbio_v7_0_hdp_flush_reg = {
+ 	.ref_and_mask_sdma1 = GPU_HDP_FLUSH_DONE__SDMA1_MASK,
+ };
+ 
++static void nbio_v7_0_detect_hw_virt(struct amdgpu_device *adev)
++{
++	if (is_virtual_machine())	/* passthrough mode exclus sriov mod */
++		adev->virt.caps |= AMDGPU_PASSTHROUGH_MODE;
++}
++
++static void nbio_v7_0_init_registers(struct amdgpu_device *adev)
++{
++
++}
++
+ const struct amdgpu_nbio_funcs nbio_v7_0_funcs = {
++	.hdp_flush_reg = &nbio_v7_0_hdp_flush_reg,
+ 	.get_hdp_flush_req_offset = nbio_v7_0_get_hdp_flush_req_offset,
+ 	.get_hdp_flush_done_offset = nbio_v7_0_get_hdp_flush_done_offset,
+ 	.get_pcie_index_offset = nbio_v7_0_get_pcie_index_offset,
+ 	.get_pcie_data_offset = nbio_v7_0_get_pcie_data_offset,
++	.get_rev_id = nbio_v7_0_get_rev_id,
++	.get_atombios_scratch_regs = nbio_v7_0_get_atombios_scratch_regs,
++	.set_atombios_scratch_regs = nbio_v7_0_set_atombios_scratch_regs,
++	.mc_access_enable = nbio_v7_0_mc_access_enable,
++	.hdp_flush = nbio_v7_0_hdp_flush,
++	.get_memsize = nbio_v7_0_get_memsize,
++	.sdma_doorbell_range = nbio_v7_0_sdma_doorbell_range,
++	.enable_doorbell_aperture = nbio_v7_0_enable_doorbell_aperture,
++	.enable_doorbell_selfring_aperture = nbio_v7_0_enable_doorbell_selfring_aperture,
++	.ih_doorbell_range = nbio_v7_0_ih_doorbell_range,
++	.update_medium_grain_clock_gating = nbio_v7_0_update_medium_grain_clock_gating,
++	.update_medium_grain_light_sleep = nbio_v7_0_update_medium_grain_light_sleep,
++	.get_clockgating_state = nbio_v7_0_get_clockgating_state,
++	.ih_control = nbio_v7_0_ih_control,
++	.init_registers = nbio_v7_0_init_registers,
++	.detect_hw_virt = nbio_v7_0_detect_hw_virt,
+ };
+-
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.h b/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.h
+index 070c3bd..508d549 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.h
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.h
+@@ -26,25 +26,6 @@
+ 
+ #include "soc15_common.h"
+ 
+-extern const struct nbio_hdp_flush_reg nbio_v7_0_hdp_flush_reg;
+ extern const struct amdgpu_nbio_funcs nbio_v7_0_funcs;
+ 
+-int nbio_v7_0_init(struct amdgpu_device *adev);
+-u32 nbio_v7_0_get_atombios_scratch_regs(struct amdgpu_device *adev,
+-                                        uint32_t idx);
+-void nbio_v7_0_set_atombios_scratch_regs(struct amdgpu_device *adev,
+-                                         uint32_t idx, uint32_t val);
+-void nbio_v7_0_mc_access_enable(struct amdgpu_device *adev, bool enable);
+-void nbio_v7_0_hdp_flush(struct amdgpu_device *adev);
+-u32 nbio_v7_0_get_memsize(struct amdgpu_device *adev);
+-void nbio_v7_0_sdma_doorbell_range(struct amdgpu_device *adev, int instance,
+-				  bool use_doorbell, int doorbell_index);
+-void nbio_v7_0_enable_doorbell_aperture(struct amdgpu_device *adev,
+-					bool enable);
+-void nbio_v7_0_ih_doorbell_range(struct amdgpu_device *adev,
+-				bool use_doorbell, int doorbell_index);
+-void nbio_v7_0_ih_control(struct amdgpu_device *adev);
+-u32 nbio_v7_0_get_rev_id(struct amdgpu_device *adev);
+-void nbio_v7_0_update_medium_grain_clock_gating(struct amdgpu_device *adev,
+-						bool enable);
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+index 4765bfb..39e6c8a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+@@ -359,12 +359,7 @@ static void sdma_v4_0_ring_emit_hdp_flush(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	u32 ref_and_mask = 0;
+-	const struct nbio_hdp_flush_reg *nbio_hf_reg;
+-
+-	if (ring->adev->flags & AMD_IS_APU)
+-		nbio_hf_reg = &nbio_v7_0_hdp_flush_reg;
+-	else
+-		nbio_hf_reg = &nbio_v6_1_hdp_flush_reg;
++	const struct nbio_hdp_flush_reg *nbio_hf_reg = adev->nbio_funcs->hdp_flush_reg;
+ 
+ 	if (ring == &ring->adev->sdma.instance[0].ring)
+ 		ref_and_mask = nbio_hf_reg->ref_and_mask_sdma0;
+@@ -629,10 +624,8 @@ static int sdma_v4_0_gfx_resume(struct amdgpu_device *adev)
+ 		}
+ 		WREG32(sdma_v4_0_get_reg_offset(adev, i, mmSDMA0_GFX_DOORBELL), doorbell);
+ 		WREG32(sdma_v4_0_get_reg_offset(adev, i, mmSDMA0_GFX_DOORBELL_OFFSET), doorbell_offset);
+-		if (adev->flags & AMD_IS_APU)
+-			nbio_v7_0_sdma_doorbell_range(adev, i, ring->use_doorbell, ring->doorbell_index);
+-		else
+-			nbio_v6_1_sdma_doorbell_range(adev, i, ring->use_doorbell, ring->doorbell_index);
++		adev->nbio_funcs->sdma_doorbell_range(adev, i, ring->use_doorbell,
++						      ring->doorbell_index);
+ 
+ 		if (amdgpu_sriov_vf(adev))
+ 			sdma_v4_0_ring_set_wptr(ring);
+diff --git a/drivers/gpu/drm/amd/amdgpu/soc15.c b/drivers/gpu/drm/amd/amdgpu/soc15.c
+index cb2dc43..6d2e6d3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/soc15.c
++++ b/drivers/gpu/drm/amd/amdgpu/soc15.c
+@@ -228,10 +228,7 @@ static void soc15_se_cac_wreg(struct amdgpu_device *adev, u32 reg, u32 v)
+ 
+ static u32 soc15_get_config_memsize(struct amdgpu_device *adev)
+ {
+-	if (adev->flags & AMD_IS_APU)
+-		return nbio_v7_0_get_memsize(adev);
+-	else
+-		return nbio_v6_1_get_memsize(adev);
++	return adev->nbio_funcs->get_memsize(adev);
+ }
+ 
+ static const u32 vega10_golden_init[] =
+@@ -460,9 +457,8 @@ static int soc15_asic_reset(struct amdgpu_device *adev)
+ 
+ 	/* wait for asic to come out of reset */
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+-		u32 memsize = (adev->flags & AMD_IS_APU) ?
+-			nbio_v7_0_get_memsize(adev) :
+-			nbio_v6_1_get_memsize(adev);
++		u32 memsize = adev->nbio_funcs->get_memsize(adev);
++
+ 		if (memsize != 0xffffffff)
+ 			break;
+ 		udelay(1);
+@@ -527,14 +523,10 @@ static void soc15_program_aspm(struct amdgpu_device *adev)
+ }
+ 
+ static void soc15_enable_doorbell_aperture(struct amdgpu_device *adev,
+-					bool enable)
++					   bool enable)
+ {
+-	if (adev->flags & AMD_IS_APU) {
+-		nbio_v7_0_enable_doorbell_aperture(adev, enable);
+-	} else {
+-		nbio_v6_1_enable_doorbell_aperture(adev, enable);
+-		nbio_v6_1_enable_doorbell_selfring_aperture(adev, enable);
+-	}
++	adev->nbio_funcs->enable_doorbell_aperture(adev, enable);
++	adev->nbio_funcs->enable_doorbell_selfring_aperture(adev, enable);
+ }
+ 
+ static const struct amdgpu_ip_block_version vega10_common_ip_block =
+@@ -558,7 +550,7 @@ int soc15_set_ip_blocks(struct amdgpu_device *adev)
+ 		return -EINVAL;
+ 	}
+ 
+-	nbio_v6_1_detect_hw_virt(adev);
++	adev->nbio_funcs->detect_hw_virt(adev);
+ 
+ 	if (amdgpu_sriov_vf(adev))
+ 		adev->virt.ops = &xgpu_ai_virt_ops;
+@@ -612,10 +604,7 @@ int soc15_set_ip_blocks(struct amdgpu_device *adev)
+ 
+ static uint32_t soc15_get_rev_id(struct amdgpu_device *adev)
+ {
+-	if (adev->flags & AMD_IS_APU)
+-		return nbio_v7_0_get_rev_id(adev);
+-	else
+-		return nbio_v6_1_get_rev_id(adev);
++	return adev->nbio_funcs->get_rev_id(adev);
+ }
+ 
+ static const struct amdgpu_asic_funcs soc15_asic_funcs =
+@@ -763,8 +752,7 @@ static int soc15_common_hw_init(void *handle)
+ 	/* enable aspm */
+ 	soc15_program_aspm(adev);
+ 	/* setup nbio registers */
+-	if (!(adev->flags & AMD_IS_APU))
+-		nbio_v6_1_init_registers(adev);
++	adev->nbio_funcs->init_registers(adev);
+ 	/* enable the doorbell aperture */
+ 	soc15_enable_doorbell_aperture(adev, true);
+ 
+@@ -925,9 +913,9 @@ static int soc15_common_set_clockgating_state(void *handle,
+ 
+ 	switch (adev->asic_type) {
+ 	case CHIP_VEGA10:
+-		nbio_v6_1_update_medium_grain_clock_gating(adev,
++		adev->nbio_funcs->update_medium_grain_clock_gating(adev,
+ 				state == AMD_CG_STATE_GATE ? true : false);
+-		nbio_v6_1_update_medium_grain_light_sleep(adev,
++		adev->nbio_funcs->update_medium_grain_light_sleep(adev,
+ 				state == AMD_CG_STATE_GATE ? true : false);
+ 		soc15_update_hdp_light_sleep(adev,
+ 				state == AMD_CG_STATE_GATE ? true : false);
+@@ -941,9 +929,9 @@ static int soc15_common_set_clockgating_state(void *handle,
+ 				state == AMD_CG_STATE_GATE ? true : false);
+ 		break;
+ 	case CHIP_RAVEN:
+-		nbio_v7_0_update_medium_grain_clock_gating(adev,
++		adev->nbio_funcs->update_medium_grain_clock_gating(adev,
+ 				state == AMD_CG_STATE_GATE ? true : false);
+-		nbio_v6_1_update_medium_grain_light_sleep(adev,
++		adev->nbio_funcs->update_medium_grain_light_sleep(adev,
+ 				state == AMD_CG_STATE_GATE ? true : false);
+ 		soc15_update_hdp_light_sleep(adev,
+ 				state == AMD_CG_STATE_GATE ? true : false);
+@@ -968,7 +956,7 @@ static void soc15_common_get_clockgating_state(void *handle, u32 *flags)
+ 	if (amdgpu_sriov_vf(adev))
+ 		*flags = 0;
+ 
+-	nbio_v6_1_get_clockgating_state(adev, flags);
++	adev->nbio_funcs->get_clockgating_state(adev, flags);
+ 
+ 	/* AMD_CG_SUPPORT_HDP_LS */
+ 	data = RREG32(SOC15_REG_OFFSET(HDP, 0, mmHDP_MEM_POWER_LS));
+diff --git a/drivers/gpu/drm/amd/amdgpu/soc15_common.h b/drivers/gpu/drm/amd/amdgpu/soc15_common.h
+index 413951c..def8650 100644
+--- a/drivers/gpu/drm/amd/amdgpu/soc15_common.h
++++ b/drivers/gpu/drm/amd/amdgpu/soc15_common.h
+@@ -24,22 +24,6 @@
+ #ifndef __SOC15_COMMON_H__
+ #define __SOC15_COMMON_H__
+ 
+-struct nbio_hdp_flush_reg {
+-	u32 ref_and_mask_cp0;
+-	u32 ref_and_mask_cp1;
+-	u32 ref_and_mask_cp2;
+-	u32 ref_and_mask_cp3;
+-	u32 ref_and_mask_cp4;
+-	u32 ref_and_mask_cp5;
+-	u32 ref_and_mask_cp6;
+-	u32 ref_and_mask_cp7;
+-	u32 ref_and_mask_cp8;
+-	u32 ref_and_mask_cp9;
+-	u32 ref_and_mask_sdma0;
+-	u32 ref_and_mask_sdma1;
+-};
+-
+-
+ /* Register Access Macros */
+ #define SOC15_REG_OFFSET(ip, inst, reg)	(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg)
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vega10_ih.c b/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
+index 39c31988..3de800c 100755
+--- a/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
+@@ -95,10 +95,7 @@ static int vega10_ih_irq_init(struct amdgpu_device *adev)
+ 	/* disable irqs */
+ 	vega10_ih_disable_interrupts(adev);
+ 
+-	if (adev->flags & AMD_IS_APU)
+-		nbio_v7_0_ih_control(adev);
+-	else
+-		nbio_v6_1_ih_control(adev);
++	adev->nbio_funcs->ih_control(adev);
+ 
+ 	ih_rb_cntl = RREG32_SOC15(OSSSYS, 0, mmIH_RB_CNTL);
+ 	/* Ring Buffer base. [39:8] of 40-bit address of the beginning of the ring buffer*/
+@@ -149,10 +146,8 @@ static int vega10_ih_irq_init(struct amdgpu_device *adev)
+ 						 ENABLE, 0);
+ 	}
+ 	WREG32_SOC15(OSSSYS, 0, mmIH_DOORBELL_RPTR, ih_doorbell_rtpr);
+-	if (adev->flags & AMD_IS_APU)
+-		nbio_v7_0_ih_doorbell_range(adev, adev->irq.ih.use_doorbell, adev->irq.ih.doorbell_index);
+-	else
+-		nbio_v6_1_ih_doorbell_range(adev, adev->irq.ih.use_doorbell, adev->irq.ih.doorbell_index);
++	adev->nbio_funcs->ih_doorbell_range(adev, adev->irq.ih.use_doorbell,
++					    adev->irq.ih.doorbell_index);
+ 
+ 	tmp = RREG32_SOC15(OSSSYS, 0, mmIH_STORM_CLIENT_LIST_CNTL);
+ 	tmp = REG_SET_FIELD(tmp, IH_STORM_CLIENT_LIST_CNTL,
+-- 
+2.7.4
+

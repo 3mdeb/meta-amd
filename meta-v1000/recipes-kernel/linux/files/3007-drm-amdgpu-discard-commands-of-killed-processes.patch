@@ -1,0 +1,63 @@
+From 35ac7d7fe96163a90d2ee7ea210bd497cc833f8a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 21 Aug 2017 14:27:51 +0200
+Subject: [PATCH 3007/5855] drm/amdgpu: discard commands of killed processes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a process is killed we shouldn't submit all waiting jobs, but instead
+clean up as fast as possible.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.c | 23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+index bb053aa..e2b79cd 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.c
+@@ -204,17 +204,32 @@ void amd_sched_entity_fini(struct amd_gpu_scheduler *sched,
+ 			   struct amd_sched_entity *entity)
+ {
+ 	struct amd_sched_rq *rq = entity->rq;
++	int r;
+ 
+ 	if (!amd_sched_entity_is_initialized(sched, entity))
+ 		return;
+-
+ 	/**
+ 	 * The client will not queue more IBs during this fini, consume existing
+-	 * queued IBs
++	 * queued IBs or discard them on SIGKILL
+ 	*/
+-	wait_event(sched->job_scheduled, amd_sched_entity_is_idle(entity));
+-
++	if ((current->flags & PF_SIGNALED) && current->exit_code == SIGKILL)
++		r = -ERESTARTSYS;
++	else
++		r = wait_event_killable(sched->job_scheduled,
++					amd_sched_entity_is_idle(entity));
+ 	amd_sched_rq_remove_entity(rq, entity);
++	if (r) {
++		struct amd_sched_job *job;
++
++		/* Park the kernel for a moment to make sure it isn't processing
++		 * our enity.
++		 */
++		kthread_park(sched->thread);
++		kthread_unpark(sched->thread);
++		while (kfifo_out(&entity->job_queue, &job, sizeof(job)))
++			sched->ops->free_job(job);
++
++	}
+ 	kfifo_free(&entity->job_queue);
+ }
+ 
+-- 
+2.7.4
+

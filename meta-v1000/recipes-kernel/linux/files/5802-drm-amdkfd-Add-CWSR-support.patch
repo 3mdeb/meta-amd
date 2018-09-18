@@ -1,0 +1,443 @@
+From 74abaf9ca2325ef3e1e8ab01fa821c993532fba3 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Tue, 14 Nov 2017 16:41:19 -0500
+Subject: [PATCH 5802/5855] drm/amdkfd: Add CWSR support
+
+This hardware feature allows the GPU to preempt shader execution in
+the middle of a compute wave, save the state and restore it later
+to resume execution.
+
+Memory for saving the state is allocated per queue in user mode and
+the address and size passed to the create_queue ioctl. The size
+depends on the number of waves that can be in flight simultaneously
+on a given ASIC.
+
+Signed-off-by: Shaoyun.liu <shaoyun.liu@amd.com>
+Signed-off-by: Yong Zhao <yong.zhao@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c           |  7 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c            | 20 ++++-
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  |  6 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_module.c            |  4 +
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c    | 27 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h              | 31 +++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c           | 87 +++++++++++++++++++++-
+ 7 files changed, 177 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 2406697..9770f12 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -117,7 +117,7 @@ static int kfd_open(struct inode *inode, struct file *filep)
+ 		return -EPERM;
+ 	}
+ 
+-	process = kfd_create_process(current);
++	process = kfd_create_process(filep);
+ 	if (IS_ERR(process))
+ 		return PTR_ERR(process);
+ 
+@@ -206,6 +206,7 @@ static int set_queue_properties_from_user(struct queue_properties *q_properties,
+ 	q_properties->ctx_save_restore_area_address =
+ 			args->ctx_save_restore_address;
+ 	q_properties->ctx_save_restore_area_size = args->ctx_save_restore_size;
++	q_properties->ctl_stack_size = args->ctl_stack_size;
+ 	if (args->queue_type == KFD_IOC_QUEUE_TYPE_COMPUTE ||
+ 		args->queue_type == KFD_IOC_QUEUE_TYPE_COMPUTE_AQL)
+ 		q_properties->type = KFD_QUEUE_TYPE_COMPUTE;
+@@ -1093,6 +1094,10 @@ static int kfd_mmap(struct file *filp, struct vm_area_struct *vma)
+ 			KFD_MMAP_EVENTS_MASK) {
+ 		vma->vm_pgoff = vma->vm_pgoff ^ KFD_MMAP_EVENTS_MASK;
+ 		return kfd_event_mmap(process, vma);
++	} else if ((vma->vm_pgoff & KFD_MMAP_RESERVED_MEM_MASK) ==
++			KFD_MMAP_RESERVED_MEM_MASK) {
++		vma->vm_pgoff = vma->vm_pgoff ^ KFD_MMAP_RESERVED_MEM_MASK;
++		return kfd_reserved_mem_mmap(process, vma);
+ 	}
+ 
+ 	return -EFAULT;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 84bc643..f6f6a6b 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -27,6 +27,7 @@
+ #include "kfd_priv.h"
+ #include "kfd_device_queue_manager.h"
+ #include "kfd_pm4_headers_vi.h"
++#include "cwsr_trap_handler_gfx8.asm"
+ 
+ #define MQD_SIZE_ALIGNED 768
+ 
+@@ -38,7 +39,8 @@ static const struct kfd_device_info kaveri_device_info = {
+ 	.ih_ring_entry_size = 4 * sizeof(uint32_t),
+ 	.event_interrupt_class = &event_interrupt_class_cik,
+ 	.num_of_watch_points = 4,
+-	.mqd_size_aligned = MQD_SIZE_ALIGNED
++	.mqd_size_aligned = MQD_SIZE_ALIGNED,
++	.supports_cwsr = false,
+ };
+ 
+ static const struct kfd_device_info carrizo_device_info = {
+@@ -49,7 +51,8 @@ static const struct kfd_device_info carrizo_device_info = {
+ 	.ih_ring_entry_size = 4 * sizeof(uint32_t),
+ 	.event_interrupt_class = &event_interrupt_class_cik,
+ 	.num_of_watch_points = 4,
+-	.mqd_size_aligned = MQD_SIZE_ALIGNED
++	.mqd_size_aligned = MQD_SIZE_ALIGNED,
++	.supports_cwsr = true,
+ };
+ 
+ struct kfd_deviceid {
+@@ -203,6 +206,17 @@ static int iommu_invalid_ppr_cb(struct pci_dev *pdev, int pasid,
+ 	return AMD_IOMMU_INV_PRI_RSP_INVALID;
+ }
+ 
++static void kfd_cwsr_init(struct kfd_dev *kfd)
++{
++	if (cwsr_enable && kfd->device_info->supports_cwsr) {
++		BUILD_BUG_ON(sizeof(cwsr_trap_gfx8_hex) > PAGE_SIZE);
++
++		kfd->cwsr_isa = cwsr_trap_gfx8_hex;
++		kfd->cwsr_isa_size = sizeof(cwsr_trap_gfx8_hex);
++		kfd->cwsr_enabled = true;
++	}
++}
++
+ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+ 			 const struct kgd2kfd_shared_resources *gpu_resources)
+ {
+@@ -277,6 +291,8 @@ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+ 		goto device_iommu_pasid_error;
+ 	}
+ 
++	kfd_cwsr_init(kfd);
++
+         if (kfd_resume(kfd))
+                 goto kfd_resume_error;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 6ea3117..77d7700 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -174,6 +174,9 @@ static int create_queue_nocpsch(struct device_queue_manager *dqm,
+ 	*allocated_vmid = qpd->vmid;
+ 	q->properties.vmid = qpd->vmid;
+ 
++	q->properties.tba_addr = qpd->tba_addr;
++	q->properties.tma_addr = qpd->tma_addr;
++
+ 	if (q->properties.type == KFD_QUEUE_TYPE_COMPUTE)
+ 		retval = create_compute_queue_nocpsch(dqm, q, qpd);
+ 	else if (q->properties.type == KFD_QUEUE_TYPE_SDMA)
+@@ -848,6 +851,9 @@ static int create_queue_cpsch(struct device_queue_manager *dqm, struct queue *q,
+ 	}
+ 
+ 	dqm->asic_ops.init_sdma_vm(dqm, q, qpd);
++
++	q->properties.tba_addr = qpd->tba_addr;
++	q->properties.tma_addr = qpd->tma_addr;
+ 	retval = mqd->init_mqd(mqd, &q->mqd, &q->mqd_mem_obj,
+ 				&q->gart_mqd_addr, &q->properties);
+ 	if (retval)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_module.c b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+index f744cae..ee8adf6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_module.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+@@ -50,6 +50,10 @@ module_param(sched_policy, int, 0444);
+ MODULE_PARM_DESC(sched_policy,
+ 	"Scheduling policy (0 = HWS (Default), 1 = HWS without over-subscription, 2 = Non-HWS (Used for debugging only)");
+ 
++int cwsr_enable = 1;
++module_param(cwsr_enable, int, 0444);
++MODULE_PARM_DESC(cwsr_enable, "CWSR enable (0 = Off, 1 = On (Default))");
++
+ int max_num_of_queues_per_device = KFD_MAX_NUM_OF_QUEUES_PER_DEVICE_DEFAULT;
+ module_param(max_num_of_queues_per_device, int, 0444);
+ MODULE_PARM_DESC(max_num_of_queues_per_device,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+index 2ba7cea..00e1f1a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -89,6 +89,28 @@ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 	if (q->format == KFD_QUEUE_FORMAT_AQL)
+ 		m->cp_hqd_iq_rptr = 1;
+ 
++	if (q->tba_addr) {
++		m->compute_tba_lo = lower_32_bits(q->tba_addr >> 8);
++		m->compute_tba_hi = upper_32_bits(q->tba_addr >> 8);
++		m->compute_tma_lo = lower_32_bits(q->tma_addr >> 8);
++		m->compute_tma_hi = upper_32_bits(q->tma_addr >> 8);
++		m->compute_pgm_rsrc2 |=
++			(1 << COMPUTE_PGM_RSRC2__TRAP_PRESENT__SHIFT);
++	}
++
++	if (mm->dev->cwsr_enabled && q->ctx_save_restore_area_address) {
++		m->cp_hqd_persistent_state |=
++			(1 << CP_HQD_PERSISTENT_STATE__QSWITCH_MODE__SHIFT);
++		m->cp_hqd_ctx_save_base_addr_lo =
++			lower_32_bits(q->ctx_save_restore_area_address);
++		m->cp_hqd_ctx_save_base_addr_hi =
++			upper_32_bits(q->ctx_save_restore_area_address);
++		m->cp_hqd_ctx_save_size = q->ctx_save_restore_area_size;
++		m->cp_hqd_cntl_stack_size = q->ctl_stack_size;
++		m->cp_hqd_cntl_stack_offset = q->ctl_stack_size;
++		m->cp_hqd_wg_state_offset = q->ctl_stack_size;
++	}
++
+ 	*mqd = m;
+ 	if (gart_addr)
+ 		*gart_addr = addr;
+@@ -167,6 +189,11 @@ static int __update_mqd(struct mqd_manager *mm, void *mqd,
+ 				2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
+ 	}
+ 
++	if (mm->dev->cwsr_enabled && q->ctx_save_restore_area_address)
++		m->cp_hqd_ctx_save_control =
++			atc_bit << CP_HQD_CTX_SAVE_CONTROL__ATC__SHIFT |
++			mtype << CP_HQD_CTX_SAVE_CONTROL__MTYPE__SHIFT;
++
+ 	q->is_active = (q->queue_size > 0 &&
+ 			q->queue_address != 0 &&
+ 			q->queue_percent > 0);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 38f3e13..b6c3e77 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -41,6 +41,7 @@
+ 
+ #define KFD_MMAP_DOORBELL_MASK 0x8000000000000
+ #define KFD_MMAP_EVENTS_MASK 0x4000000000000
++#define KFD_MMAP_RESERVED_MEM_MASK 0x2000000000000
+ 
+ /*
+  * When working with cp scheduler we should assign the HIQ manually or via
+@@ -63,6 +64,15 @@
+ #define KFD_MAX_NUM_OF_QUEUES_PER_PROCESS 1024
+ 
+ /*
++ * Size of the per-process TBA+TMA buffer: 2 pages
++ *
++ * The first page is the TBA used for the CWSR ISA code. The second
++ * page is used as TMA for daisy changing a user-mode trap handler.
++ */
++#define KFD_CWSR_TBA_TMA_SIZE (PAGE_SIZE * 2)
++#define KFD_CWSR_TMA_OFFSET PAGE_SIZE
++
++/*
+  * Kernel module parameter to specify maximum number of supported queues per
+  * device
+  */
+@@ -78,6 +88,8 @@ extern int max_num_of_queues_per_device;
+ /* Kernel module parameter to specify the scheduling policy */
+ extern int sched_policy;
+ 
++extern int cwsr_enable;
++
+ /*
+  * Kernel module parameter to specify whether to send sigterm to HSA process on
+  * unhandled exception
+@@ -131,6 +143,7 @@ struct kfd_device_info {
+ 	size_t ih_ring_entry_size;
+ 	uint8_t num_of_watch_points;
+ 	uint16_t mqd_size_aligned;
++	bool supports_cwsr;
+ };
+ 
+ struct kfd_mem_obj {
+@@ -200,6 +213,11 @@ struct kfd_dev {
+ 
+ 	/* Debug manager */
+ 	struct kfd_dbgmgr           *dbgmgr;
++
++	/* CWSR */
++	bool cwsr_enabled;
++	const void *cwsr_isa;
++	unsigned int cwsr_isa_size;
+ };
+ 
+ /* KGD2KFD callbacks */
+@@ -332,6 +350,9 @@ struct queue_properties {
+ 	uint32_t eop_ring_buffer_size;
+ 	uint64_t ctx_save_restore_area_address;
+ 	uint32_t ctx_save_restore_area_size;
++	uint32_t ctl_stack_size;
++	uint64_t tba_addr;
++	uint64_t tma_addr;
+ };
+ 
+ /**
+@@ -439,6 +460,11 @@ struct qcm_process_device {
+ 	uint32_t num_gws;
+ 	uint32_t num_oac;
+ 	uint32_t sh_hidden_private_base;
++
++	/* CWSR memory */
++	void *cwsr_kaddr;
++	uint64_t tba_addr;
++	uint64_t tma_addr;
+ };
+ 
+ 
+@@ -563,7 +589,7 @@ struct amdkfd_ioctl_desc {
+ 
+ void kfd_process_create_wq(void);
+ void kfd_process_destroy_wq(void);
+-struct kfd_process *kfd_create_process(const struct task_struct *);
++struct kfd_process *kfd_create_process(struct file *filep);
+ struct kfd_process *kfd_get_process(const struct task_struct *);
+ struct kfd_process *kfd_lookup_process_by_pasid(unsigned int pasid);
+ 
+@@ -577,6 +603,9 @@ struct kfd_process_device *kfd_get_process_device_data(struct kfd_dev *dev,
+ struct kfd_process_device *kfd_create_process_device_data(struct kfd_dev *dev,
+ 							struct kfd_process *p);
+ 
++int kfd_reserved_mem_mmap(struct kfd_process *process,
++			  struct vm_area_struct *vma);
++
+ /* Process device data iterator */
+ struct kfd_process_device *kfd_get_first_process_device_data(
+ 							struct kfd_process *p);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 1bb9b26..39f4c19 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -28,6 +28,7 @@
+ #include <linux/amd-iommu.h>
+ #include <linux/notifier.h>
+ #include <linux/compat.h>
++#include <linux/mman.h>
+ 
+ struct mm_struct;
+ 
+@@ -53,6 +54,8 @@ struct kfd_process_release_work {
+ 
+ static struct kfd_process *find_process(const struct task_struct *thread);
+ static struct kfd_process *create_process(const struct task_struct *thread);
++static int kfd_process_init_cwsr(struct kfd_process *p, struct file *filep);
++
+ 
+ void kfd_process_create_wq(void)
+ {
+@@ -68,9 +71,10 @@ void kfd_process_destroy_wq(void)
+ 	}
+ }
+ 
+-struct kfd_process *kfd_create_process(const struct task_struct *thread)
++struct kfd_process *kfd_create_process(struct file *filep)
+ {
+ 	struct kfd_process *process;
++	struct task_struct *thread = current;
+ 
+ 	if (!thread->mm)
+ 		return ERR_PTR(-EINVAL);
+@@ -101,6 +105,8 @@ struct kfd_process *kfd_create_process(const struct task_struct *thread)
+ 
+ 	up_write(&thread->mm->mmap_sem);
+ 
++	kfd_process_init_cwsr(process, filep);
++
+ 	return process;
+ }
+ 
+@@ -168,6 +174,11 @@ static void kfd_process_wq_release(struct work_struct *work)
+ 			amd_iommu_unbind_pasid(pdd->dev->pdev, p->pasid);
+ 
+ 		list_del(&pdd->per_device_list);
++
++		if (pdd->qpd.cwsr_kaddr)
++			free_pages((unsigned long)pdd->qpd.cwsr_kaddr,
++				get_order(KFD_CWSR_TBA_TMA_SIZE));
++
+ 		kfree(pdd);
+ 	}
+ 
+@@ -260,6 +271,46 @@ static const struct mmu_notifier_ops kfd_process_mmu_notifier_ops = {
+ 	.release = kfd_process_notifier_release,
+ };
+ 
++static int kfd_process_init_cwsr(struct kfd_process *p, struct file *filep)
++{
++	int err = 0;
++	unsigned long  offset;
++	struct kfd_process_device *temp, *pdd = NULL;
++	struct kfd_dev *dev = NULL;
++	struct qcm_process_device *qpd = NULL;
++
++	mutex_lock(&p->mutex);
++	list_for_each_entry_safe(pdd, temp, &p->per_device_data,
++				per_device_list) {
++		dev = pdd->dev;
++		qpd = &pdd->qpd;
++		if (!dev->cwsr_enabled || qpd->cwsr_kaddr)
++			continue;
++		offset = (dev->id | KFD_MMAP_RESERVED_MEM_MASK) << PAGE_SHIFT;
++		qpd->tba_addr = (int64_t)vm_mmap(filep, 0,
++			KFD_CWSR_TBA_TMA_SIZE, PROT_READ | PROT_EXEC,
++			MAP_SHARED, offset);
++
++		if (IS_ERR_VALUE(qpd->tba_addr)) {
++			pr_err("Failure to set tba address. error -%d.\n",
++				(int)qpd->tba_addr);
++			err = qpd->tba_addr;
++			qpd->tba_addr = 0;
++			qpd->cwsr_kaddr = NULL;
++			goto out;
++		}
++
++		memcpy(qpd->cwsr_kaddr, dev->cwsr_isa, dev->cwsr_isa_size);
++
++		qpd->tma_addr = qpd->tba_addr + KFD_CWSR_TMA_OFFSET;
++		pr_debug("set tba :0x%llx, tma:0x%llx, cwsr_kaddr:%p for pqm.\n",
++			qpd->tba_addr, qpd->tma_addr, qpd->cwsr_kaddr);
++	}
++out:
++	mutex_unlock(&p->mutex);
++	return err;
++}
++
+ static struct kfd_process *create_process(const struct task_struct *thread)
+ {
+ 	struct kfd_process *process;
+@@ -535,3 +586,37 @@ struct kfd_process *kfd_lookup_process_by_pasid(unsigned int pasid)
+ 
+ 	return p;
+ }
++
++int kfd_reserved_mem_mmap(struct kfd_process *process,
++			  struct vm_area_struct *vma)
++{
++	struct kfd_dev *dev = kfd_device_by_id(vma->vm_pgoff);
++	struct kfd_process_device *pdd;
++	struct qcm_process_device *qpd;
++
++	if (!dev)
++		return -EINVAL;
++	if ((vma->vm_end - vma->vm_start) != KFD_CWSR_TBA_TMA_SIZE) {
++		pr_err("Incorrect CWSR mapping size.\n");
++		return -EINVAL;
++	}
++
++	pdd = kfd_get_process_device_data(dev, process);
++	if (!pdd)
++		return -EINVAL;
++	qpd = &pdd->qpd;
++
++	qpd->cwsr_kaddr = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
++					get_order(KFD_CWSR_TBA_TMA_SIZE));
++	if (!qpd->cwsr_kaddr) {
++		pr_err("Error allocating per process CWSR buffer.\n");
++		return -ENOMEM;
++	}
++
++	vma->vm_flags |= VM_IO | VM_DONTCOPY | VM_DONTEXPAND
++		| VM_NORESERVE | VM_DONTDUMP | VM_PFNMAP;
++	/* Mapping pages to user process */
++	return remap_pfn_range(vma, vma->vm_start,
++			       PFN_DOWN(__pa(qpd->cwsr_kaddr)),
++			       KFD_CWSR_TBA_TMA_SIZE, vma->vm_page_prot);
++}
+-- 
+2.7.4
+

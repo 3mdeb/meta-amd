@@ -1,0 +1,359 @@
+From 1189aec564318a41112abfe58f5faa5dbd25ef25 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Fri, 28 Jul 2017 20:29:05 -0400
+Subject: [PATCH 5639/5855] drm/amdkfd: Error handling fixes ported from
+ upstream
+
+When a packet buffer that was acquired from a kernel queue cannot be
+submitted due to errors, it must be rolled back to keep the state
+of the kernel queue consistent.
+
+Destroy queue in case of failure in dbgdev_register_diq.
+
+Return error and don't keep going in case of error in
+dbgdev_wave_control_set_registers.
+
+Add back error checks that were removed when BUG_ONs were eliminated.
+Remove redundant WARN_ON about NULL pointers that will cause a BUG
+anyway.
+
+Change-Id: I56e82526e8dac87925e27f7019e0659e9519c446
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c            |  5 ++-
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c            |  7 ++++
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  |  5 +++
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c      | 11 +++++
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_v9.c   |  8 ++--
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_vi.c   |  8 ++--
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c   |  3 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c    |  3 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c    | 49 +++++++++++++++-------
+ 9 files changed, 72 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c b/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
+index 942d863..4c267a9 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_dbgdev.c
+@@ -126,6 +126,7 @@ static int dbgdev_diq_submit_ib(struct kfd_dbgdev *dbgdev,
+ 
+ 	if (status != 0) {
+ 		pr_err("Failed to allocate GART memory\n");
++		kq->ops.rollback_packet(kq);
+ 		return status;
+ 	}
+ 
+@@ -213,6 +214,7 @@ static int dbgdev_register_diq(struct kfd_dbgdev *dbgdev)
+ 
+ 	if (!kq) {
+ 		pr_err("Error getting Kernel Queue\n");
++		pqm_destroy_queue(dbgdev->pqm, qid);
+ 		return -ENOMEM;
+ 	}
+ 	dbgdev->kq = kq;
+@@ -575,8 +577,7 @@ static int dbgdev_wave_control_set_registers(
+ 		break;
+ 
+ 	default:
+-		status = -EINVAL;
+-		break;
++		return -EINVAL;
+ 	}
+ 
+ 	switch (wac_info->operand) {
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index b92647e..0a087bf 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -1065,6 +1065,13 @@ static int kfd_gtt_sa_init(struct kfd_dev *kfd, unsigned int buf_size,
+ {
+ 	unsigned int num_of_longs;
+ 
++	if (WARN_ON(buf_size < chunk_size))
++		return -EINVAL;
++	if (WARN_ON(buf_size == 0))
++		return -EINVAL;
++	if (WARN_ON(chunk_size == 0))
++		return -EINVAL;
++
+ 	kfd->gtt_sa_chunk_size = chunk_size;
+ 	kfd->gtt_sa_num_of_chunks = buf_size / chunk_size;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 903e2d4..dabd9d9 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -535,6 +535,9 @@ static struct mqd_manager *get_mqd_manager_nocpsch(
+ {
+ 	struct mqd_manager *mqd;
+ 
++	if (WARN_ON(type >= KFD_MQD_TYPE_MAX))
++		return NULL;
++
+ 	pr_debug("mqd type %d\n", type);
+ 
+ 	mqd = dqm->mqds[type];
+@@ -793,6 +796,8 @@ static void uninitialize_nocpsch(struct device_queue_manager *dqm)
+ 	int i;
+ 
+ 
++	WARN_ON(dqm->queue_count > 0 || dqm->processes_count > 0);
++
+ 	kfree(dqm->allocated_queues);
+ 	for (i = 0 ; i < KFD_MQD_TYPE_MAX ; i++)
+ 		kfree(dqm->mqds[i]);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+index b303e57..6dc7e36 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+@@ -366,6 +366,7 @@ void kernel_queue_uninit(struct kernel_queue *kq)
+ 	kfree(kq);
+ }
+ 
++/* FIXME: Can this test be removed? */
+ static __attribute__((unused)) void test_kq(struct kfd_dev *dev)
+ {
+ 	struct kernel_queue *kq;
+@@ -375,8 +376,18 @@ static __attribute__((unused)) void test_kq(struct kfd_dev *dev)
+ 	pr_err("Starting kernel queue test\n");
+ 
+ 	kq = kernel_queue_init(dev, KFD_QUEUE_TYPE_HIQ);
++	if (unlikely(!kq)) {
++		pr_err("  Failed to initialize HIQ\n");
++		pr_err("Kernel queue test failed\n");
++		return;
++	}
+ 
+ 	retval = kq->ops.acquire_packet_buffer(kq, 5, &buffer);
++	if (unlikely(retval != 0)) {
++		pr_err("  Failed to acquire packet buffer\n");
++		pr_err("Kernel queue test failed\n");
++		return;
++	}
+ 	for (i = 0; i < 5; i++)
+ 		buffer[i] = kq->nop_packet;
+ 	kq->ops.submit_packet(kq);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_v9.c b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_v9.c
+index 89edf3c..beb8732 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_v9.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_v9.c
+@@ -189,7 +189,7 @@ static int pm_map_queues_v9(struct packet_manager *pm, uint32_t *buffer,
+ 		break;
+ 	default:
+ 		WARN(1, "queue type %d\n", q->properties.type);
+-		break;
++		return -EINVAL;
+ 	}
+ 	packet->bitfields3.doorbell_offset =
+ 			q->properties.doorbell_off;
+@@ -234,7 +234,7 @@ static int pm_unmap_queues_v9(struct packet_manager *pm, uint32_t *buffer,
+ 		break;
+ 	default:
+ 		WARN(1, "queue type %d\n", type);
+-		break;
++		return -EINVAL;
+ 	}
+ 
+ 	if (reset)
+@@ -267,7 +267,7 @@ static int pm_unmap_queues_v9(struct packet_manager *pm, uint32_t *buffer,
+ 		break;
+ 	default:
+ 		WARN(1, "filter %d\n", filter);
+-		break;
++		return -EINVAL;
+ 	}
+ 
+ 	return 0;
+@@ -305,8 +305,6 @@ static uint32_t pm_release_mem_v9(uint64_t gpu_addr, uint32_t *buffer)
+ {
+ 	struct pm4_mec_release_mem *packet;
+ 
+-	WARN_ON(!buffer);
+-
+ 	packet = (struct pm4_mec_release_mem *)buffer;
+ 	memset(buffer, 0, sizeof(struct pm4_mec_release_mem));
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_vi.c
+index 007a3ea..5fbc5a0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_vi.c
+@@ -194,7 +194,7 @@ int pm_map_queues_vi(struct packet_manager *pm, uint32_t *buffer,
+ 		break;
+ 	default:
+ 		WARN(1, "queue type %d\n", q->properties.type);
+-		break;
++		return -EINVAL;
+ 	}
+ 	packet->bitfields3.doorbell_offset =
+ 			q->properties.doorbell_off;
+@@ -267,7 +267,7 @@ int pm_unmap_queues_vi(struct packet_manager *pm, uint32_t *buffer,
+ 		break;
+ 	default:
+ 		WARN(1, "queue type %d\n", type);
+-		break;
++		return -EINVAL;
+ 	}
+ 
+ 	if (reset)
+@@ -300,7 +300,7 @@ int pm_unmap_queues_vi(struct packet_manager *pm, uint32_t *buffer,
+ 		break;
+ 	default:
+ 		WARN(1, "filter %d\n", filter);
+-		break;
++		return -EINVAL;
+ 	}
+ 
+ 	return 0;
+@@ -338,8 +338,6 @@ uint32_t pm_release_mem_vi(uint64_t gpu_addr, uint32_t *buffer)
+ {
+ 	struct pm4_mec_release_mem *packet;
+ 
+-	WARN_ON(!buffer);
+-
+ 	packet = (struct pm4_mec_release_mem *)buffer;
+ 	memset(buffer, 0, sizeof(struct pm4_mec_release_mem));
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+index d50e32b..71e7521 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -485,6 +485,9 @@ struct mqd_manager *mqd_manager_init_cik(enum KFD_MQD_TYPE type,
+ {
+ 	struct mqd_manager *mqd;
+ 
++	if (WARN_ON(type >= KFD_MQD_TYPE_MAX))
++		return NULL;
++
+ 	mqd = kzalloc(sizeof(*mqd), GFP_NOIO);
+ 	if (!mqd)
+ 		return NULL;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+index 58dbd85..e698fc1 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -487,6 +487,9 @@ struct mqd_manager *mqd_manager_init_vi(enum KFD_MQD_TYPE type,
+ {
+ 	struct mqd_manager *mqd;
+ 
++	if (WARN_ON(type >= KFD_MQD_TYPE_MAX))
++		return NULL;
++
+ 	mqd = kzalloc(sizeof(*mqd), GFP_NOIO);
+ 	if (!mqd)
+ 		return NULL;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+index 93632b4..1ddd6e9 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+@@ -91,6 +91,9 @@ static int pm_allocate_runlist_ib(struct packet_manager *pm,
+ {
+ 	int retval;
+ 
++	if (WARN_ON(pm->allocated))
++		return -EINVAL;
++
+ 	pm_calc_rlib_size(pm, rl_buffer_size, is_over_subscription);
+ 
+ 	mutex_lock(&pm->lock);
+@@ -201,15 +204,16 @@ static int pm_create_runlist_ib(struct packet_manager *pm,
+ 	pr_debug("Finished map process and queues to runlist\n");
+ 
+ 	if (is_over_subscription)
+-		pm->pmf->runlist(pm, &rl_buffer[rl_wptr], *rl_gpu_addr,
+-				alloc_size_bytes / sizeof(uint32_t), true);
++		retval = pm->pmf->runlist(pm, &rl_buffer[rl_wptr],
++					*rl_gpu_addr,
++					alloc_size_bytes / sizeof(uint32_t),
++					true);
+ 
+ 	for (i = 0; i < alloc_size_bytes / sizeof(uint32_t); i++)
+ 		pr_debug("0x%2X ", rl_buffer[i]);
+-
+ 	pr_debug("\n");
+ 
+-	return 0;
++	return retval;
+ }
+ 
+ int pm_init(struct packet_manager *pm, struct device_queue_manager *dqm,
+@@ -257,6 +261,7 @@ int pm_send_set_resources(struct packet_manager *pm,
+ 				struct scheduling_resources *res)
+ {
+ 	uint32_t *buffer, size;
++	int retval = 0;
+ 
+ 	size = pm->pmf->get_set_resources_packet_size();
+ 	mutex_lock(&pm->lock);
+@@ -264,18 +269,21 @@ int pm_send_set_resources(struct packet_manager *pm,
+ 				size / sizeof(uint32_t),
+ 				(unsigned int **)&buffer);
+ 	if (!buffer) {
+-		mutex_unlock(&pm->lock);
+ 		pr_err("Failed to allocate buffer on kernel queue\n");
+-		return -ENOMEM;
++		retval = -ENOMEM;
++		goto out;
+ 	}
+ 
+-	pm->pmf->set_resources(pm, buffer, res);
+-
+-	pm->priv_queue->ops.submit_packet(pm->priv_queue);
++	retval = pm->pmf->set_resources(pm, buffer, res);
++	if (!retval)
++		pm->priv_queue->ops.submit_packet(pm->priv_queue);
++	else
++		pm->priv_queue->ops.rollback_packet(pm->priv_queue);
+ 
++out:
+ 	mutex_unlock(&pm->lock);
+ 
+-	return 0;
++	return retval;
+ }
+ 
+ int pm_send_runlist(struct packet_manager *pm, struct list_head *dqm_queues)
+@@ -328,6 +336,9 @@ int pm_send_query_status(struct packet_manager *pm, uint64_t fence_address,
+ 	uint32_t *buffer, size;
+ 	int retval = 0;
+ 
++	if (WARN_ON(!fence_address))
++		return -EFAULT;
++
+ 	size = pm->pmf->get_query_status_packet_size();
+ 	mutex_lock(&pm->lock);
+ 	pm->priv_queue->ops.acquire_packet_buffer(pm->priv_queue,
+@@ -337,8 +348,12 @@ int pm_send_query_status(struct packet_manager *pm, uint64_t fence_address,
+ 		retval = -ENOMEM;
+ 		goto out;
+ 	}
+-	pm->pmf->query_status(pm, buffer, fence_address, fence_value);
+-	pm->priv_queue->ops.submit_packet(pm->priv_queue);
++
++	retval = pm->pmf->query_status(pm, buffer, fence_address, fence_value);
++	if (!retval)
++		pm->priv_queue->ops.submit_packet(pm->priv_queue);
++	else
++		pm->priv_queue->ops.rollback_packet(pm->priv_queue);
+ 
+ out:
+ 	mutex_unlock(&pm->lock);
+@@ -362,9 +377,13 @@ int pm_send_unmap_queue(struct packet_manager *pm, enum kfd_queue_type type,
+ 		retval = -ENOMEM;
+ 		goto out;
+ 	}
+-	pm->pmf->unmap_queues(pm, buffer, type, filter, filter_param, reset,
+-			      sdma_engine);
+-	pm->priv_queue->ops.submit_packet(pm->priv_queue);
++
++	retval = pm->pmf->unmap_queues(pm, buffer, type, filter, filter_param,
++				       reset, sdma_engine);
++	if (!retval)
++		pm->priv_queue->ops.submit_packet(pm->priv_queue);
++	else
++		pm->priv_queue->ops.rollback_packet(pm->priv_queue);
+ 
+ out:
+ 	mutex_unlock(&pm->lock);
+-- 
+2.7.4
+

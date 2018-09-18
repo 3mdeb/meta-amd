@@ -1,0 +1,336 @@
+From 55c9106dd5ab2a7dfae365f82acb652d108867ff Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Sun, 24 Sep 2017 00:54:33 -0400
+Subject: [PATCH 5665/5855] drm/amdkfd: Remove indiscriminate resetting of
+ queues
+
+Resetting queues affects all processes. We can't allow any action
+triggered by a user mode process to affect other processes. Therefore
+process termination and VM faults cannot be allowed to reset queues
+indiscriminately for all processes.
+
+Change-Id: I41f0a7426ac0825041548e0718cb236be417d75d
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c   | 11 +---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c            |  4 +-
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 65 +++++++++-------------
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.h  |  3 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c    |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h              |  3 +-
+ 6 files changed, 33 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c b/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c
+index 5f122a1..00536a1 100644
+--- a/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c
++++ b/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c
+@@ -95,17 +95,10 @@ static void cik_event_interrupt_wq(struct kfd_dev *dev,
+ 		ihre->source_id == CIK_INTSRC_GFX_MEM_PROT_FAULT) {
+ 		struct kfd_vm_fault_info info;
+ 
++		kfd_process_vm_fault(dev->dqm, ihre->pasid);
++
+ 		memset(&info, 0, sizeof(info));
+ 		dev->kfd2kgd->get_vm_fault_info(dev->kgd, &info);
+-		/* When CWSR is disabled, we choose to reset the device, which
+-		 * will reset the queues from other processes on this device.
+-		 * This is a bug that we accept given by-pasid reset does not
+-		 * work well.
+-		 */
+-		if (dev->cwsr_enabled)
+-			kfd_process_vm_fault(dev->dqm, ihre->pasid, false);
+-		else
+-			kfd_process_vm_fault(dev->dqm, ihre->pasid, true);
+ 		if (!info.page_addr && !info.status)
+ 			return;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 6eed0c5..88cb65e 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -793,7 +793,7 @@ static int quiesce_process_mm(struct kfd_process *p)
+ 	unsigned int n_evicted = 0;
+ 
+ 	list_for_each_entry(pdd, &p->per_device_data, per_device_list) {
+-		r = process_evict_queues(pdd->dev->dqm, &pdd->qpd, false);
++		r = process_evict_queues(pdd->dev->dqm, &pdd->qpd);
+ 		if (r != 0) {
+ 			pr_err("Failed to evict process queues\n");
+ 			goto fail;
+@@ -865,7 +865,7 @@ int kgd2kfd_quiesce_mm(struct kfd_dev *kfd, struct mm_struct *mm)
+                 r = -ENODEV;
+                 pdd = kfd_get_process_device_data(kfd, p);
+                 if (pdd)
+-			r = process_evict_queues(kfd->dqm, &pdd->qpd, false);
++			r = process_evict_queues(kfd->dqm, &pdd->qpd);
+         } else {
+                 r = quiesce_process_mm(p);
+         }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 24c7d67..5eff3a9 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -45,11 +45,10 @@ static int create_compute_queue_nocpsch(struct device_queue_manager *dqm,
+ 					struct qcm_process_device *qpd);
+ 
+ static int execute_queues_cpsch(struct device_queue_manager *dqm,
+-				bool static_queues_included,
+-				bool reset);
++				bool static_queues_included);
+ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+ 		enum kfd_unmap_queues_filter filter,
+-		uint32_t filter_param, bool reset);
++		uint32_t filter_param);
+ 
+ static int map_queues_cpsch(struct device_queue_manager *dqm);
+ 
+@@ -503,8 +502,7 @@ static int update_queue(struct device_queue_manager *dqm, struct queue *q)
+ 	/* HWS mode, unmap first to own mqd */
+ 	if (dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS) {
+ 		retval = unmap_queues_cpsch(dqm,
+-				KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0,
+-				false);
++				KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0);
+ 		if (retval) {
+ 			pr_err("unmap queue failed");
+ 			goto out_unlock;
+@@ -567,8 +565,7 @@ static struct mqd_manager *get_mqd_manager_nocpsch(
+ }
+ 
+ int process_evict_queues(struct device_queue_manager *dqm,
+-			 struct qcm_process_device *qpd,
+-			 bool reset)
++			 struct qcm_process_device *qpd)
+ {
+ 	struct queue *q, *next;
+ 	struct mqd_manager *mqd;
+@@ -607,7 +604,7 @@ int process_evict_queues(struct device_queue_manager *dqm,
+ 			dqm->queue_count--;
+ 	}
+ 	if (dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS)
+-		retval = execute_queues_cpsch(dqm, qpd->is_debug, reset);
++		retval = execute_queues_cpsch(dqm, qpd->is_debug);
+ 
+ out:
+ 	mutex_unlock(&dqm->lock);
+@@ -677,7 +674,7 @@ int process_restore_queues(struct device_queue_manager *dqm,
+ 		}
+ 	}
+ 	if (dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS)
+-		retval = execute_queues_cpsch(dqm, false, false);
++		retval = execute_queues_cpsch(dqm, false);
+ 
+ 	if (retval == 0)
+ 		qpd->evicted = 0;
+@@ -996,7 +993,7 @@ static int start_cpsch(struct device_queue_manager *dqm)
+ 	init_interrupts(dqm);
+ 
+ 	mutex_lock(&dqm->lock);
+-	execute_queues_cpsch(dqm, false, false);
++	execute_queues_cpsch(dqm, false);
+ 	mutex_unlock(&dqm->lock);
+ 
+ 	return 0;
+@@ -1011,7 +1008,7 @@ static int stop_cpsch(struct device_queue_manager *dqm)
+ {
+ 	mutex_lock(&dqm->lock);
+ 
+-	unmap_queues_cpsch(dqm, KFD_UNMAP_QUEUES_FILTER_ALL_QUEUES, 0, false);
++	unmap_queues_cpsch(dqm, KFD_UNMAP_QUEUES_FILTER_ALL_QUEUES, 0);
+ 
+ 	mutex_unlock(&dqm->lock);
+ 
+@@ -1044,7 +1041,7 @@ static int create_kernel_queue_cpsch(struct device_queue_manager *dqm,
+ 	list_add(&kq->list, &qpd->priv_queue_list);
+ 	dqm->queue_count++;
+ 	qpd->is_debug = true;
+-	execute_queues_cpsch(dqm, false, false);
++	execute_queues_cpsch(dqm, false);
+ 	mutex_unlock(&dqm->lock);
+ 
+ 	return 0;
+@@ -1059,7 +1056,7 @@ static void destroy_kernel_queue_cpsch(struct device_queue_manager *dqm,
+ 	list_del(&kq->list);
+ 	dqm->queue_count--;
+ 	qpd->is_debug = false;
+-	execute_queues_cpsch(dqm, true, false);
++	execute_queues_cpsch(dqm, true);
+ 	/*
+ 	 * Unconditionally decrement this counter, regardless of the queue's
+ 	 * type.
+@@ -1133,7 +1130,7 @@ static int create_queue_cpsch(struct device_queue_manager *dqm, struct queue *q,
+ 	qpd->queue_count++;
+ 	if (q->properties.is_active) {
+ 		dqm->queue_count++;
+-		retval = execute_queues_cpsch(dqm, false, false);
++		retval = execute_queues_cpsch(dqm, false);
+ 	}
+ 
+ 	if (q->properties.type == KFD_QUEUE_TYPE_SDMA)
+@@ -1181,11 +1178,10 @@ int amdkfd_fence_wait_timeout(unsigned int *fence_addr,
+ }
+ 
+ static int unmap_sdma_queues(struct device_queue_manager *dqm,
+-			     unsigned int sdma_engine,
+-			     bool reset)
++			     unsigned int sdma_engine)
+ {
+ 	return pm_send_unmap_queue(&dqm->packets, KFD_QUEUE_TYPE_SDMA,
+-			KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0, reset,
++			KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0, false,
+ 			sdma_engine);
+ }
+ 
+@@ -1206,7 +1202,7 @@ static int map_queues_cpsch(struct device_queue_manager *dqm)
+ 
+ 	retval = pm_send_runlist(&dqm->packets, &dqm->queues);
+ 	if (retval) {
+-		pr_err("failed to execute runlist");
++		pr_err("failed to execute runlist\n");
+ 		return retval;
+ 	}
+ 	dqm->active_runlist = true;
+@@ -1217,7 +1213,7 @@ static int map_queues_cpsch(struct device_queue_manager *dqm)
+ /* dqm->lock mutex has to be locked before calling this function */
+ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+ 		enum kfd_unmap_queues_filter filter,
+-		uint32_t filter_param, bool reset)
++		uint32_t filter_param)
+ {
+ 	int retval;
+ 
+@@ -1230,12 +1226,12 @@ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+ 		dqm->sdma_queue_count);
+ 
+ 	if (dqm->sdma_queue_count > 0) {
+-		unmap_sdma_queues(dqm, 0, reset);
+-		unmap_sdma_queues(dqm, 1, reset);
++		unmap_sdma_queues(dqm, 0);
++		unmap_sdma_queues(dqm, 1);
+ 	}
+ 
+ 	retval = pm_send_unmap_queue(&dqm->packets, KFD_QUEUE_TYPE_COMPUTE,
+-			filter, filter_param, reset, 0);
++			filter, filter_param, false, 0);
+ 	if (retval)
+ 		return retval;
+ 
+@@ -1246,7 +1242,7 @@ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+ 	retval = amdkfd_fence_wait_timeout(dqm->fence_addr, KFD_FENCE_COMPLETED,
+ 				QUEUE_PREEMPT_DEFAULT_TIMEOUT_MS);
+ 	if (retval) {
+-		pr_err("%s queues failed.", reset ? "Resetting" : "Unmapping");
++		pr_err("Unmapping queues failed.\n");
+ 		return retval;
+ 	}
+ 
+@@ -1258,8 +1254,7 @@ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+ 
+ /* dqm->lock mutex has to be locked before calling this function */
+ static int execute_queues_cpsch(struct device_queue_manager *dqm,
+-				bool static_queues_included,
+-				bool reset)
++				bool static_queues_included)
+ {
+ 	int retval;
+ 	enum kfd_unmap_queues_filter filter;
+@@ -1268,9 +1263,9 @@ static int execute_queues_cpsch(struct device_queue_manager *dqm,
+ 			KFD_UNMAP_QUEUES_FILTER_ALL_QUEUES :
+ 			KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES;
+ 
+-	retval = unmap_queues_cpsch(dqm, filter, 0, reset);
++	retval = unmap_queues_cpsch(dqm, filter, 0);
+ 	if (retval) {
+-		pr_err("The cp might be in an unrecoverable state due to an unsuccessful queues preemption");
++		pr_err("The cp might be in an unrecoverable state due to an unsuccessful queues preemption\n");
+ 		return retval;
+ 	}
+ 
+@@ -1323,7 +1318,7 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
+ 	if (q->properties.is_active)
+ 		dqm->queue_count--;
+ 
+-	retval = execute_queues_cpsch(dqm, false, false);
++	retval = execute_queues_cpsch(dqm, false);
+ 	if (retval == -ETIME)
+ 		qpd->reset_wavefronts = true;
+ 
+@@ -1550,15 +1545,7 @@ static int process_termination_cpsch(struct device_queue_manager *dqm,
+ 		}
+ 	}
+ 
+-	/* When CWSR is disabled, we choose to reset the device, which will
+-	 * reset the queues from other processes on this device. This is
+-	 * a bug that we accept given by-pasid reset does not work well.
+-	 */
+-	if (dqm->dev->cwsr_enabled)
+-		retval = execute_queues_cpsch(dqm, true, false);
+-	else
+-		retval = execute_queues_cpsch(dqm, true, true);
+-
++	retval = execute_queues_cpsch(dqm, true);
+ 	if (retval || qpd->reset_wavefronts) {
+ 		pr_warn("Resetting wave fronts (cpsch) on dev %p\n", dqm->dev);
+ 		dbgdev_wave_reset_wavefronts(dqm->dev, qpd->pqm->process);
+@@ -1687,7 +1674,7 @@ void device_queue_manager_uninit(struct device_queue_manager *dqm)
+ }
+ 
+ int kfd_process_vm_fault(struct device_queue_manager *dqm,
+-			unsigned int pasid, bool reset)
++			unsigned int pasid)
+ {
+         struct kfd_process_device *pdd;
+         struct kfd_process *p = kfd_lookup_process_by_pasid(pasid);
+@@ -1697,7 +1684,7 @@ int kfd_process_vm_fault(struct device_queue_manager *dqm,
+                 return -EINVAL;
+         pdd = kfd_get_process_device_data(dqm->dev, p);
+         if (pdd)
+-		ret = process_evict_queues(dqm, &pdd->qpd, reset);
++		ret = process_evict_queues(dqm, &pdd->qpd);
+ 	kfd_unref_process(p);
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+index d45f9f6..2fb44cb 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+@@ -216,8 +216,7 @@ unsigned int get_queues_per_pipe(struct device_queue_manager *dqm);
+ unsigned int get_pipes_per_mec(struct device_queue_manager *dqm);
+ 
+ int process_evict_queues(struct device_queue_manager *dqm,
+-		struct qcm_process_device *qpd,
+-		bool reset);
++		struct qcm_process_device *qpd);
+ int process_restore_queues(struct device_queue_manager *dqm,
+ 		struct qcm_process_device *qpd);
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c b/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
+index ccfc89a..b2c6b52 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
+@@ -122,7 +122,7 @@ static void event_interrupt_wq_v9(struct kfd_dev *dev,
+ 		info.prot_read  = ring_id & 0x10;
+ 		info.prot_write = ring_id & 0x20;
+ 
+-		kfd_process_vm_fault(dev->dqm, pasid, false);
++		kfd_process_vm_fault(dev->dqm, pasid);
+ 		kfd_signal_vm_fault_event(dev, pasid, &info);
+ 	}
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 5bd1179..df308a2 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -896,8 +896,7 @@ void device_queue_manager_uninit(struct device_queue_manager *dqm);
+ struct kernel_queue *kernel_queue_init(struct kfd_dev *dev,
+ 					enum kfd_queue_type type);
+ void kernel_queue_uninit(struct kernel_queue *kq);
+-int kfd_process_vm_fault(struct device_queue_manager *dqm,
+-			 unsigned int pasid, bool reset);
++int kfd_process_vm_fault(struct device_queue_manager *dqm, unsigned int pasid);
+ 
+ /* Process Queue Manager */
+ struct process_queue_node {
+-- 
+2.7.4
+

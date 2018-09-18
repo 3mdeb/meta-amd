@@ -1,0 +1,144 @@
+From d33a6473ffe40ac85bcd70d0da976d46ce43e9fa Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Date: Mon, 23 Oct 2017 17:34:52 -0400
+Subject: [PATCH 5661/5855] drm/amdkfd: Relaxed mm_access for CMA
+
+mm_access() is not exported. So for DKMS build implement a relaxed
+version of mm_access. This will be enabled only when module param
+amdkfd.cma_enable is set.
+
+BUG:SWDEV-136049
+
+Change-Id: I4bbab6e74da1c8db465e33bb44f9cc9bc2df6f3a
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c | 61 +++++++++++++++++++++++++++++---
+ drivers/gpu/drm/amd/amdkfd/kfd_module.c  |  5 +++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  6 ++++
+ 3 files changed, 67 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index ff2d196d..06a345d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1682,12 +1682,58 @@ static int kfd_ioctl_get_tile_config(struct file *filep,
+ }
+ 
+ #if defined(BUILD_AS_DKMS)
+-static int kfd_ioctl_cross_memory_copy(struct file *filep,
+-				       struct kfd_process *local_p, void *data)
++static bool kfd_may_access(struct task_struct *task, unsigned int mode)
+ {
+-	return 0;
++	bool access = false;
++	const struct cred *cred = current_cred(), *tcred;
++	kuid_t caller_uid = cred->fsuid;
++	kgid_t caller_gid = cred->fsgid;
++
++	task_lock(task);
++
++	if (same_thread_group(task, current)) {
++		access = true;
++		goto ok;
++	}
++
++	tcred = __task_cred(task);
++	if (uid_eq(caller_uid, tcred->euid) &&
++	    uid_eq(caller_uid, tcred->suid) &&
++	    uid_eq(caller_uid, tcred->uid)  &&
++	    gid_eq(caller_gid, tcred->egid) &&
++	    gid_eq(caller_gid, tcred->sgid) &&
++	    gid_eq(caller_gid, tcred->gid))
++		access = true;
++
++ok:
++	task_unlock(task);
++	return access;
+ }
+-#else
++/* mm_access() is currently not exported. This is a relaxed implementation
++ * that allows access as long as both process belong to same uid
++ */
++static struct mm_struct *kfd_relaxed_mm_access(struct task_struct *task,
++					       unsigned int mode)
++{
++	struct mm_struct *mm;
++	int err;
++
++	err =  mutex_lock_killable(&task->signal->cred_guard_mutex);
++	if (err)
++		return ERR_PTR(err);
++
++	mm = get_task_mm(task);
++	if (mm && mm != current->mm &&
++			!kfd_may_access(task, mode)) {
++		mmput(mm);
++		mm = ERR_PTR(-EACCES);
++	}
++	mutex_unlock(&task->signal->cred_guard_mutex);
++
++	return mm;
++}
++#endif
++
+ static int kfd_ioctl_cross_memory_copy(struct file *filep,
+ 				       struct kfd_process *local_p, void *data)
+ {
+@@ -1749,7 +1795,13 @@ static int kfd_ioctl_cross_memory_copy(struct file *filep,
+ 	}
+ 
+ 	/* Check access permission */
++#if defined(BUILD_AS_DKMS)
++	remote_mm = cma_enable ? kfd_relaxed_mm_access(remote_task,
++				PTRACE_MODE_ATTACH_REALCREDS) :
++				ERR_PTR(-EACCES);
++#else
+ 	remote_mm = mm_access(remote_task, PTRACE_MODE_ATTACH_REALCREDS);
++#endif
+ 	if (!remote_mm || IS_ERR(remote_mm)) {
+ 		err = IS_ERR(remote_mm) ? PTR_ERR(remote_mm) : -ESRCH;
+ 		if (err == -EACCES) {
+@@ -1929,7 +1981,6 @@ static int kfd_ioctl_cross_memory_copy(struct file *filep,
+ 	args->bytes_copied = total_copied;
+ 	return err;
+ }
+-#endif
+ 
+ static int kfd_ioctl_get_queue_wave_state(struct file *filep,
+ 					  struct kfd_process *p, void *data)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_module.c b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+index aba3e9d..36da8c4 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_module.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+@@ -89,6 +89,11 @@ module_param_named(noretry, vega10_noretry, int, 0644);
+ MODULE_PARM_DESC(noretry,
+ 	"Set sh_mem_config.retry_disable on Vega10 (0 = retry enabled (default), 1 = retry disabled)");
+ 
++int cma_enable;
++module_param(cma_enable, int, 0644);
++MODULE_PARM_DESC(cma_enable,
++	"Enable CMA (1 = enable, 0 = disable (default)). Warning! relaxed access check");
++
+ int kgd2kfd_init(unsigned int interface_version,
+ 		const struct kgd2kfd_calls **g2f)
+ {
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 14a2c8a..73f1ade 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -139,6 +139,12 @@ extern int ignore_crat;
+  */
+ extern int vega10_noretry;
+ 
++/*
++ * Currently, mm_access() function is not exported. So for DKMS build,
++ * CMA will be enabled only if module param is set.
++ */
++extern int cma_enable;
++
+ /**
+  * enum kfd_sched_policy
+  *
+-- 
+2.7.4
+

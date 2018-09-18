@@ -1,0 +1,131 @@
+From 1bb7e01a42b7b901d44dad4afcc8e4df94b37b38 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Wed, 27 Sep 2017 00:09:54 -0400
+Subject: [PATCH 5762/5855] drm/amdkfd: Clean up process queue management
+
+Removed unused num_concurrent_processes.
+
+Implemented counting of queues in QPD. This makes counting the queue
+list repeatedly in several places unnecessary.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 5 +++++
+ drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c        | 7 +------
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h                  | 1 -
+ drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c | 9 ++-------
+ 4 files changed, 8 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index d43e997..47ccc97 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -190,6 +190,7 @@ static int create_queue_nocpsch(struct device_queue_manager *dqm,
+ 	}
+ 
+ 	list_add(&q->list, &qpd->queues_list);
++	qpd->queue_count++;
+ 	if (q->properties.is_active)
+ 		dqm->queue_count++;
+ 
+@@ -347,6 +348,7 @@ static int destroy_queue_nocpsch_locked(struct device_queue_manager *dqm,
+ 
+ 		deallocate_vmid(dqm, qpd, q);
+ 	}
++	qpd->queue_count--;
+ 	if (q->properties.is_active)
+ 		dqm->queue_count--;
+ 
+@@ -858,6 +860,7 @@ static int create_queue_cpsch(struct device_queue_manager *dqm, struct queue *q,
+ 		goto out;
+ 
+ 	list_add(&q->list, &qpd->queues_list);
++	qpd->queue_count++;
+ 	if (q->properties.is_active) {
+ 		dqm->queue_count++;
+ 		retval = execute_queues_cpsch(dqm,
+@@ -1016,6 +1019,7 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
+ 		dqm->sdma_queue_count--;
+ 
+ 	list_del(&q->list);
++	qpd->queue_count--;
+ 	if (q->properties.is_active)
+ 		dqm->queue_count--;
+ 
+@@ -1206,6 +1210,7 @@ static int process_termination_cpsch(struct device_queue_manager *dqm,
+ 			goto out;
+ 		}
+ 		list_del(&q->list);
++		qpd->queue_count--;
+ 		mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+index a074735..9c2dafb 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+@@ -141,8 +141,6 @@ static int pm_create_map_process(struct packet_manager *pm, uint32_t *buffer,
+ 				struct qcm_process_device *qpd)
+ {
+ 	struct pm4_mes_map_process *packet;
+-	struct queue *cur;
+-	uint32_t num_queues;
+ 
+ 	packet = (struct pm4_mes_map_process *)buffer;
+ 
+@@ -157,10 +155,7 @@ static int pm_create_map_process(struct packet_manager *pm, uint32_t *buffer,
+ 	packet->bitfields10.gds_size = qpd->gds_size;
+ 	packet->bitfields10.num_gws = qpd->num_gws;
+ 	packet->bitfields10.num_oac = qpd->num_oac;
+-	num_queues = 0;
+-	list_for_each_entry(cur, &qpd->queues_list, list)
+-		num_queues++;
+-	packet->bitfields10.num_queues = (qpd->is_debug) ? 0 : num_queues;
++	packet->bitfields10.num_queues = (qpd->is_debug) ? 0 : qpd->queue_count;
+ 
+ 	packet->sh_mem_config = qpd->sh_mem_config;
+ 	packet->sh_mem_bases = qpd->sh_mem_bases;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index efc2ef4..e001af4 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -405,7 +405,6 @@ struct scheduling_resources {
+ struct process_queue_manager {
+ 	/* data */
+ 	struct kfd_process	*process;
+-	unsigned int		num_concurrent_processes;
+ 	struct list_head	queues;
+ 	unsigned long		*queue_slot_bitmap;
+ };
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+index 892b4df..42e271f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -149,8 +149,6 @@ int pqm_create_queue(struct process_queue_manager *pqm,
+ 	struct queue *q;
+ 	struct process_queue_node *pqn;
+ 	struct kernel_queue *kq;
+-	int num_queues = 0;
+-	struct queue *cur;
+ 	enum kfd_queue_type type = properties->type;
+ 
+ 	q = NULL;
+@@ -168,11 +166,8 @@ int pqm_create_queue(struct process_queue_manager *pqm,
+ 	 * If we are just about to create DIQ, the is_debug flag is not set yet
+ 	 * Hence we also check the type as well
+ 	 */
+-	if ((pdd->qpd.is_debug) ||
+-		(type == KFD_QUEUE_TYPE_DIQ)) {
+-		list_for_each_entry(cur, &pdd->qpd.queues_list, list)
+-			num_queues++;
+-		if (num_queues >= dev->device_info->max_no_of_hqd/2)
++	if ((pdd->qpd.is_debug) || (type == KFD_QUEUE_TYPE_DIQ)) {
++		if (pdd->qpd.queue_count >= dev->device_info->max_no_of_hqd/2)
+ 			return -ENOSPC;
+ 	}
+ 
+-- 
+2.7.4
+

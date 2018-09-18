@@ -1,0 +1,946 @@
+From 23540bee668adc41791ed922f7552b438a37f8c8 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Tue, 15 Aug 2017 23:00:15 -0400
+Subject: [PATCH 5197/5855] drm/amdkfd: Update PM4 packet headers
+
+To match current firmware. The map process packet has been extended
+to support scratch. This is a non-backwards compatible change and
+it's about two years old. So no point keeping the old version around
+conditionally.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c         |   8 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c | 161 ++++--------
+ drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers.h    | 314 +++---------------------
+ drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers_vi.h | 130 +++++++++-
+ 4 files changed, 199 insertions(+), 414 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index fc6d790..43368a9 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -26,7 +26,7 @@
+ #include <linux/slab.h>
+ #include "kfd_priv.h"
+ #include "kfd_device_queue_manager.h"
+-#include "kfd_pm4_headers.h"
++#include "kfd_pm4_headers_vi.h"
+ 
+ #define MQD_SIZE_ALIGNED 768
+ 
+@@ -241,9 +241,9 @@ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+ 	 * calculate max size of runlist packet.
+ 	 * There can be only 2 packets at once
+ 	 */
+-	size += (KFD_MAX_NUM_OF_PROCESSES * sizeof(struct pm4_map_process) +
+-		max_num_of_queues_per_device *
+-		sizeof(struct pm4_map_queues) + sizeof(struct pm4_runlist)) * 2;
++	size += (KFD_MAX_NUM_OF_PROCESSES * sizeof(struct pm4_mes_map_process) +
++		max_num_of_queues_per_device * sizeof(struct pm4_mes_map_queues)
++		+ sizeof(struct pm4_mes_runlist)) * 2;
+ 
+ 	/* Add size of HIQ & DIQ */
+ 	size += KFD_KERNEL_QUEUE_SIZE * 2;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+index 367ca63..b93e85a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+@@ -26,7 +26,6 @@
+ #include "kfd_device_queue_manager.h"
+ #include "kfd_kernel_queue.h"
+ #include "kfd_priv.h"
+-#include "kfd_pm4_headers.h"
+ #include "kfd_pm4_headers_vi.h"
+ #include "kfd_pm4_opcodes.h"
+ 
+@@ -44,12 +43,12 @@ static unsigned int build_pm4_header(unsigned int opcode, size_t packet_size)
+ {
+        union PM4_MES_TYPE_3_HEADER header;
+ 
+-       header.u32all = 0;
++       header.u32All = 0;
+        header.opcode = opcode;
+        header.count = packet_size/sizeof(uint32_t) - 2;
+        header.type = PM4_TYPE_3;
+ 
+-       return header.u32all;
++       return header.u32All;
+ }
+ 
+ 
+@@ -70,12 +69,9 @@ static void pm_calc_rlib_size(struct packet_manager *pm,
+ 		*over_subscription = true;
+ 		pr_debug("Over subscribed runlist\n");
+ 	}
+-        map_queue_size =
+-                (pm->dqm->dev->device_info->asic_family == CHIP_CARRIZO) ?
+-                sizeof(struct pm4_mes_map_queues) :
+-                sizeof(struct pm4_map_queues);
++	map_queue_size = sizeof(struct pm4_mes_map_queues);
+ 	/* calculate run list ib allocation size */
+-	*rlib_size = process_count * sizeof(struct pm4_map_process) +
++	*rlib_size = process_count * sizeof(struct pm4_mes_map_process) +
+ 		     queue_count * map_queue_size;
+ 
+ 	/*
+@@ -83,7 +79,7 @@ static void pm_calc_rlib_size(struct packet_manager *pm,
+ 	 * when over subscription
+ 	 */
+ 	if (*over_subscription)
+-		*rlib_size += sizeof(struct pm4_runlist);
++		*rlib_size += sizeof(struct pm4_mes_runlist);
+ 
+ 	pr_debug("runlist ib size %d\n", *rlib_size);
+ }
+@@ -120,16 +116,16 @@ static int pm_allocate_runlist_ib(struct packet_manager *pm,
+ static int pm_create_runlist(struct packet_manager *pm, uint32_t *buffer,
+ 			uint64_t ib, size_t ib_size_in_dwords, bool chain)
+ {
+-	struct pm4_runlist *packet;
++	struct pm4_mes_runlist *packet;
+ 
+ 	if (WARN_ON(!ib))
+ 		return -EFAULT;
+ 
+-	packet = (struct pm4_runlist *)buffer;
++	packet = (struct pm4_mes_runlist *)buffer;
+ 
+-	memset(buffer, 0, sizeof(struct pm4_runlist));
+-	packet->header.u32all = build_pm4_header(IT_RUN_LIST,
+-						sizeof(struct pm4_runlist));
++	memset(buffer, 0, sizeof(struct pm4_mes_runlist));
++	packet->header.u32All = build_pm4_header(IT_RUN_LIST,
++						sizeof(struct pm4_mes_runlist));
+ 
+ 	packet->bitfields4.ib_size = ib_size_in_dwords;
+ 	packet->bitfields4.chain = chain ? 1 : 0;
+@@ -144,16 +140,16 @@ static int pm_create_runlist(struct packet_manager *pm, uint32_t *buffer,
+ static int pm_create_map_process(struct packet_manager *pm, uint32_t *buffer,
+ 				struct qcm_process_device *qpd)
+ {
+-	struct pm4_map_process *packet;
++	struct pm4_mes_map_process *packet;
+ 	struct queue *cur;
+ 	uint32_t num_queues;
+ 
+-	packet = (struct pm4_map_process *)buffer;
++	packet = (struct pm4_mes_map_process *)buffer;
+ 
+-	memset(buffer, 0, sizeof(struct pm4_map_process));
++	memset(buffer, 0, sizeof(struct pm4_mes_map_process));
+ 
+-	packet->header.u32all = build_pm4_header(IT_MAP_PROCESS,
+-					sizeof(struct pm4_map_process));
++	packet->header.u32All = build_pm4_header(IT_MAP_PROCESS,
++					sizeof(struct pm4_mes_map_process));
+ 	packet->bitfields2.diq_enable = (qpd->is_debug) ? 1 : 0;
+ 	packet->bitfields2.process_quantum = 1;
+ 	packet->bitfields2.pasid = qpd->pqm->process->pasid;
+@@ -171,23 +167,26 @@ static int pm_create_map_process(struct packet_manager *pm, uint32_t *buffer,
+ 	packet->sh_mem_ape1_base = qpd->sh_mem_ape1_base;
+ 	packet->sh_mem_ape1_limit = qpd->sh_mem_ape1_limit;
+ 
++	/* TODO: scratch support */
++	packet->sh_hidden_private_base_vmid = 0;
++
+ 	packet->gds_addr_lo = lower_32_bits(qpd->gds_context_area);
+ 	packet->gds_addr_hi = upper_32_bits(qpd->gds_context_area);
+ 
+ 	return 0;
+ }
+ 
+-static int pm_create_map_queue_vi(struct packet_manager *pm, uint32_t *buffer,
++static int pm_create_map_queue(struct packet_manager *pm, uint32_t *buffer,
+ 		struct queue *q, bool is_static)
+ {
+ 	struct pm4_mes_map_queues *packet;
+ 	bool use_static = is_static;
+ 
+ 	packet = (struct pm4_mes_map_queues *)buffer;
+-	memset(buffer, 0, sizeof(struct pm4_map_queues));
++	memset(buffer, 0, sizeof(struct pm4_mes_map_queues));
+ 
+-	packet->header.u32all = build_pm4_header(IT_MAP_QUEUES,
+-						sizeof(struct pm4_map_queues));
++	packet->header.u32All = build_pm4_header(IT_MAP_QUEUES,
++						sizeof(struct pm4_mes_map_queues));
+ 	packet->bitfields2.alloc_format =
+ 		alloc_format__mes_map_queues__one_per_pipe_vi;
+ 	packet->bitfields2.num_queues = 1;
+@@ -236,64 +235,6 @@ static int pm_create_map_queue_vi(struct packet_manager *pm, uint32_t *buffer,
+ 	return 0;
+ }
+ 
+-static int pm_create_map_queue(struct packet_manager *pm, uint32_t *buffer,
+-				struct queue *q, bool is_static)
+-{
+-	struct pm4_map_queues *packet;
+-	bool use_static = is_static;
+-
+-	packet = (struct pm4_map_queues *)buffer;
+-	memset(buffer, 0, sizeof(struct pm4_map_queues));
+-
+-	packet->header.u32all = build_pm4_header(IT_MAP_QUEUES,
+-						sizeof(struct pm4_map_queues));
+-	packet->bitfields2.alloc_format =
+-				alloc_format__mes_map_queues__one_per_pipe;
+-	packet->bitfields2.num_queues = 1;
+-	packet->bitfields2.queue_sel =
+-		queue_sel__mes_map_queues__map_to_hws_determined_queue_slots;
+-
+-	packet->bitfields2.vidmem = (q->properties.is_interop) ?
+-			vidmem__mes_map_queues__uses_video_memory :
+-			vidmem__mes_map_queues__uses_no_video_memory;
+-
+-	switch (q->properties.type) {
+-	case KFD_QUEUE_TYPE_COMPUTE:
+-	case KFD_QUEUE_TYPE_DIQ:
+-		packet->bitfields2.engine_sel =
+-				engine_sel__mes_map_queues__compute;
+-		break;
+-	case KFD_QUEUE_TYPE_SDMA:
+-		packet->bitfields2.engine_sel =
+-				engine_sel__mes_map_queues__sdma0;
+-		use_static = false; /* no static queues under SDMA */
+-		break;
+-	default:
+-		WARN(1, "queue type %d", q->properties.type);
+-		return -EINVAL;
+-	}
+-
+-	packet->mes_map_queues_ordinals[0].bitfields3.doorbell_offset =
+-			q->properties.doorbell_off;
+-
+-	packet->mes_map_queues_ordinals[0].bitfields3.is_static =
+-			(use_static) ? 1 : 0;
+-
+-	packet->mes_map_queues_ordinals[0].mqd_addr_lo =
+-			lower_32_bits(q->gart_mqd_addr);
+-
+-	packet->mes_map_queues_ordinals[0].mqd_addr_hi =
+-			upper_32_bits(q->gart_mqd_addr);
+-
+-	packet->mes_map_queues_ordinals[0].wptr_addr_lo =
+-			lower_32_bits((uint64_t)q->properties.write_ptr);
+-
+-	packet->mes_map_queues_ordinals[0].wptr_addr_hi =
+-			upper_32_bits((uint64_t)q->properties.write_ptr);
+-
+-	return 0;
+-}
+-
+ static int pm_create_runlist_ib(struct packet_manager *pm,
+ 				struct list_head *queues,
+ 				uint64_t *rl_gpu_addr,
+@@ -335,7 +276,7 @@ static int pm_create_runlist_ib(struct packet_manager *pm,
+ 			return retval;
+ 
+ 		proccesses_mapped++;
+-		inc_wptr(&rl_wptr, sizeof(struct pm4_map_process),
++		inc_wptr(&rl_wptr, sizeof(struct pm4_mes_map_process),
+ 				alloc_size_bytes);
+ 
+ 		list_for_each_entry(kq, &qpd->priv_queue_list, list) {
+@@ -345,14 +286,7 @@ static int pm_create_runlist_ib(struct packet_manager *pm,
+ 			pr_debug("static_queue, mapping kernel q %d, is debug status %d\n",
+ 				kq->queue->queue, qpd->is_debug);
+ 
+-			if (pm->dqm->dev->device_info->asic_family ==
+-					CHIP_CARRIZO)
+-				retval = pm_create_map_queue_vi(pm,
+-						&rl_buffer[rl_wptr],
+-						kq->queue,
+-						qpd->is_debug);
+-			else
+-				retval = pm_create_map_queue(pm,
++			retval = pm_create_map_queue(pm,
+ 						&rl_buffer[rl_wptr],
+ 						kq->queue,
+ 						qpd->is_debug);
+@@ -360,7 +294,7 @@ static int pm_create_runlist_ib(struct packet_manager *pm,
+ 				return retval;
+ 
+ 			inc_wptr(&rl_wptr,
+-				sizeof(struct pm4_map_queues),
++				sizeof(struct pm4_mes_map_queues),
+ 				alloc_size_bytes);
+ 		}
+ 
+@@ -371,14 +305,7 @@ static int pm_create_runlist_ib(struct packet_manager *pm,
+ 			pr_debug("static_queue, mapping user queue %d, is debug status %d\n",
+ 				q->queue, qpd->is_debug);
+ 
+-			if (pm->dqm->dev->device_info->asic_family ==
+-					CHIP_CARRIZO)
+-				retval = pm_create_map_queue_vi(pm,
+-						&rl_buffer[rl_wptr],
+-						q,
+-						qpd->is_debug);
+-			else
+-				retval = pm_create_map_queue(pm,
++			retval = pm_create_map_queue(pm,
+ 						&rl_buffer[rl_wptr],
+ 						q,
+ 						qpd->is_debug);
+@@ -387,7 +314,7 @@ static int pm_create_runlist_ib(struct packet_manager *pm,
+ 				return retval;
+ 
+ 			inc_wptr(&rl_wptr,
+-				sizeof(struct pm4_map_queues),
++				sizeof(struct pm4_mes_map_queues),
+ 				alloc_size_bytes);
+ 		}
+ 	}
+@@ -430,7 +357,7 @@ void pm_uninit(struct packet_manager *pm)
+ int pm_send_set_resources(struct packet_manager *pm,
+ 				struct scheduling_resources *res)
+ {
+-	struct pm4_set_resources *packet;
++	struct pm4_mes_set_resources *packet;
+ 	int retval = 0;
+ 
+ 	mutex_lock(&pm->lock);
+@@ -443,9 +370,9 @@ int pm_send_set_resources(struct packet_manager *pm,
+ 		goto out;
+ 	}
+ 
+-	memset(packet, 0, sizeof(struct pm4_set_resources));
+-	packet->header.u32all = build_pm4_header(IT_SET_RESOURCES,
+-					sizeof(struct pm4_set_resources));
++	memset(packet, 0, sizeof(struct pm4_mes_set_resources));
++	packet->header.u32All = build_pm4_header(IT_SET_RESOURCES,
++					sizeof(struct pm4_mes_set_resources));
+ 
+ 	packet->bitfields2.queue_type =
+ 			queue_type__mes_set_resources__hsa_interface_queue_hiq;
+@@ -483,7 +410,7 @@ int pm_send_runlist(struct packet_manager *pm, struct list_head *dqm_queues)
+ 
+ 	pr_debug("runlist IB address: 0x%llX\n", rl_gpu_ib_addr);
+ 
+-	packet_size_dwords = sizeof(struct pm4_runlist) / sizeof(uint32_t);
++	packet_size_dwords = sizeof(struct pm4_mes_runlist) / sizeof(uint32_t);
+ 	mutex_lock(&pm->lock);
+ 
+ 	retval = pm->priv_queue->ops.acquire_packet_buffer(pm->priv_queue,
+@@ -515,7 +442,7 @@ int pm_send_query_status(struct packet_manager *pm, uint64_t fence_address,
+ 			uint32_t fence_value)
+ {
+ 	int retval;
+-	struct pm4_query_status *packet;
++	struct pm4_mes_query_status *packet;
+ 
+ 	if (WARN_ON(!fence_address))
+ 		return -EFAULT;
+@@ -523,13 +450,13 @@ int pm_send_query_status(struct packet_manager *pm, uint64_t fence_address,
+ 	mutex_lock(&pm->lock);
+ 	retval = pm->priv_queue->ops.acquire_packet_buffer(
+ 			pm->priv_queue,
+-			sizeof(struct pm4_query_status) / sizeof(uint32_t),
++			sizeof(struct pm4_mes_query_status) / sizeof(uint32_t),
+ 			(unsigned int **)&packet);
+ 	if (retval)
+ 		goto fail_acquire_packet_buffer;
+ 
+-	packet->header.u32all = build_pm4_header(IT_QUERY_STATUS,
+-					sizeof(struct pm4_query_status));
++	packet->header.u32All = build_pm4_header(IT_QUERY_STATUS,
++					sizeof(struct pm4_mes_query_status));
+ 
+ 	packet->bitfields2.context_id = 0;
+ 	packet->bitfields2.interrupt_sel =
+@@ -556,22 +483,22 @@ int pm_send_unmap_queue(struct packet_manager *pm, enum kfd_queue_type type,
+ {
+ 	int retval;
+ 	uint32_t *buffer;
+-	struct pm4_unmap_queues *packet;
++	struct pm4_mes_unmap_queues *packet;
+ 
+ 	mutex_lock(&pm->lock);
+ 	retval = pm->priv_queue->ops.acquire_packet_buffer(
+ 			pm->priv_queue,
+-			sizeof(struct pm4_unmap_queues) / sizeof(uint32_t),
++			sizeof(struct pm4_mes_unmap_queues) / sizeof(uint32_t),
+ 			&buffer);
+ 	if (retval)
+ 		goto err_acquire_packet_buffer;
+ 
+-	packet = (struct pm4_unmap_queues *)buffer;
+-	memset(buffer, 0, sizeof(struct pm4_unmap_queues));
++	packet = (struct pm4_mes_unmap_queues *)buffer;
++	memset(buffer, 0, sizeof(struct pm4_mes_unmap_queues));
+ 	pr_debug("static_queue: unmapping queues: mode is %d , reset is %d , type is %d\n",
+ 		mode, reset, type);
+-	packet->header.u32all = build_pm4_header(IT_UNMAP_QUEUES,
+-					sizeof(struct pm4_unmap_queues));
++	packet->header.u32All = build_pm4_header(IT_UNMAP_QUEUES,
++					sizeof(struct pm4_mes_unmap_queues));
+ 	switch (type) {
+ 	case KFD_QUEUE_TYPE_COMPUTE:
+ 	case KFD_QUEUE_TYPE_DIQ:
+@@ -609,12 +536,12 @@ int pm_send_unmap_queue(struct packet_manager *pm, enum kfd_queue_type type,
+ 		break;
+ 	case KFD_PREEMPT_TYPE_FILTER_ALL_QUEUES:
+ 		packet->bitfields2.queue_sel =
+-				queue_sel__mes_unmap_queues__perform_request_on_all_active_queues;
++				queue_sel__mes_unmap_queues__unmap_all_queues;
+ 		break;
+ 	case KFD_PREEMPT_TYPE_FILTER_DYNAMIC_QUEUES:
+ 		/* in this case, we do not preempt static queues */
+ 		packet->bitfields2.queue_sel =
+-				queue_sel__mes_unmap_queues__perform_request_on_dynamic_queues_only;
++				queue_sel__mes_unmap_queues__unmap_all_non_static_queues;
+ 		break;
+ 	default:
+ 		WARN(1, "filter %d", mode);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers.h b/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers.h
+index 97e5442..e50f73d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers.h
+@@ -41,99 +41,6 @@ union PM4_MES_TYPE_3_HEADER {
+ };
+ #endif /* PM4_MES_HEADER_DEFINED */
+ 
+-/* --------------------MES_SET_RESOURCES-------------------- */
+-
+-#ifndef PM4_MES_SET_RESOURCES_DEFINED
+-#define PM4_MES_SET_RESOURCES_DEFINED
+-enum set_resources_queue_type_enum {
+-	queue_type__mes_set_resources__kernel_interface_queue_kiq = 0,
+-	queue_type__mes_set_resources__hsa_interface_queue_hiq = 1,
+-	queue_type__mes_set_resources__hsa_debug_interface_queue = 4
+-};
+-
+-struct pm4_set_resources {
+-	union {
+-		union PM4_MES_TYPE_3_HEADER header;	/* header */
+-		uint32_t ordinal1;
+-	};
+-
+-	union {
+-		struct {
+-			uint32_t vmid_mask:16;
+-			uint32_t unmap_latency:8;
+-			uint32_t reserved1:5;
+-			enum set_resources_queue_type_enum queue_type:3;
+-		} bitfields2;
+-		uint32_t ordinal2;
+-	};
+-
+-	uint32_t queue_mask_lo;
+-	uint32_t queue_mask_hi;
+-	uint32_t gws_mask_lo;
+-	uint32_t gws_mask_hi;
+-
+-	union {
+-		struct {
+-			uint32_t oac_mask:16;
+-			uint32_t reserved2:16;
+-		} bitfields7;
+-		uint32_t ordinal7;
+-	};
+-
+-	union {
+-		struct {
+-			uint32_t gds_heap_base:6;
+-			uint32_t reserved3:5;
+-			uint32_t gds_heap_size:6;
+-			uint32_t reserved4:15;
+-		} bitfields8;
+-		uint32_t ordinal8;
+-	};
+-
+-};
+-#endif
+-
+-/*--------------------MES_RUN_LIST-------------------- */
+-
+-#ifndef PM4_MES_RUN_LIST_DEFINED
+-#define PM4_MES_RUN_LIST_DEFINED
+-
+-struct pm4_runlist {
+-	union {
+-		union PM4_MES_TYPE_3_HEADER header;	/* header */
+-		uint32_t ordinal1;
+-	};
+-
+-	union {
+-		struct {
+-			uint32_t reserved1:2;
+-			uint32_t ib_base_lo:30;
+-		} bitfields2;
+-		uint32_t ordinal2;
+-	};
+-
+-	union {
+-		struct {
+-			uint32_t ib_base_hi:16;
+-			uint32_t reserved2:16;
+-		} bitfields3;
+-		uint32_t ordinal3;
+-	};
+-
+-	union {
+-		struct {
+-			uint32_t ib_size:20;
+-			uint32_t chain:1;
+-			uint32_t offload_polling:1;
+-			uint32_t reserved3:1;
+-			uint32_t valid:1;
+-			uint32_t reserved4:8;
+-		} bitfields4;
+-		uint32_t ordinal4;
+-	};
+-
+-};
+-#endif
+ 
+ /*--------------------MES_MAP_PROCESS-------------------- */
+ 
+@@ -186,217 +93,58 @@ struct pm4_map_process {
+ };
+ #endif
+ 
+-/*--------------------MES_MAP_QUEUES--------------------*/
+-
+-#ifndef PM4_MES_MAP_QUEUES_DEFINED
+-#define PM4_MES_MAP_QUEUES_DEFINED
+-enum map_queues_queue_sel_enum {
+-	queue_sel__mes_map_queues__map_to_specified_queue_slots = 0,
+-	queue_sel__mes_map_queues__map_to_hws_determined_queue_slots = 1,
+-	queue_sel__mes_map_queues__enable_process_queues = 2
+-};
++#ifndef PM4_MES_MAP_PROCESS_DEFINED_KV_SCRATCH
++#define PM4_MES_MAP_PROCESS_DEFINED_KV_SCRATCH
+ 
+-enum map_queues_vidmem_enum {
+-	vidmem__mes_map_queues__uses_no_video_memory = 0,
+-	vidmem__mes_map_queues__uses_video_memory = 1
+-};
+-
+-enum map_queues_alloc_format_enum {
+-	alloc_format__mes_map_queues__one_per_pipe = 0,
+-	alloc_format__mes_map_queues__all_on_one_pipe = 1
+-};
+-
+-enum map_queues_engine_sel_enum {
+-	engine_sel__mes_map_queues__compute = 0,
+-	engine_sel__mes_map_queues__sdma0 = 2,
+-	engine_sel__mes_map_queues__sdma1 = 3
+-};
+-
+-struct pm4_map_queues {
++struct pm4_map_process_scratch_kv {
+ 	union {
+-		union PM4_MES_TYPE_3_HEADER header;	/* header */
+-		uint32_t ordinal1;
+-	};
+-
+-	union {
+-		struct {
+-			uint32_t reserved1:4;
+-			enum map_queues_queue_sel_enum queue_sel:2;
+-			uint32_t reserved2:2;
+-			uint32_t vmid:4;
+-			uint32_t reserved3:4;
+-			enum map_queues_vidmem_enum vidmem:2;
+-			uint32_t reserved4:6;
+-			enum map_queues_alloc_format_enum alloc_format:2;
+-			enum map_queues_engine_sel_enum engine_sel:3;
+-			uint32_t num_queues:3;
+-		} bitfields2;
+-		uint32_t ordinal2;
+-	};
+-
+-	struct {
+-		union {
+-			struct {
+-				uint32_t is_static:1;
+-				uint32_t reserved5:1;
+-				uint32_t doorbell_offset:21;
+-				uint32_t reserved6:3;
+-				uint32_t queue:6;
+-			} bitfields3;
+-			uint32_t ordinal3;
+-		};
+-
+-		uint32_t mqd_addr_lo;
+-		uint32_t mqd_addr_hi;
+-		uint32_t wptr_addr_lo;
+-		uint32_t wptr_addr_hi;
+-
+-	} mes_map_queues_ordinals[1];	/* 1..N of these ordinal groups */
+-
+-};
+-#endif
+-
+-/*--------------------MES_QUERY_STATUS--------------------*/
+-
+-#ifndef PM4_MES_QUERY_STATUS_DEFINED
+-#define PM4_MES_QUERY_STATUS_DEFINED
+-enum query_status_interrupt_sel_enum {
+-	interrupt_sel__mes_query_status__completion_status = 0,
+-	interrupt_sel__mes_query_status__process_status = 1,
+-	interrupt_sel__mes_query_status__queue_status = 2
+-};
+-
+-enum query_status_command_enum {
+-	command__mes_query_status__interrupt_only = 0,
+-	command__mes_query_status__fence_only_immediate = 1,
+-	command__mes_query_status__fence_only_after_write_ack = 2,
+-	command__mes_query_status__fence_wait_for_write_ack_send_interrupt = 3
+-};
+-
+-enum query_status_engine_sel_enum {
+-	engine_sel__mes_query_status__compute = 0,
+-	engine_sel__mes_query_status__sdma0_queue = 2,
+-	engine_sel__mes_query_status__sdma1_queue = 3
+-};
+-
+-struct pm4_query_status {
+-	union {
+-		union PM4_MES_TYPE_3_HEADER header;	/* header */
+-		uint32_t ordinal1;
+-	};
+-
+-	union {
+-		struct {
+-			uint32_t context_id:28;
+-			enum query_status_interrupt_sel_enum interrupt_sel:2;
+-			enum query_status_command_enum command:2;
+-		} bitfields2;
+-		uint32_t ordinal2;
++		union PM4_MES_TYPE_3_HEADER   header; /* header */
++		uint32_t            ordinal1;
+ 	};
+ 
+ 	union {
+ 		struct {
+ 			uint32_t pasid:16;
+-			uint32_t reserved1:16;
+-		} bitfields3a;
+-		struct {
+-			uint32_t reserved2:2;
+-			uint32_t doorbell_offset:21;
+-			uint32_t reserved3:3;
+-			enum query_status_engine_sel_enum engine_sel:3;
+-			uint32_t reserved4:3;
+-		} bitfields3b;
+-		uint32_t ordinal3;
+-	};
+-
+-	uint32_t addr_lo;
+-	uint32_t addr_hi;
+-	uint32_t data_lo;
+-	uint32_t data_hi;
+-};
+-#endif
+-
+-/*--------------------MES_UNMAP_QUEUES--------------------*/
+-
+-#ifndef PM4_MES_UNMAP_QUEUES_DEFINED
+-#define PM4_MES_UNMAP_QUEUES_DEFINED
+-enum unmap_queues_action_enum {
+-	action__mes_unmap_queues__preempt_queues = 0,
+-	action__mes_unmap_queues__reset_queues = 1,
+-	action__mes_unmap_queues__disable_process_queues = 2
+-};
+-
+-enum unmap_queues_queue_sel_enum {
+-	queue_sel__mes_unmap_queues__perform_request_on_specified_queues = 0,
+-	queue_sel__mes_unmap_queues__perform_request_on_pasid_queues = 1,
+-	queue_sel__mes_unmap_queues__perform_request_on_all_active_queues = 2,
+-	queue_sel__mes_unmap_queues__perform_request_on_dynamic_queues_only = 3
+-};
+-
+-enum unmap_queues_engine_sel_enum {
+-	engine_sel__mes_unmap_queues__compute = 0,
+-	engine_sel__mes_unmap_queues__sdma0 = 2,
+-	engine_sel__mes_unmap_queues__sdma1 = 3
+-};
+-
+-struct pm4_unmap_queues {
+-	union {
+-		union PM4_MES_TYPE_3_HEADER header;	/* header */
+-		uint32_t ordinal1;
+-	};
+-
+-	union {
+-		struct {
+-			enum unmap_queues_action_enum action:2;
+-			uint32_t reserved1:2;
+-			enum unmap_queues_queue_sel_enum queue_sel:2;
+-			uint32_t reserved2:20;
+-			enum unmap_queues_engine_sel_enum engine_sel:3;
+-			uint32_t num_queues:3;
++			uint32_t reserved1:8;
++			uint32_t diq_enable:1;
++			uint32_t process_quantum:7;
+ 		} bitfields2;
+ 		uint32_t ordinal2;
+ 	};
+ 
+ 	union {
+ 		struct {
+-			uint32_t pasid:16;
+-			uint32_t reserved3:16;
+-		} bitfields3a;
+-		struct {
+-			uint32_t reserved4:2;
+-			uint32_t doorbell_offset0:21;
+-			uint32_t reserved5:9;
+-		} bitfields3b;
++			uint32_t page_table_base:28;
++			uint32_t reserved2:4;
++		} bitfields3;
+ 		uint32_t ordinal3;
+ 	};
+ 
+-	union {
+-		struct {
+-			uint32_t reserved6:2;
+-			uint32_t doorbell_offset1:21;
+-			uint32_t reserved7:9;
+-		} bitfields4;
+-		uint32_t ordinal4;
+-	};
+-
+-	union {
+-		struct {
+-			uint32_t reserved8:2;
+-			uint32_t doorbell_offset2:21;
+-			uint32_t reserved9:9;
+-		} bitfields5;
+-		uint32_t ordinal5;
+-	};
++	uint32_t reserved3;
++	uint32_t sh_mem_bases;
++	uint32_t sh_mem_config;
++	uint32_t sh_mem_ape1_base;
++	uint32_t sh_mem_ape1_limit;
++	uint32_t sh_hidden_private_base_vmid;
++	uint32_t reserved4;
++	uint32_t reserved5;
++	uint32_t gds_addr_lo;
++	uint32_t gds_addr_hi;
+ 
+ 	union {
+ 		struct {
+-			uint32_t reserved10:2;
+-			uint32_t doorbell_offset3:21;
+-			uint32_t reserved11:9;
+-		} bitfields6;
+-		uint32_t ordinal6;
++			uint32_t num_gws:6;
++			uint32_t reserved6:2;
++			uint32_t num_oac:4;
++			uint32_t reserved7:4;
++			uint32_t gds_size:6;
++			uint32_t num_queues:10;
++		} bitfields14;
++		uint32_t ordinal14;
+ 	};
+ 
++	uint32_t completion_signal_lo32;
++uint32_t completion_signal_hi32;
+ };
+ #endif
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers_vi.h b/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers_vi.h
+index c4eda6f..7c8d9b3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers_vi.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers_vi.h
+@@ -126,9 +126,10 @@ struct pm4_mes_runlist {
+ 			uint32_t ib_size:20;
+ 			uint32_t chain:1;
+ 			uint32_t offload_polling:1;
+-			uint32_t reserved3:1;
++			uint32_t reserved2:1;
+ 			uint32_t valid:1;
+-			uint32_t reserved4:8;
++			uint32_t process_cnt:4;
++			uint32_t reserved3:4;
+ 		} bitfields4;
+ 		uint32_t ordinal4;
+ 	};
+@@ -143,8 +144,8 @@ struct pm4_mes_runlist {
+ 
+ struct pm4_mes_map_process {
+ 	union {
+-		union PM4_MES_TYPE_3_HEADER   header;            /* header */
+-		uint32_t            ordinal1;
++		union PM4_MES_TYPE_3_HEADER header;	/* header */
++		uint32_t ordinal1;
+ 	};
+ 
+ 	union {
+@@ -155,36 +156,48 @@ struct pm4_mes_map_process {
+ 			uint32_t process_quantum:7;
+ 		} bitfields2;
+ 		uint32_t ordinal2;
+-};
++	};
+ 
+ 	union {
+ 		struct {
+ 			uint32_t page_table_base:28;
+-			uint32_t reserved2:4;
++			uint32_t reserved3:4;
+ 		} bitfields3;
+ 		uint32_t ordinal3;
+ 	};
+ 
++	uint32_t reserved;
++
+ 	uint32_t sh_mem_bases;
++	uint32_t sh_mem_config;
+ 	uint32_t sh_mem_ape1_base;
+ 	uint32_t sh_mem_ape1_limit;
+-	uint32_t sh_mem_config;
++
++	uint32_t sh_hidden_private_base_vmid;
++
++	uint32_t reserved2;
++	uint32_t reserved3;
++
+ 	uint32_t gds_addr_lo;
+ 	uint32_t gds_addr_hi;
+ 
+ 	union {
+ 		struct {
+ 			uint32_t num_gws:6;
+-			uint32_t reserved3:2;
++			uint32_t reserved4:2;
+ 			uint32_t num_oac:4;
+-			uint32_t reserved4:4;
++			uint32_t reserved5:4;
+ 			uint32_t gds_size:6;
+ 			uint32_t num_queues:10;
+ 		} bitfields10;
+ 		uint32_t ordinal10;
+ 	};
+ 
++	uint32_t completion_signal_lo;
++	uint32_t completion_signal_hi;
++
+ };
++
+ #endif
+ 
+ /*--------------------MES_MAP_QUEUES--------------------*/
+@@ -337,7 +350,7 @@ enum mes_unmap_queues_engine_sel_enum {
+ 	engine_sel__mes_unmap_queues__sdmal = 3
+ };
+ 
+-struct PM4_MES_UNMAP_QUEUES {
++struct pm4_mes_unmap_queues {
+ 	union {
+ 		union PM4_MES_TYPE_3_HEADER   header;            /* header */
+ 		uint32_t            ordinal1;
+@@ -397,4 +410,101 @@ struct PM4_MES_UNMAP_QUEUES {
+ };
+ #endif
+ 
++#ifndef PM4_MEC_RELEASE_MEM_DEFINED
++#define PM4_MEC_RELEASE_MEM_DEFINED
++enum RELEASE_MEM_event_index_enum {
++	event_index___release_mem__end_of_pipe = 5,
++	event_index___release_mem__shader_done = 6
++};
++
++enum RELEASE_MEM_cache_policy_enum {
++	cache_policy___release_mem__lru = 0,
++	cache_policy___release_mem__stream = 1,
++	cache_policy___release_mem__bypass = 2
++};
++
++enum RELEASE_MEM_dst_sel_enum {
++	dst_sel___release_mem__memory_controller = 0,
++	dst_sel___release_mem__tc_l2 = 1,
++	dst_sel___release_mem__queue_write_pointer_register = 2,
++	dst_sel___release_mem__queue_write_pointer_poll_mask_bit = 3
++};
++
++enum RELEASE_MEM_int_sel_enum {
++	int_sel___release_mem__none = 0,
++	int_sel___release_mem__send_interrupt_only = 1,
++	int_sel___release_mem__send_interrupt_after_write_confirm = 2,
++	int_sel___release_mem__send_data_after_write_confirm = 3
++};
++
++enum RELEASE_MEM_data_sel_enum {
++	data_sel___release_mem__none = 0,
++	data_sel___release_mem__send_32_bit_low = 1,
++	data_sel___release_mem__send_64_bit_data = 2,
++	data_sel___release_mem__send_gpu_clock_counter = 3,
++	data_sel___release_mem__send_cp_perfcounter_hi_lo = 4,
++	data_sel___release_mem__store_gds_data_to_memory = 5
++};
++
++struct pm4_mec_release_mem {
++	union {
++		union PM4_MES_TYPE_3_HEADER header;     /*header */
++		unsigned int ordinal1;
++	};
++
++	union {
++		struct {
++			unsigned int event_type:6;
++			unsigned int reserved1:2;
++			enum RELEASE_MEM_event_index_enum event_index:4;
++			unsigned int tcl1_vol_action_ena:1;
++			unsigned int tc_vol_action_ena:1;
++			unsigned int reserved2:1;
++			unsigned int tc_wb_action_ena:1;
++			unsigned int tcl1_action_ena:1;
++			unsigned int tc_action_ena:1;
++			unsigned int reserved3:6;
++			unsigned int atc:1;
++			enum RELEASE_MEM_cache_policy_enum cache_policy:2;
++			unsigned int reserved4:5;
++		} bitfields2;
++		unsigned int ordinal2;
++	};
++
++	union {
++		struct {
++			unsigned int reserved5:16;
++			enum RELEASE_MEM_dst_sel_enum dst_sel:2;
++			unsigned int reserved6:6;
++			enum RELEASE_MEM_int_sel_enum int_sel:3;
++			unsigned int reserved7:2;
++			enum RELEASE_MEM_data_sel_enum data_sel:3;
++		} bitfields3;
++		unsigned int ordinal3;
++	};
++
++	union {
++		struct {
++			unsigned int reserved8:2;
++			unsigned int address_lo_32b:30;
++		} bitfields4;
++		struct {
++			unsigned int reserved9:3;
++			unsigned int address_lo_64b:29;
++		} bitfields5;
++		unsigned int ordinal4;
++	};
++
++	unsigned int address_hi;
++
++	unsigned int data_lo;
++
++	unsigned int data_hi;
++};
++#endif
++
++enum {
++	CACHE_FLUSH_AND_INV_TS_EVENT = 0x00000014
++};
++
+ #endif
+-- 
+2.7.4
+

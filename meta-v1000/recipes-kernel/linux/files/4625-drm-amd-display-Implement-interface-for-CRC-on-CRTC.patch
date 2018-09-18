@@ -1,0 +1,390 @@
+From e444b8ac1d2b49e7caf4ea21e895b73669fb56b2 Mon Sep 17 00:00:00 2001
+From: "Leo (Sunpeng) Li" <sunpeng.li@amd.com>
+Date: Mon, 18 Dec 2017 14:20:39 -0500
+Subject: [PATCH 4625/5855] drm/amd/display: Implement interface for CRC on
+ CRTC
+
+Add interfaces in DC for per CRTC CRC configuration and fetching.
+Also implement amdgpu_dm functions to hook onto DRM.
+
+Signed-off-by: Leo (Sunpeng) Li <sunpeng.li@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Reviewed-by: Harry Wentland <Harry.Wentland@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/Makefile     |   4 +
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c  |   2 +
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h  |  12 +++
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c  | 113 +++++++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |  85 ++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/dc_stream.h         |  11 ++
+ .../drm/amd/display/dc/inc/hw/timing_generator.h   |  44 ++++++++
+ 7 files changed, 271 insertions(+)
+ create mode 100644 drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile b/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile
+index 4699e47..0b41f3d 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile
+@@ -10,6 +10,10 @@ ifneq ($(CONFIG_DRM_AMD_DC),)
+ AMDGPUDM += amdgpu_dm_services.o amdgpu_dm_helpers.o
+ endif
+ 
++ifneq ($(CONFIG_DEBUG_FS),)
++AMDGPUDM += amdgpu_dm_crc.o
++endif
++
+ subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc
+ 
+ AMDGPU_DM = $(addprefix $(AMDDALPATH)/amdgpu_dm/,$(AMDGPUDM))
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 91cb256..bc1b789 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -319,6 +319,7 @@ static void dm_crtc_high_irq(void *interrupt_params)
+ 		crtc_index = acrtc->crtc_id;
+ 
+ 	drm_handle_vblank(adev->ddev, crtc_index);
++	amdgpu_dm_crtc_handle_crc_irq(&acrtc->base);
+ }
+ 
+ static int dm_set_clockgating_state(void *handle,
+@@ -2534,6 +2535,7 @@ static const struct drm_crtc_funcs amdgpu_dm_crtc_funcs = {
+ 	.page_flip = drm_atomic_helper_page_flip,
+ 	.atomic_duplicate_state = dm_crtc_duplicate_state,
+ 	.atomic_destroy_state = dm_crtc_destroy_state,
++	.set_crc_source = amdgpu_dm_crtc_set_crc_source,
+ };
+ 
+ static enum drm_connector_status
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index 9992a6a..7471056 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -214,6 +214,8 @@ struct dm_plane_state {
+ struct dm_crtc_state {
+ 	struct drm_crtc_state base;
+ 	struct dc_stream_state *stream;
++
++	bool crc_first_skipped;
+ };
+ 
+ #define to_dm_crtc_state(x)    container_of(x, struct dm_crtc_state, base)
+@@ -278,6 +280,16 @@ void amdgpu_dm_add_sink_to_freesync_module(
+ void amdgpu_dm_remove_sink_from_freesync_module(
+ 		struct drm_connector *connector);
+ 
++/* amdgpu_dm_crc.c */
++#ifdef CONFIG_DEBUG_FS
++int amdgpu_dm_crtc_set_crc_source(struct drm_crtc *crtc, const char *src_name,
++				  size_t *values_cnt);
++void amdgpu_dm_crtc_handle_crc_irq(struct drm_crtc *crtc);
++#else
++#define amdgpu_dm_crtc_set_crc_source NULL
++void amdgpu_dm_crtc_handle_crc_irq(struct drm_crtc *crtc) {}
++#endif
++
+ extern const struct drm_encoder_helper_funcs amdgpu_dm_encoder_helper_funcs;
+ 
+ #endif /* __AMDGPU_DM_H__ */
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+new file mode 100644
+index 0000000..5768103
+--- /dev/null
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+@@ -0,0 +1,113 @@
++/*
++ * Copyright 2015 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#include <drm/drm_crtc.h>
++
++#include "amdgpu.h"
++#include "amdgpu_dm.h"
++#include "dc.h"
++
++enum amdgpu_dm_pipe_crc_source {
++	AMDGPU_DM_PIPE_CRC_SOURCE_NONE = 0,
++	AMDGPU_DM_PIPE_CRC_SOURCE_AUTO,
++	AMDGPU_DM_PIPE_CRC_SOURCE_MAX,
++	AMDGPU_DM_PIPE_CRC_SOURCE_INVALID = -1,
++};
++
++static enum amdgpu_dm_pipe_crc_source dm_parse_crc_source(const char *source)
++{
++	if (!source || !strcmp(source, "none"))
++		return AMDGPU_DM_PIPE_CRC_SOURCE_NONE;
++	if (!strcmp(source, "auto"))
++		return AMDGPU_DM_PIPE_CRC_SOURCE_AUTO;
++
++	return AMDGPU_DM_PIPE_CRC_SOURCE_INVALID;
++}
++
++int amdgpu_dm_crtc_set_crc_source(struct drm_crtc *crtc, const char *src_name,
++			   size_t *values_cnt)
++{
++	struct dm_crtc_state *crtc_state = to_dm_crtc_state(crtc->state);
++	struct dc_stream_state *stream_state = crtc_state->stream;
++	bool ret;
++
++	enum amdgpu_dm_pipe_crc_source source = dm_parse_crc_source(src_name);
++
++	if (source < 0) {
++		DRM_DEBUG_DRIVER("Unknown CRC source %s for CRTC%d\n",
++				 src_name, crtc->index);
++		return -EINVAL;
++	}
++
++	if (source == AMDGPU_DM_PIPE_CRC_SOURCE_AUTO) {
++		ret = dc_stream_configure_crc(stream_state->ctx->dc,
++					      stream_state,
++					      true, true);
++	} else {
++		ret = dc_stream_configure_crc(stream_state->ctx->dc,
++					      stream_state,
++					      false, false);
++	}
++
++	if (ret) {
++		*values_cnt = 3;
++		/* Reset crc_skipped flag on dm state */
++		crtc_state->crc_first_skipped = false;
++		return 0;
++	}
++	return -EINVAL;
++}
++
++/**
++ * amdgpu_dm_crtc_handle_crc_irq: Report to DRM the CRC on given CRTC.
++ * @crtc: DRM CRTC object.
++ *
++ * This function should be called at the end of a vblank, when the fb has been
++ * fully processed through the pipe.
++ */
++void amdgpu_dm_crtc_handle_crc_irq(struct drm_crtc *crtc)
++{
++	struct dm_crtc_state *crtc_state = to_dm_crtc_state(crtc->state);
++	struct dc_stream_state *stream_state = crtc_state->stream;
++	uint32_t crcs[3];
++
++	/*
++	 * Since flipping and crc enablement happen asynchronously, we - more
++	 * often than not - will be returning an 'uncooked' crc on first frame.
++	 * Probably because hw isn't ready yet. Simply skip the first crc
++	 * value.
++	 */
++	if (!crtc_state->crc_first_skipped) {
++		crtc_state->crc_first_skipped = true;
++		return;
++	}
++
++	if (!dc_stream_get_crc(stream_state->ctx->dc, stream_state,
++			       &crcs[0], &crcs[1], &crcs[2]))
++		return;
++
++	drm_crtc_add_crc_entry(crtc, true,
++			       drm_crtc_accurate_vblank_count(crtc), crcs);
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 770a6f8..f7d4851 100755
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -215,6 +215,91 @@ bool dc_stream_get_crtc_position(struct dc *dc,
+ 	return ret;
+ }
+ 
++/**
++ * dc_stream_configure_crc: Configure CRC capture for the given stream.
++ * @dc: DC Object
++ * @stream: The stream to configure CRC on.
++ * @enable: Enable CRC if true, disable otherwise.
++ * @continuous: Capture CRC on every frame if true. Otherwise, only capture
++ *              once.
++ *
++ * By default, only CRC0 is configured, and the entire frame is used to
++ * calculate the crc.
++ */
++bool dc_stream_configure_crc(struct dc *dc, struct dc_stream_state *stream,
++			     bool enable, bool continuous)
++{
++	int i;
++	struct pipe_ctx *pipe;
++	struct crc_params param;
++	struct timing_generator *tg;
++
++	for (i = 0; i < MAX_PIPES; i++) {
++		pipe = &dc->current_state->res_ctx.pipe_ctx[i];
++		if (pipe->stream == stream)
++			break;
++	}
++	/* Stream not found */
++	if (i == MAX_PIPES)
++		return false;
++
++	/* Always capture the full frame */
++	param.windowa_x_start = 0;
++	param.windowa_y_start = 0;
++	param.windowa_x_end = pipe->stream->timing.h_addressable;
++	param.windowa_y_end = pipe->stream->timing.v_addressable;
++	param.windowb_x_start = 0;
++	param.windowb_y_start = 0;
++	param.windowb_x_end = pipe->stream->timing.h_addressable;
++	param.windowb_y_end = pipe->stream->timing.v_addressable;
++
++	/* Default to the union of both windows */
++	param.selection = UNION_WINDOW_A_B;
++	param.continuous_mode = continuous;
++	param.enable = enable;
++
++	tg = pipe->stream_res.tg;
++
++	/* Only call if supported */
++	if (tg->funcs->configure_crc)
++		return tg->funcs->configure_crc(tg, &param);
++	dm_logger_write(dc->ctx->logger, LOG_WARNING, "CRC capture not supported.");
++	return false;
++}
++
++/**
++ * dc_stream_get_crc: Get CRC values for the given stream.
++ * @dc: DC object
++ * @stream: The DC stream state of the stream to get CRCs from.
++ * @r_cr, g_y, b_cb: CRC values for the three channels are stored here.
++ *
++ * dc_stream_configure_crc needs to be called beforehand to enable CRCs.
++ * Return false if stream is not found, or if CRCs are not enabled.
++ */
++bool dc_stream_get_crc(struct dc *dc, struct dc_stream_state *stream,
++		       uint32_t *r_cr, uint32_t *g_y, uint32_t *b_cb)
++{
++	int i;
++	struct pipe_ctx *pipe;
++	struct timing_generator *tg;
++
++	for (i = 0; i < MAX_PIPES; i++) {
++		pipe = &dc->current_state->res_ctx.pipe_ctx[i];
++		if (pipe->stream == stream)
++			break;
++	}
++	/* Stream not found */
++	if (i == MAX_PIPES)
++		return false;
++
++	tg = pipe->stream_res.tg;
++
++	if (tg->funcs->get_crc)
++		return tg->funcs->get_crc(tg, r_cr, g_y, b_cb);
++	dm_logger_write(dc->ctx->logger, LOG_WARNING, "CRC capture not supported.");
++	return false;
++}
++
+ void dc_stream_set_static_screen_events(struct dc *dc,
+ 		struct dc_stream_state **streams,
+ 		int num_streams,
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_stream.h b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+index 01c60f1..be3eb57f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_stream.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+@@ -267,6 +267,17 @@ bool dc_stream_get_crtc_position(struct dc *dc,
+ 				 unsigned int *v_pos,
+ 				 unsigned int *nom_v_pos);
+ 
++bool dc_stream_configure_crc(struct dc *dc,
++			     struct dc_stream_state *stream,
++			     bool enable,
++			     bool continuous);
++
++bool dc_stream_get_crc(struct dc *dc,
++		       struct dc_stream_state *stream,
++		       uint32_t *r_cr,
++		       uint32_t *g_y,
++		       uint32_t *b_cb);
++
+ void dc_stream_set_static_screen_events(struct dc *dc,
+ 					struct dc_stream_state **stream,
+ 					int num_streams,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+index ec312f1..3ca3462 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+@@ -92,6 +92,36 @@ struct crtc_stereo_flags {
+ 	uint8_t DISABLE_STEREO_DP_SYNC : 1;
+ };
+ 
++enum crc_selection {
++	/* Order must match values expected by hardware */
++	UNION_WINDOW_A_B = 0,
++	UNION_WINDOW_A_NOT_B,
++	UNION_WINDOW_NOT_A_B,
++	UNION_WINDOW_NOT_A_NOT_B,
++	INTERSECT_WINDOW_A_B,
++	INTERSECT_WINDOW_A_NOT_B,
++	INTERSECT_WINDOW_NOT_A_B,
++	INTERSECT_WINDOW_NOT_A_NOT_B,
++};
++
++struct crc_params {
++	/* Regions used to calculate CRC*/
++	uint16_t windowa_x_start;
++	uint16_t windowa_x_end;
++	uint16_t windowa_y_start;
++	uint16_t windowa_y_end;
++
++	uint16_t windowb_x_start;
++	uint16_t windowb_x_end;
++	uint16_t windowb_y_start;
++	uint16_t windowb_y_end;
++
++	enum crc_selection selection;
++
++	bool continuous_mode;
++	bool enable;
++};
++
+ struct timing_generator {
+ 	const struct timing_generator_funcs *funcs;
+ 	struct dc_bios *bp;
+@@ -173,6 +203,20 @@ struct timing_generator_funcs {
+ 	bool (*is_tg_enabled)(struct timing_generator *tg);
+ 	bool (*is_optc_underflow_occurred)(struct timing_generator *tg);
+ 	void (*clear_optc_underflow)(struct timing_generator *tg);
++
++	/**
++	 * Configure CRCs for the given timing generator. Return false if TG is
++	 * not on.
++	 */
++	bool (*configure_crc)(struct timing_generator *tg,
++			       const struct crc_params *params);
++
++	/**
++	 * Get CRCs for the given timing generator. Return false if CRCs are
++	 * not enabled (via configure_crc).
++	 */
++	bool (*get_crc)(struct timing_generator *tg,
++			uint32_t *r_cr, uint32_t *g_y, uint32_t *b_cb);
+ };
+ 
+ #endif
+-- 
+2.7.4
+

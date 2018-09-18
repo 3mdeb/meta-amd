@@ -1,0 +1,114 @@
+From 5852ed912a1d6c6ea9b00f1554b13957c9774d04 Mon Sep 17 00:00:00 2001
+From: Robin Murphy <robin.murphy@arm.com>
+Date: Thu, 16 Mar 2017 17:00:19 +0000
+Subject: [PATCH 4933/5855] iommu/dma: Make PCI window reservation generic
+
+Now that we're applying the IOMMU API reserved regions to our IOVA
+domains, we shouldn't need to privately special-case PCI windows, or
+indeed anything else which isn't specific to our iommu-dma layer.
+However, since those aren't IOMMU-specific either, rather than start
+duplicating code into IOMMU drivers let's transform the existing
+function into an iommu_get_resv_regions() helper that they can share.
+
+Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/arm-smmu-v3.c |  2 ++
+ drivers/iommu/arm-smmu.c    |  2 ++
+ drivers/iommu/dma-iommu.c   | 38 ++++++++++++++++++++++++++++----------
+ 3 files changed, 32 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/iommu/arm-smmu-v3.c b/drivers/iommu/arm-smmu-v3.c
+index 591bb96..bbd46ef 100644
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@ -1893,6 +1893,8 @@ static void arm_smmu_get_resv_regions(struct device *dev,
+ 		return;
+ 
+ 	list_add_tail(&region->list, head);
++
++	iommu_dma_get_resv_regions(dev, head);
+ }
+ 
+ static void arm_smmu_put_resv_regions(struct device *dev,
+diff --git a/drivers/iommu/arm-smmu.c b/drivers/iommu/arm-smmu.c
+index b493c99..9b33700 100644
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@ -1613,6 +1613,8 @@ static void arm_smmu_get_resv_regions(struct device *dev,
+ 		return;
+ 
+ 	list_add_tail(&region->list, head);
++
++	iommu_dma_get_resv_regions(dev, head);
+ }
+ 
+ static void arm_smmu_put_resv_regions(struct device *dev,
+diff --git a/drivers/iommu/dma-iommu.c b/drivers/iommu/dma-iommu.c
+index 5787f91..8565211 100644
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -167,22 +167,43 @@ void iommu_put_dma_cookie(struct iommu_domain *domain)
+ }
+ EXPORT_SYMBOL(iommu_put_dma_cookie);
+ 
+-static void iova_reserve_pci_windows(struct pci_dev *dev,
+-		struct iova_domain *iovad)
++/**
++ * iommu_dma_get_resv_regions - Reserved region driver helper
++ * @dev: Device from iommu_get_resv_regions()
++ * @list: Reserved region list from iommu_get_resv_regions()
++ *
++ * IOMMU drivers can use this to implement their .get_resv_regions callback
++ * for general non-IOMMU-specific reservations. Currently, this covers host
++ * bridge windows for PCI devices.
++ */
++void iommu_dma_get_resv_regions(struct device *dev, struct list_head *list)
+ {
+-	struct pci_host_bridge *bridge = pci_find_host_bridge(dev->bus);
++	struct pci_host_bridge *bridge;
+ 	struct resource_entry *window;
+-	unsigned long lo, hi;
+ 
++	if (!dev_is_pci(dev))
++		return;
++
++	bridge = pci_find_host_bridge(to_pci_dev(dev)->bus);
+ 	resource_list_for_each_entry(window, &bridge->windows) {
++		struct iommu_resv_region *region;
++		phys_addr_t start;
++		size_t length;
++
+ 		if (resource_type(window->res) != IORESOURCE_MEM)
+ 			continue;
+ 
+-		lo = iova_pfn(iovad, window->res->start - window->offset);
+-		hi = iova_pfn(iovad, window->res->end - window->offset);
+-		reserve_iova(iovad, lo, hi);
++		start = window->res->start - window->offset;
++		length = window->res->end - window->res->start + 1;
++		region = iommu_alloc_resv_region(start, length, 0,
++				IOMMU_RESV_RESERVED);
++		if (!region)
++			return;
++
++		list_add_tail(&region->list, list);
+ 	}
+ }
++EXPORT_SYMBOL(iommu_dma_get_resv_regions);
+ 
+ static int cookie_init_hw_msi_region(struct iommu_dma_cookie *cookie,
+ 		phys_addr_t start, phys_addr_t end)
+@@ -218,9 +239,6 @@ static int iova_reserve_iommu_regions(struct device *dev,
+ 	LIST_HEAD(resv_regions);
+ 	int ret = 0;
+ 
+-	if (dev_is_pci(dev))
+-		iova_reserve_pci_windows(to_pci_dev(dev), iovad);
+-
+ 	iommu_get_resv_regions(dev, &resv_regions);
+ 	list_for_each_entry(region, &resv_regions, list) {
+ 		unsigned long lo, hi;
+-- 
+2.7.4
+

@@ -1,0 +1,73 @@
+From 911923aab11b9f293f82eb2e5d8f41a2bbab9811 Mon Sep 17 00:00:00 2001
+From: Horace Chen <horace.chen@amd.com>
+Date: Wed, 1 Nov 2017 19:32:11 +0800
+Subject: [PATCH 3768/5855] drm/amdgpu: refine SR-IOV firmware VRAM reservation
+ to protect data
+
+The previous solution will create a zero buffer on the system
+domain and then move the zeroes to the VRAM. This will break the
+original data on the VRAM.
+
+Refine the code to create bo on VRAM domain directly and then remove
+and re-create mem node to the exact position before bo_pin. This can
+avoid breaking the data and will not cause eviction.
+
+Signed-off-by: Horace Chen <horace.chen@amd.com>
+Reivewed-by: monk liu <monk.liu@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 9a02c8b..b362c57 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -679,8 +679,12 @@ void amdgpu_fw_reserve_vram_fini(struct amdgpu_device *adev)
+ int amdgpu_fw_reserve_vram_init(struct amdgpu_device *adev)
+ {
+ 	int r = 0;
++	int i;
+ 	u64 gpu_addr;
+ 	u64 vram_size = adev->mc.visible_vram_size;
++	u64 offset = adev->fw_vram_usage.start_offset;
++	u64 size = adev->fw_vram_usage.size;
++	struct amdgpu_bo *bo;
+ 
+ 	adev->fw_vram_usage.va = NULL;
+ 	adev->fw_vram_usage.reserved_bo = NULL;
+@@ -689,7 +693,7 @@ int amdgpu_fw_reserve_vram_init(struct amdgpu_device *adev)
+ 		adev->fw_vram_usage.size <= vram_size) {
+ 
+ 		r = amdgpu_bo_create(adev, adev->fw_vram_usage.size,
+-			PAGE_SIZE, true, 0,
++			PAGE_SIZE, true, AMDGPU_GEM_DOMAIN_VRAM,
+ 			AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED |
+ 			AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS, NULL, NULL, 0,
+ 			&adev->fw_vram_usage.reserved_bo);
+@@ -699,6 +703,23 @@ int amdgpu_fw_reserve_vram_init(struct amdgpu_device *adev)
+ 		r = amdgpu_bo_reserve(adev->fw_vram_usage.reserved_bo, false);
+ 		if (r)
+ 			goto error_reserve;
++
++		/* remove the original mem node and create a new one at the
++		 * request position
++		 */
++		bo = adev->fw_vram_usage.reserved_bo;
++		offset = ALIGN(offset, PAGE_SIZE);
++		for (i = 0; i < bo->placement.num_placement; ++i) {
++			bo->placements[i].fpfn = offset >> PAGE_SHIFT;
++			bo->placements[i].lpfn = (offset + size) >> PAGE_SHIFT;
++		}
++
++		ttm_bo_mem_put(&bo->tbo, &bo->tbo.mem);
++		r = ttm_bo_mem_space(&bo->tbo, &bo->placement, &bo->tbo.mem,
++				     false, false);
++		if (r)
++			goto error_pin;
++
+ 		r = amdgpu_bo_pin_restricted(adev->fw_vram_usage.reserved_bo,
+ 			AMDGPU_GEM_DOMAIN_VRAM,
+ 			adev->fw_vram_usage.start_offset,
+-- 
+2.7.4
+

@@ -1,0 +1,95 @@
+From 27cc5a4862aa4351ae8341574daccaeb621e4c53 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Fri, 27 Oct 2017 19:35:29 -0400
+Subject: [PATCH 5689/5855] drm/amdkfd: Make event limit dependent on user mode
+ mapping size
+
+This allows increasing the KFD_SIGNAL_EVENT_LIMIT in kfd_ioctl.h
+without breaking processes built with older kfd_ioctl.h versions.
+
+Change-Id: I6826203ff37a232be77348dbb583f727e1bc035c
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_events.c | 25 +++++++++++++++++++------
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h   |  1 +
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_events.c b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+index 9bdea43..ef2e131 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+@@ -101,9 +101,17 @@ static int allocate_event_notification_slot(struct kfd_process *p,
+ 		p->signal_page = allocate_signal_page(p);
+ 		if (!p->signal_page)
+ 			return -ENOMEM;
++		/* Oldest user mode expects 256 event slots */
++		p->signal_mapped_size = 256*8;
+ 	}
+ 
+-	id = idr_alloc(&p->event_idr, ev, 0, KFD_SIGNAL_EVENT_LIMIT,
++	/*
++	 * Compatibility with old user mode: Only use signal slots
++	 * user mode has mapped, may be less than
++	 * KFD_SIGNAL_EVENT_LIMIT. This also allows future increase
++	 * of the event limit without breaking user mode.
++	 */
++	id = idr_alloc(&p->event_idr, ev, 0, p->signal_mapped_size / 8,
+ 		       GFP_KERNEL);
+ 	if (id < 0)
+ 		return id;
+@@ -200,7 +208,8 @@ static int create_signal_event(struct file *devkfd,
+ {
+ 	int ret;
+ 
+-	if (p->signal_event_count == KFD_SIGNAL_EVENT_LIMIT) {
++	if (p->signal_mapped_size &&
++	    p->signal_event_count == p->signal_mapped_size / 8) {
+ 		if (!p->signal_event_limit_reached) {
+ 			pr_warn("Signal event wasn't created because limit was reached\n");
+ 			p->signal_event_limit_reached = true;
+@@ -776,12 +785,12 @@ int kfd_wait_on_events(struct kfd_process *p,
+ 
+ int kfd_event_mmap(struct kfd_process *p, struct vm_area_struct *vma)
+ {
+-
+ 	unsigned long pfn;
+ 	struct kfd_signal_page *page;
++	int ret;
+ 
+-	/* check required size is logical */
+-	if (get_order(KFD_SIGNAL_EVENT_LIMIT * 8) !=
++	/* check required size doesn't exceed the allocated size */
++	if (get_order(KFD_SIGNAL_EVENT_LIMIT * 8) <
+ 			get_order(vma->vm_end - vma->vm_start)) {
+ 		pr_err("Event page mmap requested illegal size\n");
+ 		return -EINVAL;
+@@ -811,8 +820,12 @@ int kfd_event_mmap(struct kfd_process *p, struct vm_area_struct *vma)
+ 	page->user_address = (uint64_t __user *)vma->vm_start;
+ 
+ 	/* mapping the page to user process */
+-	return remap_pfn_range(vma, vma->vm_start, pfn,
++	ret = remap_pfn_range(vma, vma->vm_start, pfn,
+ 			vma->vm_end - vma->vm_start, vma->vm_page_prot);
++	if (!ret)
++		p->signal_mapped_size = vma->vm_end - vma->vm_start;
++
++	return ret;
+ }
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 062b215..cc59b40 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -717,6 +717,7 @@ struct kfd_process {
+ 	struct idr event_idr;
+ 	/* Event page */
+ 	struct kfd_signal_page *signal_page;
++	size_t signal_mapped_size;
+ 	size_t signal_event_count;
+ 	bool signal_event_limit_reached;
+ 
+-- 
+2.7.4
+

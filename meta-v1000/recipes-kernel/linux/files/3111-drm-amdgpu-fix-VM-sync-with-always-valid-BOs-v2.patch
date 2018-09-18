@@ -1,0 +1,128 @@
+From 5ac3c05d7cc21d51349787e7e0bdd8c62fc9e72a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 8 Sep 2017 14:09:41 +0200
+Subject: [PATCH 3111/5855] drm/amdgpu: fix VM sync with always valid BOs v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+All users of a VM must always wait for updates with always
+valid BOs to be completed.
+
+v2: remove debugging leftovers, rename struct member
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Roger He <Hongbo.He@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Raveendra Talabattula <raveendra.talabattula@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c           | 10 ++++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c           | 15 ++++++++++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h           |  2 +-
+ 4 files changed, 18 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 4ea89f1..0f3c5a6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -945,7 +945,7 @@ static int update_gpuvm_pte(struct amdgpu_device *adev,
+ 		return ret;
+ 	}
+ 
+-	amdgpu_sync_fence(adev, sync, vm->last_dir_update);
++	amdgpu_sync_fence(adev, sync, vm->last_update);
+ 
+ 	/* Update the page tables  */
+ 	ret = amdgpu_vm_bo_update(adev, bo_va, false);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index c914c46..1b02f5c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -760,10 +760,6 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p)
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_sync_fence(adev, &p->job->sync, vm->last_dir_update);
+-	if (r)
+-		return r;
+-
+ 	r = amdgpu_vm_clear_freed(adev, vm, NULL);
+ 	if (r)
+ 		return r;
+@@ -818,6 +814,12 @@ static int amdgpu_bo_vm_update_pte(struct amdgpu_cs_parser *p)
+ 	}
+ 
+ 	r = amdgpu_vm_handle_moved(adev, vm, &p->job->sync);
++	if (r)
++		return r;
++
++	r = amdgpu_sync_fence(adev, &p->job->sync, vm->last_update);
++	if (r)
++		return r;
+ 
+ 	if (amdgpu_vm_debug && p->bo_list) {
+ 		/* Invalidate all BOs to test for userspace bugs */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 781dc2b..33540a1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1141,9 +1141,8 @@ static int amdgpu_vm_update_level(struct amdgpu_device *adev,
+ 			goto error_free;
+ 
+ 			amdgpu_bo_fence(parent->base.bo, fence, true);
+-			fence_put(vm->last_dir_update);
+-			vm->last_dir_update = fence_get(fence);
+-			fence_put(fence);
++			fence_put(vm->last_update);
++			vm->last_update = fence;
+ 		}
+ 	}
+ 
+@@ -1831,6 +1830,12 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 			trace_amdgpu_vm_bo_mapping(mapping);
+ 	}
+ 
++	if (bo_va->base.bo &&
++	    bo_va->base.bo->tbo.resv == vm->root.base.bo->tbo.resv) {
++		fence_put(vm->last_update);
++		vm->last_update = fence_get(bo_va->last_pt_update);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -2614,7 +2619,7 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 			 vm->use_cpu_for_update ? "CPU" : "SDMA");
+ 	WARN_ONCE((vm->use_cpu_for_update & !amdgpu_vm_is_large_bar(adev)),
+ 		  "CPU update of VM recommended only for large BAR system\n");
+-	vm->last_dir_update = NULL;
++	vm->last_update = NULL;
+ 
+ 	flags = AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS |
+ 			AMDGPU_GEM_CREATE_VRAM_CLEARED;
+@@ -2759,7 +2764,7 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ 	}
+ 
+ 	amdgpu_vm_free_levels(&vm->root);
+-	fence_put(vm->last_dir_update);
++	fence_put(vm->last_update);
+ 	for (i = 0; i < AMDGPU_MAX_VMHUBS; i++)
+ 		amdgpu_vm_free_reserved_vmid(adev, vm, i);
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 595e457..5f0fca8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -140,7 +140,7 @@ struct amdgpu_vm {
+ 
+ 	/* contains the page directory */
+ 	struct amdgpu_vm_pt     root;
+-	struct fence		*last_dir_update;
++	struct fence		*last_update;
+ 
+ 	/* protecting freed */
+ 	spinlock_t		freed_lock;
+-- 
+2.7.4
+

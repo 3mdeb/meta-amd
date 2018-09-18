@@ -1,0 +1,836 @@
+From d97878c0cec2c5c3b2b8be8ea336ee2a42a5a480 Mon Sep 17 00:00:00 2001
+From: Mikita Lipski <mikita.lipski@amd.com>
+Date: Tue, 17 Oct 2017 15:29:22 -0400
+Subject: [PATCH 4247/5855] drm/amd/display: Multi display synchronization
+ logic
+
+This feature synchronizes multiple displays with various timings
+to a display with the highest refresh rate
+it is enabled if edid caps flag multi_display_sync is set to one
+
+There are limitations on refresh rates allowed
+that can be synchronized. That would
+prevent from underflow and other potential
+corruptions.
+
+Multi display synchronization is using the
+same functions as timing_sync in order to minimize
+redunduncy and decision to disable synchronization is
+based on trigger parametre set in DM
+
+Feature is developed for DCN1 and DCE11
+
+Signed-off-by: Mikita Lipski <mikita.lipski@amd.com>
+Reviewed-by: Mikita Lipski <Mikita.Lipski@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c  |  54 ++++-
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |  26 +-
+ drivers/gpu/drm/amd/display/dc/dc.h                |   3 +
+ drivers/gpu/drm/amd/display/dc/dc_hw_types.h       |  16 ++
+ .../amd/display/dc/dce110/dce110_hw_sequencer.c    |  46 +++-
+ .../display/dc/dce110/dce110_timing_generator.c    | 264 +++++++++++++++++----
+ .../display/dc/dce110/dce110_timing_generator.h    |   6 +
+ .../drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c  |  29 ++-
+ .../amd/display/dc/dcn10/dcn10_timing_generator.c  |  66 +++++-
+ .../drm/amd/display/dc/inc/hw/timing_generator.h   |   6 +-
+ drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h  |   5 +
+ 11 files changed, 455 insertions(+), 66 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 58f5ce4..ea22ecc 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2280,6 +2280,56 @@ static int create_fake_sink(struct amdgpu_dm_connector *aconnector)
+ 	return 0;
+ }
+ 
++static void set_multisync_trigger_params(
++		struct dc_stream_state *stream)
++{
++	if (stream->triggered_crtc_reset.enabled) {
++		stream->triggered_crtc_reset.event = CRTC_EVENT_VSYNC_RISING;
++		stream->triggered_crtc_reset.delay = TRIGGER_DELAY_NEXT_LINE;
++	}
++}
++
++static void set_master_stream(struct dc_stream_state *stream_set[],
++			      int stream_count)
++{
++	int j, highest_rfr = 0, master_stream = 0;
++
++	for (j = 0;  j < stream_count; j++) {
++		if (stream_set[j] && stream_set[j]->triggered_crtc_reset.enabled) {
++			int refresh_rate = 0;
++
++			refresh_rate = (stream_set[j]->timing.pix_clk_khz*1000)/
++				(stream_set[j]->timing.h_total*stream_set[j]->timing.v_total);
++			if (refresh_rate > highest_rfr) {
++				highest_rfr = refresh_rate;
++				master_stream = j;
++			}
++		}
++	}
++	for (j = 0;  j < stream_count; j++) {
++		if (stream_set[j] && j != master_stream)
++			stream_set[j]->triggered_crtc_reset.event_source = stream_set[master_stream];
++	}
++}
++
++static void dm_enable_per_frame_crtc_master_sync(struct dc_state *context)
++{
++	int i = 0;
++
++	if (context->stream_count < 2)
++		return;
++	for (i = 0; i < context->stream_count ; i++) {
++		if (!context->streams[i])
++			continue;
++		/* TODO: add a function to read AMD VSDB bits and will set
++		 * crtc_sync_master.multi_sync_enabled flag
++		 * For now its set to false
++		 */
++		set_multisync_trigger_params(context->streams[i]);
++	}
++	set_master_stream(context->streams, context->stream_count);
++}
++
+ static struct dc_stream_state *create_stream_for_sink(
+ 		struct amdgpu_dm_connector *aconnector,
+ 		const struct drm_display_mode *drm_mode,
+@@ -4196,8 +4246,10 @@ static void amdgpu_dm_atomic_commit_tail(
+ 		}
+ 	}
+ 
+-	if (dm_state->context)
++	if (dm_state->context) {
++		dm_enable_per_frame_crtc_master_sync(dm_state->context);
+ 		WARN_ON(!dc_commit_state(dm->dc, dm_state->context));
++	}
+ 
+ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
+ 		new_crtc_state = crtc->state;
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 388d35c..5c6daf4 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -674,6 +674,28 @@ void dc_destroy(struct dc **dc)
+ 	*dc = NULL;
+ }
+ 
++static void enable_timing_multisync(
++		struct dc *dc,
++		struct dc_state *ctx)
++{
++	int i = 0, multisync_count = 0;
++	int pipe_count = dc->res_pool->pipe_count;
++	struct pipe_ctx *multisync_pipes[MAX_PIPES] = { NULL };
++
++	for (i = 0; i < pipe_count; i++) {
++		if (!ctx->res_ctx.pipe_ctx[i].stream ||
++				!ctx->res_ctx.pipe_ctx[i].stream->triggered_crtc_reset.enabled)
++			continue;
++		multisync_pipes[multisync_count] = &ctx->res_ctx.pipe_ctx[i];
++		multisync_count++;
++	}
++
++	if (multisync_count > 1) {
++		dc->hwss.enable_per_frame_crtc_position_reset(
++			dc, multisync_count, multisync_pipes);
++	}
++}
++
+ static void program_timing_sync(
+ 		struct dc *dc,
+ 		struct dc_state *ctx)
+@@ -852,7 +874,9 @@ static enum dc_status dc_commit_state_no_check(struct dc *dc, struct dc_state *c
+ 	}
+ 	result = dc->hwss.apply_ctx_to_hw(dc, context);
+ 
+-	program_timing_sync(dc, context);
++	if (context->stream_count > 1)
++		enable_timing_multisync(dc, context);
++		program_timing_sync(dc, context);
+ 
+ 	dc_enable_stereo(dc, context, dc_streams, context->stream_count);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 7600447..ad461d3 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -623,6 +623,9 @@ struct dc_stream_state {
+ 
+ 	/* from stream struct */
+         atomic_t ref_count;
++
++	struct crtc_trigger_info triggered_crtc_reset;
++
+ };
+ 
+ struct dc_stream_update {
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+index f9a45b6..1badf20 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+@@ -676,6 +676,22 @@ enum dc_timing_3d_format {
+ 	TIMING_3D_FORMAT_MAX,
+ };
+ 
++enum trigger_delay {
++	TRIGGER_DELAY_NEXT_PIXEL = 0,
++	TRIGGER_DELAY_NEXT_LINE,
++};
++
++enum crtc_event {
++	CRTC_EVENT_VSYNC_RISING = 0,
++	CRTC_EVENT_VSYNC_FALLING
++};
++
++struct crtc_trigger_info {
++	bool enabled;
++	struct dc_stream_state *event_source;
++	enum crtc_event event;
++	enum trigger_delay delay;
++};
+ 
+ struct dc_crtc_timing {
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 6baa554..5339fd9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -2462,20 +2462,16 @@ static void dce110_enable_timing_synchronization(
+ 
+ 	for (i = 1 /* skip the master */; i < group_size; i++)
+ 		grouped_pipes[i]->stream_res.tg->funcs->enable_reset_trigger(
+-					grouped_pipes[i]->stream_res.tg, gsl_params.gsl_group);
+-
+-
++				grouped_pipes[i]->stream_res.tg,
++				gsl_params.gsl_group);
+ 
+ 	for (i = 1 /* skip the master */; i < group_size; i++) {
+ 		DC_SYNC_INFO("GSL: waiting for reset to occur.\n");
+ 		wait_for_reset_trigger_to_occur(dc_ctx, grouped_pipes[i]->stream_res.tg);
+-		/* Regardless of success of the wait above, remove the reset or
+-		 * the driver will start timing out on Display requests. */
+-		DC_SYNC_INFO("GSL: disabling trigger-reset.\n");
+-		grouped_pipes[i]->stream_res.tg->funcs->disable_reset_trigger(grouped_pipes[i]->stream_res.tg);
++		grouped_pipes[i]->stream_res.tg->funcs->disable_reset_trigger(
++				grouped_pipes[i]->stream_res.tg);
+ 	}
+ 
+-
+ 	/* GSL Vblank synchronization is a one time sync mechanism, assumption
+ 	 * is that the sync'ed displays will not drift out of sync over time*/
+ 	DC_SYNC_INFO("GSL: Restoring register states.\n");
+@@ -2485,6 +2481,39 @@ static void dce110_enable_timing_synchronization(
+ 	DC_SYNC_INFO("GSL: Set-up complete.\n");
+ }
+ 
++static void dce110_enable_per_frame_crtc_position_reset(
++		struct dc *dc,
++		int group_size,
++		struct pipe_ctx *grouped_pipes[])
++{
++	struct dc_context *dc_ctx = dc->ctx;
++	struct dcp_gsl_params gsl_params = { 0 };
++	int i;
++
++	gsl_params.gsl_group = 0;
++	gsl_params.gsl_master = grouped_pipes[0]->stream->triggered_crtc_reset.event_source->status.primary_otg_inst;
++
++	for (i = 0; i < group_size; i++)
++		grouped_pipes[i]->stream_res.tg->funcs->setup_global_swap_lock(
++					grouped_pipes[i]->stream_res.tg, &gsl_params);
++
++	DC_SYNC_INFO("GSL: enabling trigger-reset\n");
++
++	for (i = 1; i < group_size; i++)
++		grouped_pipes[i]->stream_res.tg->funcs->enable_crtc_reset(
++				grouped_pipes[i]->stream_res.tg,
++				gsl_params.gsl_master,
++				&grouped_pipes[i]->stream->triggered_crtc_reset);
++
++	DC_SYNC_INFO("GSL: waiting for reset to occur.\n");
++	for (i = 1; i < group_size; i++)
++		wait_for_reset_trigger_to_occur(dc_ctx, grouped_pipes[i]->stream_res.tg);
++
++	for (i = 0; i < group_size; i++)
++		grouped_pipes[i]->stream_res.tg->funcs->tear_down_global_swap_lock(grouped_pipes[i]->stream_res.tg);
++
++}
++
+ static void init_hw(struct dc *dc)
+ {
+ 	int i;
+@@ -2990,6 +3019,7 @@ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.power_down = dce110_power_down,
+ 	.enable_accelerated_mode = dce110_enable_accelerated_mode,
+ 	.enable_timing_synchronization = dce110_enable_timing_synchronization,
++	.enable_per_frame_crtc_position_reset = dce110_enable_per_frame_crtc_position_reset,
+ 	.update_info_frame = dce110_update_info_frame,
+ 	.enable_stream = dce110_enable_stream,
+ 	.disable_stream = dce110_disable_stream,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
+index 67ac737..e886f66 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
+@@ -1224,27 +1224,46 @@ void dce110_timing_generator_setup_global_swap_lock(
+ 
+ 	/* This pipe will belong to GSL Group zero. */
+ 	set_reg_field_value(value,
+-			1,
+-			DCP_GSL_CONTROL,
+-			DCP_GSL0_EN);
++			    1,
++			    DCP_GSL_CONTROL,
++			    DCP_GSL0_EN);
+ 
+ 	set_reg_field_value(value,
+-			gsl_params->gsl_master == tg->inst,
+-			DCP_GSL_CONTROL,
+-			DCP_GSL_MASTER_EN);
++			    gsl_params->gsl_master == tg->inst,
++			    DCP_GSL_CONTROL,
++			    DCP_GSL_MASTER_EN);
+ 
+ 	set_reg_field_value(value,
+-			HFLIP_READY_DELAY,
+-			DCP_GSL_CONTROL,
+-			DCP_GSL_HSYNC_FLIP_FORCE_DELAY);
++			    HFLIP_READY_DELAY,
++			    DCP_GSL_CONTROL,
++			    DCP_GSL_HSYNC_FLIP_FORCE_DELAY);
+ 
+ 	/* Keep signal low (pending high) during 6 lines.
+ 	 * Also defines minimum interval before re-checking signal. */
+ 	set_reg_field_value(value,
+-			HFLIP_CHECK_DELAY,
+-			DCP_GSL_CONTROL,
+-			DCP_GSL_HSYNC_FLIP_CHECK_DELAY);
++			    HFLIP_CHECK_DELAY,
++			    DCP_GSL_CONTROL,
++			    DCP_GSL_HSYNC_FLIP_CHECK_DELAY);
++
++	dm_write_reg(tg->ctx, CRTC_REG(mmDCP_GSL_CONTROL), value);
++	value = 0;
+ 
++	set_reg_field_value(value,
++			    gsl_params->gsl_master,
++			    DCIO_GSL0_CNTL,
++			    DCIO_GSL0_VSYNC_SEL);
++
++	set_reg_field_value(value,
++			    0,
++			    DCIO_GSL0_CNTL,
++			    DCIO_GSL0_TIMING_SYNC_SEL);
++
++	set_reg_field_value(value,
++			    0,
++			    DCIO_GSL0_CNTL,
++			    DCIO_GSL0_GLOBAL_UNLOCK_SEL);
++
++	dm_write_reg(tg->ctx, CRTC_REG(mmDCIO_GSL0_CNTL), value);
+ 
+ 	{
+ 		uint32_t value_crtc_vtotal;
+@@ -1253,38 +1272,38 @@ void dce110_timing_generator_setup_global_swap_lock(
+ 				CRTC_REG(mmCRTC_V_TOTAL));
+ 
+ 		set_reg_field_value(value,
+-				0,/* DCP_GSL_PURPOSE_SURFACE_FLIP */
+-				DCP_GSL_CONTROL,
+-				DCP_GSL_SYNC_SOURCE);
++				    0,/* DCP_GSL_PURPOSE_SURFACE_FLIP */
++				    DCP_GSL_CONTROL,
++				    DCP_GSL_SYNC_SOURCE);
+ 
+ 		/* Checkpoint relative to end of frame */
+ 		check_point = get_reg_field_value(value_crtc_vtotal,
+-				CRTC_V_TOTAL,
+-				CRTC_V_TOTAL);
++						  CRTC_V_TOTAL,
++						  CRTC_V_TOTAL);
+ 
+ 		dm_write_reg(tg->ctx, CRTC_REG(mmCRTC_GSL_WINDOW), 0);
+ 	}
+ 
+ 	set_reg_field_value(value,
+-			1,
+-			DCP_GSL_CONTROL,
+-			DCP_GSL_DELAY_SURFACE_UPDATE_PENDING);
++			    1,
++			    DCP_GSL_CONTROL,
++			    DCP_GSL_DELAY_SURFACE_UPDATE_PENDING);
+ 
+ 	dm_write_reg(tg->ctx, address, value);
+ 
+ 	/********************************************************************/
+ 	address = CRTC_REG(mmCRTC_GSL_CONTROL);
+ 
+-	value = 0;
++	value = dm_read_reg(tg->ctx, address);
+ 	set_reg_field_value(value,
+-			check_point - FLIP_READY_BACK_LOOKUP,
+-			CRTC_GSL_CONTROL,
+-			CRTC_GSL_CHECK_LINE_NUM);
++			    check_point - FLIP_READY_BACK_LOOKUP,
++			    CRTC_GSL_CONTROL,
++			    CRTC_GSL_CHECK_LINE_NUM);
+ 
+ 	set_reg_field_value(value,
+-			VFLIP_READY_DELAY,
+-			CRTC_GSL_CONTROL,
+-			CRTC_GSL_FORCE_DELAY);
++			    VFLIP_READY_DELAY,
++			    CRTC_GSL_CONTROL,
++			    CRTC_GSL_FORCE_DELAY);
+ 
+ 	dm_write_reg(tg->ctx, address, value);
+ }
+@@ -1555,6 +1574,138 @@ void dce110_timing_generator_enable_reset_trigger(
+ 	dm_write_reg(tg->ctx, CRTC_REG(mmCRTC_FORCE_COUNT_NOW_CNTL), value);
+ }
+ 
++void dce110_timing_generator_enable_crtc_reset(
++		struct timing_generator *tg,
++		int source_tg_inst,
++		struct crtc_trigger_info *crtc_tp)
++{
++	uint32_t value = 0;
++	uint32_t rising_edge = 0;
++	uint32_t falling_edge = 0;
++	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
++
++	/* Setup trigger edge */
++	switch (crtc_tp->event) {
++	case CRTC_EVENT_VSYNC_RISING:
++			rising_edge = 1;
++			break;
++
++	case CRTC_EVENT_VSYNC_FALLING:
++		falling_edge = 1;
++		break;
++	}
++
++	value = dm_read_reg(tg->ctx, CRTC_REG(mmCRTC_TRIGB_CNTL));
++
++	set_reg_field_value(value,
++			    source_tg_inst,
++			    CRTC_TRIGB_CNTL,
++			    CRTC_TRIGB_SOURCE_SELECT);
++
++	set_reg_field_value(value,
++			    TRIGGER_POLARITY_SELECT_LOGIC_ZERO,
++			    CRTC_TRIGB_CNTL,
++			    CRTC_TRIGB_POLARITY_SELECT);
++
++	set_reg_field_value(value,
++			    rising_edge,
++			    CRTC_TRIGB_CNTL,
++			    CRTC_TRIGB_RISING_EDGE_DETECT_CNTL);
++
++	set_reg_field_value(value,
++			    falling_edge,
++			    CRTC_TRIGB_CNTL,
++			    CRTC_TRIGB_FALLING_EDGE_DETECT_CNTL);
++
++	set_reg_field_value(value,
++			    1, /* clear trigger status */
++			    CRTC_TRIGB_CNTL,
++			    CRTC_TRIGB_CLEAR);
++
++	dm_write_reg(tg->ctx, CRTC_REG(mmCRTC_TRIGB_CNTL), value);
++
++	/**************************************************************/
++
++	switch (crtc_tp->delay) {
++	case TRIGGER_DELAY_NEXT_LINE:
++		value = dm_read_reg(tg->ctx, CRTC_REG(mmCRTC_FORCE_COUNT_NOW_CNTL));
++
++		set_reg_field_value(value,
++				    0, /* force H count to H_TOTAL and V count to V_TOTAL */
++				    CRTC_FORCE_COUNT_NOW_CNTL,
++				    CRTC_FORCE_COUNT_NOW_MODE);
++
++		set_reg_field_value(value,
++				    0, /* TriggerB - we never use TriggerA */
++				    CRTC_FORCE_COUNT_NOW_CNTL,
++				    CRTC_FORCE_COUNT_NOW_TRIG_SEL);
++
++		set_reg_field_value(value,
++				    1, /* clear trigger status */
++				    CRTC_FORCE_COUNT_NOW_CNTL,
++				    CRTC_FORCE_COUNT_NOW_CLEAR);
++
++		dm_write_reg(tg->ctx, CRTC_REG(mmCRTC_FORCE_COUNT_NOW_CNTL), value);
++
++		value = dm_read_reg(tg->ctx, CRTC_REG(mmCRTC_VERT_SYNC_CONTROL));
++
++		set_reg_field_value(value,
++				    1,
++				    CRTC_VERT_SYNC_CONTROL,
++				    CRTC_FORCE_VSYNC_NEXT_LINE_CLEAR);
++
++		set_reg_field_value(value,
++				    2,
++				    CRTC_VERT_SYNC_CONTROL,
++				    CRTC_AUTO_FORCE_VSYNC_MODE);
++
++		break;
++
++	case TRIGGER_DELAY_NEXT_PIXEL:
++		value = dm_read_reg(tg->ctx, CRTC_REG(mmCRTC_VERT_SYNC_CONTROL));
++
++		set_reg_field_value(value,
++				    1,
++				    CRTC_VERT_SYNC_CONTROL,
++				    CRTC_FORCE_VSYNC_NEXT_LINE_CLEAR);
++
++		set_reg_field_value(value,
++				    0,
++				    CRTC_VERT_SYNC_CONTROL,
++				    CRTC_AUTO_FORCE_VSYNC_MODE);
++
++		dm_write_reg(tg->ctx, CRTC_REG(mmCRTC_VERT_SYNC_CONTROL), value);
++
++		value = dm_read_reg(tg->ctx, CRTC_REG(mmCRTC_FORCE_COUNT_NOW_CNTL));
++
++		set_reg_field_value(value,
++				    2, /* force H count to H_TOTAL and V count to V_TOTAL */
++				    CRTC_FORCE_COUNT_NOW_CNTL,
++				    CRTC_FORCE_COUNT_NOW_MODE);
++
++		set_reg_field_value(value,
++				    1, /* TriggerB - we never use TriggerA */
++				    CRTC_FORCE_COUNT_NOW_CNTL,
++				    CRTC_FORCE_COUNT_NOW_TRIG_SEL);
++
++		set_reg_field_value(value,
++				    1, /* clear trigger status */
++				    CRTC_FORCE_COUNT_NOW_CNTL,
++				    CRTC_FORCE_COUNT_NOW_CLEAR);
++
++		dm_write_reg(tg->ctx, CRTC_REG(mmCRTC_FORCE_COUNT_NOW_CNTL), value);
++		break;
++	}
++
++	value = dm_read_reg(tg->ctx, CRTC_REG(mmCRTC_MASTER_UPDATE_MODE));
++
++	set_reg_field_value(value,
++			    2,
++			    CRTC_MASTER_UPDATE_MODE,
++			    MASTER_UPDATE_MODE);
++
++	dm_write_reg(tg->ctx, CRTC_REG(mmCRTC_MASTER_UPDATE_MODE), value);
++}
+ void dce110_timing_generator_disable_reset_trigger(
+ 	struct timing_generator *tg)
+ {
+@@ -1564,34 +1715,48 @@ void dce110_timing_generator_disable_reset_trigger(
+ 	value = dm_read_reg(tg->ctx, CRTC_REG(mmCRTC_FORCE_COUNT_NOW_CNTL));
+ 
+ 	set_reg_field_value(value,
+-			0, /* force counter now mode is disabled */
+-			CRTC_FORCE_COUNT_NOW_CNTL,
+-			CRTC_FORCE_COUNT_NOW_MODE);
++			    0, /* force counter now mode is disabled */
++			    CRTC_FORCE_COUNT_NOW_CNTL,
++			    CRTC_FORCE_COUNT_NOW_MODE);
+ 
+ 	set_reg_field_value(value,
+-			1, /* clear trigger status */
+-			CRTC_FORCE_COUNT_NOW_CNTL,
+-			CRTC_FORCE_COUNT_NOW_CLEAR);
++			    1, /* clear trigger status */
++			    CRTC_FORCE_COUNT_NOW_CNTL,
++			    CRTC_FORCE_COUNT_NOW_CLEAR);
+ 
+ 	dm_write_reg(tg->ctx, CRTC_REG(mmCRTC_FORCE_COUNT_NOW_CNTL), value);
+ 
++	value = dm_read_reg(tg->ctx, CRTC_REG(mmCRTC_VERT_SYNC_CONTROL));
++
++	set_reg_field_value(value,
++			    1,
++			    CRTC_VERT_SYNC_CONTROL,
++			    CRTC_FORCE_VSYNC_NEXT_LINE_CLEAR);
++
++	set_reg_field_value(value,
++			    0,
++			    CRTC_VERT_SYNC_CONTROL,
++			    CRTC_AUTO_FORCE_VSYNC_MODE);
++
++	dm_write_reg(tg->ctx, CRTC_REG(mmCRTC_VERT_SYNC_CONTROL), value);
++
+ 	/********************************************************************/
+ 	value = dm_read_reg(tg->ctx, CRTC_REG(mmCRTC_TRIGB_CNTL));
+ 
+ 	set_reg_field_value(value,
+-			TRIGGER_SOURCE_SELECT_LOGIC_ZERO,
+-			CRTC_TRIGB_CNTL,
+-			CRTC_TRIGB_SOURCE_SELECT);
++			    TRIGGER_SOURCE_SELECT_LOGIC_ZERO,
++			    CRTC_TRIGB_CNTL,
++			    CRTC_TRIGB_SOURCE_SELECT);
+ 
+ 	set_reg_field_value(value,
+-			TRIGGER_POLARITY_SELECT_LOGIC_ZERO,
+-			CRTC_TRIGB_CNTL,
+-			CRTC_TRIGB_POLARITY_SELECT);
++			    TRIGGER_POLARITY_SELECT_LOGIC_ZERO,
++			    CRTC_TRIGB_CNTL,
++			    CRTC_TRIGB_POLARITY_SELECT);
+ 
+ 	set_reg_field_value(value,
+-			1, /* clear trigger status */
+-			CRTC_TRIGB_CNTL,
+-			CRTC_TRIGB_CLEAR);
++			    1, /* clear trigger status */
++			    CRTC_TRIGB_CNTL,
++			    CRTC_TRIGB_CLEAR);
+ 
+ 	dm_write_reg(tg->ctx, CRTC_REG(mmCRTC_TRIGB_CNTL), value);
+ }
+@@ -1611,10 +1776,16 @@ bool dce110_timing_generator_did_triggered_reset_occur(
+ 	struct dce110_timing_generator *tg110 = DCE110TG_FROM_TG(tg);
+ 	uint32_t value = dm_read_reg(tg->ctx,
+ 			CRTC_REG(mmCRTC_FORCE_COUNT_NOW_CNTL));
+-
+-	return get_reg_field_value(value,
+-			CRTC_FORCE_COUNT_NOW_CNTL,
+-			CRTC_FORCE_COUNT_NOW_OCCURRED) != 0;
++	uint32_t value1 = dm_read_reg(tg->ctx,
++			CRTC_REG(mmCRTC_VERT_SYNC_CONTROL));
++	bool force = get_reg_field_value(value,
++					 CRTC_FORCE_COUNT_NOW_CNTL,
++					 CRTC_FORCE_COUNT_NOW_OCCURRED) != 0;
++	bool vert_sync = get_reg_field_value(value1,
++					     CRTC_VERT_SYNC_CONTROL,
++					     CRTC_FORCE_VSYNC_NEXT_LINE_OCCURRED) != 0;
++
++	return (force || vert_sync);
+ }
+ 
+ /**
+@@ -1928,6 +2099,7 @@ static const struct timing_generator_funcs dce110_tg_funcs = {
+ 		.setup_global_swap_lock =
+ 				dce110_timing_generator_setup_global_swap_lock,
+ 		.enable_reset_trigger = dce110_timing_generator_enable_reset_trigger,
++		.enable_crtc_reset = dce110_timing_generator_enable_crtc_reset,
+ 		.disable_reset_trigger = dce110_timing_generator_disable_reset_trigger,
+ 		.tear_down_global_swap_lock =
+ 				dce110_timing_generator_tear_down_global_swap_lock,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h
+index 82737de..232747c 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.h
+@@ -174,6 +174,12 @@ void dce110_timing_generator_setup_global_swap_lock(
+ void dce110_timing_generator_tear_down_global_swap_lock(
+ 	struct timing_generator *tg);
+ 
++/* Reset crtc position on master VSync */
++void dce110_timing_generator_enable_crtc_reset(
++	struct timing_generator *tg,
++	int source,
++	struct crtc_trigger_info *crtc_tp);
++
+ /* Reset slave controllers on master VSync */
+ void dce110_timing_generator_enable_reset_trigger(
+ 	struct timing_generator *tg,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index aa9f73f..de94c7e 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -1359,14 +1359,15 @@ static void dcn10_enable_timing_synchronization(
+ 
+ 	for (i = 1; i < group_size; i++)
+ 		grouped_pipes[i]->stream_res.tg->funcs->enable_reset_trigger(
+-				grouped_pipes[i]->stream_res.tg, grouped_pipes[0]->stream_res.tg->inst);
+-
++				grouped_pipes[i]->stream_res.tg,
++				grouped_pipes[0]->stream_res.tg->inst);
+ 
+ 	DC_SYNC_INFO("Waiting for trigger\n");
+ 
+ 	/* Need to get only check 1 pipe for having reset as all the others are
+ 	 * synchronized. Look at last pipe programmed to reset.
+ 	 */
++
+ 	wait_for_reset_trigger_to_occur(dc_ctx, grouped_pipes[1]->stream_res.tg);
+ 	for (i = 1; i < group_size; i++)
+ 		grouped_pipes[i]->stream_res.tg->funcs->disable_reset_trigger(
+@@ -1375,6 +1376,29 @@ static void dcn10_enable_timing_synchronization(
+ 	DC_SYNC_INFO("Sync complete\n");
+ }
+ 
++static void dcn10_enable_per_frame_crtc_position_reset(
++	struct dc *dc,
++	int group_size,
++	struct pipe_ctx *grouped_pipes[])
++{
++	struct dc_context *dc_ctx = dc->ctx;
++	int i;
++
++	DC_SYNC_INFO("Setting up\n");
++	for (i = 0; i < group_size; i++)
++		grouped_pipes[i]->stream_res.tg->funcs->enable_crtc_reset(
++				grouped_pipes[i]->stream_res.tg,
++				grouped_pipes[i]->stream->triggered_crtc_reset.event_source->status.primary_otg_inst,
++				&grouped_pipes[i]->stream->triggered_crtc_reset);
++
++	DC_SYNC_INFO("Waiting for trigger\n");
++
++	for (i = 1; i < group_size; i++)
++		wait_for_reset_trigger_to_occur(dc_ctx, grouped_pipes[i]->stream_res.tg);
++
++	DC_SYNC_INFO("Multi-display sync is complete\n");
++}
++
+ static void print_rq_dlg_ttu(
+ 		struct dc *core_dc,
+ 		struct pipe_ctx *pipe_ctx)
+@@ -2537,6 +2561,7 @@ static const struct hw_sequencer_funcs dcn10_funcs = {
+ 	.power_down = dce110_power_down,
+ 	.enable_accelerated_mode = dce110_enable_accelerated_mode,
+ 	.enable_timing_synchronization = dcn10_enable_timing_synchronization,
++	.enable_per_frame_crtc_position_reset = dcn10_enable_per_frame_crtc_position_reset,
+ 	.update_info_frame = dce110_update_info_frame,
+ 	.enable_stream = dce110_enable_stream,
+ 	.disable_stream = dce110_disable_stream,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.c
+index 4d0d1f0..5f1b422 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_timing_generator.c
+@@ -610,12 +610,28 @@ static bool tgn10_did_triggered_reset_occur(
+ 	struct timing_generator *tg)
+ {
+ 	struct dcn10_timing_generator *tgn10 = DCN10TG_FROM_TG(tg);
+-	uint32_t occurred;
++	uint32_t occurred_force, occurred_vsync;
+ 
+ 	REG_GET(OTG_FORCE_COUNT_NOW_CNTL,
+-		OTG_FORCE_COUNT_NOW_OCCURRED, &occurred);
++		OTG_FORCE_COUNT_NOW_OCCURRED, &occurred_force);
+ 
+-	return occurred != 0;
++	REG_GET(OTG_VERT_SYNC_CONTROL,
++		OTG_FORCE_VSYNC_NEXT_LINE_OCCURRED, &occurred_vsync);
++
++	return occurred_vsync != 0 || occurred_force != 0;
++}
++
++static void tgn10_disable_reset_trigger(struct timing_generator *tg)
++{
++	struct dcn10_timing_generator *tgn10 = DCN10TG_FROM_TG(tg);
++
++	REG_WRITE(OTG_TRIGA_CNTL, 0);
++
++	REG_SET(OTG_FORCE_COUNT_NOW_CNTL, 0,
++		OTG_FORCE_COUNT_NOW_CLEAR, 1);
++
++	REG_SET(OTG_VERT_SYNC_CONTROL, 0,
++		OTG_FORCE_VSYNC_NEXT_LINE_CLEAR, 1);
+ }
+ 
+ static void tgn10_enable_reset_trigger(struct timing_generator *tg, int source_tg_inst)
+@@ -652,14 +668,49 @@ static void tgn10_enable_reset_trigger(struct timing_generator *tg, int source_t
+ 			OTG_FORCE_COUNT_NOW_MODE, 2);
+ }
+ 
+-static void tgn10_disable_reset_trigger(struct timing_generator *tg)
++void tgn10_enable_crtc_reset(
++		struct timing_generator *tg,
++		int source_tg_inst,
++		struct crtc_trigger_info *crtc_tp)
+ {
+ 	struct dcn10_timing_generator *tgn10 = DCN10TG_FROM_TG(tg);
++	uint32_t falling_edge = 0;
++	uint32_t rising_edge = 0;
+ 
+-	REG_WRITE(OTG_TRIGA_CNTL, 0);
++	switch (crtc_tp->event) {
+ 
+-	REG_SET(OTG_FORCE_COUNT_NOW_CNTL, 0,
+-			OTG_FORCE_COUNT_NOW_CLEAR, 1);
++	case CRTC_EVENT_VSYNC_RISING:
++		rising_edge = 1;
++		break;
++
++	case CRTC_EVENT_VSYNC_FALLING:
++		falling_edge = 1;
++		break;
++	}
++
++	REG_SET_4(OTG_TRIGA_CNTL, 0,
++		 /* vsync signal from selected OTG pipe based
++		  * on OTG_TRIG_SOURCE_PIPE_SELECT setting
++		  */
++		  OTG_TRIGA_SOURCE_SELECT, 20,
++		  OTG_TRIGA_SOURCE_PIPE_SELECT, source_tg_inst,
++		  /* always detect falling edge */
++		  OTG_TRIGA_RISING_EDGE_DETECT_CNTL, rising_edge,
++		  OTG_TRIGA_FALLING_EDGE_DETECT_CNTL, falling_edge);
++
++	switch (crtc_tp->delay) {
++	case TRIGGER_DELAY_NEXT_LINE:
++		REG_SET(OTG_VERT_SYNC_CONTROL, 0,
++				OTG_AUTO_FORCE_VSYNC_MODE, 1);
++		break;
++	case TRIGGER_DELAY_NEXT_PIXEL:
++		REG_SET(OTG_FORCE_COUNT_NOW_CNTL, 0,
++			/* force H count to H_TOTAL and V count to V_TOTAL in
++			 * progressive mode and V_TOTAL-1 in interlaced mode
++			 */
++			OTG_FORCE_COUNT_NOW_MODE, 2);
++		break;
++	}
+ }
+ 
+ static void tgn10_wait_for_state(struct timing_generator *tg,
+@@ -1129,6 +1180,7 @@ static const struct timing_generator_funcs dcn10_tg_funcs = {
+ 		.set_blank_color = tgn10_program_blank_color,
+ 		.did_triggered_reset_occur = tgn10_did_triggered_reset_occur,
+ 		.enable_reset_trigger = tgn10_enable_reset_trigger,
++		.enable_crtc_reset = tgn10_enable_crtc_reset,
+ 		.disable_reset_trigger = tgn10_disable_reset_trigger,
+ 		.lock = tgn10_lock,
+ 		.unlock = tgn10_unlock,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+index c6ab38c..75f7a01 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+@@ -158,7 +158,11 @@ struct timing_generator_funcs {
+ 							const struct dcp_gsl_params *gsl_params);
+ 	void (*unlock)(struct timing_generator *tg);
+ 	void (*lock)(struct timing_generator *tg);
+-	void (*enable_reset_trigger)(struct timing_generator *tg, int source_tg_inst);
++	void (*enable_reset_trigger)(struct timing_generator *tg,
++				     int source_tg_inst);
++	void (*enable_crtc_reset)(struct timing_generator *tg,
++				  int source_tg_inst,
++				  struct crtc_trigger_info *crtc_tp);
+ 	void (*disable_reset_trigger)(struct timing_generator *tg);
+ 	void (*tear_down_global_swap_lock)(struct timing_generator *tg);
+ 	void (*enable_advanced_request)(struct timing_generator *tg,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index 8734689..cebbba3 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -114,6 +114,11 @@ struct hw_sequencer_funcs {
+ 			int group_size,
+ 			struct pipe_ctx *grouped_pipes[]);
+ 
++	void (*enable_per_frame_crtc_position_reset)(
++			struct dc *dc,
++			int group_size,
++			struct pipe_ctx *grouped_pipes[]);
++
+ 	void (*enable_display_pipe_clock_gating)(
+ 					struct dc_context *ctx,
+ 					bool clock_gating);
+-- 
+2.7.4
+

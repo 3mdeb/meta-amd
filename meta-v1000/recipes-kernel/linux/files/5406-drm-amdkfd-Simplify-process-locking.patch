@@ -1,0 +1,284 @@
+From 0b64b5ca66d678089d599311823c27f62d0de0b1 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Tue, 25 Jul 2017 15:32:23 -0400
+Subject: [PATCH 5406/5855] drm/amdkfd: Simplify process locking
+
+It's no longer necessary to drop the process lock when calling into
+amdgpu. The reason is that the process lock isn't taken any more when
+amdgpu calls KFD functions ever since this use of the process lock
+was replaced by a process reference count.
+
+Change-Id: I43059e4f0a10b4e76e57f12dce1825ef4645299b
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+
+ Conflicts[4.12]:
+	drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c | 63 ++++++++++++++++----------------
+ drivers/gpu/drm/amd/amdkfd/kfd_ipc.c     | 33 ++++++++++-------
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c |  5 +--
+ 3 files changed, 51 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 54afaff..13b3cca 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1205,12 +1205,6 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
+ 	if (!dev)
+ 		return -EINVAL;
+ 
+-	mutex_lock(&p->mutex);
+-	pdd = kfd_bind_process_to_device(dev, p);
+-	mutex_unlock(&p->mutex);
+-	if (IS_ERR(pdd))
+-		return PTR_ERR(pdd);
+-
+ 	if (flags & KFD_IOC_ALLOC_MEM_FLAGS_USERPTR) {
+ 		/* Check if the userptr corresponds to another (or third-party)
+ 		 * device local memory. If so treat is as a doorbell. User
+@@ -1232,25 +1226,31 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
+ 		offset = kfd_get_process_doorbells(dev, p);
+ 	}
+ 
++	mutex_lock(&p->mutex);
++
++	pdd = kfd_bind_process_to_device(dev, p);
++	if (IS_ERR(pdd)) {
++		err = PTR_ERR(pdd);
++		goto err_unlock;
++	}
++
+ 	err = dev->kfd2kgd->alloc_memory_of_gpu(
+ 		dev->kgd, args->va_addr, args->size,
+ 		pdd->vm, (struct kgd_mem **) &mem, &offset,
+ 		NULL, flags);
+ 
+-	if (err != 0)
+-		return err;
++	if (err)
++		goto err_unlock;
+ 
+-	mutex_lock(&p->mutex);
+ 	idr_handle = kfd_process_device_create_obj_handle(pdd, mem,
+ 			args->va_addr, args->size, NULL);
+-	mutex_unlock(&p->mutex);
+ 	if (idr_handle < 0) {
+-		dev->kfd2kgd->free_memory_of_gpu(dev->kgd,
+-						 (struct kgd_mem *) mem,
+-						 pdd->vm);
+-		return -EFAULT;
++		err = -EFAULT;
++		goto err_free;
+ 	}
+ 
++	mutex_unlock(&p->mutex);
++
+ 	args->handle = MAKE_HANDLE(args->gpu_id, idr_handle);
+ 	if ((args->flags & KFD_IOC_ALLOC_MEM_FLAGS_VRAM) != 0 &&
+ 			!kfd_is_large_bar(dev)) {
+@@ -1263,6 +1263,14 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
+ 	}
+ 
+ 	return 0;
++
++err_free:
++	dev->kfd2kgd->free_memory_of_gpu(dev->kgd,
++					 (struct kgd_mem *) mem,
++					 pdd->vm);
++err_unlock:
++	mutex_unlock(&p->mutex);
++	return err;
+ }
+ 
+ static int kfd_ioctl_free_memory_of_gpu(struct file *filep,
+@@ -1295,22 +1303,15 @@ static int kfd_ioctl_free_memory_of_gpu(struct file *filep,
+ 	}
+ 	run_rdma_free_callback(buf_obj);
+ 
+-	mutex_unlock(&p->mutex);
+-
+ 	ret = dev->kfd2kgd->free_memory_of_gpu(dev->kgd, buf_obj->mem,
+ 					       pdd->vm);
+ 
+ 	/* If freeing the buffer failed, leave the handle in place for
+ 	 * clean-up during process tear-down.
+ 	 */
+-	if (ret == 0) {
+-		mutex_lock(&p->mutex);
++	if (ret == 0)
+ 		kfd_process_device_remove_obj_handle(
+ 			pdd, GET_IDR_HANDLE(args->handle));
+-		mutex_unlock(&p->mutex);
+-	}
+-
+-	return ret;
+ 
+ err_unlock:
+ 	mutex_unlock(&p->mutex);
+@@ -1363,8 +1364,6 @@ static int kfd_ioctl_map_memory_to_gpu(struct file *filep,
+ 
+ 	mem = kfd_process_device_translate_handle(pdd,
+ 						GET_IDR_HANDLE(args->handle));
+-	mutex_unlock(&p->mutex);
+-
+ 	if (!mem) {
+ 		err = PTR_ERR(mem);
+ 		goto get_mem_obj_from_handle_failed;
+@@ -1380,9 +1379,8 @@ static int kfd_ioctl_map_memory_to_gpu(struct file *filep,
+ 				err = -EFAULT;
+ 				goto get_mem_obj_from_handle_failed;
+ 			}
+-			mutex_lock(&p->mutex);
++
+ 			peer_pdd = kfd_bind_process_to_device(peer, p);
+-			mutex_unlock(&p->mutex);
+ 			if (!peer_pdd) {
+ 				err = -EFAULT;
+ 				goto get_mem_obj_from_handle_failed;
+@@ -1399,6 +1397,8 @@ static int kfd_ioctl_map_memory_to_gpu(struct file *filep,
+ 			pr_err("Failed to map\n");
+ 	}
+ 
++	mutex_unlock(&p->mutex);
++
+ 	err = dev->kfd2kgd->sync_memory(dev->kgd, (struct kgd_mem *) mem, true);
+ 	if (err) {
+ 		pr_debug("Sync memory failed, wait interrupted by user signal\n");
+@@ -1426,8 +1426,8 @@ static int kfd_ioctl_map_memory_to_gpu(struct file *filep,
+ 	return err;
+ 
+ bind_process_to_device_failed:
+-	mutex_unlock(&p->mutex);
+ get_mem_obj_from_handle_failed:
++	mutex_unlock(&p->mutex);
+ copy_from_user_failed:
+ sync_memory_failed:
+ 	kfree(devices_arr);
+@@ -1496,8 +1496,6 @@ static int kfd_ioctl_unmap_memory_from_gpu(struct file *filep,
+ 
+ 	mem = kfd_process_device_translate_handle(pdd,
+ 						GET_IDR_HANDLE(args->handle));
+-	mutex_unlock(&p->mutex);
+-
+ 	if (!mem) {
+ 		err = PTR_ERR(mem);
+ 		goto get_mem_obj_from_handle_failed;
+@@ -1511,9 +1509,8 @@ static int kfd_ioctl_unmap_memory_from_gpu(struct file *filep,
+ 				err = -EFAULT;
+ 				goto get_mem_obj_from_handle_failed;
+ 			}
+-			mutex_lock(&p->mutex);
++
+ 			peer_pdd = kfd_get_process_device_data(peer, p);
+-			mutex_unlock(&p->mutex);
+ 			if (!peer_pdd) {
+ 				err = -EFAULT;
+ 				goto get_mem_obj_from_handle_failed;
+@@ -1524,11 +1521,13 @@ static int kfd_ioctl_unmap_memory_from_gpu(struct file *filep,
+ 	} else
+ 		kfd_unmap_memory_from_gpu(mem, pdd);
+ 
++	mutex_unlock(&p->mutex);
++
+ 	return 0;
+ 
+ bind_process_to_device_failed:
+-	mutex_unlock(&p->mutex);
+ get_mem_obj_from_handle_failed:
++	mutex_unlock(&p->mutex);
+ copy_from_user_failed:
+ 	kfree(devices_arr);
+ 	return err;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c b/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c
+index da3765d..c6be3ba 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_ipc.c
+@@ -127,35 +127,42 @@ static int kfd_import_dmabuf_create_kfd_bo(struct kfd_dev *dev,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&p->mutex);
++
+ 	pdd = kfd_bind_process_to_device(dev, p);
+-	mutex_unlock(&p->mutex);
+-	if (IS_ERR(pdd))
+-		return PTR_ERR(pdd);
++	if (IS_ERR(pdd)) {
++		r = PTR_ERR(pdd);
++		goto err_unlock;
++	}
+ 
+ 	r = dev->kfd2kgd->import_dmabuf(dev->kgd, dmabuf,
+ 					va_addr, pdd->vm,
+ 					(struct kgd_mem **)&mem, &size,
+ 					mmap_offset);
+ 	if (r)
+-		return r;
++		goto err_unlock;
+ 
+-	mutex_lock(&p->mutex);
+ 	idr_handle = kfd_process_device_create_obj_handle(pdd, mem,
+ 							  va_addr, size,
+ 							  ipc_obj);
+-	mutex_unlock(&p->mutex);
+ 	if (idr_handle < 0) {
+-		dev->kfd2kgd->free_memory_of_gpu(dev->kgd,
+-						 (struct kgd_mem *)mem,
+-						 pdd->vm);
+-		return -EFAULT;
++		r = -EFAULT;
++		goto err_free;
+ 	}
+ 
+-	*handle = MAKE_HANDLE(gpu_id, idr_handle);
++	mutex_unlock(&p->mutex);
+ 
++	*handle = MAKE_HANDLE(gpu_id, idr_handle);
+ 	if (mmap_offset)
+ 		*mmap_offset = (kfd_mmap_flags << PAGE_SHIFT) | *mmap_offset;
+ 
++	return 0;
++
++err_free:
++	dev->kfd2kgd->free_memory_of_gpu(dev->kgd,
++					 (struct kgd_mem *)mem,
++					 pdd->vm);
++err_unlock:
++	mutex_unlock(&p->mutex);
+ 	return r;
+ }
+ 
+@@ -241,14 +248,12 @@ int kfd_ipc_export_as_handle(struct kfd_dev *dev, struct kfd_process *p,
+ 
+ 	mutex_lock(&p->mutex);
+ 	pdd = kfd_bind_process_to_device(dev, p);
+-	mutex_unlock(&p->mutex);
+-
+ 	if (IS_ERR(pdd)) {
++		mutex_unlock(&p->mutex);
+ 		pr_err("Failed to get pdd\n");
+ 		return PTR_ERR(pdd);
+ 	}
+ 
+-	mutex_lock(&p->mutex);
+ 	kfd_bo = kfd_process_device_find_bo(pdd, GET_IDR_HANDLE(handle));
+ 	mutex_unlock(&p->mutex);
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index d51ec08..39d9e6d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -113,10 +113,7 @@ static void kfd_process_free_gpuvm(struct kgd_mem *mem,
+  *	This function should be only called right after the process
+  *	is created and when kfd_processes_mutex is still being held
+  *	to avoid concurrency. Because of that exclusiveness, we do
+- *	not need to take p->mutex. Because kfd_processes_mutex instead
+- *	of p->mutex is held, we do not need to release the lock when
+- *	calling into kgd through functions such as alloc_memory_of_gpu()
+- *	etc.
++ *	not need to take p->mutex.
+  */
+ static int kfd_process_alloc_gpuvm(struct kfd_process *p,
+ 		struct kfd_dev *kdev, uint64_t gpu_va, uint32_t size,
+-- 
+2.7.4
+
