@@ -1,0 +1,148 @@
+From 82b7c1e70a87d5430af9f5e37ed9ff36c1426ee7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 18 Aug 2017 15:50:17 +0200
+Subject: [PATCH 3006/5855] drm/amdgpu: fix and cleanup shadow handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Set the shadow flag on the shadow and not the parent, always bind shadow BOs
+during allocation instead of manually, use the reservation_object wrappers
+to grab the lock.
+
+This fixes a couple of issues with binding the shadow BOs as well as correctly
+evicting them when memory becomes tight.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  6 ----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 46 +++++++++++++++---------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c     |  8 ------
+ 3 files changed, 23 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index c9dc9b7..780fe08 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2707,12 +2707,6 @@ static int amdgpu_recover_vram_from_shadow(struct amdgpu_device *adev,
+ 			goto err;
+ 		}
+ 
+-		r = amdgpu_ttm_bind(&bo->shadow->tbo, &bo->shadow->tbo.mem);
+-		if (r) {
+-			DRM_ERROR("%p bind failed\n", bo->shadow);
+-			goto err;
+-		}
+-
+ 		r = amdgpu_bo_restore_from_shadow(adev, ring, bo,
+ 						 NULL, fence, true);
+ 		if (r) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 2f723a3..486a380 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -112,7 +112,10 @@ static void amdgpu_ttm_placement_init(struct amdgpu_device *adev,
+ 
+ 	if (domain & AMDGPU_GEM_DOMAIN_GTT) {
+ 		places[c].fpfn = 0;
+-		places[c].lpfn = 0;
++		if (flags & AMDGPU_GEM_CREATE_SHADOW)
++			places[c].lpfn = adev->mc.gart_size >> PAGE_SHIFT;
++		else
++			places[c].lpfn = 0;
+ 		places[c].flags = TTM_PL_FLAG_TT;
+ 		if (flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC)
+ 			places[c].flags |= TTM_PL_FLAG_WC |
+@@ -482,17 +485,16 @@ static int amdgpu_bo_create_shadow(struct amdgpu_device *adev,
+ 	if (bo->shadow)
+ 		return 0;
+ 
+-	bo->flags |= AMDGPU_GEM_CREATE_SHADOW;
+-	memset(&placements, 0,
+-	       (AMDGPU_GEM_DOMAIN_MAX + 1) * sizeof(struct ttm_place));
+-
+-	amdgpu_ttm_placement_init(adev, &placement,
+-				  placements, AMDGPU_GEM_DOMAIN_GTT,
+-				  AMDGPU_GEM_CREATE_CPU_GTT_USWC);
++	memset(&placements, 0, sizeof(placements));
++	amdgpu_ttm_placement_init(adev, &placement, placements,
++				  AMDGPU_GEM_DOMAIN_GTT,
++				  AMDGPU_GEM_CREATE_CPU_GTT_USWC |
++				  AMDGPU_GEM_CREATE_SHADOW);
+ 
+ 	r = amdgpu_bo_create_restricted(adev, size, byte_align, true,
+ 					AMDGPU_GEM_DOMAIN_GTT,
+-					AMDGPU_GEM_CREATE_CPU_GTT_USWC,
++					AMDGPU_GEM_CREATE_CPU_GTT_USWC |
++					AMDGPU_GEM_CREATE_SHADOW,
+ 					NULL, &placement,
+ 					bo->tbo.resv,
+ 					0,
+@@ -520,30 +522,28 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
+ {
+ 	struct ttm_placement placement = {0};
+ 	struct ttm_place placements[AMDGPU_GEM_DOMAIN_MAX + 1];
++	uint64_t parent_flags = flags & ~AMDGPU_GEM_CREATE_SHADOW;
+ 	int r;
+ 
+-	memset(&placements, 0,
+-	       (AMDGPU_GEM_DOMAIN_MAX + 1) * sizeof(struct ttm_place));
++	memset(&placements, 0, sizeof(placements));
++	amdgpu_ttm_placement_init(adev, &placement, placements,
++				  domain, parent_flags);
+ 
+-	amdgpu_ttm_placement_init(adev, &placement,
+-				  placements, domain, flags);
+-
+-	r = amdgpu_bo_create_restricted(adev, size, byte_align, kernel,
+-					domain, flags, sg, &placement,
+-					resv, init_value, bo_ptr);
++	r = amdgpu_bo_create_restricted(adev, size, byte_align, kernel, domain,
++					parent_flags, sg, &placement, resv,
++					init_value, bo_ptr);
+ 	if (r)
+ 		return r;
+ 
+-	if (amdgpu_need_backup(adev) && (flags & AMDGPU_GEM_CREATE_SHADOW)) {
+-		if (!resv) {
+-			r = ww_mutex_lock(&(*bo_ptr)->tbo.resv->lock, NULL);
+-			WARN_ON(r != 0);
+-		}
++	if ((flags & AMDGPU_GEM_CREATE_SHADOW) && amdgpu_need_backup(adev)) {
++		if (!resv)
++			WARN_ON(reservation_object_lock((*bo_ptr)->tbo.resv,
++							NULL));
+ 
+ 		r = amdgpu_bo_create_shadow(adev, size, byte_align, (*bo_ptr));
+ 
+ 		if (!resv)
+-			ww_mutex_unlock(&(*bo_ptr)->tbo.resv->lock);
++			reservation_object_unlock((*bo_ptr)->tbo.resv);
+ 
+ 		if (r)
+ 			amdgpu_bo_unref(bo_ptr);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index f2f2b19..3da1ca0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -165,14 +165,6 @@ static int amdgpu_vm_validate_level(struct amdgpu_vm_pt *parent,
+ 	unsigned i;
+ 	int r;
+ 
+-	if (parent->bo->shadow) {
+-		struct amdgpu_bo *shadow = parent->bo->shadow;
+-
+-		r = amdgpu_ttm_bind(&shadow->tbo, &shadow->tbo.mem);
+-		if (r)
+-			return r;
+-	}
+-
+ 	if (use_cpu_for_update) {
+ 		r = amdgpu_bo_kmap(parent->bo, NULL);
+ 		if (r)
+-- 
+2.7.4
+

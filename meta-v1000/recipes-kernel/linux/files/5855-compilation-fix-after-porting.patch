@@ -1,0 +1,369 @@
+From 2095225b9040fafde517b84ef7d6ad6eea072ce8 Mon Sep 17 00:00:00 2001
+From: Chaudhary Amit Kumar <chaudharyamit.kumar@amd.com>
+Date: Wed, 11 Jul 2018 13:31:21 +0530
+Subject: [PATCH 5855/5855] compilation fix after porting
+
+Signed-off-by: Chaudhary Amit Kumar <chaudharyamit.kumar@amd.com>
+---
+ arch/x86/include/asm/xen/hypercall.h                   |  3 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h                    |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c             | 18 ++++++++++--------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h             |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c      |  6 +++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c       |  7 +------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c                |  2 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c                  | 11 ++++++-----
+ drivers/gpu/drm/amd/amdgpu/vi.c                        |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c                |  5 ++---
+ drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  | 13 +++++--------
+ drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c |  2 +-
+ drivers/gpu/drm/amd/include/kgd_kfd_interface.h        |  5 +----
+ drivers/gpu/drm/ttm/ttm_bo.c                           |  1 +
+ 14 files changed, 39 insertions(+), 39 deletions(-)
+
+diff --git a/arch/x86/include/asm/xen/hypercall.h b/arch/x86/include/asm/xen/hypercall.h
+index 8b1f91f..ccdc23d 100644
+--- a/arch/x86/include/asm/xen/hypercall.h
++++ b/arch/x86/include/asm/xen/hypercall.h
+@@ -43,6 +43,7 @@
+ 
+ #include <asm/page.h>
+ #include <asm/pgtable.h>
++#include <asm/smap.h>
+ #include <asm/nospec-branch.h>
+ 
+ #include <xen/interface/xen.h>
+@@ -215,10 +216,12 @@ privcmd_call(unsigned call,
+ 	__HYPERCALL_DECLS;
+ 	__HYPERCALL_5ARG(a1, a2, a3, a4, a5);
+ 
++	stac();
+ 	asm volatile(CALL_NOSPEC
+ 		     : __HYPERCALL_5PARAM
+ 		     : [thunk_target] "a" (&hypercall_page[call])
+ 		     : __HYPERCALL_CLOBBER5);
++	clac();
+ 
+ 	return (long)__res;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 394f1e4..77ea663 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -83,7 +83,7 @@
+ extern int amdgpu_modeset;
+ extern int amdgpu_vram_limit;
+ extern int amdgpu_vis_vram_limit;
+-extern unsigned amdgpu_gart_size;
++extern int amdgpu_gart_size;
+ extern int amdgpu_gtt_size;
+ extern int amdgpu_moverate;
+ extern int amdgpu_benchmarking;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index 38b5639..fdd109e 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -99,6 +99,7 @@ void amdgpu_amdkfd_device_probe(struct amdgpu_device *adev)
+ 		kfd2kgd = amdgpu_amdkfd_gfx_9_0_get_functions();
+ 		break;
+ 	default:
++		dev_dbg(adev->dev, "kfd not supported on this ASIC\n");
+ 		return;
+ 	}
+ 	adev->kfd = kgd2kfd->probe((struct kgd_dev *)adev,
+@@ -146,11 +147,13 @@ void amdgpu_amdkfd_device_init(struct amdgpu_device *adev)
+ 
+ 	if (adev->kfd) {
+ 		struct kgd2kfd_shared_resources gpu_resources = {
+-			.compute_vmid_bitmap = global_compute_vmid_bitmap,
+-			.num_mec = adev->gfx.mec.num_mec,
++			.compute_vmid_bitmap = compute_vmid_bitmap,
+ 			.num_pipe_per_mec = adev->gfx.mec.num_pipe_per_mec,
+ 			.num_queue_per_pipe = adev->gfx.mec.num_queue_per_pipe,
+-			.gpuvm_size = (uint64_t)amdgpu_vm_size << 30
++			.gpuvm_size = min(adev->vm_manager.max_pfn
++				<< AMDGPU_GPU_PAGE_SHIFT,
++				AMDGPU_VA_HOLE_START),
++			.drm_render_minor = adev->ddev->render->index
+ 		};
+ 
+ 		/* this is going to have a few of the MSBs set that we need to
+@@ -171,7 +174,7 @@ void amdgpu_amdkfd_device_init(struct amdgpu_device *adev)
+ 		/* According to linux/bitmap.h we shouldn't use bitmap_clear if
+ 		 * nbits is not compile time constant
+ 		 */
+-		last_valid_bit = adev->gfx.mec.num_mec
++		last_valid_bit = 1 /* only first MEC can have compute queues */
+ 				* adev->gfx.mec.num_pipe_per_mec
+ 				* adev->gfx.mec.num_queue_per_pipe;
+ 		for (i = last_valid_bit; i < KGD_MAX_QUEUES; ++i)
+@@ -353,8 +356,7 @@ void get_local_mem_info(struct kgd_dev *kgd,
+ 					     ~((1ULL << 32) - 1);
+ 	aper_limit = adev->gmc.aper_base + adev->gmc.aper_size;
+ 	memset(mem_info, 0, sizeof(*mem_info));
+-	if (!(adev->gmc.aper_base & address_mask ||
+-			aper_limit & address_mask)) {
++	if (!(adev->gmc.aper_base & address_mask || aper_limit & address_mask)) {
+ 		mem_info->local_mem_size_public = adev->gmc.visible_vram_size;
+ 		mem_info->local_mem_size_private = adev->gmc.real_vram_size -
+ 				adev->gmc.visible_vram_size;
+@@ -364,8 +366,8 @@ void get_local_mem_info(struct kgd_dev *kgd,
+ 	}
+ 	mem_info->vram_width = adev->gmc.vram_width;
+ 
+-	pr_debug("Address base: 0x%llx limit 0x%llx public 0x%llx private 0x%llx\n",
+-			adev->gmc.aper_base, aper_limit,
++	pr_debug("Address base: %pap limit %pap public 0x%llx private 0x%llx\n",
++			&adev->gmc.aper_base, &aper_limit,
+ 			mem_info->local_mem_size_public,
+ 			mem_info->local_mem_size_private);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index b2ab890..ee19e48 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -102,6 +102,7 @@ struct amdkfd_process_info {
+ 	struct pid *pid;
+ };
+ 
++int amdgpu_amdkfd_init(void);
+ void amdgpu_amdkfd_fini(void);
+ 
+ void amdgpu_amdkfd_suspend(struct amdgpu_device *adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
+index 2784181..5172770 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
+@@ -80,6 +80,9 @@
+ #define mmMMHUB_VM_INVALIDATE_ENG16_ADDR_RANGE_HI32		0x0728
+ #define mmMMHUB_VM_INVALIDATE_ENG16_ADDR_RANGE_HI32_BASE_IDX	0
+ 
++#define V9_PIPE_PER_MEC		(4)
++#define V9_QUEUES_PER_PIPE_MEC	(8)
++
+ enum hqd_dequeue_request_type {
+ 	NO_ACTION = 0,
+ 	DRAIN_PIPE,
+@@ -304,7 +307,7 @@ static void acquire_queue(struct kgd_dev *kgd, uint32_t pipe_id,
+ static uint32_t get_queue_mask(struct amdgpu_device *adev,
+ 			       uint32_t pipe_id, uint32_t queue_id)
+ {
+-	unsigned int bit = (pipe_id * adev->gfx.mec.num_pipe_per_mec +
++	unsigned int bit = (pipe_id * adev->gfx.mec.num_queue_per_pipe +
+ 			    queue_id) & 31;
+ 
+ 	return ((uint32_t)1) << bit;
+@@ -956,6 +959,7 @@ static void write_vmid_invalidate_request(struct kgd_dev *kgd, uint8_t vmid)
+ static int invalidate_tlbs_with_kiq(struct amdgpu_device *adev, uint16_t pasid)
+ {
+ 	signed long r;
++	uint32_t seq;
+ 	struct amdgpu_ring *ring = &adev->gfx.kiq.ring;
+ 
+ 	spin_lock(&adev->gfx.kiq.ring_lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index cfaa6dd3..8f9b48f 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1541,20 +1541,15 @@ int amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
+         struct amdkfd_process_info *process_info =
+                 ((struct amdgpu_vm *)vm)->process_info;
+         unsigned long bo_size = mem->bo->tbo.mem.size;
+-
+ 	struct kfd_bo_va_list *entry;
+-	int ret = 0;
+ 	struct bo_vm_reservation_context ctx;
+-
+ 	int ret;
++
+ 	mutex_lock(&mem->lock);
+ 
+         ret = reserve_bo_and_cond_vms(mem, vm, BO_VM_MAPPED, &ctx);
+         if (unlikely(ret))
+-
+ 		goto out;
+-	}
+-
+         /* If no VMs were reserved, it means the BO wasn't actually mapped */
+         if (ctx.n_vms == 0) {
+ 		ret = -EINVAL;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index cc43e02..946cdd5 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -82,7 +82,7 @@
+ 
+ int amdgpu_vram_limit = 0;
+ int amdgpu_vis_vram_limit = 0;
+-unsigned amdgpu_gart_size = 256;
++int amdgpu_gart_size = -1; /* auto */
+ int amdgpu_gtt_size = -1; /* auto */
+ int amdgpu_moverate = -1; /* auto */
+ int amdgpu_benchmarking = 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 017b254..d46ce69 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -1687,6 +1687,11 @@ static int gfx_v8_0_do_edc_gpr_workarounds(struct amdgpu_device *adev)
+ 		goto fail;
+ 	}
+ 
++	/* read back registers to clear the counters */
++	for (i = 0; i < ARRAY_SIZE(sec_ded_counter_registers); i++)
++		RREG32(sec_ded_counter_registers[i]);
++
++#if 0
+ 	tmp = REG_SET_FIELD(tmp, GB_EDC_MODE, DED_MODE, 2);
+ 	tmp = REG_SET_FIELD(tmp, GB_EDC_MODE, PROP_FED, 1);
+ 	WREG32(mmGB_EDC_MODE, tmp);
+@@ -1694,11 +1699,7 @@ static int gfx_v8_0_do_edc_gpr_workarounds(struct amdgpu_device *adev)
+ 	tmp = RREG32(mmCC_GC_EDC_CONFIG);
+ 	tmp = REG_SET_FIELD(tmp, CC_GC_EDC_CONFIG, DIS_EDC, 0) | 1;
+ 	WREG32(mmCC_GC_EDC_CONFIG, tmp);
+-
+-
+-	/* read back registers to clear the counters */
+-	for (i = 0; i < ARRAY_SIZE(sec_ded_counter_registers); i++)
+-		RREG32(sec_ded_counter_registers[i]);
++#endif
+ 
+ fail:
+ 	amdgpu_ib_free(adev, &ib, NULL);
+diff --git a/drivers/gpu/drm/amd/amdgpu/vi.c b/drivers/gpu/drm/amd/amdgpu/vi.c
+index cdb9a14..a757cad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vi.c
++++ b/drivers/gpu/drm/amd/amdgpu/vi.c
+@@ -1056,7 +1056,7 @@ static int vi_common_early_init(void *handle)
+ 		/* rev0 hardware requires workarounds to support PG */
+ 		adev->pg_flags = 0;
+ 		if (adev->rev_id != 0x00 || CZ_REV_BRISTOL(adev->pdev->revision)) {
+-			adev->pg_flags |= AMD_PG_SUPPORT_GFX_PG |
++			adev->pg_flags |=
+ 				AMD_PG_SUPPORT_GFX_SMG |
+ 				AMD_PG_SUPPORT_GFX_PIPELINE |
+ 				AMD_PG_SUPPORT_CP |
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 0890647..7f4ead9 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -517,7 +517,7 @@ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+ 	kfd->dbgmgr = NULL;
+ 
+ 	kfd->init_complete = true;
+-	dev_info(kfd_device, "added device %x:%x\n", kfd->pdev->vendor
++	dev_info(kfd_device, "added device %x:%x\n", kfd->pdev->vendor,
+ 		 kfd->pdev->device);
+ 	pr_debug("Starting kfd with the following scheduling policy %d\n",
+ 		kfd->dqm->sched_policy);
+@@ -554,7 +554,6 @@ void kgd2kfd_device_exit(struct kfd_dev *kfd)
+ 		kfd_gtt_sa_fini(kfd);
+ 		kfd->kfd2kgd->free_gtt_mem(kfd->kgd, kfd->gtt_mem);
+ 	}
+-#endif
+ 
+ 	kfree(kfd);
+ }
+@@ -600,7 +599,7 @@ int kgd2kfd_resume(struct kfd_dev *kfd)
+         return ret;
+ }
+ 
+-statie int kfd_resume(struct kfd_dev *kfd)
++static int kfd_resume(struct kfd_dev *kfd)
+ {
+         int err = 0;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 78497b1..ae56e75 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -841,8 +841,7 @@ static void init_interrupts(struct device_queue_manager *dqm)
+ 
+ static int initialize_nocpsch(struct device_queue_manager *dqm)
+ {
+-	int i;
+-	BUG_ON(!dqm);
++	int pipe, queue;
+ 
+ 	pr_debug("num of pipes: %d\n", get_pipes_per_mec(dqm));
+ 
+@@ -873,8 +872,7 @@ static int initialize_nocpsch(struct device_queue_manager *dqm)
+ 
+ static void uninitialize(struct device_queue_manager *dqm)
+ {
+-	int pipe, queue;
+-
++	int i;
+ 
+ 	WARN_ON(dqm->queue_count > 0 || dqm->processes_count > 0);
+ 
+@@ -949,16 +947,15 @@ static int create_sdma_queue_nocpsch(struct device_queue_manager *dqm,
+ 	dqm->asic_ops.init_sdma_vm(dqm, q, qpd);
+ 	retval = mqd->init_mqd(mqd, &q->mqd, &q->mqd_mem_obj,
+ 				&q->gart_mqd_addr, &q->properties);
+-	if (retval) {
++	if (retval)
+ 		goto out_deallocate_doorbell;
+-	}
+ 
+ 	retval = mqd->load_mqd(mqd, q->mqd, 0, 0, &q->properties, NULL);
+-        if (retval) {
++        if (retval)
+ 		goto out_uninit_mqd;
+-        }
+ 
+ 	return 0;
++
+ out_uninit_mqd:
+         mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
+ out_deallocate_doorbell:
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+index 89616d5..84b5807 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -201,7 +201,7 @@ int pqm_create_queue(struct process_queue_manager *pqm,
+ 		retval = dev->dqm->ops.create_queue(dev->dqm, q, &pdd->qpd);
+                 pr_debug("DQM returned %d for create_queue\n", retval);
+                 print_queue(q);
+-                break
++                break;
+ 
+ 	case KFD_QUEUE_TYPE_COMPUTE:
+ 		/* check if there is over subscription */
+diff --git a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+index 3a5ad2a..72b7a42 100644
+--- a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+@@ -107,9 +107,6 @@ struct kgd2kfd_shared_resources {
+ 	/* Bit n == 1 means VMID n is available for KFD. */
+ 	unsigned int compute_vmid_bitmap;
+ 
+-	/* number of mec available from the hardware */
+-	uint32_t num_mec;
+-
+ 	/* number of pipes per mec */
+ 	uint32_t num_pipe_per_mec;
+ 
+@@ -368,7 +365,7 @@ struct kfd2kgd_calls {
+ 	void (*get_cu_info)(struct kgd_dev *kgd,
+ 			struct kfd_cu_info *cu_info);
+ 	int (*map_gtt_bo_to_kernel)(struct kgd_dev *kgd,
+-			struct kgd_mem *mem, void **kptr);
++			struct kgd_mem *mem, void **kptr, uint64_t *size);
+ 	void (*set_vm_context_page_table_base)(struct kgd_dev *kgd, uint32_t vmid,
+ 			uint32_t page_table_base);
+ 
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index a3505a6..8c14db7 100755
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -1735,6 +1735,7 @@ static int ttm_bo_swapout(struct ttm_mem_shrink *shrink)
+ 	struct ttm_buffer_object *bo;
+ 	int ret = -EBUSY;
+ 	int put_count;
++	uint32_t swap_placement = (TTM_PL_FLAG_CACHED | TTM_PL_FLAG_SYSTEM);
+ 	unsigned i;
+ 
+ 	spin_lock(&glob->lru_lock);
+-- 
+2.7.4
+

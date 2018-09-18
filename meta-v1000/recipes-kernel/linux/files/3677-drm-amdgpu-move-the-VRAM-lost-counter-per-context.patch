@@ -1,0 +1,138 @@
+From 24b301e996ece995748f3794bbe23d7203b0a303 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 9 Oct 2017 15:18:43 +0200
+Subject: [PATCH 3677/5855] drm/amdgpu: move the VRAM lost counter per context
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead of per device track the VRAM lost per context and return ECANCELED
+instead of ENODEV.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Nicolai Hähnle <nicolai.haehnle@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu.h
+
+Change-Id: Icc1a205ff59807aa1c14efd4b95c50b8ac24c208
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  4 +---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  |  9 +++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c | 16 ----------------
+ 4 files changed, 7 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index b03e70c..efaf012 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -755,6 +755,7 @@ struct amdgpu_ctx {
+ 	struct amdgpu_device    *adev;
+ 	struct amdgpu_queue_mgr queue_mgr;
+ 	unsigned		reset_counter;
++        uint32_t                vram_lost_counter;
+ 	spinlock_t		ring_lock;
+ 	struct fence            **fences;
+ 	struct amdgpu_ctx_ring	rings[AMDGPU_MAX_RINGS];
+@@ -803,7 +804,6 @@ struct amdgpu_fpriv {
+ 	struct amdgpu_ctx_mgr	ctx_mgr;
+ 	spinlock_t		sem_handles_lock;
+ 	struct idr		sem_handles;
+-	u32			vram_lost_counter;
+ };
+ 
+ /*
+@@ -1952,8 +1952,6 @@ static inline bool amdgpu_has_atpx(void) { return false; }
+ extern const struct drm_ioctl_desc amdgpu_ioctls_kms[];
+ extern const int amdgpu_max_kms_ioctl;
+ 
+-bool amdgpu_kms_vram_lost(struct amdgpu_device *adev,
+-			struct amdgpu_fpriv *fpriv);
+ int amdgpu_driver_load_kms(struct drm_device *dev, unsigned long flags);
+ int amdgpu_driver_unload_kms(struct drm_device *dev);
+ void amdgpu_driver_lastclose_kms(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index c674ea5..e9fc4f1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -172,7 +172,11 @@ static int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
+ 	if (ret)
+ 		goto free_all_kdata;
+ 
+-	p->job->vram_lost_counter = fpriv->vram_lost_counter;
++	p->job->vram_lost_counter = atomic_read(&p->adev->vram_lost_counter);
++	if (p->ctx->vram_lost_counter != p->job->vram_lost_counter) {
++		ret = -ECANCELED;
++		goto free_all_kdata;
++	}
+ 
+ 	if (p->uf_entry.robj)
+ 		p->job->uf_addr = uf_offset;
+@@ -1187,7 +1191,6 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ {
+ 	struct amdgpu_device *adev = dev->dev_private;
+-	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+ 	union drm_amdgpu_cs *cs = data;
+ 	struct amdgpu_cs_parser parser = {};
+ 	bool reserved_buffers = false;
+@@ -1195,8 +1198,6 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 
+ 	if (!adev->accel_working)
+ 		return -EBUSY;
+-	if (amdgpu_kms_vram_lost(adev, fpriv))
+-		return -ENODEV;
+ 
+ 	parser.adev = adev;
+ 	parser.filp = filp;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index 050c7fa..ad8dd91 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -77,6 +77,7 @@ static int amdgpu_ctx_init(struct amdgpu_device *adev,
+ 	}
+ 
+ 	ctx->reset_counter = atomic_read(&adev->gpu_reset_counter);
++	ctx->vram_lost_counter = atomic_read(&adev->vram_lost_counter);
+ 	ctx->init_priority = priority;
+ 	ctx->override_priority = AMD_SCHED_PRIORITY_UNSET;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index ccf785e..50532d5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -822,21 +822,6 @@ void amdgpu_driver_lastclose_kms(struct drm_device *dev)
+ }
+ 
+ /**
+- * amdgpu_kms_vram_lost - check if VRAM was lost for this client
+- *
+- * @adev: amdgpu device
+- * @fpriv: client private
+- *
+- * Check if all CS is blocked for the client because of lost VRAM
+- */
+-bool amdgpu_kms_vram_lost(struct amdgpu_device *adev,
+-			  struct amdgpu_fpriv *fpriv)
+-{
+-	return fpriv->vram_lost_counter !=
+-		atomic_read(&adev->vram_lost_counter);
+-}
+-
+-/**
+  * amdgpu_driver_open_kms - drm callback for open
+  *
+  * @dev: drm dev pointer
+@@ -894,7 +879,6 @@ int amdgpu_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
+ 
+ 	amdgpu_ctx_mgr_init(&fpriv->ctx_mgr);
+ 
+-	fpriv->vram_lost_counter = atomic_read(&adev->vram_lost_counter);
+ 	file_priv->driver_priv = fpriv;
+ 
+ out_suspend:
+-- 
+2.7.4
+

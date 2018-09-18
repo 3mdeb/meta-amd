@@ -1,0 +1,1107 @@
+From b607221242108f94978d1f7243e26c8a4c2595ab Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Thu, 24 Aug 2017 19:22:32 -0400
+Subject: [PATCH 3519/5855] drm/amd: Closed hash table with low overhead
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This adds a statically sized closed hash table implementation with
+low memory and CPU overhead. The API is inspired by kfifo.
+
+Storing, retrieving and deleting data does not involve any dynamic
+memory management, which makes it ideal for use in interrupt context.
+Static memory usage per entry comprises a 32 or 64 bit hash key, two
+bits for occupancy tracking and the value size stored in the table.
+No list heads or pointers are needed. Therefore this data structure
+should be quite cache-friendly, too.
+
+It uses linear probing and lazy deletion. During lookups free space
+is reclaimed and entries relocated to speed up future lookups.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/Kconfig                   |   2 +
+ drivers/gpu/drm/Makefile                  |   1 +
+ drivers/gpu/drm/amd/include/linux/chash.h | 358 +++++++++++++++++
+ drivers/gpu/drm/amd/lib/Kconfig           |  27 ++
+ drivers/gpu/drm/amd/lib/Makefile          |  11 +
+ drivers/gpu/drm/amd/lib/chash.c           | 622 ++++++++++++++++++++++++++++++
+ 6 files changed, 1021 insertions(+)
+ create mode 100644 drivers/gpu/drm/amd/include/linux/chash.h
+ create mode 100644 drivers/gpu/drm/amd/lib/Kconfig
+ create mode 100644 drivers/gpu/drm/amd/lib/Makefile
+ create mode 100644 drivers/gpu/drm/amd/lib/chash.c
+
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+index 483059a..a77f785 100644
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -148,6 +148,8 @@ config DRM_AMDGPU
+ 
+ source "drivers/gpu/drm/amd/amdgpu/Kconfig"
+ 
++source "drivers/gpu/drm/amd/lib/Kconfig"
++
+ source "drivers/gpu/drm/nouveau/Kconfig"
+ 
+ source "drivers/gpu/drm/i915/Kconfig"
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index 1201842..c0b5838 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -45,6 +45,7 @@ obj-$(CONFIG_DRM_ARM)	+= arm/
+ obj-$(CONFIG_DRM_TTM)	+= ttm/
+ obj-$(CONFIG_DRM_TDFX)	+= tdfx/
+ obj-$(CONFIG_DRM_R128)	+= r128/
++obj-y			+= amd/lib/
+ obj-$(CONFIG_HSA_AMD) += amd/amdkfd/
+ obj-$(CONFIG_DRM_RADEON)+= radeon/
+ obj-$(CONFIG_DRM_AMDGPU)+= amd/amdgpu/
+diff --git a/drivers/gpu/drm/amd/include/linux/chash.h b/drivers/gpu/drm/amd/include/linux/chash.h
+new file mode 100644
+index 0000000..c89b92b
+--- /dev/null
++++ b/drivers/gpu/drm/amd/include/linux/chash.h
+@@ -0,0 +1,358 @@
++/*
++ * Copyright 2017 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef _LINUX_CHASH_H
++#define _LINUX_CHASH_H
++
++#include <linux/types.h>
++#include <linux/hash.h>
++#include <linux/bug.h>
++#include <linux/bitops.h>
++
++struct __chash_table {
++	u8 bits;
++	u8 key_size;
++	unsigned int value_size;
++	u32 size_mask;
++	unsigned long *occup_bitmap, *valid_bitmap;
++	union {
++		u32 *keys32;
++		u64 *keys64;
++	};
++	u8 *values;
++
++#ifdef CONFIG_CHASH_STATS
++	u64 hits, hits_steps, hits_time_ns;
++	u64 miss, miss_steps, miss_time_ns;
++	u64 relocs, reloc_dist;
++#endif
++};
++
++#define __CHASH_BITMAP_SIZE(bits)				\
++	(((1 << (bits)) + BITS_PER_LONG - 1) / BITS_PER_LONG)
++#define __CHASH_ARRAY_SIZE(bits, size)				\
++	((((size) << (bits)) + sizeof(long) - 1) / sizeof(long))
++
++#define __CHASH_DATA_SIZE(bits, key_size, value_size)	\
++	(__CHASH_BITMAP_SIZE(bits) * 2 +		\
++	 __CHASH_ARRAY_SIZE(bits, key_size) +		\
++	 __CHASH_ARRAY_SIZE(bits, value_size))
++
++#define STRUCT_CHASH_TABLE(bits, key_size, value_size)			\
++	struct {							\
++		struct __chash_table table;				\
++		unsigned long data					\
++			[__CHASH_DATA_SIZE(bits, key_size, value_size)];\
++	}
++
++/**
++ * struct chash_table - Dynamically allocated closed hash table
++ *
++ * Use this struct for dynamically allocated hash tables (using
++ * chash_table_alloc and chash_table_free), where the size is
++ * determined at runtime.
++ */
++struct chash_table {
++	struct __chash_table table;
++	unsigned long *data;
++};
++
++/**
++ * DECLARE_CHASH_TABLE - macro to declare a closed hash table
++ * @table: name of the declared hash table
++ * @bts: Table size will be 2^bits entries
++ * @key_sz: Size of hash keys in bytes, 4 or 8
++ * @val_sz: Size of data values in bytes, can be 0
++ *
++ * This declares the hash table variable with a static size.
++ *
++ * The closed hash table stores key-value pairs with low memory and
++ * lookup overhead. In operation it performs no dynamic memory
++ * management. The data being stored does not require any
++ * list_heads. The hash table performs best with small @val_sz and as
++ * long as some space (about 50%) is left free in the table. But the
++ * table can still work reasonably efficiently even when filled up to
++ * about 90%. If bigger data items need to be stored and looked up,
++ * store the pointer to it as value in the hash table.
++ *
++ * @val_sz may be 0. This can be useful when all the stored
++ * information is contained in the key itself and the fact that it is
++ * in the hash table (or not).
++ */
++#define DECLARE_CHASH_TABLE(table, bts, key_sz, val_sz)		\
++	STRUCT_CHASH_TABLE(bts, key_sz, val_sz) table
++
++#ifdef CONFIG_CHASH_STATS
++#define __CHASH_STATS_INIT(prefix),		\
++		prefix.hits = 0,		\
++		prefix.hits_steps = 0,		\
++		prefix.hits_time_ns = 0,	\
++		prefix.miss = 0,		\
++		prefix.miss_steps = 0,		\
++		prefix.miss_time_ns = 0,	\
++		prefix.relocs = 0,		\
++		prefix.reloc_dist = 0
++#else
++#define __CHASH_STATS_INIT(prefix)
++#endif
++
++#define __CHASH_TABLE_INIT(prefix, data, bts, key_sz, val_sz)	\
++	prefix.bits = (bts),					\
++		prefix.key_size = (key_sz),			\
++		prefix.value_size = (val_sz),			\
++		prefix.size_mask = ((1 << bts) - 1),		\
++		prefix.occup_bitmap = &data[0],			\
++		prefix.valid_bitmap = &data			\
++			[__CHASH_BITMAP_SIZE(bts)],		\
++		prefix.keys64 = (u64 *)&data			\
++			[__CHASH_BITMAP_SIZE(bts) * 2],		\
++		prefix.values = (u8 *)&data			\
++			[__CHASH_BITMAP_SIZE(bts) * 2 +		\
++			 __CHASH_ARRAY_SIZE(bts, key_sz)]	\
++		__CHASH_STATS_INIT(prefix)
++
++/**
++ * DEFINE_CHASH_TABLE - macro to define and initialize a closed hash table
++ * @tbl: name of the declared hash table
++ * @bts: Table size will be 2^bits entries
++ * @key_sz: Size of hash keys in bytes, 4 or 8
++ * @val_sz: Size of data values in bytes, can be 0
++ *
++ * Note: the macro can be used for global and local hash table variables.
++ */
++#define DEFINE_CHASH_TABLE(tbl, bts, key_sz, val_sz)			\
++	DECLARE_CHASH_TABLE(tbl, bts, key_sz, val_sz) = {		\
++		.table = {						\
++			__CHASH_TABLE_INIT(, (tbl).data, bts, key_sz, val_sz) \
++		},							\
++		.data = {0}						\
++	}
++
++/**
++ * INIT_CHASH_TABLE - Initialize a hash table declared by DECLARE_CHASH_TABLE
++ * @tbl: name of the declared hash table
++ * @bts: Table size will be 2^bits entries
++ * @key_sz: Size of hash keys in bytes, 4 or 8
++ * @val_sz: Size of data values in bytes, can be 0
++ */
++#define INIT_CHASH_TABLE(tbl, bts, key_sz, val_sz)			\
++	__CHASH_TABLE_INIT(((tbl).table), (tbl).data, bts, key_sz, val_sz)
++
++int chash_table_alloc(struct chash_table *table, u8 bits, u8 key_size,
++		      unsigned int value_size, gfp_t gfp_mask);
++void chash_table_free(struct chash_table *table);
++
++/**
++ * chash_table_dump_stats - Dump statistics of a closed hash table
++ * @tbl: Pointer to the table structure
++ *
++ * Dumps some performance statistics of the table gathered in operation
++ * in the kernel log using pr_debug. If CONFIG_DYNAMIC_DEBUG is enabled,
++ * user must turn on messages for chash.c (file chash.c +p).
++ */
++#ifdef CONFIG_CHASH_STATS
++#define chash_table_dump_stats(tbl) __chash_table_dump_stats(&(*tbl).table)
++
++void __chash_table_dump_stats(struct __chash_table *table);
++#else
++#define chash_table_dump_stats(tbl)
++#endif
++
++/**
++ * chash_table_reset_stats - Reset statistics of a closed hash table
++ * @tbl: Pointer to the table structure
++ */
++#ifdef CONFIG_CHASH_STATS
++#define chash_table_reset_stats(tbl) __chash_table_reset_stats(&(*tbl).table)
++
++static inline void __chash_table_reset_stats(struct __chash_table *table)
++{
++	(void)table __CHASH_STATS_INIT((*table));
++}
++#else
++#define chash_table_reset_stats(tbl)
++#endif
++
++/**
++ * chash_table_copy_in - Copy a new value into the hash table
++ * @tbl: Pointer to the table structure
++ * @key: Key of the entry to add or update
++ * @value: Pointer to value to copy, may be NULL
++ *
++ * If @key already has an entry, its value is replaced. Otherwise a
++ * new entry is added. If @value is NULL, the value is left unchanged
++ * or uninitialized. Returns 1 if an entry already existed, 0 if a new
++ * entry was added or %-ENOMEM if there was no free space in the
++ * table.
++ */
++#define chash_table_copy_in(tbl, key, value)			\
++	__chash_table_copy_in(&(*tbl).table, key, value)
++
++int __chash_table_copy_in(struct __chash_table *table, u64 key,
++			  const void *value);
++
++/**
++ * chash_table_copy_out - Copy a value out of the hash table
++ * @tbl: Pointer to the table structure
++ * @key: Key of the entry to find
++ * @value: Pointer to value to copy, may be NULL
++ *
++ * If @value is not NULL and the table has a non-0 value_size, the
++ * value at @key is copied to @value. Returns the slot index of the
++ * entry or %-EINVAL if @key was not found.
++ */
++#define chash_table_copy_out(tbl, key, value)			\
++	__chash_table_copy_out(&(*tbl).table, key, value, false)
++
++int __chash_table_copy_out(struct __chash_table *table, u64 key,
++			   void *value, bool remove);
++
++/**
++ * chash_table_remove - Remove an entry from the hash table
++ * @tbl: Pointer to the table structure
++ * @key: Key of the entry to find
++ * @value: Pointer to value to copy, may be NULL
++ *
++ * If @value is not NULL and the table has a non-0 value_size, the
++ * value at @key is copied to @value. The entry is removed from the
++ * table. Returns the slot index of the removed entry or %-EINVAL if
++ * @key was not found.
++ */
++#define chash_table_remove(tbl, key, value)			\
++	__chash_table_copy_out(&(*tbl).table, key, value, true)
++
++/*
++ * Low level iterator API used internally by the above functions.
++ */
++struct chash_iter {
++	struct __chash_table *table;
++	unsigned long mask;
++	int slot;
++};
++
++/**
++ * CHASH_ITER_INIT - Initialize a hash table iterator
++ * @tbl: Pointer to hash table to iterate over
++ * @s: Initial slot number
++ */
++#define CHASH_ITER_INIT(table, s) {			\
++		table,					\
++		1UL << ((s) & (BITS_PER_LONG - 1)),	\
++		s					\
++	}
++/**
++ * CHASH_ITER_SET - Set hash table iterator to new slot
++ * @iter: Iterator
++ * @s: Slot number
++ */
++#define CHASH_ITER_SET(iter, s)					\
++	(iter).mask = 1UL << ((s) & (BITS_PER_LONG - 1)),	\
++	(iter).slot = (s)
++/**
++ * CHASH_ITER_INC - Increment hash table iterator
++ * @table: Hash table to iterate over
++ *
++ * Wraps around at the end.
++ */
++#define CHASH_ITER_INC(iter) do {					\
++		(iter).mask = (iter).mask << 1 |			\
++			(iter).mask >> (BITS_PER_LONG - 1);		\
++		(iter).slot = ((iter).slot + 1) & (iter).table->size_mask; \
++	} while (0)
++
++static inline bool chash_iter_is_valid(const struct chash_iter iter)
++{
++	BUG_ON((unsigned)iter.slot >= (1 << iter.table->bits));
++	return !!(iter.table->valid_bitmap[iter.slot >> _BITOPS_LONG_SHIFT] &
++		  iter.mask);
++}
++static inline bool chash_iter_is_empty(const struct chash_iter iter)
++{
++	BUG_ON((unsigned)iter.slot >= (1 << iter.table->bits));
++	return !(iter.table->occup_bitmap[iter.slot >> _BITOPS_LONG_SHIFT] &
++		 iter.mask);
++}
++
++static inline void chash_iter_set_valid(const struct chash_iter iter)
++{
++	BUG_ON((unsigned)iter.slot >= (1 << iter.table->bits));
++	iter.table->valid_bitmap[iter.slot >> _BITOPS_LONG_SHIFT] |= iter.mask;
++	iter.table->occup_bitmap[iter.slot >> _BITOPS_LONG_SHIFT] |= iter.mask;
++}
++static inline void chash_iter_set_invalid(const struct chash_iter iter)
++{
++	BUG_ON((unsigned)iter.slot >= (1 << iter.table->bits));
++	iter.table->valid_bitmap[iter.slot >> _BITOPS_LONG_SHIFT] &= ~iter.mask;
++}
++static inline void chash_iter_set_empty(const struct chash_iter iter)
++{
++	BUG_ON((unsigned)iter.slot >= (1 << iter.table->bits));
++	iter.table->occup_bitmap[iter.slot >> _BITOPS_LONG_SHIFT] &= ~iter.mask;
++}
++
++static inline u32 chash_iter_key32(const struct chash_iter iter)
++{
++	BUG_ON(iter.table->key_size != 4);
++	BUG_ON((unsigned)iter.slot >= (1 << iter.table->bits));
++	return iter.table->keys32[iter.slot];
++}
++static inline u64 chash_iter_key64(const struct chash_iter iter)
++{
++	BUG_ON(iter.table->key_size != 8);
++	BUG_ON((unsigned)iter.slot >= (1 << iter.table->bits));
++	return iter.table->keys64[iter.slot];
++}
++static inline u64 chash_iter_key(const struct chash_iter iter)
++{
++	BUG_ON((unsigned)iter.slot >= (1 << iter.table->bits));
++	return (iter.table->key_size == 4) ?
++		iter.table->keys32[iter.slot] : iter.table->keys64[iter.slot];
++}
++
++static inline u32 chash_iter_hash32(const struct chash_iter iter)
++{
++	BUG_ON(iter.table->key_size != 4);
++	return hash_32(chash_iter_key32(iter), iter.table->bits);
++}
++
++static inline u32 chash_iter_hash64(const struct chash_iter iter)
++{
++	BUG_ON(iter.table->key_size != 8);
++	return hash_64(chash_iter_key64(iter), iter.table->bits);
++}
++
++static inline u32 chash_iter_hash(const struct chash_iter iter)
++{
++	return (iter.table->key_size == 4) ?
++		hash_32(chash_iter_key32(iter), iter.table->bits) :
++		hash_64(chash_iter_key64(iter), iter.table->bits);
++}
++
++static inline void *chash_iter_value(const struct chash_iter iter)
++{
++	BUG_ON((unsigned)iter.slot >= (1 << iter.table->bits));
++	return iter.table->values +
++		((unsigned long)iter.slot * iter.table->value_size);
++}
++
++#endif /* _LINUX_CHASH_H */
+diff --git a/drivers/gpu/drm/amd/lib/Kconfig b/drivers/gpu/drm/amd/lib/Kconfig
+new file mode 100644
+index 0000000..03ee7ad
+--- /dev/null
++++ b/drivers/gpu/drm/amd/lib/Kconfig
+@@ -0,0 +1,27 @@
++menu "AMD Library routines"
++
++#
++# Closed hash table
++#
++config CHASH
++	tristate "Closed hash table"
++	help
++	 Statically sized closed hash table implementation with low
++	 memory and CPU overhead.
++
++config CHASH_STATS
++	bool "Closed hash table performance statistics"
++	depends on CHASH
++	default n
++	help
++	 Enable collection of performance statistics for closed hash tables.
++
++config CHASH_SELFTEST
++	bool "Closed hash table self test"
++	depends on CHASH
++	default n
++	help
++	 Runs a selftest during module load. Several module parameters
++	 are available to modify the behaviour of the test.
++
++endmenu
+diff --git a/drivers/gpu/drm/amd/lib/Makefile b/drivers/gpu/drm/amd/lib/Makefile
+new file mode 100644
+index 0000000..87cd700
+--- /dev/null
++++ b/drivers/gpu/drm/amd/lib/Makefile
+@@ -0,0 +1,11 @@
++#
++# Makefile for AMD library routines, which are used by AMD driver
++# components.
++#
++# This is for common library routines that can be shared between AMD
++# driver components or later moved to kernel/lib for sharing with
++# other drivers.
++
++ccflags-y := -I$(src)/../include
++
++obj-$(CONFIG_CHASH) += chash.o
+diff --git a/drivers/gpu/drm/amd/lib/chash.c b/drivers/gpu/drm/amd/lib/chash.c
+new file mode 100644
+index 0000000..1bc4287
+--- /dev/null
++++ b/drivers/gpu/drm/amd/lib/chash.c
+@@ -0,0 +1,622 @@
++/*
++ * Copyright 2017 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#include <linux/types.h>
++#include <linux/hash.h>
++#include <linux/bug.h>
++#include <linux/slab.h>
++#include <linux/module.h>
++#include <linux/sched/clock.h>
++#include <linux/chash.h>
++
++/**
++ * chash_table_alloc - Allocate closed hash table
++ * @table: Pointer to the table structure
++ * @bits: Table size will be 2^bits entries
++ * @key_size: Size of hash keys in bytes, 4 or 8
++ * @value_size: Size of data values in bytes, can be 0
++ */
++int chash_table_alloc(struct chash_table *table, u8 bits, u8 key_size,
++		      unsigned int value_size, gfp_t gfp_mask)
++{
++	if (bits > 31)
++		return -EINVAL;
++
++	if (key_size != 4 && key_size != 8)
++		return -EINVAL;
++
++	table->data = kcalloc(__CHASH_DATA_SIZE(bits, key_size, value_size),
++		       sizeof(long), gfp_mask);
++	if (!table->data)
++		return -ENOMEM;
++
++	__CHASH_TABLE_INIT(table->table, table->data,
++			   bits, key_size, value_size);
++
++	return 0;
++}
++EXPORT_SYMBOL(chash_table_alloc);
++
++/**
++ * chash_table_free - Free closed hash table
++ * @table: Pointer to the table structure
++ */
++void chash_table_free(struct chash_table *table)
++{
++	kfree(table->data);
++}
++EXPORT_SYMBOL(chash_table_free);
++
++#ifdef CONFIG_CHASH_STATS
++
++#define DIV_FRAC(nom, denom, quot, frac, frac_digits) do {		\
++		(quot) = (nom) / (denom);				\
++		(frac) = ((nom) % (denom) * (frac_digits) +		\
++			  (denom) / 2) / (denom);			\
++	} while (0)
++
++void __chash_table_dump_stats(struct __chash_table *table)
++{
++	struct chash_iter iter = CHASH_ITER_INIT(table, 0);
++	u32 filled = 0, empty = 0, tombstones = 0;
++	u64 quot1, quot2;
++	u32 frac1, frac2;
++
++	do {
++		if (chash_iter_is_valid(iter))
++			filled++;
++		else if (chash_iter_is_empty(iter))
++			empty++;
++		else
++			tombstones++;
++		CHASH_ITER_INC(iter);
++	} while (iter.slot);
++
++	pr_debug("chash: key size %u, value size %u\n",
++		 table->key_size, table->value_size);
++	pr_debug("  Slots total/filled/empty/tombstones: %u / %u / %u / %u\n",
++		 1 << table->bits, filled, empty, tombstones);
++	if (table->hits > 0) {
++		DIV_FRAC(table->hits_steps, table->hits, quot1, frac1, 1000);
++		DIV_FRAC(table->hits * 1000, table->hits_time_ns,
++			 quot2, frac2, 1000);
++	} else {
++		quot1 = quot2 = 0;
++		frac1 = frac2 = 0;
++	}
++	pr_debug("  Hits   (avg.cost, rate): %llu (%llu.%03u, %llu.%03u M/s)\n",
++		 table->hits, quot1, frac1, quot2, frac2);
++	if (table->miss > 0) {
++		DIV_FRAC(table->miss_steps, table->miss, quot1, frac1, 1000);
++		DIV_FRAC(table->miss * 1000, table->miss_time_ns,
++			 quot2, frac2, 1000);
++	} else {
++		quot1 = quot2 = 0;
++		frac1 = frac2 = 0;
++	}
++	pr_debug("  Misses (avg.cost, rate): %llu (%llu.%03u, %llu.%03u M/s)\n",
++		 table->miss, quot1, frac1, quot2, frac2);
++	if (table->hits + table->miss > 0) {
++		DIV_FRAC(table->hits_steps + table->miss_steps,
++			 table->hits + table->miss, quot1, frac1, 1000);
++		DIV_FRAC((table->hits + table->miss) * 1000,
++			 (table->hits_time_ns + table->miss_time_ns),
++			 quot2, frac2, 1000);
++	} else {
++		quot1 = quot2 = 0;
++		frac1 = frac2 = 0;
++	}
++	pr_debug("  Total  (avg.cost, rate): %llu (%llu.%03u, %llu.%03u M/s)\n",
++		 table->hits + table->miss, quot1, frac1, quot2, frac2);
++	if (table->relocs > 0) {
++		DIV_FRAC(table->hits + table->miss, table->relocs,
++			 quot1, frac1, 1000);
++		DIV_FRAC(table->reloc_dist, table->relocs, quot2, frac2, 1000);
++		pr_debug("  Relocations (freq, avg.dist): %llu (1:%llu.%03u, %llu.%03u)\n",
++			 table->relocs, quot1, frac1, quot2, frac2);
++	} else {
++		pr_debug("  No relocations\n");
++	}
++}
++EXPORT_SYMBOL(__chash_table_dump_stats);
++
++#undef DIV_FRAC
++#endif
++
++#define CHASH_INC(table, a) ((a) = ((a) + 1) & (table)->size_mask)
++#define CHASH_ADD(table, a, b) (((a) + (b)) & (table)->size_mask)
++#define CHASH_SUB(table, a, b) (((a) - (b)) & (table)->size_mask)
++#define CHASH_IN_RANGE(table, slot, first, last) \
++	(CHASH_SUB(table, slot, first) <= CHASH_SUB(table, last, first))
++
++/*#define CHASH_DEBUG Uncomment this to enable verbose debug output*/
++#ifdef CHASH_DEBUG
++static void chash_table_dump(struct __chash_table *table)
++{
++	struct chash_iter iter = CHASH_ITER_INIT(table, 0);
++
++	do {
++		if ((iter.slot & 3) == 0)
++			pr_debug("%04x: ", iter.slot);
++
++		if (chash_iter_is_valid(iter))
++			pr_debug("[%016llx] ", chash_iter_key(iter));
++		else if (chash_iter_is_empty(iter))
++			pr_debug("[    <empty>     ] ");
++		else
++			pr_debug("[  <tombstone>   ] ");
++
++		if ((iter.slot & 3) == 3)
++			pr_debug("\n");
++
++		CHASH_ITER_INC(iter);
++	} while (iter.slot);
++
++	if ((iter.slot & 3) != 0)
++		pr_debug("\n");
++}
++
++static int chash_table_check(struct __chash_table *table)
++{
++	u32 hash;
++	struct chash_iter iter = CHASH_ITER_INIT(table, 0);
++	struct chash_iter cur = CHASH_ITER_INIT(table, 0);
++
++	do {
++		if (!chash_iter_is_valid(iter)) {
++			CHASH_ITER_INC(iter);
++			continue;
++		}
++
++		hash = chash_iter_hash(iter);
++		CHASH_ITER_SET(cur, hash);
++		while (cur.slot != iter.slot) {
++			if (chash_iter_is_empty(cur)) {
++				pr_err("Path to element at %x with hash %x broken at slot %x\n",
++				       iter.slot, hash, cur.slot);
++				chash_table_dump(table);
++				return -EINVAL;
++			}
++			CHASH_ITER_INC(cur);
++		}
++
++		CHASH_ITER_INC(iter);
++	} while (iter.slot);
++
++	return 0;
++}
++#endif
++
++static void chash_iter_relocate(struct chash_iter dst, struct chash_iter src)
++{
++	BUG_ON(src.table == dst.table && src.slot == dst.slot);
++	BUG_ON(src.table->key_size != src.table->key_size);
++	BUG_ON(src.table->value_size != src.table->value_size);
++
++	if (dst.table->key_size == 4)
++		dst.table->keys32[dst.slot] = src.table->keys32[src.slot];
++	else
++		dst.table->keys64[dst.slot] = src.table->keys64[src.slot];
++
++	if (dst.table->value_size)
++		memcpy(chash_iter_value(dst), chash_iter_value(src),
++		       dst.table->value_size);
++
++	chash_iter_set_valid(dst);
++	chash_iter_set_invalid(src);
++
++#ifdef CONFIG_CHASH_STATS
++	if (src.table == dst.table) {
++		dst.table->relocs++;
++		dst.table->reloc_dist +=
++			CHASH_SUB(dst.table, src.slot, dst.slot);
++	}
++#endif
++}
++
++/**
++ * __chash_table_find - Helper for looking up a hash table entry
++ * @iter: Pointer to hash table iterator
++ * @key: Key of the entry to find
++ * @for_removal: set to true if the element will be removed soon
++ *
++ * Searches for an entry in the hash table with a given key. iter must
++ * be initialized by the caller to point to the home position of the
++ * hypothetical entry, i.e. it must be initialized with the hash table
++ * and the key's hash as the initial slot for the search.
++ *
++ * This function also does some local clean-up to speed up future
++ * look-ups by relocating entries to better slots and removing
++ * tombstones that are no longer needed.
++ *
++ * If @for_removal is true, the function avoids relocating the entry
++ * that is being returned.
++ *
++ * Returns 0 if the search is successful. In this case iter is updated
++ * to point to the found entry. Otherwise %-EINVAL is returned and the
++ * iter is updated to point to the first available slot for the given
++ * key. If the table is full, the slot is set to -1.
++ */
++static int chash_table_find(struct chash_iter *iter, u64 key,
++			    bool for_removal)
++{
++#ifdef CONFIG_CHASH_STATS
++	u64 ts1 = local_clock();
++#endif
++	u32 hash = iter->slot;
++	struct chash_iter first_redundant = CHASH_ITER_INIT(iter->table, -1);
++	int first_avail = (for_removal ? -2 : -1);
++
++	while (!chash_iter_is_valid(*iter) || chash_iter_key(*iter) != key) {
++		if (chash_iter_is_empty(*iter)) {
++			/* Found an empty slot, which ends the
++			 * search. Clean up any preceding tombstones
++			 * that are no longer needed because they lead
++			 * to no-where
++			 */
++			if ((int)first_redundant.slot < 0)
++				goto not_found;
++			while (first_redundant.slot != iter->slot) {
++				if (!chash_iter_is_valid(first_redundant))
++					chash_iter_set_empty(first_redundant);
++				CHASH_ITER_INC(first_redundant);
++			}
++#ifdef CHASH_DEBUG
++			chash_table_check(iter->table);
++#endif
++			goto not_found;
++		} else if (!chash_iter_is_valid(*iter)) {
++			/* Found a tombstone. Remember it as candidate
++			 * for relocating the entry we're looking for
++			 * or for adding a new entry with the given key
++			 */
++			if (first_avail == -1)
++				first_avail = iter->slot;
++			/* Or mark it as the start of a series of
++			 * potentially redundant tombstones
++			 */
++			else if (first_redundant.slot == -1)
++				CHASH_ITER_SET(first_redundant, iter->slot);
++		} else if (first_redundant.slot >= 0) {
++			/* Found a valid, occupied slot with a
++			 * preceding series of tombstones. Relocate it
++			 * to a better position that no longer depends
++			 * on those tombstones
++			 */
++			u32 cur_hash = chash_iter_hash(*iter);
++
++			if (!CHASH_IN_RANGE(iter->table, cur_hash,
++					    first_redundant.slot + 1,
++					    iter->slot)) {
++				/* This entry has a hash at or before
++				 * the first tombstone we found. We
++				 * can relocate it to that tombstone
++				 * and advance to the next tombstone
++				 */
++				chash_iter_relocate(first_redundant, *iter);
++				do {
++					CHASH_ITER_INC(first_redundant);
++				} while (chash_iter_is_valid(first_redundant));
++			} else if (cur_hash != iter->slot) {
++				/* Relocate entry to its home position
++				 * or as close as possible so it no
++				 * longer depends on any preceding
++				 * tombstones
++				 */
++				struct chash_iter new_iter =
++					CHASH_ITER_INIT(iter->table, cur_hash);
++
++				while (new_iter.slot != iter->slot &&
++				       chash_iter_is_valid(new_iter))
++					CHASH_ITER_INC(new_iter);
++
++				if (new_iter.slot != iter->slot)
++					chash_iter_relocate(new_iter, *iter);
++			}
++		}
++
++		CHASH_ITER_INC(*iter);
++		if (iter->slot == hash) {
++			iter->slot = -1;
++			goto not_found;
++		}
++	}
++
++#ifdef CONFIG_CHASH_STATS
++	iter->table->hits++;
++	iter->table->hits_steps += CHASH_SUB(iter->table, iter->slot, hash) + 1;
++#endif
++
++	if (first_avail >= 0) {
++		CHASH_ITER_SET(first_redundant, first_avail);
++		chash_iter_relocate(first_redundant, *iter);
++		iter->slot = first_redundant.slot;
++		iter->mask = first_redundant.mask;
++	}
++
++#ifdef CONFIG_CHASH_STATS
++	iter->table->hits_time_ns += local_clock() - ts1;
++#endif
++
++	return 0;
++
++not_found:
++#ifdef CONFIG_CHASH_STATS
++	iter->table->miss++;
++	iter->table->miss_steps += (iter->slot < 0) ?
++		(1 << iter->table->bits) :
++		CHASH_SUB(iter->table, iter->slot, hash) + 1;
++#endif
++
++	if (first_avail >= 0)
++		CHASH_ITER_SET(*iter, first_avail);
++
++#ifdef CONFIG_CHASH_STATS
++	iter->table->miss_time_ns += local_clock() - ts1;
++#endif
++
++	return -EINVAL;
++}
++
++int __chash_table_copy_in(struct __chash_table *table, u64 key,
++			  const void *value)
++{
++	u32 hash = (table->key_size == 4) ?
++		hash_32(key, table->bits) : hash_64(key, table->bits);
++	struct chash_iter iter = CHASH_ITER_INIT(table, hash);
++	int r = chash_table_find(&iter, key, false);
++
++	/* Found an existing entry */
++	if (!r) {
++		if (value && table->value_size)
++			memcpy(chash_iter_value(iter), value,
++			       table->value_size);
++		return 1;
++	}
++
++	/* Is there a place to add a new entry? */
++	if (iter.slot < 0) {
++		pr_err("Hash table overflow\n");
++		return -ENOMEM;
++	}
++
++	chash_iter_set_valid(iter);
++
++	if (table->key_size == 4)
++		table->keys32[iter.slot] = key;
++	else
++		table->keys64[iter.slot] = key;
++	if (value && table->value_size)
++		memcpy(chash_iter_value(iter), value, table->value_size);
++
++	return 0;
++}
++EXPORT_SYMBOL(__chash_table_copy_in);
++
++int __chash_table_copy_out(struct __chash_table *table, u64 key,
++			   void *value, bool remove)
++{
++	u32 hash = (table->key_size == 4) ?
++		hash_32(key, table->bits) : hash_64(key, table->bits);
++	struct chash_iter iter = CHASH_ITER_INIT(table, hash);
++	int r = chash_table_find(&iter, key, remove);
++
++	if (r < 0)
++		return r;
++
++	if (value && table->value_size)
++		memcpy(value, chash_iter_value(iter), table->value_size);
++
++	if (remove)
++		chash_iter_set_invalid(iter);
++
++	return iter.slot;
++}
++EXPORT_SYMBOL(__chash_table_copy_out);
++
++#ifdef CONFIG_CHASH_SELFTEST
++/**
++ * chash_self_test - Run a self-test of the hash table implementation
++ * @bits: Table size will be 2^bits entries
++ * @key_size: Size of hash keys in bytes, 4 or 8
++ * @min_fill: Minimum fill level during the test
++ * @max_fill: Maximum fill level during the test
++ * @iterations: Number of test iterations
++ *
++ * The test adds and removes entries from a hash table, cycling the
++ * fill level between min_fill and max_fill entries. Also tests lookup
++ * and value retrieval.
++ */
++static int __init chash_self_test(u8 bits, u8 key_size,
++				  int min_fill, int max_fill,
++				  u64 iterations)
++{
++	struct chash_table table;
++	int ret;
++	u64 add_count, rmv_count;
++	u64 value;
++
++	if (key_size == 4 && iterations > 0xffffffff)
++		return -EINVAL;
++	if (min_fill >= max_fill)
++		return -EINVAL;
++
++	ret = chash_table_alloc(&table, bits, key_size, sizeof(u64),
++				GFP_KERNEL);
++	if (ret) {
++		pr_err("chash_table_alloc failed: %d\n", ret);
++		return ret;
++	}
++
++	for (add_count = 0, rmv_count = 0; add_count < iterations;
++	     add_count++) {
++		/* When we hit the max_fill level, remove entries down
++		 * to min_fill
++		 */
++		if (add_count - rmv_count == max_fill) {
++			u64 find_count = rmv_count;
++
++			/* First try to find all entries that we're
++			 * about to remove, confirm their value, test
++			 * writing them back a second time.
++			 */
++			for (; add_count - find_count > min_fill;
++			     find_count++) {
++				ret = chash_table_copy_out(&table, find_count,
++							   &value);
++				if (ret < 0) {
++					pr_err("chash_table_copy_out failed: %d\n",
++					       ret);
++					goto out;
++				}
++				if (value != ~find_count) {
++					pr_err("Wrong value retrieved for key 0x%llx, expected 0x%llx got 0x%llx\n",
++					       find_count, ~find_count, value);
++#ifdef CHASH_DEBUG
++					chash_table_dump(&table.table);
++#endif
++					ret = -EFAULT;
++					goto out;
++				}
++				ret = chash_table_copy_in(&table, find_count,
++							  &value);
++				if (ret != 1) {
++					pr_err("copy_in second time returned %d, expected 1\n",
++					       ret);
++					ret = -EFAULT;
++					goto out;
++				}
++			}
++			/* Remove them until we hit min_fill level */
++			for (; add_count - rmv_count > min_fill; rmv_count++) {
++				ret = chash_table_remove(&table, rmv_count,
++							 NULL);
++				if (ret < 0) {
++					pr_err("chash_table_remove failed: %d\n",
++					       ret);
++					goto out;
++				}
++			}
++		}
++
++		/* Add a new value */
++		value = ~add_count;
++		ret = chash_table_copy_in(&table, add_count, &value);
++		if (ret != 0) {
++			pr_err("copy_in first time returned %d, expected 0\n",
++			       ret);
++			ret = -EFAULT;
++			goto out;
++		}
++	}
++
++	chash_table_dump_stats(&table);
++	chash_table_reset_stats(&table);
++
++out:
++	chash_table_free(&table);
++	return ret;
++}
++
++static unsigned int chash_test_bits = 10;
++MODULE_PARM_DESC(test_bits,
++		 "Selftest number of hash bits ([4..20], default=10)");
++module_param_named(test_bits, chash_test_bits, uint, 0444);
++
++static unsigned int chash_test_keysize = 8;
++MODULE_PARM_DESC(test_keysize, "Selftest keysize (4 or 8, default=8)");
++module_param_named(test_keysize, chash_test_keysize, uint, 0444);
++
++static unsigned int chash_test_minfill;
++MODULE_PARM_DESC(test_minfill, "Selftest minimum #entries (default=50%)");
++module_param_named(test_minfill, chash_test_minfill, uint, 0444);
++
++static unsigned int chash_test_maxfill;
++MODULE_PARM_DESC(test_maxfill, "Selftest maximum #entries (default=80%)");
++module_param_named(test_maxfill, chash_test_maxfill, uint, 0444);
++
++static unsigned long chash_test_iters;
++MODULE_PARM_DESC(test_iters, "Selftest iterations (default=1000 x #entries)");
++module_param_named(test_iters, chash_test_iters, ulong, 0444);
++
++static int __init chash_init(void)
++{
++	int ret;
++	u64 ts1_ns, ts_delta_us;
++
++	/* Skip self test on user errors */
++	if (chash_test_bits < 4 || chash_test_bits > 20) {
++		pr_err("chash: test_bits out of range [4..20].\n");
++		return 0;
++	}
++	if (chash_test_keysize != 4 && chash_test_keysize != 8) {
++		pr_err("chash: test_keysize invalid. Must be 4 or 8.\n");
++		return 0;
++	}
++
++	if (!chash_test_minfill)
++		chash_test_minfill = (1 << chash_test_bits) / 2;
++	if (!chash_test_maxfill)
++		chash_test_maxfill = (1 << chash_test_bits) * 4 / 5;
++	if (!chash_test_iters)
++		chash_test_iters = (1 << chash_test_bits) * 1000;
++
++	if (chash_test_minfill >= (1 << chash_test_bits)) {
++		pr_err("chash: test_minfill too big. Must be < table size.\n");
++		return 0;
++	}
++	if (chash_test_maxfill >= (1 << chash_test_bits)) {
++		pr_err("chash: test_maxfill too big. Must be < table size.\n");
++		return 0;
++	}
++	if (chash_test_minfill >= chash_test_maxfill) {
++		pr_err("chash: test_minfill must be < test_maxfill.\n");
++		return 0;
++	}
++	if (chash_test_keysize == 4 && chash_test_iters > 0xffffffff) {
++		pr_err("chash: test_iters must be < 4G for 4 byte keys.\n");
++		return 0;
++	}
++
++	ts1_ns = local_clock();
++	ret = chash_self_test(chash_test_bits, chash_test_keysize,
++			      chash_test_minfill, chash_test_maxfill,
++			      chash_test_iters);
++	if (!ret) {
++		ts_delta_us = (local_clock() - ts1_ns) / 1000;
++		pr_info("chash: self test took %llu us, %llu iterations/s\n",
++			ts_delta_us,
++			(u64)chash_test_iters * 1000000 / ts_delta_us);
++	} else {
++		pr_err("chash: self test failed: %d\n", ret);
++	}
++
++	return ret;
++}
++
++module_init(chash_init);
++
++#endif /* CONFIG_CHASH_SELFTEST */
++
++MODULE_DESCRIPTION("Closed hash table");
++MODULE_LICENSE("GPL and additional rights");
+-- 
+2.7.4
+

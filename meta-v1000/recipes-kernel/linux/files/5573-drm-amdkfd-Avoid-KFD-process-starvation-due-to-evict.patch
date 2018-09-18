@@ -1,0 +1,111 @@
+From 9e64079a4a94c6b3ab662fd0a81bb43079b83924 Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Date: Tue, 28 Mar 2017 16:56:41 -0400
+Subject: [PATCH 5573/5855] drm/amdkfd: Avoid KFD process starvation due to
+ evictions
+
+Insert a timeout before the same process can be evicted again.
+
+Change-Id: Iac3ef0f54edf860dd023a6cb5d7c0f7edd9d1893
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c  | 29 ++++++++++++++++++++++++++---
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  6 ++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c |  1 +
+ 3 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 4bb1c25..a5a3cfb 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -852,6 +852,17 @@ void kfd_restore_bo_worker(struct work_struct *work)
+ 
+ 	pr_info("Started restoring process of pasid %d\n", p->pasid);
+ 
++	/* Setting last_restore_timestamp before successful restoration.
++	 * Otherwise this would have to be set by KGD (restore_process_bos)
++	 * before KFD BOs are unreserved. If not, the process can be evicted
++	 * again before the timestamp is set.
++	 * If restore fails, the timestamp will be set again in the next
++	 * attempt. This would mean that the minimum GPU quanta would be
++	 * PROCESS_ACTIVE_TIME_MS - (time to execute the following two
++	 * functions)
++	 */
++
++	p->last_restore_timestamp = get_jiffies_64();
+ 	ret = pdd->dev->kfd2kgd->restore_process_bos(p->process_info);
+ 	if (ret) {
+ 		pr_info("Restore failed, try again after %d ms\n",
+@@ -881,6 +892,8 @@ int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
+ 					       struct fence *fence)
+ {
+ 	struct kfd_process *p;
++	unsigned long active_time;
++	unsigned long delay_jiffies = msecs_to_jiffies(PROCESS_ACTIVE_TIME_MS);
+ 
+ 	if (!fence)
+ 		return -EINVAL;
+@@ -906,11 +919,21 @@ int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
+ 		}
+ 	}
+ 
+-	/* During process initialization eviction_work.work is initialized
++	p->eviction_work.eviction_fence = fence_get(fence);
++
++	/* Avoid KFD process starvation. Wait for at least
++	 * PROCESS_ACTIVE_TIME_MS before evicting the process again
++	 */
++	active_time = get_jiffies_64() - p->last_restore_timestamp;
++	if (delay_jiffies > active_time)
++		delay_jiffies -= active_time;
++	else
++		delay_jiffies = 0;
++
++	/* During process initialization eviction_work.dwork is initialized
+ 	 * to kfd_evict_bo_worker
+ 	 */
+-	p->eviction_work.eviction_fence = fence_get(fence);
+-	schedule_delayed_work(&p->eviction_work.dwork, 0);
++	schedule_delayed_work(&p->eviction_work.dwork, delay_jiffies);
+ out:
+ 	kfd_unref_process(p);
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index cafa568..dd1f757 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -583,6 +583,8 @@ struct kfd_eviction_work {
+ #define PROCESS_RESTORE_TIME_MS 100
+ /* Approx. back off time if restore fails due to lack of memory */
+ #define PROCESS_BACK_OFF_TIME_MS 100
++/* Approx. time before evicting the process again */
++#define PROCESS_ACTIVE_TIME_MS 10
+ 
+ void kfd_evict_bo_worker(struct work_struct *work);
+ void kfd_restore_bo_worker(struct work_struct *work);
+@@ -722,6 +724,10 @@ struct kfd_process {
+ 	/* Work items for evicting and restoring BOs */
+ 	struct kfd_eviction_work eviction_work;
+ 	struct delayed_work restore_work;
++	/* Approx. the last timestamp (in jiffies) when the process was
++	 * restored after an eviction
++	 */
++	unsigned long last_restore_timestamp;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index affa4184..562f061 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -599,6 +599,7 @@ static struct kfd_process *create_process(const struct task_struct *thread,
+ 
+ 	INIT_DELAYED_WORK(&process->eviction_work.dwork, kfd_evict_bo_worker);
+ 	INIT_DELAYED_WORK(&process->restore_work, kfd_restore_bo_worker);
++	process->last_restore_timestamp = get_jiffies_64();
+ 
+ 	/* If PeerDirect interface was not detected try to detect it again
+ 	* in case if network driver was loaded later.
+-- 
+2.7.4
+

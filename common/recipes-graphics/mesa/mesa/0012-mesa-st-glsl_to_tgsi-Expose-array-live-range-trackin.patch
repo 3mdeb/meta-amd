@@ -1,0 +1,204 @@
+From 3669f47f03dcf696188294da78def040cffa77a2 Mon Sep 17 00:00:00 2001
+From: Gert Wollny <gw.fossdev@gmail.com>
+Date: Fri, 9 Feb 2018 11:11:16 +0100
+Subject: [PATCH 12/13] mesa/st/glsl_to_tgsi: Expose array live range tracking
+ and merging
+
+Rename get_temp_registers_required_live_ranges to get_required_live_ranges and
+change its interface to also accomodate the live range tracking for arrays.
+Remove the placeholder arrays in this function and tie the array merging.
+
+This makes the register spilling in piglit
+  glsl-1.30/execution/fs-multiple-large-local-arrays
+on r600/barts unneccessary.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=100200
+Signed-off-by: Gert Wollny <gw.fossdev@gmail.com>
+---
+ src/mesa/state_tracker/st_glsl_to_tgsi.cpp         | 25 +++++++++++++++++-----
+ .../state_tracker/st_glsl_to_tgsi_temprename.cpp   | 13 +++++------
+ .../state_tracker/st_glsl_to_tgsi_temprename.h     | 19 ++++++++++------
+ src/mesa/state_tracker/tests/st_tests_common.cpp   | 19 ++++++++--------
+ 4 files changed, 48 insertions(+), 28 deletions(-)
+
+diff --git a/src/mesa/state_tracker/st_glsl_to_tgsi.cpp b/src/mesa/state_tracker/st_glsl_to_tgsi.cpp
+index 163f334..c58fac0 100644
+--- a/src/mesa/state_tracker/st_glsl_to_tgsi.cpp
++++ b/src/mesa/state_tracker/st_glsl_to_tgsi.cpp
+@@ -5467,25 +5467,40 @@ glsl_to_tgsi_visitor::split_arrays(void)
+    next_array = n_remaining_arrays;
+ }
+ 
+-/* Merges temporary registers together where possible to reduce the number of
+- * registers needed to run a program.
++/* Merges temporary registers and arrays together where possible to reduce
++ * the number of registers needed to run a program.
+  *
+  * Produces optimal code only after copy propagation and dead code elimination
+  * have been run. */
+ void
+ glsl_to_tgsi_visitor::merge_registers(void)
+ {
++   struct array_live_range *arr_live_ranges = NULL;
++
+    struct register_live_range *reg_live_ranges =
+          rzalloc_array(mem_ctx, struct register_live_range, this->next_temp);
+ 
+-   if (get_temp_registers_required_live_ranges(reg_live_ranges, &this->instructions,
+-                                             this->next_temp, reg_live_ranges)) {
++   if (this->next_array > 0) {
++      arr_live_ranges = new array_live_range[this->next_array];
++      for (unsigned i = 0; i < this->next_array; ++i)
++         arr_live_ranges[i] = array_live_range(i+1, this->array_sizes[i+1]);
++   }
++
++
++   if (get_required_live_ranges(reg_live_ranges, &this->instructions,
++                                this->next_temp, reg_live_ranges,
++                                this->next_array, arr_live_ranges)) {
+       struct rename_reg_pair *renames =
+             rzalloc_array(reg_live_ranges, struct rename_reg_pair, this->next_temp);
+       get_temp_registers_remapping(reg_live_ranges, this->next_temp,
+                                    reg_live_ranges, renames);
+       rename_temp_registers(renames);
+-      ralloc_free(renames);
++
++      this->next_array =  merge_arrays(this->next_array, this->array_sizes,
++                                       &this->instructions, arr_live_ranges);
++
++      if (arr_live_ranges)
++         delete[] arr_live_ranges;
+    }
+    ralloc_free(reg_live_ranges);
+ }
+diff --git a/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.cpp b/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.cpp
+index e276471..eafe4cd 100644
+--- a/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.cpp
++++ b/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.cpp
+@@ -1102,12 +1102,13 @@ static void dump_instruction(ostream& os, int line, prog_scope *scope,
+                              const glsl_to_tgsi_instruction& inst);
+ #endif
+ 
+-/* Scan the program and estimate the required register live ranges.
+- * live_ranges must be pre-allocated.
++/* Scan the program and estimate the required register and array live ranges.
++ * The *live_ranges must be pre-allocated.
+  */
+ bool
+-get_temp_registers_required_live_ranges(void *mem_ctx, exec_list *instructions,
+-                  int ntemps, struct register_live_range *register_live_ranges)
++get_required_live_ranges(void *mem_ctx, exec_list *instructions, int ntemps,
++                         struct register_live_range *register_live_ranges,
++                         int narrays, struct array_live_range *array_live_ranges)
+ {
+    int line = 0;
+    int loop_id = 1;
+@@ -1116,10 +1117,6 @@ get_temp_registers_required_live_ranges(void *mem_ctx, exec_list *instructions,
+    bool is_at_end = false;
+    int n_scopes = 1;
+ 
+-   /* Placeholder to make the reladdr tests pass, will be removed with the next patch. */
+-   int narrays = 2;
+-   struct array_live_range array_live_ranges[3];
+-
+    /* Count scopes to allocate the needed space without the need for
+     * re-allocation
+     */
+diff --git a/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.h b/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.h
+index 86c2158..e0dbc3d 100644
+--- a/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.h
++++ b/src/mesa/state_tracker/st_glsl_to_tgsi_temprename.h
+@@ -24,7 +24,7 @@
+ #ifndef MESA_GLSL_TO_TGSI_TEMPRENAME_H
+ #define MESA_GLSL_TO_TGSI_TEMPRENAME_H
+ 
+-#include "st_glsl_to_tgsi_private.h"
++#include "st_glsl_to_tgsi_array_merge.h"
+ 
+ /** Storage to record the required live range of a temporary register
+  * begin == end == -1 indicates that the register can be reused without
+@@ -38,9 +38,9 @@ struct register_live_range {
+    int end;
+ };
+ 
+-/** Evaluates the required live ranges of temporary registers in a shader.
+- * The live range estimation can only be run sucessfully if the shader doesn't
+- * call a subroutine.
++/** Evaluates the required live ranges of temporary registers and arrays in a
++ * shader. The live range estimation can only be run sucessfully if the shader
++ * doesn't call a subroutine.
+  * @param[in] mem_ctx a memory context that can be used with the ralloc_*
+  *            functions
+  * @param[in] instructions the shader to be anlzyed
+@@ -50,12 +50,19 @@ struct register_live_range {
+  *   point to allocated memory that can hold ntemps register_live_range
+  *   structures. On output the live ranges contains the live ranges for
+  *   the registers with the exception of TEMP[0]
++ * @param[in] narrays number of array sreserved for this shader
++ * @param[in,out] arr_live_ranges memory location to store the estimated required
++ *   live ranges for each array. The parameter must point to allocated memory
++ *   that can hold narrays array_live_range structures. On output the live
++ *   ranges contains the live ranges for the registers with the exception of
++ *   ARRAY[0].
+  * @returns: true if the lifetimes were estimated, false if not (i.e. if a
+  * subroutine was called).
+  */
+ bool
+-get_temp_registers_required_live_ranges(void *mem_ctx, exec_list *instructions,
+-                  int ntemps, struct register_live_range *register_live_ranges);
++get_required_live_ranges(void *mem_ctx, exec_list *instructions,
++                  int ntemps, struct register_live_range *register_live_ranges,
++                  int narrays, array_live_range *array_live_ranges);
+ 
+ /** Estimate the merge remapping of the registers.
+  * @param[in] mem_ctx a memory context that can be used with the ralloc_*
+diff --git a/src/mesa/state_tracker/tests/st_tests_common.cpp b/src/mesa/state_tracker/tests/st_tests_common.cpp
+index f1e4a83..33d669d 100644
+--- a/src/mesa/state_tracker/tests/st_tests_common.cpp
++++ b/src/mesa/state_tracker/tests/st_tests_common.cpp
+@@ -409,11 +409,11 @@ LifetimeEvaluatorTest::run(const vector<FakeCodeline>& code, bool& success)
+ {
+    FakeShader shader(code);
+    lifetime_result result(shader.get_num_temps());
+-
++   vector <array_live_range> arr(10);
+    success =
+-         get_temp_registers_required_live_ranges(mem_ctx, shader.get_program(mem_ctx),
++         get_required_live_ranges(mem_ctx, shader.get_program(mem_ctx),
+                                                shader.get_num_temps(),
+-                                               &result[0]);
++                                               &result[0], 9, &arr[0]);
+ 
+    return result;
+ }
+@@ -422,11 +422,11 @@ void LifetimeEvaluatorTest::run(const vector<FakeCodeline>& code, const temp_lt_
+ {
+    FakeShader shader(code);
+    lifetime_result result(shader.get_num_temps());
+-
++   vector <array_live_range> arr(10);
+    bool success =
+-      get_temp_registers_required_live_ranges(mem_ctx, shader.get_program(mem_ctx),
++      get_required_live_ranges(mem_ctx, shader.get_program(mem_ctx),
+                                             shader.get_num_temps(),
+-                                            &result[0]);
++                                            &result[0], 9, &arr[0]);
+    ASSERT_TRUE(success);
+    ASSERT_EQ(result.size(), e.size());
+    check(result, e);
+@@ -478,8 +478,9 @@ void RegisterLifetimeAndRemappingTest::run(const vector<FakeCodeline>& code,
+ {
+      FakeShader shader(code);
+      std::vector<register_live_range> lt(shader.get_num_temps());
+-
+-     get_temp_registers_required_live_ranges(mem_ctx, shader.get_program(mem_ctx),
+-                                           shader.get_num_temps(), &lt[0]);
++     vector <array_live_range> arr(10);
++     get_required_live_ranges(mem_ctx, shader.get_program(mem_ctx),
++                                             shader.get_num_temps(), &lt[0],
++                                             9, &arr[0]);
+      this->run(lt, expect);
+ }
+-- 
+2.7.4
+

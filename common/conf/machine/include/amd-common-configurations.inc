@@ -1,3 +1,5 @@
+require conf/machine/include/amd-features.inc
+
 POKY_DEFAULT_DISTRO_FEATURES_remove = "wayland"
 
 PREFERRED_PROVIDER_jpeg ?= "jpeg"
@@ -19,8 +21,6 @@ MACHINE_EXTRA_RRECOMMENDS += "vdpauinfo grub parted util-linux-blkid"
 MACHINE_EXTRA_RRECOMMENDS += "rtc-test watchdog-test spi-test smbus-test gpio-test"
 MACHINE_EXTRA_RRECOMMENDS += "amd-wdt amd-spi"
 MACHINE_EXTRA_RRECOMMENDS += "${@bb.utils.contains_any("DISTRO", "mel mel-lite", "firmware-wireless", "", d)}"
-
-RELEASE_IMAGE ?= "core-image-sato"
 
 # Add serial consoles to kernel commandline, these should occur before the tty0
 KERNEL_SERIAL_CONSOLE ??= ""
@@ -45,3 +45,6 @@ EXTRA_OECONF_append_pn-matchbox-panel-2 = " --with-battery=acpi"
 IMAGE_FSTYPES += "hddimg iso"
 
 IMAGE_OVERHEAD_FACTOR = "1.1"
+
+MACHINE_FEATURES_append_amdgpu = " x11"
+MACHINE_FEATURES_append_radeon = " x11"

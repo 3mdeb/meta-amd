@@ -1,0 +1,152 @@
+From 742114cd3e3a62d3a33460c9dee0957eef7f5353 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Thu, 2 Nov 2017 10:52:09 -0400
+Subject: [PATCH 4269/5855] drm/amd/display: fix regamma programming
+
+When new coefficients match cached we would skip setting regamma mode
+Also, when doing a stream update we would program regamma for all pipes,
+even thos that are not yet powered on. This resulted in never setting
+regamma since we would cache before the pipe is powered.
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c                  | 14 +++-----------
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c          | 10 +++-------
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h          |  6 ------
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c |  1 -
+ 4 files changed, 6 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index dc72886..f9ee84b 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1345,27 +1345,19 @@ static void commit_planes_for_stream(struct dc *dc,
+ 		}
+ 	}
+ 
+-	if (update_type > UPDATE_TYPE_FAST) {
++	if (stream && stream_update && update_type > UPDATE_TYPE_FAST)
+ 		for (j = 0; j < dc->res_pool->pipe_count; j++) {
+ 			struct pipe_ctx *pipe_ctx =
+ 					&context->res_ctx.pipe_ctx[j];
+ 
+-			if (!pipe_ctx->stream)
++			if (pipe_ctx->stream != stream)
+ 				continue;
+ 
+-			if (stream_update != NULL &&
+-				stream_update->out_transfer_func != NULL) {
+-				dc->hwss.set_output_transfer_func(
+-						pipe_ctx, pipe_ctx->stream);
+-			}
+-
+-			if (stream_update != NULL &&
+-				stream_update->hdr_static_metadata) {
++			if (stream_update->hdr_static_metadata) {
+ 				resource_build_info_frame(pipe_ctx);
+ 				dc->hwss.update_info_frame(pipe_ctx);
+ 			}
+ 		}
+-	}
+ }
+ 
+ void dc_commit_updates_for_stream(struct dc *dc,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
+index a38b1ab..4264f6a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.c
+@@ -187,9 +187,7 @@ static void dpp1_cm_set_regamma_pwl(
+ 	struct dpp *dpp_base, const struct pwl_params *params, enum opp_regamma mode)
+ {
+ 	struct dcn10_dpp *dpp = TO_DCN10_DPP(dpp_base);
+-	uint32_t re_mode = 0;
+-	uint32_t obuf_bypass = 0; /* need for pipe split */
+-	uint32_t obuf_hupscale = 0;
++	uint32_t re_mode;
+ 
+ 	switch (mode) {
+ 	case OPP_REGAMMA_BYPASS:
+@@ -202,8 +200,9 @@ static void dpp1_cm_set_regamma_pwl(
+ 		re_mode = 2;
+ 		break;
+ 	case OPP_REGAMMA_USER:
++		re_mode = dpp->is_write_to_ram_a_safe ? 4 : 3;
+ 		if (memcmp(&dpp->pwl_data, params, sizeof(*params)) == 0)
+-			return;
++			break;
+ 
+ 		dpp1_cm_power_on_regamma_lut(dpp_base, true);
+ 		dpp1_cm_configure_regamma_lut(dpp_base, dpp->is_write_to_ram_a_safe);
+@@ -224,9 +223,6 @@ static void dpp1_cm_set_regamma_pwl(
+ 		break;
+ 	}
+ 	REG_SET(CM_RGAM_CONTROL, 0, CM_RGAM_LUT_MODE, re_mode);
+-	REG_UPDATE_2(OBUF_CONTROL,
+-			OBUF_BYPASS, obuf_bypass,
+-			OBUF_H_2X_UPSCALE_EN, obuf_hupscale);
+ }
+ 
+ static void dpp1_setup_format_flags(enum surface_pixel_format input_format,\
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
+index b6b2817..a45a701 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp.h
+@@ -71,7 +71,6 @@
+ 	SRI(SCL_VERT_FILTER_INIT_BOT_C, DSCL, id), \
+ 	SRI(RECOUT_START, DSCL, id), \
+ 	SRI(RECOUT_SIZE, DSCL, id), \
+-	SRI(OBUF_CONTROL, DSCL, id), \
+ 	SRI(CM_ICSC_CONTROL, CM, id), \
+ 	SRI(CM_ICSC_C11_C12, CM, id), \
+ 	SRI(CM_ICSC_C33_C34, CM, id), \
+@@ -230,7 +229,6 @@
+ 	TF_SF(DSCL0_SCL_VERT_FILTER_INIT_BOT_C, SCL_V_INIT_INT_BOT_C, mask_sh),\
+ 	TF_SF(DSCL0_SCL_MODE, SCL_CHROMA_COEF_MODE, mask_sh),\
+ 	TF_SF(DSCL0_SCL_MODE, SCL_COEF_RAM_SELECT_CURRENT, mask_sh), \
+-	TF_SF(DSCL0_OBUF_CONTROL, OBUF_BYPASS, mask_sh), \
+ 	TF_SF(CM0_CM_ICSC_CONTROL, CM_ICSC_MODE, mask_sh), \
+ 	TF_SF(CM0_CM_ICSC_C11_C12, CM_ICSC_C11, mask_sh), \
+ 	TF_SF(CM0_CM_ICSC_C11_C12, CM_ICSC_C12, mask_sh), \
+@@ -397,7 +395,6 @@
+ 	TF_SF(CM0_CM_RGAM_RAMA_REGION_32_33, CM_RGAM_RAMA_EXP_REGION33_LUT_OFFSET, mask_sh), \
+ 	TF_SF(CM0_CM_RGAM_RAMA_REGION_32_33, CM_RGAM_RAMA_EXP_REGION33_NUM_SEGMENTS, mask_sh), \
+ 	TF_SF(CM0_CM_RGAM_CONTROL, CM_RGAM_LUT_MODE, mask_sh), \
+-	TF_SF(DSCL0_OBUF_CONTROL, OBUF_H_2X_UPSCALE_EN, mask_sh), \
+ 	TF_SF(CM0_CM_IGAM_CONTROL, CM_IGAM_LUT_MODE, mask_sh), \
+ 	TF_SF(CM0_CM_IGAM_CONTROL, CM_IGAM_LUT_FORMAT_R, mask_sh), \
+ 	TF_SF(CM0_CM_IGAM_CONTROL, CM_IGAM_LUT_FORMAT_G, mask_sh), \
+@@ -561,8 +558,6 @@
+ 	type CM_RGAM_RAMA_EXP_REGION33_NUM_SEGMENTS; \
+ 	type CM_RGAM_LUT_MODE; \
+ 	type CM_CMOUT_ROUND_TRUNC_MODE; \
+-	type OBUF_BYPASS; \
+-	type OBUF_H_2X_UPSCALE_EN; \
+ 	type CM_BLNDGAM_LUT_MODE; \
+ 	type CM_BLNDGAM_RAMB_EXP_REGION_START_B; \
+ 	type CM_BLNDGAM_RAMB_EXP_REGION_START_SEGMENT_B; \
+@@ -1105,7 +1100,6 @@ struct dcn_dpp_registers {
+ 	uint32_t CM_RGAM_RAMA_REGION_32_33;
+ 	uint32_t CM_RGAM_CONTROL;
+ 	uint32_t CM_CMOUT_CONTROL;
+-	uint32_t OBUF_CONTROL;
+ 	uint32_t CM_BLNDGAM_LUT_WRITE_EN_MASK;
+ 	uint32_t CM_BLNDGAM_CONTROL;
+ 	uint32_t CM_BLNDGAM_RAMB_START_CNTL_B;
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 8dda61d..8737f97 100755
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -873,7 +873,6 @@ static void reset_hw_ctx_wrap(
+ 			struct clock_source *old_clk = pipe_ctx_old->clock_source;
+ 
+ 			reset_back_end_for_pipe(dc, pipe_ctx_old, dc->current_state);
+-
+ 			if (old_clk)
+ 				old_clk->funcs->cs_power_down(old_clk);
+ 		}
+-- 
+2.7.4
+

@@ -1,0 +1,206 @@
+From eae9cbf9ceb4617284a94a6f6afccad4ba83a8e1 Mon Sep 17 00:00:00 2001
+From: Andres Rodriguez <andresx7@gmail.com>
+Date: Fri, 28 Apr 2017 20:05:51 -0400
+Subject: [PATCH 3649/5855] drm/amdgpu: implement ring set_priority for gfx_v8
+ compute v9
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Programming CP_HQD_QUEUE_PRIORITY enables a queue to take priority over
+other queues on the same pipe. Multiple queues on a pipe are timesliced
+so this gives us full precedence over other queues.
+
+Programming CP_HQD_PIPE_PRIORITY changes the SPI_ARB_PRIORITY of the
+wave as follows:
+        0x2: CS_H
+        0x1: CS_M
+        0x0: CS_L
+
+The SPI block will then dispatch work according to the policy set by
+SPI_ARB_PRIORITY. In the current policy CS_H is higher priority than
+gfx.
+
+In order to prevent getting stuck in loops of resources bouncing between
+GFX and high priority compute and introducing further latency, we
+statically reserve a portion of the pipe.
+
+v2: fix srbm_select to ring->queue and use ring->funcs->type
+v3: use AMD_SCHED_PRIORITY_* instead of AMDGPU_CTX_PRIORITY_*
+v4: switch int to enum amd_sched_priority
+v5: corresponding changes for srbm_lock
+v6: change CU reservation to PIPE_PERCENT allocation
+v7: use kiq instead of MMIO
+v8: back to MMIO, and make the implementation sleep safe.
+v9: corresponding changes for splitting HIGH into _HW/_SW
+
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Andres Rodriguez <andresx7@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+
+ Conflicts:
+	drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+
+Change-Id: Id1f0d2c60e85b0e4c9bac61f60c9bef9dc2fad9d
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  4 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  2 +
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c      | 99 ++++++++++++++++++++++++++++++
+ 3 files changed, 105 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index c9b8fe1..358392b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1062,6 +1062,10 @@ struct amdgpu_gfx {
+ 	bool                            in_suspend;
+ 	/* NGG */
+ 	struct amdgpu_ngg		ngg;
++
++	/* pipe reservation */
++	struct mutex			pipe_reserve_mutex;
++	DECLARE_BITMAP			(pipe_reserve_bitmap, AMDGPU_MAX_COMPUTE_QUEUES);
+ };
+ 
+ int amdgpu_ib_get(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index d887c17..d43c9bd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2164,6 +2164,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	adev->vm_manager.vm_pte_num_rings = 0;
+ 	adev->gart.gart_funcs = NULL;
+ 	adev->fence_context = fence_context_alloc(AMDGPU_MAX_RINGS);
++        bitmap_zero(adev->gfx.pipe_reserve_bitmap, AMDGPU_MAX_COMPUTE_QUEUES);
+ 
+ 	adev->smc_rreg = &amdgpu_invalid_rreg;
+ 	adev->smc_wreg = &amdgpu_invalid_wreg;
+@@ -2191,6 +2192,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	mutex_init(&adev->pm.mutex);
+ 	mutex_init(&adev->gfx.gpu_clock_mutex);
+ 	mutex_init(&adev->srbm_mutex);
++	mutex_init(&adev->gfx.pipe_reserve_mutex);
+ 	mutex_init(&adev->grbm_idx_mutex);
+ 	mutex_init(&adev->mn_lock);
+ 	mutex_init(&adev->virt.vf_errors.lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index 0aac4f7..0fbab83 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -6397,6 +6397,104 @@ static void gfx_v8_0_ring_set_wptr_compute(struct amdgpu_ring *ring)
+ 	WDOORBELL32(ring->doorbell_index, lower_32_bits(ring->wptr));
+ }
+ 
++static void gfx_v8_0_ring_set_pipe_percent(struct amdgpu_ring *ring,
++					   bool acquire)
++{
++	struct amdgpu_device *adev = ring->adev;
++	int pipe_num, tmp, reg;
++	int pipe_percent = acquire ? SPI_WCL_PIPE_PERCENT_GFX__VALUE_MASK : 0x1;
++
++	pipe_num = ring->me * adev->gfx.mec.num_pipe_per_mec + ring->pipe;
++
++	/* first me only has 2 entries, GFX and HP3D */
++	if (ring->me > 0)
++		pipe_num -= 2;
++
++	reg = mmSPI_WCL_PIPE_PERCENT_GFX + pipe_num;
++	tmp = RREG32(reg);
++	tmp = REG_SET_FIELD(tmp, SPI_WCL_PIPE_PERCENT_GFX, VALUE, pipe_percent);
++	WREG32(reg, tmp);
++}
++
++static void gfx_v8_0_pipe_reserve_resources(struct amdgpu_device *adev,
++					    struct amdgpu_ring *ring,
++					    bool acquire)
++{
++	int i, pipe;
++	bool reserve;
++	struct amdgpu_ring *iring;
++
++	mutex_lock(&adev->gfx.pipe_reserve_mutex);
++	pipe = amdgpu_gfx_queue_to_bit(adev, ring->me, ring->pipe, 0);
++	if (acquire)
++		set_bit(pipe, adev->gfx.pipe_reserve_bitmap);
++	else
++		clear_bit(pipe, adev->gfx.pipe_reserve_bitmap);
++
++	if (!bitmap_weight(adev->gfx.pipe_reserve_bitmap, AMDGPU_MAX_COMPUTE_QUEUES)) {
++		/* Clear all reservations - everyone reacquires all resources */
++		for (i = 0; i < adev->gfx.num_gfx_rings; ++i)
++			gfx_v8_0_ring_set_pipe_percent(&adev->gfx.gfx_ring[i],
++						       true);
++
++		for (i = 0; i < adev->gfx.num_compute_rings; ++i)
++			gfx_v8_0_ring_set_pipe_percent(&adev->gfx.compute_ring[i],
++						       true);
++	} else {
++		/* Lower all pipes without a current reservation */
++		for (i = 0; i < adev->gfx.num_gfx_rings; ++i) {
++			iring = &adev->gfx.gfx_ring[i];
++			pipe = amdgpu_gfx_queue_to_bit(adev,
++						       iring->me,
++						       iring->pipe,
++						       0);
++			reserve = test_bit(pipe, adev->gfx.pipe_reserve_bitmap);
++			gfx_v8_0_ring_set_pipe_percent(iring, reserve);
++		}
++
++		for (i = 0; i < adev->gfx.num_compute_rings; ++i) {
++			iring = &adev->gfx.compute_ring[i];
++			pipe = amdgpu_gfx_queue_to_bit(adev,
++						       iring->me,
++						       iring->pipe,
++						       0);
++			reserve = test_bit(pipe, adev->gfx.pipe_reserve_bitmap);
++			gfx_v8_0_ring_set_pipe_percent(iring, reserve);
++		}
++	}
++
++	mutex_unlock(&adev->gfx.pipe_reserve_mutex);
++}
++
++static void gfx_v8_0_hqd_set_priority(struct amdgpu_device *adev,
++				      struct amdgpu_ring *ring,
++				      bool acquire)
++{
++	uint32_t pipe_priority = acquire ? 0x2 : 0x0;
++	uint32_t queue_priority = acquire ? 0xf : 0x0;
++
++	mutex_lock(&adev->srbm_mutex);
++	vi_srbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
++
++	WREG32(mmCP_HQD_PIPE_PRIORITY, pipe_priority);
++	WREG32(mmCP_HQD_QUEUE_PRIORITY, queue_priority);
++
++	vi_srbm_select(adev, 0, 0, 0, 0);
++	mutex_unlock(&adev->srbm_mutex);
++}
++static void gfx_v8_0_ring_set_priority_compute(struct amdgpu_ring *ring,
++					       enum amd_sched_priority priority)
++{
++	struct amdgpu_device *adev = ring->adev;
++	bool acquire = priority == AMD_SCHED_PRIORITY_HIGH_HW;
++
++	if (ring->funcs->type != AMDGPU_RING_TYPE_COMPUTE)
++		return;
++
++	gfx_v8_0_hqd_set_priority(adev, ring, acquire);
++	gfx_v8_0_pipe_reserve_resources(adev, ring, acquire);
++}
++
+ static void gfx_v8_0_ring_emit_fence_compute(struct amdgpu_ring *ring,
+ 					     u64 addr, u64 seq,
+ 					     unsigned flags)
+@@ -6842,6 +6940,7 @@ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_compute = {
+ 	.test_ib = gfx_v8_0_ring_test_ib,
+ 	.insert_nop = amdgpu_ring_insert_nop,
+ 	.pad_ib = amdgpu_ring_generic_pad_ib,
++	.set_priority = gfx_v8_0_ring_set_priority_compute,
+ };
+ 
+ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_kiq = {
+-- 
+2.7.4
+

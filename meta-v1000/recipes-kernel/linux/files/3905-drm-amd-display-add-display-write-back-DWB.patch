@@ -1,0 +1,170 @@
+From 363ef0e982852230743a15ced1eb20ba9a6f3758 Mon Sep 17 00:00:00 2001
+From: Duke Du <Duke.Du@amd.com>
+Date: Thu, 3 Aug 2017 10:20:52 -0400
+Subject: [PATCH 3905/5855] drm/amd/display: add display write back(DWB)
+
+Signed-off-by: Duke Du <Duke.Du@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Harry Wentland <Harry.Wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           | 10 +++
+ drivers/gpu/drm/amd/display/dc/dc.h                |  2 +
+ .../gpu/drm/amd/display/dc/dce/dce_clock_source.c  | 84 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/inc/clock_source.h  |  4 ++
+ 4 files changed, 100 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 846ede5..aee3c25 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1572,6 +1572,16 @@ struct dwbc *dc_get_dwb_at_pipe(struct dc *dc, uint32_t pipe)
+ 	}
+ }
+ 
++struct dwbc *dc_get_dwb_at_pipe(const struct dc *dc, uint32_t pipe)
++{
++	struct core_dc *core_dc = DC_TO_CORE(dc);
++	if ((pipe >= dwb_pipe0) && (pipe < dwb_pipe_max_num)) {
++		return core_dc->res_pool->dwbc[(int)pipe];
++	} else {
++		return NULL;
++	}
++}
++
+ const struct graphics_object_id dc_get_link_id_at_index(
+ 	struct dc *dc, uint32_t link_index)
+ {
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index e2c13d7..77d252f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -882,6 +882,8 @@ const struct dc_link_status *dc_link_get_status(const struct dc_link *dc_link);
+  */
+ struct dc_link *dc_get_link_at_index(struct dc *dc, uint32_t link_index);
+ 
++struct dwbc *dc_get_dwb_at_pipe(const struct dc *dc, uint32_t pipe);
++
+ /* Set backlight level of an embedded panel (eDP, LVDS). */
+ bool dc_link_set_backlight_level(const struct dc_link *dc_link, uint32_t level,
+ 		uint32_t frame_ramp, const struct dc_stream_state *stream);
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c b/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c
+index d3b61b9..df5a55f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c
+@@ -34,6 +34,7 @@
+ 
+ #include "dce_clock_source.h"
+ 
++#include "core_dc.h"
+ #include "reg_helper.h"
+ 
+ #define REG(reg)\
+@@ -686,6 +687,89 @@ static uint32_t dce110_get_pix_rate_in_hz(
+ 	return pix_rate;
+ }
+ 
++static uint32_t dce110_get_pll_pixel_rate_in_hz(
++	struct clock_source *cs,
++	struct pixel_clk_params *pix_clk_params,
++	struct pll_settings *pll_settings)
++{
++	uint32_t inst = pix_clk_params->controller_id - CONTROLLER_ID_D0;
++	struct core_dc *dc_core = DC_TO_CORE(cs->ctx->dc);
++	struct validate_context *context = dc_core->current_context;
++	struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[inst];
++
++	/* This function need separate to different DCE version, before separate, just use pixel clock */
++	return pipe_ctx->stream->phy_pix_clk;
++}
++
++static uint32_t dce110_get_dp_pixel_rate_from_combo_phy_pll(
++	struct clock_source *cs,
++	struct pixel_clk_params *pix_clk_params,
++	struct pll_settings *pll_settings)
++{
++	uint32_t inst = pix_clk_params->controller_id - CONTROLLER_ID_D0;
++	struct core_dc *dc_core = DC_TO_CORE(cs->ctx->dc);
++	struct validate_context *context = dc_core->current_context;
++	struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[inst];
++
++	/* This function need separate to different DCE version, before separate, just use pixel clock */
++	return pipe_ctx->stream->phy_pix_clk;
++}
++
++static uint32_t dce110_get_d_to_pixel_rate_in_hz(
++	struct clock_source *cs,
++	struct pixel_clk_params *pix_clk_params,
++	struct pll_settings *pll_settings)
++{
++	uint32_t inst = pix_clk_params->controller_id - CONTROLLER_ID_D0;
++	struct dce110_clk_src *clk_src = TO_DCE110_CLK_SRC(cs);
++	int dto_enabled = 0;
++	struct fixed31_32 pix_rate;
++
++	REG_GET(PIXEL_RATE_CNTL[inst], DP_DTO0_ENABLE, &dto_enabled);
++
++	if (dto_enabled) {
++		uint32_t phase = 0;
++		uint32_t modulo = 0;
++		REG_GET(PHASE[inst], DP_DTO0_PHASE, &phase);
++		REG_GET(MODULO[inst], DP_DTO0_MODULO, &modulo);
++
++		if (modulo == 0) {
++			return 0;
++		}
++
++		pix_rate = dal_fixed31_32_from_int(clk_src->ref_freq_khz);
++		pix_rate = dal_fixed31_32_mul_int(pix_rate, 1000);
++		pix_rate = dal_fixed31_32_mul_int(pix_rate, phase);
++		pix_rate = dal_fixed31_32_div_int(pix_rate, modulo);
++
++		return dal_fixed31_32_round(pix_rate);
++	} else {
++		return dce110_get_dp_pixel_rate_from_combo_phy_pll(cs, pix_clk_params, pll_settings);
++	}
++}
++
++static uint32_t dce110_get_pix_rate_in_hz(
++	struct clock_source *cs,
++	struct pixel_clk_params *pix_clk_params,
++	struct pll_settings *pll_settings)
++{
++	uint32_t pix_rate = 0;
++	switch (pix_clk_params->signal_type) {
++	case	SIGNAL_TYPE_DISPLAY_PORT:
++	case	SIGNAL_TYPE_DISPLAY_PORT_MST:
++	case	SIGNAL_TYPE_EDP:
++	case	SIGNAL_TYPE_VIRTUAL:
++		pix_rate = dce110_get_d_to_pixel_rate_in_hz(cs, pix_clk_params, pll_settings);
++		break;
++	case	SIGNAL_TYPE_HDMI_TYPE_A:
++	default:
++		pix_rate = dce110_get_pll_pixel_rate_in_hz(cs, pix_clk_params, pll_settings);
++		break;
++	}
++
++	return pix_rate;
++}
++
+ static bool disable_spread_spectrum(struct dce110_clk_src *clk_src)
+ {
+ 	enum bp_result result;
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/clock_source.h b/drivers/gpu/drm/amd/display/dc/inc/clock_source.h
+index ebcf67b..cfe009a 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/clock_source.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/clock_source.h
+@@ -170,6 +170,10 @@ struct clock_source_funcs {
+ 			struct clock_source *,
+ 			struct pixel_clk_params *,
+ 			struct pll_settings *);
++	uint32_t (*get_pix_rate_in_hz)(
++			struct clock_source *,
++			struct pixel_clk_params *,
++			struct pll_settings *);
+ };
+ 
+ struct clock_source {
+-- 
+2.7.4
+

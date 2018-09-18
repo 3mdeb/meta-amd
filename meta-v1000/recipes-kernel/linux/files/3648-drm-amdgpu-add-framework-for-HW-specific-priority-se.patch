@@ -1,0 +1,251 @@
+From 978594bed6907e142f424e463c988170e2c95542 Mon Sep 17 00:00:00 2001
+From: Andres Rodriguez <andresx7@gmail.com>
+Date: Mon, 20 Feb 2017 17:53:19 -0500
+Subject: [PATCH 3648/5855] drm/amdgpu: add framework for HW specific priority
+ settings v9
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add an initial framework for changing the HW priorities of rings. The
+framework allows requesting priority changes for the lifetime of an
+amdgpu_job. After the job completes the priority will decay to the next
+lowest priority for which a request is still valid.
+
+A new ring function set_priority() can now be populated to take care of
+the HW specific programming sequence for priority changes.
+
+v2: set priority before emitting IB, and take a ref on amdgpu_job
+v3: use AMD_SCHED_PRIORITY_* instead of AMDGPU_CTX_PRIORITY_*
+v4: plug amdgpu_ring_restore_priority_cb into amdgpu_job_free_cb
+v5: use atomic for tracking job priorities instead of last_job
+v6: rename amdgpu_ring_priority_[get/put]() and align parameters
+v7: replace spinlocks with mutexes for KIQ compatibility
+v8: raise ring priority during cs_ioctl, instead of job_run
+v9: priority_get() before push_job()
+
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Andres Rodriguez <andresx7@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+
+Signed-off-by: Pavan Kumar Ramayanam <pavan.ramayanam@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c        |  2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c       |  3 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c      | 76 ++++++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h      | 15 ++++++
+ drivers/gpu/drm/amd/scheduler/gpu_scheduler.h |  7 +++
+ 5 files changed, 102 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 4bbf513..3fc0ee4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -1159,6 +1159,8 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ 	cs->out.handle = amdgpu_ctx_add_fence(p->ctx, ring, p->fence);
+ 	job->uf_sequence = cs->out.handle;
+ 	amdgpu_job_free_resources(job);
++	amdgpu_ring_priority_get(job->ring,
++				 amd_sched_get_job_priority(&job->base));
+ 
+ 	trace_amdgpu_cs_ioctl(job);
+ 	amd_sched_entity_push_job(&job->base);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index e9e5185..a3d6988 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -103,6 +103,7 @@ static void amdgpu_job_free_cb(struct amd_sched_job *s_job)
+ {
+ 	struct amdgpu_job *job = container_of(s_job, struct amdgpu_job, base);
+ 
++        amdgpu_ring_priority_put(job->ring, amd_sched_get_job_priority(s_job));
+ 	fence_put(job->fence);
+ 	amdgpu_sync_free(&job->sync);
+ 	amdgpu_sync_free(&job->dep_sync);
+@@ -139,6 +140,8 @@ int amdgpu_job_submit(struct amdgpu_job *job, struct amdgpu_ring *ring,
+ 	job->fence_ctx = entity->fence_context;
+ 	*f = fence_get(&job->base.s_fence->finished);
+ 	amdgpu_job_free_resources(job);
++	amdgpu_ring_priority_get(job->ring,
++				 amd_sched_get_job_priority(&job->base));
+ 	amd_sched_entity_push_job(&job->base);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index 019932a..e5ece1f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -155,6 +155,75 @@ void amdgpu_ring_undo(struct amdgpu_ring *ring)
+ }
+ 
+ /**
++ * amdgpu_ring_priority_put - restore a ring's priority
++ *
++ * @ring: amdgpu_ring structure holding the information
++ * @priority: target priority
++ *
++ * Release a request for executing at @priority
++ */
++void amdgpu_ring_priority_put(struct amdgpu_ring *ring,
++			      enum amd_sched_priority priority)
++{
++	int i;
++
++	if (!ring->funcs->set_priority)
++		return;
++
++	if (atomic_dec_return(&ring->num_jobs[priority]) > 0)
++		return;
++
++	/* no need to restore if the job is already at the lowest priority */
++	if (priority == AMD_SCHED_PRIORITY_NORMAL)
++		return;
++
++	mutex_lock(&ring->priority_mutex);
++	/* something higher prio is executing, no need to decay */
++	if (ring->priority > priority)
++		goto out_unlock;
++
++	/* decay priority to the next level with a job available */
++	for (i = priority; i >= AMD_SCHED_PRIORITY_MIN; i--) {
++		if (i == AMD_SCHED_PRIORITY_NORMAL
++				|| atomic_read(&ring->num_jobs[i])) {
++			ring->priority = i;
++			ring->funcs->set_priority(ring, i);
++			break;
++		}
++	}
++
++out_unlock:
++	mutex_unlock(&ring->priority_mutex);
++}
++
++/**
++ * amdgpu_ring_priority_get - change the ring's priority
++ *
++ * @ring: amdgpu_ring structure holding the information
++ * @priority: target priority
++ *
++ * Request a ring's priority to be raised to @priority (refcounted).
++ */
++void amdgpu_ring_priority_get(struct amdgpu_ring *ring,
++			      enum amd_sched_priority priority)
++{
++	if (!ring->funcs->set_priority)
++		return;
++
++	atomic_inc(&ring->num_jobs[priority]);
++
++	mutex_lock(&ring->priority_mutex);
++	if (priority <= ring->priority)
++		goto out_unlock;
++
++	ring->priority = priority;
++	ring->funcs->set_priority(ring, priority);
++
++out_unlock:
++	mutex_unlock(&ring->priority_mutex);
++}
++
++/**
+  * amdgpu_ring_init - init driver ring struct.
+  *
+  * @adev: amdgpu_device pointer
+@@ -169,7 +238,7 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 		     unsigned max_dw, struct amdgpu_irq_src *irq_src,
+ 		     unsigned irq_type)
+ {
+-	int r;
++	int r, i;
+ 	int sched_hw_submission = amdgpu_sched_hw_submission;
+ 
+ 	/* Set the hw submission limit higher for KIQ because
+@@ -247,9 +316,14 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 	}
+ 
+ 	ring->max_dw = max_dw;
++	ring->priority = AMD_SCHED_PRIORITY_NORMAL;
++	mutex_init(&ring->priority_mutex);
+ 	INIT_LIST_HEAD(&ring->lru_list);
+ 	amdgpu_ring_lru_touch(adev, ring);
+ 
++	for (i = 0; i < AMD_SCHED_PRIORITY_MAX; ++i)
++		atomic_set(&ring->num_jobs[i], 0);
++
+ 	if (amdgpu_debugfs_ring_init(adev, ring)) {
+ 		DRM_ERROR("Failed to register debugfs file for rings !\n");
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+index 1e7e3b8..bf597aa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -24,6 +24,7 @@
+ #ifndef __AMDGPU_RING_H__
+ #define __AMDGPU_RING_H__
+ 
++#include <drm/amdgpu_drm.h>
+ #include "gpu_scheduler.h"
+ 
+ /* max number of rings */
+@@ -57,6 +58,7 @@ struct amdgpu_device;
+ struct amdgpu_ring;
+ struct amdgpu_ib;
+ struct amdgpu_cs_parser;
++struct amdgpu_job;
+ 
+ /*
+  * Fences.
+@@ -148,6 +150,9 @@ struct amdgpu_ring_funcs {
+ 	void (*emit_rreg)(struct amdgpu_ring *ring, uint32_t reg);
+ 	void (*emit_wreg)(struct amdgpu_ring *ring, uint32_t reg, uint32_t val);
+ 	void (*emit_tmz)(struct amdgpu_ring *ring, bool start);
++	/* priority functions */
++	void (*set_priority) (struct amdgpu_ring *ring,
++			      enum amd_sched_priority priority);
+ };
+ 
+ struct amdgpu_ring {
+@@ -188,6 +193,12 @@ struct amdgpu_ring {
+ 	volatile u32		*cond_exe_cpu_addr;
+ 	unsigned		vm_inv_eng;
+ 	bool			has_compute_vm_bug;
++
++	atomic_t		num_jobs[AMD_SCHED_PRIORITY_MAX];
++	struct mutex		priority_mutex;
++	/* protected by priority_mutex */
++	int			priority;
++
+ #if defined(CONFIG_DEBUG_FS)
+ 	struct dentry *ent;
+ #endif
+@@ -198,6 +209,10 @@ void amdgpu_ring_insert_nop(struct amdgpu_ring *ring, uint32_t count);
+ void amdgpu_ring_generic_pad_ib(struct amdgpu_ring *ring, struct amdgpu_ib *ib);
+ void amdgpu_ring_commit(struct amdgpu_ring *ring);
+ void amdgpu_ring_undo(struct amdgpu_ring *ring);
++void amdgpu_ring_priority_get(struct amdgpu_ring *ring,
++			      enum amd_sched_priority priority);
++void amdgpu_ring_priority_put(struct amdgpu_ring *ring,
++			      enum amd_sched_priority priority);
+ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 		     unsigned ring_size, struct amdgpu_irq_src *irq_src,
+ 		     unsigned irq_type);
+diff --git a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+index d5dada5..3d3af5c 100644
+--- a/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
++++ b/drivers/gpu/drm/amd/scheduler/gpu_scheduler.h
+@@ -170,4 +170,11 @@ void amd_sched_job_recovery(struct amd_gpu_scheduler *sched);
+ bool amd_sched_dependency_optimized(struct fence* fence,
+ 				    struct amd_sched_entity *entity);
+ void amd_sched_job_kickout(struct amd_sched_job *s_job);
++
++static inline enum amd_sched_priority
++amd_sched_get_job_priority(struct amd_sched_job *job)
++{
++	return (job->s_entity->rq - job->sched->sched_rq);
++}
++
+ #endif
+-- 
+2.7.4
+

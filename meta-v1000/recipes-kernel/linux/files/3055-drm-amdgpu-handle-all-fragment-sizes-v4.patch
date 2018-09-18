@@ -1,0 +1,114 @@
+From 496f9bb9b2b5fe7e7c40dbe4f2c010f77ed40770 Mon Sep 17 00:00:00 2001
+From: Roger He <Hongbo.He@amd.com>
+Date: Wed, 30 Aug 2017 13:01:19 +0800
+Subject: [PATCH 3055/5855] drm/amdgpu: handle all fragment sizes v4
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This can improve performance for some cases.
+
+v2 (chk): handle all sizes, simplify the patch quite a bit
+v3 (chk): adjust dw estimation as well
+v4 (chk): use single loop, make end mask 64bit
+
+Signed-off-by: Roger He <Hongbo.He@amd.com>
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Tested-by: Roger He <Hongbo.He@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Chunming Zhou <david1.zhou@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c | 55 ++++++++++++++++------------------
+ 1 file changed, 26 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index db684a3..2347b07 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1421,8 +1421,6 @@ static int amdgpu_vm_frag_ptes(struct amdgpu_pte_update_params	*params,
+ 				uint64_t start, uint64_t end,
+ 				uint64_t dst, uint64_t flags)
+ {
+-	int r;
+-
+ 	/**
+ 	 * The MC L1 TLB supports variable sized pages, based on a fragment
+ 	 * field in the PTE. When this field is set to a non-zero value, page
+@@ -1441,39 +1439,38 @@ static int amdgpu_vm_frag_ptes(struct amdgpu_pte_update_params	*params,
+ 	 * Userspace can support this by aligning virtual base address and
+ 	 * allocation size to the fragment size.
+ 	 */
+-	unsigned pages_per_frag = params->adev->vm_manager.fragment_size;
+-	uint64_t frag_flags = AMDGPU_PTE_FRAG(pages_per_frag);
+-	uint64_t frag_align = 1 << pages_per_frag;
+-
+-	uint64_t frag_start = ALIGN(start, frag_align);
+-	uint64_t frag_end = end & ~(frag_align - 1);
++	unsigned max_frag = params->adev->vm_manager.fragment_size;
++	int r;
+ 
+ 	/* system pages are non continuously */
+-	if (params->src || !(flags & AMDGPU_PTE_VALID) ||
+-	    (frag_start >= frag_end))
++	if (params->src || !(flags & AMDGPU_PTE_VALID))
+ 		return amdgpu_vm_update_ptes(params, start, end, dst, flags);
+ 
+-	/* handle the 4K area at the beginning */
+-	if (start != frag_start) {
+-		r = amdgpu_vm_update_ptes(params, start, frag_start,
+-					  dst, flags);
++	while (start != end) {
++		uint64_t frag_flags, frag_end;
++		unsigned frag;
++
++		/* This intentionally wraps around if no bit is set */
++		frag = min((unsigned)ffs(start) - 1,
++			   (unsigned)fls64(end - start) - 1);
++		if (frag >= max_frag) {
++			frag_flags = AMDGPU_PTE_FRAG(max_frag);
++			frag_end = end & ~((1ULL << max_frag) - 1);
++		} else {
++			frag_flags = AMDGPU_PTE_FRAG(frag);
++			frag_end = start + (1 << frag);
++		}
++
++		r = amdgpu_vm_update_ptes(params, start, frag_end, dst,
++					  flags | frag_flags);
+ 		if (r)
+ 			return r;
+-		dst += (frag_start - start) * AMDGPU_GPU_PAGE_SIZE;
+-	}
+-
+-	/* handle the area in the middle */
+-	r = amdgpu_vm_update_ptes(params, frag_start, frag_end, dst,
+-				  flags | frag_flags);
+-	if (r)
+-		return r;
+ 
+-	/* handle the 4K area at the end */
+-	if (frag_end != end) {
+-		dst += (frag_end - frag_start) * AMDGPU_GPU_PAGE_SIZE;
+-		r = amdgpu_vm_update_ptes(params, frag_end, end, dst, flags);
++		dst += (frag_end - start) * AMDGPU_GPU_PAGE_SIZE;
++		start = frag_end;
+ 	}
+-	return r;
++
++	return 0;
+ }
+ 
+ /**
+@@ -1563,8 +1560,8 @@ static int amdgpu_vm_bo_update_mapping(struct amdgpu_device *adev,
+ 		/* set page commands needed */
+ 		ndw += ncmds * 10;
+ 
+-		/* two extra commands for begin/end of fragment */
+-		ndw += 2 * 10;
++		/* extra commands for begin/end fragments */
++		ndw += 2 * 10 * adev->vm_manager.fragment_size;
+ 
+ 		params.func = amdgpu_vm_do_set_ptes;
+ 	}
+-- 
+2.7.4
+

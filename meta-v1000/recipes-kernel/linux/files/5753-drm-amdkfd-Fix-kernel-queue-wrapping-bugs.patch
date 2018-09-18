@@ -1,0 +1,67 @@
+From c060d1cdbd322ea1c8b4cb5d0ec1c4bb1373cd6a Mon Sep 17 00:00:00 2001
+From: Yong Zhao <yong.zhao@amd.com>
+Date: Wed, 20 Sep 2017 18:10:21 -0400
+Subject: [PATCH 5753/5855] drm/amdkfd: Fix kernel-queue wrapping bugs
+
+Avoid intermediate negative numbers when doing calculations with a mix
+of signed and unsigned variables where implicit conversions can lead
+to unexpected results.
+
+When kernel queue buffer wraps around to 0, we need to check that rptr
+won't be overwritten by the new packet.
+
+Signed-off-by: Yong Zhao <yong.zhao@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+index d7ed10e..8b0c064 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+@@ -210,6 +210,11 @@ static int acquire_packet_buffer(struct kernel_queue *kq,
+ 	uint32_t wptr, rptr;
+ 	unsigned int *queue_address;
+ 
++	/* When rptr == wptr, the buffer is empty.
++	 * When rptr == wptr + 1, the buffer is full.
++	 * It is always rptr that advances to the position of wptr, rather than
++	 * the opposite. So we can only use up to queue_size_dwords - 1 dwords.
++	 */
+ 	rptr = *kq->rptr_kernel;
+ 	wptr = *kq->wptr_kernel;
+ 	queue_address = (unsigned int *)kq->pq_kernel_addr;
+@@ -219,11 +224,10 @@ static int acquire_packet_buffer(struct kernel_queue *kq,
+ 	pr_debug("wptr: %d\n", wptr);
+ 	pr_debug("queue_address 0x%p\n", queue_address);
+ 
+-	available_size = (rptr - 1 - wptr + queue_size_dwords) %
++	available_size = (rptr + queue_size_dwords - 1 - wptr) %
+ 							queue_size_dwords;
+ 
+-	if (packet_size_in_dwords >= queue_size_dwords ||
+-			packet_size_in_dwords >= available_size) {
++	if (packet_size_in_dwords > available_size) {
+ 		/*
+ 		 * make sure calling functions know
+ 		 * acquire_packet_buffer() failed
+@@ -233,6 +237,14 @@ static int acquire_packet_buffer(struct kernel_queue *kq,
+ 	}
+ 
+ 	if (wptr + packet_size_in_dwords >= queue_size_dwords) {
++		/* make sure after rolling back to position 0, there is
++		 * still enough space.
++		 */
++		if (packet_size_in_dwords >= rptr) {
++			*buffer_ptr = NULL;
++			return -ENOMEM;
++		}
++		/* fill nops, roll back and start at position 0 */
+ 		while (wptr > 0) {
+ 			queue_address[wptr] = kq->nop_packet;
+ 			wptr = (wptr + 1) % queue_size_dwords;
+-- 
+2.7.4
+
